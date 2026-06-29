@@ -1,0 +1,16 @@
+[package]
+name = "dira-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Source-of-truth wire schema shared between the Dira daemon (producer) and cloud (consumer)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+
+[[bin]]
+name = "emit-schema"
+path = "src/bin/emit_schema.rs"

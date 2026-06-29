@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = [
+    "contract",
+    "cli/core",
+    "cli/sources",
+    "cli/dirad",
+    "cli/dira",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/dodi-smart/dirahq-cli"
+rust-version = "1.80"
+
+# Centralized dependency versions. Members opt in via `dep.workspace = true`.
+[workspace.dependencies]
+# Async runtime + ingress
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+axum = "0.8"
+tower = "0.5"
+
+# HTTP client (daemon → cloud ingest, CLI → device claim). rustls so we never
+# depend on a system OpenSSL; json for (de)serializing envelope/claim bodies.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+
+# Terminal UI (the `dira watch` live dashboard). crossterm's `event-stream`
+# feature gives an async `EventStream` we can poll alongside the refresh timer;
+# the version is pinned to match ratatui's own crossterm to avoid two copies.
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+# `StreamExt::next` for crossterm's async `EventStream`; no executor pulled in.
+futures-util = { version = "0.3", default-features = false }
+
+# Storage
+# `macros` provides `migrate!` + `query!`; we use runtime queries only, so builds
+# and CI never need a live DB (no `query!` calls = no compile-time DB check).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+
+# Serialization + schema
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# Crypto + identity
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+serde_jcs = "0.1"
+base64 = "0.22"
+
+# Config + ids + logging
+figment = { version = "0.10", features = ["toml", "env"] }
+# Surgical, comment-preserving edits to the XDG `config.toml` (`dira config set`).
+# Already in the tree transitively via figment; pinned to the same 0.22 line.
+toml_edit = "0.22"
+ulid = { version = "1", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time + errors + utils
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
+thiserror = "2"
+anyhow = "1"
+directories = "5"
+
+# Internal crates
+dira-contract = { path = "contract" }
+dira-core = { path = "cli/core" }
+dira-sources = { path = "cli/sources" }
+
+# Dev-only
+criterion = "0.5"
+proptest = "1"
+tempfile = "3"
+
+# Faster incremental dev builds; release stays optimized.
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+strip = true

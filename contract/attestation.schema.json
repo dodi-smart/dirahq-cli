@@ -1,0 +1,402 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Envelope",
+  "description": "A signed batch as it travels over the wire to `POST /api/v1/ingest`.\n\nThe signature is computed over the canonical-JSON (RFC 8785) encoding of\n`payload` only, so it verifies independently of how the envelope is framed.",
+  "type": "object",
+  "properties": {
+    "deviceId": {
+      "description": "ULID of the device that produced and signed this batch.",
+      "type": "string"
+    },
+    "payload": {
+      "description": "The attestation batch being attested to.",
+      "$ref": "#/$defs/AttestationBatch"
+    },
+    "schemaVersion": {
+      "description": "Semver of this contract, e.g. `\"1.0.0\"`.",
+      "type": "string"
+    },
+    "sig": {
+      "description": "`ed25519(JCS(payload))`, base64 (standard, no padding).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "deviceId",
+    "payload",
+    "sig"
+  ],
+  "$defs": {
+    "ArtifactKind": {
+      "description": "What an artifact ref points at.",
+      "type": "string",
+      "enum": [
+        "commit",
+        "pull_request"
+      ]
+    },
+    "ArtifactRef": {
+      "description": "A git artifact the cloud can anchor against (confirm it exists + author matches).",
+      "type": "object",
+      "properties": {
+        "authorEmail": {
+          "description": "Commit author email — the identity the cloud anchors the commit to.\nOptional + omitted-when-absent (keeps the signing vector byte-identical).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authoredAt": {
+          "description": "RFC 3339 author date of the commit. Lets the cloud anchor an interval to a\ncommit by author + time without re-reading the remote.\nOptional + omitted-when-absent so older payloads (and the signing vector)\nstay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "blobs": {
+          "description": "**Squash-resilient session signal.** Per touched path, the git post-image\nblob SHA at the session tip — the object id git already stores. A squashed\ncommit's tree carries the same blob SHA for any file not further modified\nduring the squash, so blob-set overlap is a robust content-*identity* anchor\nthe cloud can verify against the remote (which exposes the same blob SHAs).\n\n`blobs` is git's own term (no denylisted token); each entry is a path + an\nobject id, never file content. Optional + omitted-when-absent.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/BlobRef"
+          }
+        },
+        "changeId": {
+          "description": "`git patch-id --stable` of the commit — a stable hash of the *change* that\nsurvives rebase / amend / cherry-pick (the SHA does not). Lets the cloud\nre-anchor work whose original SHA was rewritten out of the remote: it finds\nthe surviving commit by branch + author + window, then confirms it carries\nthe same patch-id. Metadata only — never the diff itself.\n\nSerialized as `changeId` on the wire: it is a stable *change identity*, not\na patch/diff — the privacy invariant denylists the `patch` token to keep\ncontent off the wire, and this id (a SHA-1 over the normalized diff) is not\ncontent.\nOptional + omitted-when-absent (keeps the signing vector byte-identical).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gitRef": {
+          "description": "e.g. the PR number or branch ref.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKind"
+        },
+        "repoCanonical": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionChangeId": {
+          "description": "**Squash-resilient session signal.** `git patch-id --stable` over the\nsession's *cumulative* diff (`merge-base(upstream, HEAD)..HEAD`), not this\none commit. A squash-merge collapses N commits into one whose combined diff\nmatches none of the per-commit `changeId`s — but it equals this cumulative\nid when the base hasn't moved, so the cloud can re-anchor the squashed\ncommit by an exact match. Carried per artifact (the commits of a session\nshare it) so an artifact-only flush still ships it.\n\nNamed `sessionChangeId` (not `*PatchId`/`*Diff*`): a stable change identity,\nnever the diff. Optional + omitted-when-absent (keeps the signing vector\nbyte-identical).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha": {
+          "description": "Commit SHA (the thing the cloud confirms in the remote).",
+          "type": "string"
+        },
+        "sourceSession": {
+          "description": "The session the daemon observed producing this repo at capture time, IFF\nunambiguous. Lets the cloud anchor deterministically instead of guessing.\nOptional + omitted-when-absent (keeps the signing vector byte-identical).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "touchedPaths": {
+          "description": "**Squash-resilient session signal.** Repo-relative paths the session changed\nacross the cumulative range. Survives squash *and* rebase (the squashed\ncommit touches the union of paths), enabling fuzzy path-set overlap when\n`sessionChangeId` misses (base moved / conflict resolution). Paths only —\nno file content. Optional + omitted-when-absent.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "sha"
+      ]
+    },
+    "AttestationBatch": {
+      "description": "The unit of sync: a collection of settled facts captured locally.\n\nIdempotent by `batchId`; append-only — corrections are *new* batches that\nsupersede, never mutations of a synced one.",
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "description": "Git artifacts referenced by intervals, for cloud-side anchoring.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          }
+        },
+        "batchId": {
+          "description": "ULID; the idempotency key for ingest.",
+          "type": "string"
+        },
+        "deviceId": {
+          "description": "ULID of the producing device (matches the envelope).",
+          "type": "string"
+        },
+        "generatedAt": {
+          "description": "RFC 3339 timestamp the batch was assembled.",
+          "type": "string"
+        },
+        "intervals": {
+          "description": "De-duplicated, idle-trimmed billable human-time intervals.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Interval"
+          }
+        },
+        "sessions": {
+          "description": "Per-session rollups (agent wall-clock, harness, repo).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionRollup"
+          }
+        },
+        "tokenUsage": {
+          "description": "Token usage — a sibling metric, never a billing base.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TokenUsage"
+          }
+        }
+      },
+      "required": [
+        "batchId",
+        "deviceId",
+        "generatedAt"
+      ]
+    },
+    "BlobRef": {
+      "description": "One touched path and its git post-image blob SHA — a content-identity pointer\n(the object id git stores), never the file's bytes. Part of the squash-resilient\nanchoring signals on [`ArtifactRef`].",
+      "type": "object",
+      "properties": {
+        "blob": {
+          "description": "The git blob object id (SHA) for that path at the session tip.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Repo-relative path the session changed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "blob"
+      ]
+    },
+    "Harness": {
+      "description": "Which harness produced a session.\n\n`Generic` is a tool piping events through the JSON-lines adapter — distinct\nfrom `Manual` (a human `dira start` dira): these are agent-style events from\nan unmodeled harness.",
+      "type": "string",
+      "enum": [
+        "claude_code",
+        "codex",
+        "open_code",
+        "generic",
+        "manual"
+      ]
+    },
+    "Interval": {
+      "description": "A de-duplicated, idle-trimmed slice of human-engaged time, attributed to a repo.\n\n`humanSeconds` is the billing base. Project/client grouping is derived in the\ncloud from the repo — never frozen here.",
+      "type": "object",
+      "properties": {
+        "activity": {
+          "description": "Optional activity label (e.g. `meeting`, `manual-testing`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endedAt": {
+          "type": "string"
+        },
+        "humanSeconds": {
+          "description": "De-duplicated human-engaged seconds in this interval.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "description": "ULID.",
+          "type": "string"
+        },
+        "identityEmail": {
+          "description": "`git config user.email` of the person the work is attributed to.",
+          "type": "string"
+        },
+        "repoCanonical": {
+          "description": "Canonical repo ref, e.g. `github.com/acme/api`. `None` for unresolved dirs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceSession": {
+          "description": "The session this interval was derived from.",
+          "type": "string"
+        },
+        "startedAt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "identityEmail",
+        "startedAt",
+        "endedAt",
+        "humanSeconds",
+        "sourceSession"
+      ]
+    },
+    "SessionKind": {
+      "description": "How a piece of work was captured. Drives assurance on the cloud side.",
+      "oneOf": [
+        {
+          "description": "An AI coding harness session (Claude Code, Codex, OpenCode).",
+          "type": "string",
+          "const": "agent"
+        },
+        {
+          "description": "A manual `dira start` dira (meeting, manual testing, etc.).",
+          "type": "string",
+          "const": "manual"
+        }
+      ]
+    },
+    "SessionRollup": {
+      "description": "Per-session rollup. Agent wall-clock sums freely; it is evidence, never billed.",
+      "type": "object",
+      "properties": {
+        "agentWallSeconds": {
+          "description": "Total agent wall-clock seconds observed for this session.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "branch": {
+          "description": "The session branch (`git rev-parse --abbrev-ref HEAD`), if resolved. Lets\nthe cloud anchor commits on this session to the branch it was worked on.\nOptional + omitted-when-absent so older payloads (and the signing vector)\nstay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "harness": {
+          "$ref": "#/$defs/Harness"
+        },
+        "identityEmail": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SessionKind"
+        },
+        "prompts": {
+          "description": "Count of human prompts (user_prompt events) observed in this session.\nOptional + omitted-when-absent so older payloads (and the signing vector)\nstay byte-identical.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "repoCanonical": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "description": "Harness session id, or daemon-issued ULID for manual sessions.",
+          "type": "string"
+        },
+        "startedAt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "harness",
+        "kind",
+        "identityEmail",
+        "startedAt",
+        "agentWallSeconds"
+      ]
+    },
+    "TokenUsage": {
+      "description": "Token usage for a session/turn. Cost is always an estimate, separate from time.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "string"
+        },
+        "cacheCreate": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cacheRead": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "estCostUsd": {
+          "description": "Estimated USD cost from the bundled pricing table. Always a label, never billed.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "id": {
+          "type": "string"
+        },
+        "input": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string"
+        },
+        "output": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "repoCanonical": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sessionId",
+        "model",
+        "input",
+        "output",
+        "cacheRead",
+        "cacheCreate",
+        "at"
+      ]
+    }
+  }
+}

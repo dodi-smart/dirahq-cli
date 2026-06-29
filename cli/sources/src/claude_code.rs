@@ -1,0 +1,105 @@
+//! Claude Code http-hook normalization.
+//!
+//! Claude Code POSTs a JSON body per hook with at least `hook_event_name`,
+//! `session_id`, and `cwd`; tool events add `tool_name`. We map the event name to
+//! our internal [`EventKind`] and drop everything else.
+
+use crate::{HarnessSource, Normalized};
+use dira_contract::Harness;
+use dira_core::model::EventKind;
+use serde::Deserialize;
+
+/// The Claude Code source: maps Claude's `hook_event_name` payloads.
+pub struct ClaudeCodeSource;
+
+impl HarnessSource for ClaudeCodeSource {
+    fn harness(&self) -> Harness {
+        Harness::ClaudeCode
+    }
+    fn id(&self) -> &'static str {
+        "claude"
+    }
+    fn normalize(&self, payload: serde_json::Value) -> Option<Normalized> {
+        let hook: ClaudeHook = serde_json::from_value(payload).ok()?;
+        normalize(&hook)
+    }
+}
+
+/// The subset of a Claude Code hook payload we read. Unknown fields are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeHook {
+    #[serde(default)]
+    pub hook_event_name: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// Absolute path to the session transcript JSONL. Claude Code includes this
+    /// on most hooks; we read it only to extract token usage counts.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+}
+
+/// Map a Claude Code hook to a normalized event. Returns `None` for hook names we
+/// don't account for (so new/unknown hooks are safely ignored).
+pub fn normalize(hook: &ClaudeHook) -> Option<Normalized> {
+    let kind = match hook.hook_event_name.as_deref()? {
+        "SessionStart" => EventKind::SessionStart,
+        "SessionEnd" => EventKind::SessionEnd,
+        "UserPromptSubmit" => EventKind::UserPrompt,
+        "Stop" | "SubagentStop" => EventKind::Stop,
+        "PreToolUse" => EventKind::PreTool,
+        "PostToolUse" => EventKind::PostTool,
+        // Notifications are emitted when Claude needs the human (e.g. permission);
+        // treat as a human-attention signal.
+        "PermissionRequest" | "Notification" => EventKind::PermissionDecision,
+        _ => return None,
+    };
+    Some(Normalized {
+        session_id: hook
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        kind,
+        cwd: hook.cwd.clone(),
+        tool: hook.tool_name.clone(),
+        transcript_path: hook.transcript_path.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_user_prompt() {
+        let hook: ClaudeHook = serde_json::from_str(
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"abc","cwd":"/repo"}"#,
+        )
+        .unwrap();
+        let n = normalize(&hook).unwrap();
+        assert_eq!(n.kind, EventKind::UserPrompt);
+        assert_eq!(n.session_id, "abc");
+        assert_eq!(n.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn maps_tool_events_with_name() {
+        let hook: ClaudeHook = serde_json::from_str(
+            r#"{"hook_event_name":"PreToolUse","session_id":"abc","tool_name":"Bash"}"#,
+        )
+        .unwrap();
+        let n = normalize(&hook).unwrap();
+        assert_eq!(n.kind, EventKind::PreTool);
+        assert_eq!(n.tool.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn unknown_hook_is_ignored() {
+        let hook: ClaudeHook =
+            serde_json::from_str(r#"{"hook_event_name":"PreCompact","session_id":"x"}"#).unwrap();
+        assert!(normalize(&hook).is_none());
+    }
+}

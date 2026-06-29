@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# Never cancel an in-flight release — a half-pushed tag/version commit is worse
+# than waiting. Releases for different refs are still isolated.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: jdx/mise-action@v2
+      # The JS release tooling (semantic-release + plugins) runs under bun/node.
+      # mise here only provides the Rust toolchain (cargo set-version), so install
+      # bun + node explicitly rather than pinning them in the Rust repo's mise.toml.
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install cargo-edit (provides `cargo set-version`)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+      - name: Install release tooling
+        run: bun install --frozen-lockfile
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bunx semantic-release --extends ./.releaserc.js
+
+  # After stable releases on main, fast-forward the prerelease channel by merging
+  # main back into develop so develop never lags behind production.
+  backmerge:
+    name: Backmerge main → develop
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [release]
+    if: |
+      always() &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped') &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Merge main into develop
+        run: |
+          git fetch origin develop:develop
+          git checkout develop
+          git merge main --no-ff -m "chore(release): merge main into develop [skip ci]"
+          git push origin develop

@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [develop, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Enforce Conventional Commits on every PR. Lightweight — stays on
+  # GitHub-hosted runners (no self-hosted fallback needed).
+  commit-lint:
+    name: Commit Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: commitlint.config.mjs
+
+  # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
+  # to `ubuntu-latest` when none are available. Downstream jobs read the chosen
+  # label set from `outputs.runner` via `fromJson()`.
+  check-runners:
+    name: Pick runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.draft == false
+    outputs:
+      runner: ${{ steps.set-runner.outputs.use-runner }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Check runner availability
+        id: set-runner
+        uses: dodi-smart/runner-fallback-action@v2
+        with:
+          organization: ${{ github.repository_owner }}
+          primary-runner: "self-hosted,build"
+          fallback-runner: "ubuntu-latest"
+          github-token: ${{ steps.app-token.outputs.token }}
+          fallback-on-error: true
+
+  rust:
+    name: Rust (capture layer)
+    needs: [check-runners]
+    runs-on: ${{ fromJson(needs.check-runners.outputs.runner) }}
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: contract schema is up to date
+        run: |
+          cargo run -q -p dira-contract --bin emit-schema
+          git diff --exit-code contract/attestation.schema.json \
+            || (echo "contract/attestation.schema.json is stale — run 'just contract-schema'"; exit 1)
+      - name: signing vector fixture is up to date
+        run: |
+          cargo run -q -p dira-core --bin sign_vector > contract/testdata/signing-vector.json
+          git diff --exit-code contract/testdata/signing-vector.json \
+            || (echo "signing-vector fixture is stale — run 'just vector'"; exit 1)

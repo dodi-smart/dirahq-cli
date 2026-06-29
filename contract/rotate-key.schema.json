@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RotateKeyEnvelope",
+  "description": "A signed key-rotation request as it travels over the wire.\n\nMirrors [`Envelope`]'s framing, but the signature is computed by the **old**\nkey over `JCS(payload)` — the cloud verifies against the device's\ncurrently-registered pubkey before swapping in `payload.new_pubkey`.",
+  "type": "object",
+  "properties": {
+    "deviceId": {
+      "description": "ULID of the device (matches `payload.device_id`).",
+      "type": "string"
+    },
+    "payload": {
+      "description": "The rotation request being attested to.",
+      "$ref": "#/$defs/RotateKeyRequest"
+    },
+    "sig": {
+      "description": "`ed25519_oldkey(JCS(payload))`, base64 (standard, no padding).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "deviceId",
+    "payload",
+    "sig"
+  ],
+  "$defs": {
+    "RotateKeyRequest": {
+      "description": "A request to rotate a device's signing key, sent to\n`POST /api/v1/devices/rotate-key`.\n\nThe payload names the device, the *new* public key, and when the rotation was\nrequested. It is signed by the **old** key (see [`RotateKeyEnvelope`]), proving\nthe holder of the current key authorized the swap. The cloud verifies the\nsignature against the device's currently-registered pubkey, then installs the\nnew one. Cloud-side verification is out of scope for this repo (producer-side).",
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "description": "ULID of the device whose key is rotating.",
+          "type": "string"
+        },
+        "newPubkey": {
+          "description": "The new Ed25519 public key, standard base64 — what the cloud will register.",
+          "type": "string"
+        },
+        "rotatedAt": {
+          "description": "RFC 3339 timestamp the rotation was requested.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "deviceId",
+        "newPubkey",
+        "rotatedAt"
+      ]
+    }
+  }
+}

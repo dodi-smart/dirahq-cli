@@ -1,0 +1,24 @@
+{
+  "name": "dirahq-cli-release",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Release & commit-convention tooling for the Dira CLI (cli + contract).",
+  "scripts": {
+    "release": "semantic-release --extends ./.releaserc.js",
+    "release:dry-run": "semantic-release --dry-run --no-ci --extends ./.releaserc.js",
+    "commitlint": "commitlint"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "21.1.0",
+    "@commitlint/config-conventional": "21.1.0",
+    "@semantic-release/changelog": "6.0.3",
+    "@semantic-release/commit-analyzer": "13.0.1",
+    "@semantic-release/exec": "7.1.0",
+    "@semantic-release/git": "10.0.1",
+    "@semantic-release/github": "12.0.8",
+    "@semantic-release/release-notes-generator": "14.1.1",
+    "conventional-changelog-conventionalcommits": "9.3.1",
+    "semantic-release": "25.0.5",
+    "semantic-release-scope-filter": "1.0.0"
+  }
+}

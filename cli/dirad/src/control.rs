@@ -1,0 +1,468 @@
+//! The Unix domain socket control server: handles `dira` CLI commands.
+//!
+//! Unlike the HTTP hot path, these are human-initiated and may resolve git
+//! synchronously — millisecond latency is fine. Each connection carries exactly
+//! one length-prefixed JSON request and gets one length-prefixed JSON response.
+
+use crate::events::{handle_of, manual_event, materialize_interval};
+use crate::state::{AppState, EventMsg};
+use dira_core::accounting::{self, Signal};
+use dira_core::model::{EventKind, RawEvent};
+use dira_core::project;
+use dira_core::protocol::{ReportScope, Request, Response, SessionView, StatusView, StopSelector};
+use dira_core::report;
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use time::{Duration, OffsetDateTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use ulid::Ulid;
+
+/// Lock a mutex, recovering the guard even if it was poisoned.
+///
+/// A poisoned mutex means some other holder panicked mid-update, so the data may
+/// be slightly inconsistent — but for the live-session registry and the repo-dir
+/// map that's "stale but serving", which is far better than crashing the
+/// CLI-facing control surface. [`PoisonError::into_inner`] hands back the guard
+/// regardless, so a one-off panic anywhere degrades gracefully instead of
+/// permanently breaking `status`/`sessions`/`stop` with a re-panic. This replaces
+/// the former `.lock().unwrap()` sites, which would propagate the poison.
+pub fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// [`lock_recover`] for the repo-dir map; a thin alias kept for call-site clarity.
+pub fn lock_recover_map<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock_recover(m)
+}
+
+/// Read one framed JSON value (4-byte BE length prefix + payload).
+pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Write one framed JSON value.
+pub async fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> std::io::Result<()> {
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await?;
+    stream.write_all(bytes).await?;
+    stream.flush().await
+}
+
+/// Serve a single CLI connection.
+pub async fn handle_conn(state: AppState, mut stream: UnixStream) {
+    let resp = match read_frame(&mut stream).await {
+        Ok(buf) => match serde_json::from_slice::<Request>(&buf) {
+            Ok(req) => dispatch(&state, req).await,
+            Err(e) => Response::Error {
+                message: format!("bad request: {e}"),
+            },
+        },
+        Err(e) => Response::Error {
+            message: format!("read error: {e}"),
+        },
+    };
+    let bytes = serde_json::to_vec(&resp).unwrap_or_default();
+    let _ = write_frame(&mut stream, &bytes).await;
+}
+
+/// Dispatch a single control request to its handler. Public so integration tests
+/// can drive the control surface without framing a socket round-trip.
+pub async fn dispatch(state: &AppState, req: Request) -> Response {
+    match req {
+        Request::Ping => Response::Pong,
+        Request::Status => status(state).await,
+        Request::Sessions => sessions(state).await,
+        Request::Start {
+            project,
+            label,
+            activity,
+            cwd,
+        } => start(state, project, label, activity, cwd).await,
+        Request::Stop { selector } => stop(state, selector).await,
+        Request::Log {
+            duration_secs,
+            project,
+            note,
+            cwd,
+        } => log(state, duration_secs, project, note, cwd).await,
+        Request::Report { scope } => report_cmd(state, scope).await,
+        Request::IngestHook { harness, payload } => ingest_hook(state, harness, payload).await,
+        Request::Nuke => nuke(state).await,
+        Request::DaemonInfo => daemon_info(state),
+    }
+}
+
+/// Build + runtime info for the running daemon (`dira version`). The version is
+/// the daemon binary's own `CARGO_PKG_VERSION`, so the CLI can flag a skew when
+/// it differs from the CLI build.
+fn daemon_info(state: &AppState) -> Response {
+    Response::DaemonInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        schema_version: dira_contract::SCHEMA_VERSION.to_string(),
+        pid: std::process::id(),
+        uptime_seconds: state.started_at.elapsed().as_secs(),
+    }
+}
+
+/// Wipe all local statistics and clear the live-session registry, so the daemon
+/// doesn't keep reporting sessions whose events were just deleted. Device
+/// identity is kept (the store preserves it).
+async fn nuke(state: &AppState) -> Response {
+    let (events, tokens) = match state.store.nuke().await {
+        Ok(counts) => counts,
+        Err(e) => {
+            return Response::Error {
+                message: format!("nuke failed: {e}"),
+            }
+        }
+    };
+    lock_recover(&state.sessions).clear();
+    tracing::info!(events, tokens, "nuked local statistics");
+    Response::Nuked { events, tokens }
+}
+
+/// Normalize a forwarded harness hook and enqueue it on the same path as HTTP
+/// ingress. Acks immediately; enrichment + append happen in the writer task.
+async fn ingest_hook(state: &AppState, harness: String, payload: serde_json::Value) -> Response {
+    let (norm, harness_kind) = match dira_sources::normalize_for(&harness, payload) {
+        Some(pair) => pair,
+        None => {
+            // Distinguish a genuinely unknown harness from a known harness whose
+            // hook we don't account for (the latter is a normal, silent ignore).
+            if dira_sources::is_known_harness(&harness) {
+                return Response::Ok; // known harness, ignored/unknown hook
+            }
+            return Response::Error {
+                message: format!("unknown harness: {harness}"),
+            };
+        }
+    };
+
+    let msg = EventMsg::Hook {
+        norm,
+        harness: harness_kind,
+        at: OffsetDateTime::now_utc(),
+    };
+    match state.tx.try_send(msg) {
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Response::Ok,
+        Err(_) => Response::Error {
+            message: "daemon shutting down".into(),
+        },
+    }
+}
+
+/// Resolve a project: explicit value wins, else resolve from cwd, else daemon cwd.
+fn resolve(project: Option<String>, cwd: Option<String>) -> (Option<String>, Option<String>) {
+    if let Some(p) = project {
+        return (Some(p), None);
+    }
+    let dir = cwd.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf())
+    });
+    let r = project::resolve(&dir);
+    (r.project, r.identity_email)
+}
+
+async fn start(
+    state: &AppState,
+    project: Option<String>,
+    label: Option<String>,
+    activity: Option<String>,
+    cwd: Option<String>,
+) -> Response {
+    let (project, identity) = resolve(project, cwd.clone());
+    // Register the dira's working dir against its repo so the idle-ticker commit
+    // poller can pick up commits made during a pure manual dira (no agent events).
+    if let (Some(p), Some(dir)) = (project.as_deref(), cwd.as_deref()) {
+        lock_recover_map(&state.repo_dirs).insert(p.to_string(), dir.to_string());
+    }
+    let session_id = Ulid::new().to_string();
+    let handle = handle_of(&session_id);
+    let ev = manual_event(
+        &session_id,
+        EventKind::ManualStart,
+        OffsetDateTime::now_utc(),
+        project.clone(),
+        identity,
+        label,
+        activity,
+    );
+    if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_err() {
+        return Response::Error {
+            message: "daemon shutting down".into(),
+        };
+    }
+    Response::Started { handle, project }
+}
+
+async fn stop(state: &AppState, selector: StopSelector) -> Response {
+    let (by_handle, by_label, all, auto) = match selector {
+        StopSelector::Handle { ref handle } => (Some(handle.as_str()), None, false, false),
+        StopSelector::Label { ref label } => (None, Some(label.as_str()), false, false),
+        StopSelector::All => (None, None, true, false),
+        StopSelector::Auto => (None, None, false, true),
+    };
+
+    let targets =
+        {
+            let reg = lock_recover(&state.sessions);
+            if auto {
+                let manual = reg.active_manual();
+                match manual.len() {
+                    1 => vec![manual[0].session_id.clone()],
+                    0 => {
+                        return Response::Error {
+                            message: "no active manual session".into(),
+                        }
+                    }
+                    _ => return Response::Error {
+                        message:
+                            "several manual sessions active; specify a handle, --label, or --all"
+                                .into(),
+                    },
+                }
+            } else {
+                reg.select_manual(by_handle, by_label, all)
+            }
+        };
+
+    if targets.is_empty() {
+        return Response::Error {
+            message: "no matching active manual session".into(),
+        };
+    }
+
+    let mut count = 0usize;
+    for sid in targets {
+        // Pull the session's project so the stop event is attributed correctly.
+        let (project, identity, label) = {
+            let reg = lock_recover(&state.sessions);
+            reg.active_manual()
+                .into_iter()
+                .find(|s| s.session_id == sid)
+                .map(|s| (s.project, s.identity_email, s.label))
+                .unwrap_or((None, None, None))
+        };
+        let ev = manual_event(
+            &sid,
+            EventKind::ManualStop,
+            OffsetDateTime::now_utc(),
+            project,
+            identity,
+            label,
+            None,
+        );
+        if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_ok() {
+            count += 1;
+        }
+    }
+    Response::Stopped { count }
+}
+
+async fn log(
+    state: &AppState,
+    duration_secs: u64,
+    project: Option<String>,
+    note: Option<String>,
+    cwd: Option<String>,
+) -> Response {
+    let (project, identity) = resolve(project, cwd);
+    let end = OffsetDateTime::now_utc();
+    let start = end - Duration::seconds(duration_secs as i64);
+    let session_id = Ulid::new().to_string();
+    let handle = handle_of(&session_id);
+    let events = materialize_interval(&session_id, start, end, project, identity, note, None);
+    for ev in events {
+        if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_err() {
+            return Response::Error {
+                message: "daemon shutting down".into(),
+            };
+        }
+    }
+    Response::Logged { handle }
+}
+
+async fn status(state: &AppState) -> Response {
+    let since = start_of_today(state);
+    let events = state
+        .store
+        .events_since(Some(since))
+        .await
+        .unwrap_or_default();
+    let today = report::build(&events, state.config.idle());
+    let active = build_session_views(state, &events, true);
+    // Un-synced backlog: events past the confirmed sync cursor.
+    let cursor = state
+        .store
+        .meta_get(crate::sync::META_SYNC_CURSOR)
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let sync_pending = state
+        .store
+        .count_events_after(cursor.as_deref())
+        .await
+        .unwrap_or(0);
+    Response::Status(StatusView {
+        active,
+        today,
+        sync_pending,
+        hydrating: !state.hydrated.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+async fn sessions(state: &AppState) -> Response {
+    let events = state
+        .store
+        .events_since(Some(start_of_today(state)))
+        .await
+        .unwrap_or_default();
+    Response::Sessions {
+        sessions: build_session_views(state, &events, false),
+    }
+}
+
+async fn report_cmd(state: &AppState, scope: ReportScope) -> Response {
+    let (since, project_filter) = match scope {
+        ReportScope::Today => (Some(start_of_today(state)), None),
+        ReportScope::Week => (Some(start_of_today(state) - Duration::days(7)), None),
+        ReportScope::All => (None, None),
+        ReportScope::Project { project } => (None, Some(project)),
+    };
+    let mut events = state.store.events_since(since).await.unwrap_or_default();
+    if let Some(p) = &project_filter {
+        events.retain(|e| e.project.as_deref() == Some(p.as_str()));
+    }
+
+    // Fold in the compacted historical rollup so totals survive retention. The
+    // rollup window matches the report's lower bound: a `since` inside the
+    // retention window means no rollups match (they only hold older data), so
+    // `--today/--week` stay exactly raw.
+    let since_day = since.and_then(|s| {
+        s.format(&time::format_description::well_known::Iso8601::DATE)
+            .ok()
+    });
+    let mut rollups = state
+        .store
+        .rollup_totals_since(since_day.as_deref())
+        .await
+        .unwrap_or_default();
+    if let Some(p) = &project_filter {
+        rollups.retain(|l| l.project.as_deref() == Some(p.as_str()));
+    }
+    let rollup_sessions = state
+        .store
+        .rollup_session_count(since_day.as_deref())
+        .await
+        .unwrap_or(0);
+
+    Response::Report(report::build_merged(
+        &events,
+        state.config.idle(),
+        &rollups,
+        rollup_sessions,
+    ))
+}
+
+/// Build session views, optionally only active ones.
+fn build_session_views(
+    state: &AppState,
+    events: &[RawEvent],
+    active_only: bool,
+) -> Vec<SessionView> {
+    let reg = lock_recover(&state.sessions);
+    let live = if active_only { reg.active() } else { reg.all() };
+    let now = OffsetDateTime::now_utc();
+    let idle = state.config.idle();
+
+    live.into_iter()
+        .map(|s| {
+            let (human, agent) = session_seconds(events, &s.session_id, idle);
+            SessionView {
+                handle: s.handle(),
+                session_id: s.session_id.clone(),
+                harness: format!("{:?}", s.harness),
+                kind: format!("{:?}", s.kind),
+                project: s.project.clone(),
+                label: s.label.clone(),
+                started_at: s
+                    .started_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                human_seconds: human,
+                agent_seconds: agent,
+                idle: s.is_idle(now, idle),
+                // Live tails for the `watch` dashboard: it grows the timers by
+                // `now - these` (clamped to idle) between polls.
+                last_activity_at: Some(fmt_ts(s.last_active_at.unwrap_or(s.last_event_at))),
+                last_human_at: s.last_human_signal_at.or(s.last_signal_at).map(fmt_ts),
+            }
+        })
+        .collect()
+}
+
+/// Format an instant as RFC3339 for the wire (empty string on the format error,
+/// which never happens for a valid `OffsetDateTime`).
+fn fmt_ts(t: OffsetDateTime) -> String {
+    t.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// Per-session (non-deduped) human + agent seconds, for display only. The
+/// authoritative de-duplicated totals live in the report.
+fn session_seconds(events: &[RawEvent], session_id: &str, idle: Duration) -> (i64, i64) {
+    let mut signals = Vec::new();
+    let mut first = None;
+    let mut last = None;
+    let mut had_activity = false;
+    for e in events.iter().filter(|e| e.session_id == session_id) {
+        first.get_or_insert(e.at);
+        last = Some(e.at);
+        if e.kind.is_human_signal() {
+            signals.push(Signal {
+                at: e.at,
+                project: e.project.clone(),
+            });
+        }
+        if e.kind.is_agent_activity() {
+            had_activity = true;
+        }
+    }
+    let human = accounting::total_human_seconds(&signals, idle);
+    let agent = match (first, last, had_activity) {
+        (Some(f), Some(l), true) => (l - f).whole_seconds(),
+        _ => 0,
+    };
+    (human, agent)
+}
+
+/// The start of "today" for report windows, as a UTC instant.
+///
+/// By default this is UTC midnight (`config.report_local_day == false`), which
+/// preserves the original Phase 1 behavior. When `report_local_day` is enabled
+/// the boundary is computed in the system local timezone via
+/// [`dira_core::config::start_of_day`]. Resolving the local offset can fail in a
+/// multithreaded process (`UtcOffset::current_local_offset` returns an error when
+/// it can't prove soundness); on failure we log at debug and fall back to UTC so
+/// reporting never breaks.
+fn start_of_today(state: &AppState) -> OffsetDateTime {
+    let now = OffsetDateTime::now_utc();
+    if !state.config.report_local_day {
+        return now.replace_time(time::Time::MIDNIGHT);
+    }
+    match time::UtcOffset::current_local_offset() {
+        Ok(offset) => dira_core::config::start_of_day(now, offset),
+        Err(e) => {
+            tracing::debug!(error = %e, "local offset unavailable; using UTC day boundary");
+            now.replace_time(time::Time::MIDNIGHT)
+        }
+    }
+}

@@ -1,0 +1,13 @@
+# Toolchain pins for the Dira CLI (open source).
+# Rust builds the capture layer (cli/* + contract); just runs the task recipes;
+# node/bun run the JS release tooling (semantic-release + commitlint).
+[tools]
+rust = "stable"
+just = "latest"
+node = "24"
+bun = "latest"
+
+[env]
+RUST_BACKTRACE = "1"
+# Local-only default; the daemon falls back to XDG paths when unset.
+DIRA_SOCKET = "{{ env.TMPDIR | default(value='/tmp/') }}dira.sock"

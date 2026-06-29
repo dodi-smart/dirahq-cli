@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PresenceEnvelope",
+  "description": "A signed live-presence heartbeat as it travels over the wire.\n\nMirrors [`Envelope`] exactly (same framing, same signing rule): the signature\nis computed over the canonical-JSON (RFC 8785) encoding of `payload` only.\nPresence is a separate, additive channel from the attestation `Envelope` — it\ncarries no billing facts, only which sessions are currently live.",
+  "type": "object",
+  "properties": {
+    "deviceId": {
+      "description": "ULID of the device that produced and signed this heartbeat.",
+      "type": "string"
+    },
+    "payload": {
+      "description": "The presence heartbeat being attested to.",
+      "$ref": "#/$defs/PresencePing"
+    },
+    "schemaVersion": {
+      "description": "Semver of this contract, e.g. `\"1.0.0\"`.",
+      "type": "string"
+    },
+    "sig": {
+      "description": "`ed25519(JCS(payload))`, base64 (standard, no padding).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "deviceId",
+    "payload",
+    "sig"
+  ],
+  "$defs": {
+    "Harness": {
+      "description": "Which harness produced a session.\n\n`Generic` is a tool piping events through the JSON-lines adapter — distinct\nfrom `Manual` (a human `dira start` dira): these are agent-style events from\nan unmodeled harness.",
+      "type": "string",
+      "enum": [
+        "claude_code",
+        "codex",
+        "open_code",
+        "generic",
+        "manual"
+      ]
+    },
+    "PresencePing": {
+      "description": "A single heartbeat: the set of sessions a device considers live right now.\n\nHeartbeats are stateless snapshots — the cloud derives liveness from the most\nrecent ping per device, never by accumulating deltas.",
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "description": "ULID of the producing device (matches the envelope).",
+          "type": "string"
+        },
+        "presenceTtlSecs": {
+          "description": "The device's configured presence TTL in seconds — how long the cloud should\ntreat this beat as fresh before considering the device offline. Sent in-band\nso the cloud knows the device's intended TTL even before it answers with a\n[`PresenceAck`]. Optional + omitted-when-None so older payloads (and the\nsigning vector) stay byte-identical.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sentAt": {
+          "description": "RFC 3339 timestamp the heartbeat was assembled.",
+          "type": "string"
+        },
+        "sessions": {
+          "description": "The sessions this device currently considers live.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PresenceSession"
+          }
+        }
+      },
+      "required": [
+        "deviceId",
+        "sentAt"
+      ]
+    },
+    "PresenceSession": {
+      "description": "A live session as seen at heartbeat time. Presence-only — never a billing base.",
+      "type": "object",
+      "properties": {
+        "agentWallSeconds": {
+          "description": "Active agent run-time in seconds (gap-counted, idle gaps excluded) — NOT\nsession wall span.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "branch": {
+          "description": "The session branch (`git rev-parse --abbrev-ref HEAD`), if resolved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engagedSeconds": {
+          "description": "Human-engaged seconds observed for this session so far. Evidence, not billed.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "harness": {
+          "$ref": "#/$defs/Harness"
+        },
+        "identityEmail": {
+          "description": "`git config user.email` of the person the session is attributed to.",
+          "type": "string"
+        },
+        "idle": {
+          "description": "Whether the session is currently idle (no recent activity signal).",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/SessionKind"
+        },
+        "lastSignalAt": {
+          "description": "RFC 3339 timestamp of the last activity signal observed for this session.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repoCanonical": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "description": "Harness session id, or daemon-issued ULID for manual sessions.",
+          "type": "string"
+        },
+        "startedAt": {
+          "description": "RFC 3339 timestamp the session started.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "harness",
+        "kind",
+        "identityEmail",
+        "startedAt",
+        "engagedSeconds",
+        "agentWallSeconds",
+        "idle"
+      ]
+    },
+    "SessionKind": {
+      "description": "How a piece of work was captured. Drives assurance on the cloud side.",
+      "oneOf": [
+        {
+          "description": "An AI coding harness session (Claude Code, Codex, OpenCode).",
+          "type": "string",
+          "const": "agent"
+        },
+        {
+          "description": "A manual `dira start` dira (meeting, manual testing, etc.).",
+          "type": "string",
+          "const": "manual"
+        }
+      ]
+    }
+  }
+}

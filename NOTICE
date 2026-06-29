@@ -1,0 +1,12 @@
+Dira
+Copyright 2026 Dodi Smart OOD
+
+This product includes software developed at Dodi Smart OOD
+(https://github.com/dodi-smart/dirahq-cli).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file
+in this repository for the full license text.
+
+This Apache-2.0 license applies to the Dira CLI and contract crates
+(the `cli/` and `contract/` directories). It does NOT apply to the
+Dira cloud service, which is proprietary.

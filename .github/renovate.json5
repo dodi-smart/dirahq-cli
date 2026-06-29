@@ -1,0 +1,55 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:best-practices",
+    // Listed AFTER best-practices so it wins: config:recommended's
+    // :semanticPrefixFixDepsChoreOthers would otherwise make production deps `fix(deps)`,
+    // which the release config maps to a PATCH release. Forcing `chore(deps)` everywhere => no
+    // release (`.releaserc.js` maps `chore` to release:false, even though `deps` is an
+    // allowed release scope), so dependency bumps never cut a version on their own.
+    ":semanticCommitTypeAll(chore)",
+  ],
+  timezone: "Europe/Sofia",
+  // The GitHub default branch IS `develop` (the trunk), so Renovate both reads its config
+  // from and opens PRs against `develop`. Pinned explicitly for clarity.
+  baseBranchPatterns: ["develop"],
+  semanticCommits: "enabled", // make the chore(deps) prefix deterministic (default is "auto")
+  labels: ["dependencies"],
+  schedule: ["before 6am on monday"], // weekly batch; security PRs ignore the schedule
+  lockFileMaintenance: { automerge: true }, // refreshes Cargo.lock + bun.lock weekly
+  // NOTE: vulnerabilityAlerts is enabled by default (config:recommended) and works on the
+  // Mend hosted community app; it only fires if GitHub "Dependabot alerts" are on for the repo.
+  // osvVulnerabilityAlerts is intentionally NOT used (experimental / uncertain on community tier).
+  packageRules: [
+    // Keep GitHub Actions on readable tags — undo best-practices' digest (SHA) pinning.
+    // (No Docker manager in this repo, so no docker rule.)
+    { matchManagers: ["github-actions"], pinDigests: false },
+    // Auto-merge non-major GitHub Action tag bumps (CI-gated).
+    {
+      matchManagers: ["github-actions"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "github actions",
+      automerge: true,
+    },
+    // Auto-merge batched non-major dev dependencies (CI-gated). Covers the npm release
+    // tooling (`devDependencies` in package.json) and any Rust `[dev-dependencies]`.
+    // "pin" covers :pinDevDependencies' initial PR.
+    {
+      matchDepTypes: ["devDependencies", "dev-dependencies"],
+      matchUpdateTypes: ["minor", "patch", "pin"],
+      groupName: "dev dependencies (non-major)",
+      automerge: true,
+    },
+    // Batch non-major production deps into one PR for manual review. For this Cargo workspace
+    // the third-party crates are declared in root `[workspace.dependencies]`, so they surface
+    // under the `workspace.dependencies` depType; `dependencies`/`build-dependencies` cover the
+    // npm and per-crate cases.
+    {
+      matchDepTypes: ["dependencies", "workspace.dependencies", "build-dependencies"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "production dependencies (non-major)",
+    },
+    // Label majors for visibility (they're not auto-merged — automerge defaults to false).
+    { matchUpdateTypes: ["major"], addLabels: ["major"] },
+  ],
+}

@@ -1,0 +1,29 @@
+[package]
+name = "dira"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The Dira CLI: a thin control client over the daemon's Unix domain socket."
+
+[[bin]]
+name = "dira"
+path = "src/main.rs"
+
+[dependencies]
+dira-core.workspace = true
+dira-sources.workspace = true
+dira-contract.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+anyhow.workspace = true
+ulid.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+toml_edit.workspace = true

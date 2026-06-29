@@ -1,0 +1,13 @@
+[package]
+name = "dira-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CaptureSource implementations: normalize each harness's hooks into Dira's event model."
+
+[dependencies]
+dira-core.workspace = true
+dira-contract.workspace = true
+serde.workspace = true
+serde_json.workspace = true

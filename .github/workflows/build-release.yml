@@ -1,0 +1,166 @@
+name: Build Release Artifacts
+
+# Tags pushed by GITHUB_TOKEN don't re-trigger workflows, so we react to the
+# Release workflow finishing rather than to the `v*` tag push. We then build
+# the CLI binaries for the newest tag and attach them to its GitHub release.
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "tag to build (e.g. v1.2.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # Find the tag to build and whether its release still needs artifacts.
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+      proceed: ${{ steps.pick.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pick tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$DISPATCH_TAG" ]; then
+            tag="$DISPATCH_TAG"
+          else
+            tag=$(git tag -l 'v*' --sort=-creatordate | head -n1)
+          fi
+          if [ -z "$tag" ]; then
+            echo "No v* tag found — nothing to build."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Stable releases only: skip prerelease tags (a SemVer suffix like
+          # v0.2.0-develop.1). Binaries ship for clean vX.Y.Z tags cut on main.
+          # A manual workflow_dispatch can still force a build for any tag.
+          case "$tag" in
+            *-*)
+              if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+                echo "Tag $tag is a prerelease — binaries build for stable releases only, skipping."
+                echo "proceed=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+          esac
+          # Only build for a tag that semantic-release actually published as a GitHub
+          # Release. A bare tag with no Release object (e.g. the v0.1.0 baseline tag)
+          # is not a real release — skip it so we never publish binaries prematurely.
+          if ! gh release view "$tag" >/dev/null 2>&1 && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "Tag $tag has no GitHub Release — not a published release, skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Idempotency: skip if this release already has tarball assets.
+          count=$(gh release view "$tag" --json assets -q '[.assets[] | select(.name | endswith(".tar.gz"))] | length' 2>/dev/null || echo 0)
+          if [ "${count:-0}" -gt 0 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "Release $tag already has $count artifact(s) — skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+  # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
+  # to `ubuntu-latest`. Used for the heaviest native compile (x86_64 linux).
+  check-runners:
+    name: Pick runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [resolve]
+    if: needs.resolve.outputs.proceed == 'true'
+    outputs:
+      runner: ${{ steps.set-runner.outputs.use-runner }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Check runner availability
+        id: set-runner
+        uses: dodi-smart/runner-fallback-action@v2
+        with:
+          organization: ${{ github.repository_owner }}
+          primary-runner: "self-hosted,build"
+          fallback-runner: "ubuntu-latest"
+          github-token: ${{ steps.app-token.outputs.token }}
+          fallback-on-error: true
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [resolve, check-runners]
+    if: needs.resolve.outputs.proceed == 'true'
+    timeout-minutes: 45
+    # x86_64 linux (the heaviest) runs on the self-hosted runner when available;
+    # every other target builds natively on its matching GitHub-hosted runner.
+    runs-on: ${{ matrix.use_fallback && fromJson(needs.check-runners.outputs.runner) || matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            use_fallback: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+      - uses: jdx/mise-action@v2
+      - name: Build & upload binaries
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: dira,dirad
+          target: ${{ matrix.target }}
+          archive: dira-${{ needs.resolve.outputs.version }}-$target
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          tar: unix
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Attach the contract artifacts (schema + signing fixture) to the release so the
+  # cloud repo's `just contract-pull` can fetch them when no sibling checkout exists.
+  contract-assets:
+    name: Publish contract artifacts
+    needs: [resolve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: needs.resolve.outputs.proceed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+      - name: Upload contract artifacts to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.resolve.outputs.tag }}" \
+            contract/attestation.schema.json \
+            contract/testdata/signing-vector.json \
+            --clobber

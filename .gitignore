@@ -1,0 +1,41 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Node (release tooling only: semantic-release + commitlint)
+/node_modules
+node_modules
+
+# SQL migrations MUST be tracked. The user's global ~/.gitignore_global has a
+# blanket `*.sql`, which silently drops these — re-include them explicitly.
+# sqlx needs them at build/runtime.
+!cli/core/migrations/*.sql
+
+# Local capture store (never commit captured data)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Machine-specific Claude Code settings (generated per-machine by `dira init`)
+.claude/settings.json
+.claude/settings.local.json
+
+# Harness-managed external skill cache (regenerable). skills-lock.json IS tracked
+# so the skills can be installed fresh from the lock.
+.agents/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea
+
+# agent worktrees (transient)
+.claude/worktrees/

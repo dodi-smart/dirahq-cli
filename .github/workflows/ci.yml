@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 5
     if: github.event.pull_request.draft == false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: wagoid/commitlint-github-action@v6
@@ -63,7 +63,7 @@ jobs:
     env:
       RUST_BACKTRACE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Set up the Rust toolchain directly instead of via mise. The self-hosted
       # `build` runners don't ship rustup, so mise's `rust = "stable"` silently
       # no-ops there and `cargo` ends up missing (`cargo: command not found`).

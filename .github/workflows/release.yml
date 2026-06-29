@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
       # The JS release tooling (semantic-release + plugins) runs under bun/node.
       # mise here only provides the Rust toolchain (cargo set-version), so install
       # bun + node explicitly rather than pinning them in the Rust repo's mise.toml.

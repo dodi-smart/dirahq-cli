@@ -52,7 +52,7 @@ schemars = "1"
 # Crypto + identity
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
-keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+keyring = { version = "4", features = ["apple-native", "linux-native", "windows-native"] }
 serde_jcs = "0.1"
 base64 = "0.22"
 

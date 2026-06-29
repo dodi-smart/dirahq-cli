@@ -132,7 +132,7 @@ jobs:
         with:
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
       - name: Build & upload binaries
         uses: taiki-e/upload-rust-binary-action@v1
         with:

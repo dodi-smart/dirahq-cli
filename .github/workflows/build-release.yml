@@ -29,7 +29,7 @@ jobs:
       version: ${{ steps.pick.outputs.version }}
       proceed: ${{ steps.pick.outputs.proceed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Pick tag
@@ -128,7 +128,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
@@ -168,7 +168,7 @@ jobs:
     timeout-minutes: 5
     if: needs.resolve.outputs.proceed == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           fetch-depth: 0

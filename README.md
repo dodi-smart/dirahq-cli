@@ -60,6 +60,21 @@ dira report --week
 runs `dira hook claude`, which forwards the payload to the daemon over the socket. The hot
 path only does a non-blocking enqueue, so the agent loop never waits on us.
 
+Other harnesses are wired the same way — `dira init <harness>`:
+
+| Harness | `dira init …` | How it's wired |
+|---|---|---|
+| Claude Code | `dira init` (default) | command hooks → `.claude/settings.json` |
+| Codex | `dira init codex` | prints `~/.codex/config.toml` `[[hooks.…]]` snippet to paste |
+| Gemini CLI | `dira init gemini` | command hooks → `~/.gemini/settings.json` |
+| Cursor | `dira init cursor` | command hooks → `~/.cursor/hooks.json` |
+| OpenCode | `dira init opencode` | forwarder plugin → `~/.config/opencode/plugin/dira.js` (HTTP) |
+
+The command-hook harnesses (Claude, Codex, Gemini, Cursor) all forward over the same
+stdin→socket shim (`dira hook <harness>`); OpenCode has no command hooks, so it POSTs to the
+daemon's loopback `/hooks/opencode` route instead. Each harness's own hook vocabulary is
+normalized into Dira's shared event set in `cli/sources`.
+
 ## Contract
 
 The wire schema is authored once in Rust (`/contract`) because the daemon is the producer.

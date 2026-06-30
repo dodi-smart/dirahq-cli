@@ -34,6 +34,8 @@
       "enum": [
         "claude_code",
         "codex",
+        "gemini",
+        "cursor",
         "open_code",
         "generic",
         "manual"

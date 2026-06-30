@@ -12,6 +12,8 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod cursor;
+pub mod gemini;
 pub mod generic;
 pub mod opencode;
 
@@ -51,21 +53,32 @@ pub fn registry() -> Vec<Box<dyn HarnessSource>> {
     vec![
         Box::new(claude_code::ClaudeCodeSource),
         Box::new(codex::CodexSource),
+        Box::new(gemini::GeminiSource),
+        Box::new(cursor::CursorSource),
         Box::new(opencode::OpenCodeSource),
         Box::new(generic::GenericSource),
     ]
 }
 
-/// Resolve a harness id (with a few friendly aliases) to its source.
-fn source_for(id: &str) -> Option<Box<dyn HarnessSource>> {
-    let id = id.trim().to_ascii_lowercase();
-    let canonical = match id.as_str() {
+/// Resolve a harness id (with a few friendly aliases) to its canonical wire id
+/// (the `id()` a source answers to). The single source of truth for alias spelling
+/// — both hook dispatch ([`source_for`]) and `dira init` rely on this so the
+/// accepted spellings can never drift between the two.
+pub fn canonical_harness_id(id: &str) -> Option<&'static str> {
+    Some(match id.trim().to_ascii_lowercase().as_str() {
         "claude" | "claude_code" | "claudecode" | "claude-code" => "claude",
         "codex" | "codex-notify" | "codexnotify" => "codex",
+        "gemini" | "gemini_cli" | "geminicli" | "gemini-cli" => "gemini",
+        "cursor" => "cursor",
         "opencode" | "open_code" | "open-code" => "opencode",
         "generic" => "generic",
         _ => return None,
-    };
+    })
+}
+
+/// Resolve a harness id (with a few friendly aliases) to its source.
+fn source_for(id: &str) -> Option<Box<dyn HarnessSource>> {
+    let canonical = canonical_harness_id(id)?;
     registry().into_iter().find(|s| s.id() == canonical)
 }
 
@@ -103,6 +116,34 @@ mod tests {
             assert_eq!(n.kind, EventKind::UserPrompt);
             assert_eq!(h, Harness::ClaudeCode);
         }
+    }
+
+    #[test]
+    fn dispatch_routes_gemini_aliases() {
+        let payload = serde_json::json!({
+            "hook_event_name": "BeforeAgent",
+            "session_id": "g1",
+            "cwd": "/repo"
+        });
+        for alias in ["gemini", "gemini_cli", "geminicli", "gemini-cli"] {
+            let (n, h) = normalize_for(alias, payload.clone()).expect("known alias");
+            assert_eq!(n.kind, EventKind::UserPrompt);
+            assert_eq!(h, Harness::Gemini);
+        }
+    }
+
+    #[test]
+    fn dispatch_routes_cursor() {
+        let payload = serde_json::json!({
+            "hook_event_name": "beforeSubmitPrompt",
+            "conversation_id": "c1",
+            "workspace_roots": ["/repo"]
+        });
+        let (n, h) = normalize_for("cursor", payload).expect("known harness");
+        assert_eq!(n.kind, EventKind::UserPrompt);
+        assert_eq!(n.session_id, "c1");
+        assert_eq!(n.cwd.as_deref(), Some("/repo"));
+        assert_eq!(h, Harness::Cursor);
     }
 
     #[test]

@@ -108,6 +108,10 @@ pub struct PartialSession {
     /// Human prompts observed so far, if tracked (else omitted on the wire).
     pub prompts: Option<u64>,
     pub branch: Option<String>,
+    /// Free-text description for a manual session, if set (`--note`/comment).
+    pub note: Option<String>,
+    /// Operational tag for a manual session, if set (`--label`).
+    pub label: Option<String>,
 }
 
 /// Build an attestation batch from a window of events, token rows, and artifacts.
@@ -205,6 +209,8 @@ fn assemble_batch(
             agent_wall_seconds: p.active_seconds,
             prompts: p.prompts,
             branch: p.branch.clone(),
+            note: p.note.clone(),
+            label: p.label.clone(),
         });
     }
 
@@ -393,6 +399,9 @@ fn build_intervals(events: &[RawEvent], idle: Duration) -> Vec<Interval> {
     // A resolved fallback email per session, used to satisfy the contract's
     // non-empty `identity_email` requirement on each interval.
     let emails = session_emails(events);
+    // First non-null activity per session (manual sessions classify their time —
+    // "meeting", "qa", … — which the cloud uses for billing assurance).
+    let activities = session_activities(events);
 
     let mut out: Vec<Interval> = Vec::new();
     for pair in tagged.windows(2) {
@@ -429,8 +438,9 @@ fn build_intervals(events: &[RawEvent], idle: Duration) -> Vec<Interval> {
             started_at: fmt(a.at),
             ended_at: fmt(b.at),
             human_seconds: human,
-            // Activity is carried per-session; surface it if the session has one.
-            activity: None,
+            // Per-session activity classification (surfaced for manual sessions;
+            // None for agent work that carries no activity).
+            activity: activities.get(&a.session_id).cloned().flatten(),
             source_session: a.session_id.clone(),
         });
     }
@@ -506,6 +516,10 @@ fn build_sessions(events: &[RawEvent], idle: Duration) -> Vec<SessionRollup> {
         branch_counts: BTreeMap<String, u64>,
         /// Every event timestamp in the session, for idle-trimmed wall-clock.
         event_times: Vec<OffsetDateTime>,
+        /// First non-null free-text note / operational label across the session's
+        /// events (manual sessions; agent sessions leave these None).
+        note: Option<String>,
+        label: Option<String>,
     }
 
     let mut sessions: BTreeMap<&str, Acc> = BTreeMap::new();
@@ -526,6 +540,8 @@ fn build_sessions(events: &[RawEvent], idle: Duration) -> Vec<SessionRollup> {
                 start_branch: e.branch.clone(),
                 branch_counts: BTreeMap::new(),
                 event_times: Vec::new(),
+                note: e.note.clone(),
+                label: e.label.clone(),
             });
         entry.event_times.push(e.at);
         if let Some(b) = &e.branch {
@@ -550,6 +566,12 @@ fn build_sessions(events: &[RawEvent], idle: Duration) -> Vec<SessionRollup> {
         }
         if entry.email.is_none() && e.identity_email.is_some() {
             entry.email = e.identity_email.clone();
+        }
+        if entry.note.is_none() && e.note.is_some() {
+            entry.note = e.note.clone();
+        }
+        if entry.label.is_none() && e.label.is_some() {
+            entry.label = e.label.clone();
         }
         if matches!(e.kind, EventKind::SessionEnd | EventKind::ManualStop) {
             entry.ended = true;
@@ -589,6 +611,8 @@ fn build_sessions(events: &[RawEvent], idle: Duration) -> Vec<SessionRollup> {
                 agent_wall_seconds: agent_wall,
                 prompts: Some(a.prompts),
                 branch,
+                note: a.note,
+                label: a.label,
             }
         })
         .collect()
@@ -619,6 +643,18 @@ fn session_emails(events: &[RawEvent]) -> BTreeMap<String, Option<String>> {
         let entry = out.entry(e.session_id.clone()).or_insert(None);
         if entry.is_none() && e.identity_email.is_some() {
             *entry = e.identity_email.clone();
+        }
+    }
+    out
+}
+
+/// Resolve the first non-null activity classification per session.
+fn session_activities(events: &[RawEvent]) -> BTreeMap<String, Option<String>> {
+    let mut out: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for e in events {
+        let entry = out.entry(e.session_id.clone()).or_insert(None);
+        if entry.is_none() && e.activity.is_some() {
+            *entry = e.activity.clone();
         }
     }
     out
@@ -757,6 +793,7 @@ mod tests {
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
     }
 
@@ -1051,6 +1088,8 @@ mod tests {
             active_seconds: 4242,
             prompts: Some(7),
             branch: Some("feat/x".into()),
+            note: None,
+            label: None,
         }];
         let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, NOW);
         let s = batch
@@ -1087,6 +1126,8 @@ mod tests {
             active_seconds: 999,
             prompts: None,
             branch: None,
+            note: None,
+            label: None,
         }];
         let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, NOW);
         let rollups: Vec<_> = batch
@@ -1113,6 +1154,8 @@ mod tests {
             active_seconds: 0,
             prompts: None,
             branch: None,
+            note: None,
+            label: None,
         }];
         let batch = build_batch_with_partials(&[], &[], &[], &partials, "d", IDLE, NOW);
         assert!(
@@ -1192,5 +1235,41 @@ mod tests {
             single, chunked,
             "chunked union == single window (lossless, no double count)"
         );
+    }
+
+    #[test]
+    fn manual_session_surfaces_note_label_and_activity() {
+        // A manual session whose start carries note/label/activity: build_sessions
+        // surfaces note + label (first non-null across events), and build_intervals
+        // threads the session's activity onto its counted gap.
+        let mut start = ev("m", 0, EventKind::ManualStart, "p");
+        start.note = Some("Meeting with Fol".into());
+        start.label = Some("standup".into());
+        start.activity = Some("meeting".into());
+        let stop = ev("m", 60, EventKind::ManualStop, "p");
+        let batch = build_batch(&[start, stop], &[], &[], "d", IDLE, NOW);
+
+        let sess = batch
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "m")
+            .expect("manual session rolled up");
+        assert_eq!(sess.note.as_deref(), Some("Meeting with Fol"));
+        assert_eq!(sess.label.as_deref(), Some("standup"));
+        assert!(
+            batch
+                .intervals
+                .iter()
+                .any(|i| i.activity.as_deref() == Some("meeting")),
+            "activity threads onto the interval"
+        );
+
+        // An agent session carries none of them.
+        let a = ev("a", 0, EventKind::UserPrompt, "p");
+        let b = ev("a", 30, EventKind::SessionEnd, "p");
+        let abatch = build_batch(&[a, b], &[], &[], "d", IDLE, NOW);
+        if let Some(asess) = abatch.sessions.iter().find(|s| s.session_id == "a") {
+            assert!(asess.note.is_none() && asess.label.is_none());
+        }
     }
 }

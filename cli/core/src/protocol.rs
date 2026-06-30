@@ -22,6 +22,8 @@ pub enum Request {
         project: Option<String>,
         label: Option<String>,
         activity: Option<String>,
+        /// Free-text description for the manual session (`--note`).
+        note: Option<String>,
         /// Working dir to resolve a project from when `project` is omitted.
         cwd: Option<String>,
     },
@@ -32,6 +34,10 @@ pub enum Request {
         duration_secs: u64,
         project: Option<String>,
         note: Option<String>,
+        /// Activity classification (`--activity`), e.g. "meeting".
+        activity: Option<String>,
+        /// Operational tag (`--label`).
+        label: Option<String>,
         cwd: Option<String>,
     },
     /// Local report for a scope.
@@ -132,6 +138,11 @@ pub struct SessionView {
     pub kind: String,
     pub project: Option<String>,
     pub label: Option<String>,
+    /// Activity classification + free-text note for manual sessions (display).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub started_at: String,
     pub human_seconds: i64,
     pub agent_seconds: i64,

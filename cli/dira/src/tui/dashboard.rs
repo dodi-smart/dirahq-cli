@@ -476,6 +476,8 @@ mod tests {
             kind: "agent".to_string(),
             project: project.map(|p| p.to_string()),
             label: None,
+            activity: None,
+            note: None,
             started_at: "now".to_string(),
             human_seconds: 0,
             agent_seconds: agent,

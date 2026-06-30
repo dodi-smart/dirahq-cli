@@ -145,6 +145,13 @@ enum DeviceAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Rewind the sync cursor and re-send events to the cloud (manual recovery).
+    /// Safe — the cloud dedups, so a re-send never double-counts.
+    Resync {
+        /// Rewind to this event id instead of the beginning (full re-send default).
+        #[arg(long)]
+        from: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -240,6 +247,7 @@ async fn main() -> Result<()> {
                 DeviceAction::Status => device::status(&config).await,
                 DeviceAction::RotateKey => device::rotate_key(&config).await,
                 DeviceAction::Unlink { yes } => device::unlink(&config, *yes).await,
+                DeviceAction::Resync { from } => device::resync(&config, from.clone()).await,
             };
         }
         _ => {}

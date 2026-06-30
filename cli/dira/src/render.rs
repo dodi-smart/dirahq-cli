@@ -7,7 +7,7 @@
 
 use crate::format::{bar as bar_cells, hms, project_label, repo_short, truncate};
 use crate::theme::{self, Role};
-use dira_core::protocol::{Response, SessionView, StatusView};
+use dira_core::protocol::{any_engaged, Response, SessionView, StatusView};
 use dira_core::report::Report;
 
 /// The width the layout was originally hand-tuned for. Used as the fallback when
@@ -244,12 +244,18 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
     // With no engaged human time the multiplier (agent ÷ engaged) is undefined and
     // "0.0× today" reads as meaningless — show just the agent count instead.
     let head = theme::paint("PARALLEL", Role::Muted);
+    // Mark the operator in when they're actively supervising (see `any_engaged`).
+    let you = if any_engaged(active) {
+        theme::paint(" and you", Role::Engaged)
+    } else {
+        String::new()
+    };
     if eng > 0 {
         let parallel = today.total_agent_seconds as f64 / eng as f64;
         let mult = theme::paint(&format!("{parallel:.1}× today"), Role::Accent);
-        println!("{head}  ·  {} agent(s) · {mult}", active.len());
+        println!("{head}  ·  {} agent(s){you} · {mult}", active.len());
     } else {
-        println!("{head}  ·  {} agent(s)", active.len());
+        println!("{head}  ·  {} agent(s){you}", active.len());
     }
     println!();
     // `◆` marks an agent lane (purple), `●` the deduped human baseline (teal) —

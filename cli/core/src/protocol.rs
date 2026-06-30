@@ -173,3 +173,10 @@ pub struct StatusView {
     #[serde(default)]
     pub hydrating: bool,
 }
+
+/// True when the operator is in the loop — at least one of these sessions has a
+/// recent human signal (not idle). Drives the "and you" marker in the CLI
+/// renderers, mirroring the cloud's engaged badge.
+pub fn any_engaged(sessions: &[SessionView]) -> bool {
+    sessions.iter().any(|s| !s.idle)
+}

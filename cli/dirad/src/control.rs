@@ -321,8 +321,16 @@ async fn log(
     let start = end - Duration::seconds(duration_secs as i64);
     let session_id = Ulid::new().to_string();
     let handle = handle_of(&session_id);
-    let events =
-        materialize_interval(&session_id, start, end, project, identity, label, activity, note);
+    let events = materialize_interval(
+        &session_id,
+        start,
+        end,
+        project,
+        identity,
+        label,
+        activity,
+        note,
+    );
     for ev in events {
         if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_err() {
             return Response::Error {

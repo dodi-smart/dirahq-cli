@@ -315,12 +315,11 @@ pub fn build_chunked_batches(
         .map(|(i, (s, e))| {
             let is_last = i == n - 1;
             let chunk = &events[s..=e];
-            let (toks, arts, parts): (&[TokenRow], &[ArtifactRow], &[PartialSession]) =
-                if is_last {
-                    (token_rows, artifact_rows, partials)
-                } else {
-                    (&[], &[], &[])
-                };
+            let (toks, arts, parts): (&[TokenRow], &[ArtifactRow], &[PartialSession]) = if is_last {
+                (token_rows, artifact_rows, partials)
+            } else {
+                (&[], &[], &[])
+            };
             let batch = assemble_batch(
                 chunk,
                 toks,
@@ -724,8 +723,7 @@ fn batch_id_for_chunk(events: &[RawEvent], artifacts: &[ArtifactRow]) -> String 
     match max_ts_ms {
         // ULID = 48-bit timestamp (high) | 80-bit randomness (low). Stamp the time
         // and keep the low 80 bits of the content hash as the "randomness".
-        Some(ts) => Ulid::from(((ts as u128) << 80) | (content & ((1u128 << 80) - 1)))
-            .to_string(),
+        Some(ts) => Ulid::from(((ts as u128) << 80) | (content & ((1u128 << 80) - 1))).to_string(),
         None => Ulid::from(content).to_string(),
     }
 }
@@ -1218,8 +1216,10 @@ mod tests {
             ev("s", 2000, EventKind::UserPrompt, "p"),
             ev("s", 2060, EventKind::UserPrompt, "p"),
         ];
-        let mut single: Vec<String> =
-            build_intervals(&events, IDLE).into_iter().map(|i| i.id).collect();
+        let mut single: Vec<String> = build_intervals(&events, IDLE)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
         single.sort();
 
         let ranges = chunk_ranges(&events, IDLE, 2);

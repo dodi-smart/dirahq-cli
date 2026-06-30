@@ -81,7 +81,7 @@ enum Command {
     },
     /// Wire a harness's hooks to report to the daemon (default: claude).
     Init {
-        /// Harness to wire: `claude` (default), `codex`, or `opencode`.
+        /// Harness to wire: `claude` (default), `codex`, `gemini`, `cursor`, or `opencode`.
         harness: Option<String>,
         #[arg(long)]
         global: bool,
@@ -192,12 +192,17 @@ async fn main() -> Result<()> {
             global,
             print,
         } => {
-            return match harness.as_deref().unwrap_or("claude") {
-                "claude" | "claude_code" | "claudecode" => init::run(*global, *print),
-                "codex" => init::run_codex(*print),
-                "opencode" => init::run_opencode(&config, *print).await,
-                other => Err(anyhow::anyhow!(
-                    "unknown harness '{other}' (expected: claude, codex, opencode)"
+            let id = harness.as_deref().unwrap_or("claude");
+            // Alias spelling lives in the sources crate so it can't drift from
+            // what the hook dispatch accepts.
+            return match dira_sources::canonical_harness_id(id) {
+                Some("claude") => init::run(*global, *print),
+                Some("codex") => init::run_codex(*print),
+                Some("gemini") => init::run_gemini(*global, *print),
+                Some("cursor") => init::run_cursor(*global, *print),
+                Some("opencode") => init::run_opencode(&config, *print).await,
+                _ => Err(anyhow::anyhow!(
+                    "unknown harness '{id}' (expected: claude, codex, gemini, cursor, opencode)"
                 )),
             };
         }

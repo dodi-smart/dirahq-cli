@@ -85,6 +85,8 @@ pub enum SessionKind {
 pub enum Harness {
     ClaudeCode,
     Codex,
+    Gemini,
+    Cursor,
     OpenCode,
     Generic,
     Manual,

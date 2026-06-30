@@ -52,7 +52,13 @@ schemars = "1"
 # Crypto + identity
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
-keyring = { version = "4", features = ["apple-native", "linux-native", "windows-native"] }
+# keyring 4 was rewritten: the platform backends now live in separate store crates and
+# the old `*-native` features are gone. The `v1` feature re-exposes the original drop-in
+# `Entry` API (Keychain on macOS, Credential Manager on Windows, Secret Service on *nix).
+# `keyring-core` (test-only) provides the in-memory mock store so tests never touch the
+# real OS keychain — it must track the version keyring depends on.
+keyring = { version = "4", features = ["v1"] }
+keyring-core = "1"
 serde_jcs = "0.1"
 base64 = "0.22"
 

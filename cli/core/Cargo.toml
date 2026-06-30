@@ -28,6 +28,8 @@ proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true }
 criterion.workspace = true
+# In-memory keyring store for tests (see `identity::tests::use_mock_keychain`).
+keyring-core.workspace = true
 
 [[bench]]
 name = "accounting"

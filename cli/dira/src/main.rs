@@ -9,6 +9,7 @@ mod duration;
 mod format;
 mod init;
 mod render;
+mod theme;
 mod tui;
 
 use anyhow::Result;

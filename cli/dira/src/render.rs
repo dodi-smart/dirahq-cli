@@ -6,6 +6,7 @@
 //! parse the plain output (and pipes, which fall back to 80) stay stable.
 
 use crate::format::{bar as bar_cells, hms, project_label, repo_short, truncate};
+use crate::theme::{self, Role};
 use dira_core::protocol::{Response, SessionView, StatusView};
 use dira_core::report::Report;
 
@@ -140,17 +141,23 @@ fn print_status(s: &StatusView, layout: &Layout) {
         .cloned()
         .collect();
     if active.is_empty() {
-        println!("no active sessions");
+        println!("{}", theme::paint("no active sessions", Role::Faint));
     } else {
-        println!("ACTIVE SESSIONS");
+        println!("{}", theme::paint("ACTIVE SESSIONS", Role::Muted));
         print_sessions(&active, layout);
         println!();
         print_parallel(&active, &s.today, layout);
     }
-    println!("TODAY");
+    println!("{}", theme::paint("TODAY", Role::Muted));
     print_report(&s.today, layout);
     if s.sync_pending > 0 {
-        println!("\n{} event(s) pending sync", s.sync_pending);
+        println!(
+            "\n{}",
+            theme::paint(
+                &format!("{} event(s) pending sync", s.sync_pending),
+                Role::Compute,
+            )
+        );
     }
 }
 
@@ -160,11 +167,19 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout) {
         return;
     }
     let pw = layout.session_project;
-    println!(
+    let header = format!(
         "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  STATE",
         "HANDLE", "HARNESS", "KIND", "PROJECT", "HUMAN", "AGENT"
     );
+    println!("{}", theme::paint(&header, Role::Muted));
     for s in sessions {
+        // Paint only the trailing STATE word so the fixed-width columns stay
+        // aligned (the colour escapes have zero display width).
+        let state = if s.idle {
+            theme::paint("idle", Role::Faint)
+        } else {
+            theme::paint("engaged", Role::Engaged)
+        };
         println!(
             "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
             truncate(&s.handle, 8),
@@ -173,7 +188,7 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout) {
             truncate(&project_label(&s.project), pw),
             hms(s.human_seconds),
             hms(s.agent_seconds),
-            if s.idle { "idle" } else { "engaged" },
+            state,
         );
     }
 }
@@ -198,26 +213,30 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
         .max(1);
     // With no engaged human time the multiplier (agent ÷ engaged) is undefined and
     // "0.0× today" reads as meaningless — show just the agent count instead.
+    let head = theme::paint("PARALLEL", Role::Muted);
     if eng > 0 {
         let parallel = today.total_agent_seconds as f64 / eng as f64;
-        println!(
-            "PARALLEL  ·  {} agent(s) · {parallel:.1}× today",
-            active.len()
-        );
+        let mult = theme::paint(&format!("{parallel:.1}× today"), Role::Accent);
+        println!("{head}  ·  {} agent(s) · {mult}", active.len());
     } else {
-        println!("PARALLEL  ·  {} agent(s)", active.len());
+        println!("{head}  ·  {} agent(s)", active.len());
     }
     println!();
+    // `◆` marks an agent lane (purple), `●` the deduped human baseline (teal) —
+    // the same shape/colour language as the cloud's "Right Now" view. Painting
+    // only the glyph keeps the padded label column aligned.
+    let agent_mark = theme::paint("◆", Role::Agent);
     for s in active {
         let label = truncate(&format!("{} · {}", s.harness, repo_short(&s.project)), lw);
         println!(
-            "  ◆ {label:<lw$}   {}   {:>8}",
+            "  {agent_mark} {label:<lw$}   {}   {:>8}",
             bar(s.agent_seconds as f64 / max as f64, bw),
             hms(s.agent_seconds),
         );
     }
     println!(
-        "  ● {:<lw$}   {}   {:>8}",
+        "  {} {:<lw$}   {}   {:>8}",
+        theme::paint("●", Role::Engaged),
         "you (engaged)",
         bar(eng as f64 / max as f64, bw),
         hms(eng),
@@ -227,11 +246,12 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
 
 fn print_report(r: &Report, layout: &Layout) {
     if r.projects.is_empty() {
-        println!("  no time tracked");
+        println!("  {}", theme::paint("no time tracked", Role::Faint));
         return;
     }
     let pw = layout.report_project;
-    println!("  {:<pw$} {:>10} {:>10}", "PROJECT", "HUMAN", "AGENT");
+    let header = format!("  {:<pw$} {:>10} {:>10}", "PROJECT", "HUMAN", "AGENT");
+    println!("{}", theme::paint(&header, Role::Muted));
     for p in &r.projects {
         println!(
             "  {:<pw$} {:>10} {:>10}",
@@ -240,12 +260,13 @@ fn print_report(r: &Report, layout: &Layout) {
             hms(p.agent_wall_seconds),
         );
     }
-    println!(
+    let total = format!(
         "  {:<pw$} {:>10} {:>10}",
         "— total —",
         hms(r.total_human_seconds),
         hms(r.total_agent_seconds),
     );
+    println!("{}", theme::paint(&total, Role::Ink));
     println!("  ({} session(s))", r.session_count);
 }
 

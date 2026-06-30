@@ -219,7 +219,10 @@ fn print_session_meta(s: &SessionView) {
         bits.push(format!("\u{201c}{}\u{201d}", truncate(n, 56)));
     }
     if !bits.is_empty() {
-        println!("{}", theme::paint(&format!("           {}", bits.join("  ")), Role::Muted));
+        println!(
+            "{}",
+            theme::paint(&format!("           {}", bits.join("  ")), Role::Muted)
+        );
     }
 }
 

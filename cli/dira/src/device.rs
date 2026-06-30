@@ -273,7 +273,10 @@ pub async fn status(config: &Config) -> Result<()> {
         .await?
         .filter(|s| !s.is_empty());
     let local_head = store.max_event_id().await?;
-    println!("{}", cloud_status_line(cloud_wm.as_deref(), local_head.as_deref(), pending));
+    println!(
+        "{}",
+        cloud_status_line(cloud_wm.as_deref(), local_head.as_deref(), pending)
+    );
     Ok(())
 }
 

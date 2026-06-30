@@ -172,6 +172,7 @@ mod tests {
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
     }
 
@@ -221,6 +222,7 @@ mod tests {
                 tool: None,
                 label: None,
                 activity: None,
+                note: None,
             });
         }
         for i in 0..3 {
@@ -237,6 +239,7 @@ mod tests {
                 tool: None,
                 label: None,
                 activity: None,
+                note: None,
             });
         }
         for e in &all {

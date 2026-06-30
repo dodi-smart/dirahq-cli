@@ -7,7 +7,7 @@
 
 use crate::format::{bar as bar_cells, hms, project_label, repo_short, truncate};
 use crate::theme::{self, Role};
-use dira_core::protocol::{Response, SessionView, StatusView};
+use dira_core::protocol::{any_engaged, Response, SessionView, StatusView};
 use dira_core::report::Report;
 
 /// The width the layout was originally hand-tuned for. Used as the fallback when
@@ -200,6 +200,26 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout) {
             hms(s.agent_seconds),
             state,
         );
+        print_session_meta(s);
+    }
+}
+
+/// An indented sub-line with a manual session's metadata: the `activity`
+/// classification, the `#label` tag, and the free-text note in quotes — only the
+/// parts that are set. Nothing prints for a plain agent session.
+fn print_session_meta(s: &SessionView) {
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(a) = &s.activity {
+        bits.push(a.clone());
+    }
+    if let Some(l) = &s.label {
+        bits.push(format!("#{l}"));
+    }
+    if let Some(n) = &s.note {
+        bits.push(format!("\u{201c}{}\u{201d}", truncate(n, 56)));
+    }
+    if !bits.is_empty() {
+        println!("{}", theme::paint(&format!("           {}", bits.join("  ")), Role::Muted));
     }
 }
 
@@ -224,12 +244,18 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
     // With no engaged human time the multiplier (agent ÷ engaged) is undefined and
     // "0.0× today" reads as meaningless — show just the agent count instead.
     let head = theme::paint("PARALLEL", Role::Muted);
+    // Mark the operator in when they're actively supervising (see `any_engaged`).
+    let you = if any_engaged(active) {
+        theme::paint(" and you", Role::Engaged)
+    } else {
+        String::new()
+    };
     if eng > 0 {
         let parallel = today.total_agent_seconds as f64 / eng as f64;
         let mult = theme::paint(&format!("{parallel:.1}× today"), Role::Accent);
-        println!("{head}  ·  {} agent(s) · {mult}", active.len());
+        println!("{head}  ·  {} agent(s){you} · {mult}", active.len());
     } else {
-        println!("{head}  ·  {} agent(s)", active.len());
+        println!("{head}  ·  {} agent(s){you}", active.len());
     }
     println!();
     // `◆` marks an agent lane (purple), `●` the deduped human baseline (teal) —

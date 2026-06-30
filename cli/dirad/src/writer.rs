@@ -214,6 +214,7 @@ fn enrich(
         tool: norm.tool,
         label: None,
         activity: None,
+        note: None,
     }
 }
 
@@ -337,6 +338,7 @@ mod tests {
             tool: Some("Bash".into()),
             label: None,
             activity: None,
+            note: None,
         }
     }
 

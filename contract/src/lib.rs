@@ -144,6 +144,18 @@ pub struct SessionRollup {
     /// stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Free-text human description for a manual session (`dira log`/`invoice`/`start`
+    /// `--note`, or the trailing comment). Purely descriptive — the invoice line.
+    /// Optional + omitted-when-absent so older payloads (and the signing vector)
+    /// stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Operational tag for a manual session (`--label`), used locally to select/stop
+    /// sessions; surfaced read-only in the cloud.
+    /// Optional + omitted-when-absent so older payloads (and the signing vector)
+    /// stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Token usage for a session/turn. Cost is always an estimate, separate from time.
@@ -673,6 +685,8 @@ mod tests {
                     agent_wall_seconds: 1,
                     prompts: Some(1),
                     branch: Some("b".into()),
+                    note: None,
+                    label: None,
                 }],
                 token_usage: vec![TokenUsage {
                     id: "t".into(),

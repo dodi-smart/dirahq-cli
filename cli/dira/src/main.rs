@@ -48,6 +48,9 @@ enum Command {
         label: Option<String>,
         #[arg(long)]
         activity: Option<String>,
+        /// Free-text description for the session.
+        #[arg(long)]
+        note: Option<String>,
     },
     /// Stop a manual session: by handle, by --label, or --all. Bare = the only one open.
     Stop {
@@ -60,13 +63,23 @@ enum Command {
     },
     /// List active + recent sessions.
     Sessions,
-    /// Retroactive manual entry, e.g. `dira log 45 --note "review"` (bare = minutes).
+    /// Retroactive manual entry, e.g. `dira invoice 1h Meeting with Fol` (bare = minutes).
+    /// Trailing words become the note; `--note` wins if both are given.
+    #[command(alias = "invoice")]
     Log {
         duration: String,
+        /// Free-text comment — the trailing words after the duration.
+        comment: Vec<String>,
         #[arg(long)]
         project: Option<String>,
         #[arg(long)]
         note: Option<String>,
+        /// Activity classification, e.g. "meeting", "code review".
+        #[arg(long)]
+        activity: Option<String>,
+        /// Operational tag for the entry.
+        #[arg(long)]
+        label: Option<String>,
     },
     /// Local report straight from the on-device store.
     Report {
@@ -261,10 +274,12 @@ async fn main() -> Result<()> {
             project,
             label,
             activity,
+            note,
         } => Request::Start {
             project,
             label,
             activity,
+            note,
             cwd,
         },
         Command::Stop { handle, label, all } => Request::Stop {
@@ -280,14 +295,24 @@ async fn main() -> Result<()> {
         },
         Command::Log {
             duration,
+            comment,
             project,
             note,
+            activity,
+            label,
         } => {
             let secs = duration::parse(&duration).map_err(|e| anyhow::anyhow!(e))?;
+            // `--note` wins; otherwise the trailing positional words form the note.
+            let note = note.or_else(|| {
+                let joined = comment.join(" ");
+                (!joined.trim().is_empty()).then_some(joined)
+            });
             Request::Log {
                 duration_secs: secs,
                 project,
                 note,
+                activity,
+                label,
                 cwd,
             }
         }

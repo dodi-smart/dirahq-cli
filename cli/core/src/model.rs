@@ -42,6 +42,10 @@ pub struct RawEvent {
     /// Optional activity classification, surfaced on intervals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// Optional free-text description for a manual session (`--note`/comment),
+    /// surfaced on the session rollup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// What happened. Split into human signals, agent activity, and lifecycle so the

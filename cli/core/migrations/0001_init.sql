@@ -12,7 +12,11 @@ CREATE TABLE IF NOT EXISTS events (
     branch         TEXT,               -- session branch (git --abbrev-ref HEAD), if any
     tool           TEXT,
     label          TEXT,
-    activity       TEXT
+    activity       TEXT,
+    -- Free-text human description for a manual session (`dira log`/`invoice`/`start`
+    -- `--note`, or the trailing comment). Surfaced on the session rollup and synced
+    -- to the cloud.
+    note           TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_at ON events (at);
@@ -55,18 +59,37 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_at ON token_usage (at);
 --
 -- Rows are shipped in order of their implicit `rowid`; the sync cursor (meta key
 -- `artifacts_sync_cursor`) holds the last `rowid` confirmed-accepted by the cloud.
+--
+-- `patch_id` is `git patch-id --stable`: it survives rebase/amend/cherry-pick (the
+-- sha does not), so the cloud can re-anchor a commit whose sha was rewritten out of
+-- the remote. Nullable: older rows and commits with no diff (merges) carry NULL.
+--
+-- `session_change_id`, `touched_paths`, and `blobs` are squash-resilient anchoring
+-- signals computed over the session's *cumulative* diff (merge-base(upstream,
+-- HEAD)..HEAD), not per individual commit. A squash merge collapses N commits into
+-- one whose combined diff matches no per-commit patch-id — but it equals the
+-- cumulative diff and its tree keeps the same post-image blob SHAs, so persisting
+-- these lets the cloud re-anchor a squashed/rewritten commit. Metadata only (hashes
+-- and paths) — never a diff or file content. `touched_paths` is a JSON array of
+-- strings; `blobs` a JSON array of {"path","blob"} objects, so one column holds the
+-- set without a side table. Nullable: older rows, merges, detached HEAD, or a
+-- missing upstream base carry NULL.
 CREATE TABLE IF NOT EXISTS artifacts (
-    sha            TEXT PRIMARY KEY,   -- commit SHA; doubles as the wire ArtifactRef.id
-    repo           TEXT,               -- canonical repo ref, e.g. github.com/org/repo
-    git_ref        TEXT,               -- branch at capture time
-    kind           TEXT NOT NULL,      -- 'commit' (PRs are future)
-    authored_at    TEXT,               -- RFC 3339, commit author date
-    author_email   TEXT,               -- commit author email (shipped, for anchoring)
-    author_name    TEXT,               -- commit author name (local-only; never shipped)
-    source_session TEXT,               -- session the daemon observed for this repo at capture
-    message        TEXT,               -- commit subject (first line)
-    additions      INTEGER,
-    deletions      INTEGER
+    sha               TEXT PRIMARY KEY,   -- commit SHA; doubles as the wire ArtifactRef.id
+    repo              TEXT,               -- canonical repo ref, e.g. github.com/org/repo
+    git_ref           TEXT,               -- branch at capture time
+    kind              TEXT NOT NULL,      -- 'commit' (PRs are future)
+    authored_at       TEXT,               -- RFC 3339, commit author date
+    author_email      TEXT,               -- commit author email (shipped, for anchoring)
+    author_name       TEXT,               -- commit author name (local-only; never shipped)
+    source_session    TEXT,               -- session the daemon observed for this repo at capture
+    message           TEXT,               -- commit subject (first line)
+    additions         INTEGER,
+    deletions         INTEGER,
+    patch_id          TEXT,               -- `git patch-id --stable`; rebase/amend-stable change id
+    session_change_id TEXT,               -- cumulative-diff change id (squash-resilient)
+    touched_paths     TEXT,               -- JSON array of paths in the cumulative diff
+    blobs             TEXT                -- JSON array of {"path","blob"} post-image blob SHAs
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_repo ON artifacts (repo);

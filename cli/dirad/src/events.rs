@@ -28,6 +28,7 @@ pub fn handle_of(session_id: &str) -> String {
 }
 
 /// Build a single event for a manual session.
+#[allow(clippy::too_many_arguments)]
 pub fn manual_event(
     session_id: &str,
     kind: EventKind,
@@ -36,6 +37,7 @@ pub fn manual_event(
     identity_email: Option<String>,
     label: Option<String>,
     activity: Option<String>,
+    note: Option<String>,
 ) -> RawEvent {
     RawEvent {
         id: new_id(),
@@ -52,6 +54,7 @@ pub fn manual_event(
         tool: None,
         label,
         activity,
+        note,
     }
 }
 
@@ -66,6 +69,7 @@ pub fn materialize_interval(
     identity_email: Option<String>,
     label: Option<String>,
     activity: Option<String>,
+    note: Option<String>,
 ) -> Vec<RawEvent> {
     let mk = |kind, at| {
         manual_event(
@@ -76,6 +80,7 @@ pub fn materialize_interval(
             identity_email.clone(),
             label.clone(),
             activity.clone(),
+            note.clone(),
         )
     };
 
@@ -98,7 +103,7 @@ mod tests {
     fn materialized_interval_accrues_full_duration() {
         let start = OffsetDateTime::UNIX_EPOCH;
         let end = start + Duration::minutes(10);
-        let events = materialize_interval("s", start, end, None, None, None, None);
+        let events = materialize_interval("s", start, end, None, None, None, None, None);
         let signals: Vec<Signal> = events
             .iter()
             .filter(|e| e.kind.is_human_signal())

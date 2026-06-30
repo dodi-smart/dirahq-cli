@@ -83,15 +83,18 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             project,
             label,
             activity,
+            note,
             cwd,
-        } => start(state, project, label, activity, cwd).await,
+        } => start(state, project, label, activity, note, cwd).await,
         Request::Stop { selector } => stop(state, selector).await,
         Request::Log {
             duration_secs,
             project,
             note,
+            activity,
+            label,
             cwd,
-        } => log(state, duration_secs, project, note, cwd).await,
+        } => log(state, duration_secs, project, note, activity, label, cwd).await,
         Request::Report { scope } => report_cmd(state, scope).await,
         Request::IngestHook { harness, payload } => ingest_hook(state, harness, payload).await,
         Request::Nuke => nuke(state).await,
@@ -208,6 +211,7 @@ async fn start(
     project: Option<String>,
     label: Option<String>,
     activity: Option<String>,
+    note: Option<String>,
     cwd: Option<String>,
 ) -> Response {
     let (project, identity) = resolve(project, cwd.clone());
@@ -226,6 +230,7 @@ async fn start(
         identity,
         label,
         activity,
+        note,
     );
     if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_err() {
         return Response::Error {
@@ -291,6 +296,8 @@ async fn stop(state: &AppState, selector: StopSelector) -> Response {
             identity,
             label,
             None,
+            // Note rides the ManualStart event; build_sessions takes first non-null.
+            None,
         );
         if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_ok() {
             count += 1;
@@ -299,11 +306,14 @@ async fn stop(state: &AppState, selector: StopSelector) -> Response {
     Response::Stopped { count }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log(
     state: &AppState,
     duration_secs: u64,
     project: Option<String>,
     note: Option<String>,
+    activity: Option<String>,
+    label: Option<String>,
     cwd: Option<String>,
 ) -> Response {
     let (project, identity) = resolve(project, cwd);
@@ -311,7 +321,8 @@ async fn log(
     let start = end - Duration::seconds(duration_secs as i64);
     let session_id = Ulid::new().to_string();
     let handle = handle_of(&session_id);
-    let events = materialize_interval(&session_id, start, end, project, identity, note, None);
+    let events =
+        materialize_interval(&session_id, start, end, project, identity, label, activity, note);
     for ev in events {
         if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_err() {
             return Response::Error {
@@ -426,6 +437,8 @@ fn build_session_views(
                 kind: format!("{:?}", s.kind),
                 project: s.project.clone(),
                 label: s.label.clone(),
+                activity: s.activity.clone(),
+                note: s.note.clone(),
                 started_at: s
                     .started_at
                     .format(&time::format_description::well_known::Rfc3339)

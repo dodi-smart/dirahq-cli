@@ -4,7 +4,7 @@
 
 use crate::format::{bar, hms, project_label, repo_short, truncate};
 use crate::theme::{self, Role};
-use dira_core::protocol::{SessionView, StatusView};
+use dira_core::protocol::{any_engaged, SessionView, StatusView};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -220,6 +220,11 @@ fn draw_header(frame: &mut Frame, area: Rect, s: &StatusView) {
             theme::style(Role::Accent).add_modifier(Modifier::BOLD),
         ),
     ];
+    // Mark the operator in when they're actively supervising (see `any_engaged`).
+    if any_engaged(&s.active) {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled("· and you", theme::style(Role::Engaged)));
+    }
     if h.sync_pending > 0 {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -476,6 +481,8 @@ mod tests {
             kind: "agent".to_string(),
             project: project.map(|p| p.to_string()),
             label: None,
+            activity: None,
+            note: None,
             started_at: "now".to_string(),
             human_seconds: 0,
             agent_seconds: agent,

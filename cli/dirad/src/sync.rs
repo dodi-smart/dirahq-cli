@@ -486,6 +486,8 @@ fn partial_rollups(
             // from the event window, carries them). Omitted-when-None on the wire.
             prompts: None,
             branch: None,
+            note: s.note,
+            label: s.label,
         })
         .collect()
 }

@@ -3,9 +3,10 @@
 //! numbers lives here (and is unit-tested) so the draw code stays dumb.
 
 use crate::format::{bar, hms, project_label, repo_short, truncate};
+use crate::theme::{self, Role};
 use dira_core::protocol::{SessionView, StatusView};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
@@ -161,9 +162,9 @@ pub fn tick(s: &StatusView, now: time::OffsetDateTime, idle: i64) -> StatusView 
 /// The colour for a session row / lane based on engagement.
 fn engaged_style(idle: bool) -> Style {
     if idle {
-        Style::default().fg(Color::DarkGray)
+        theme::style(Role::Faint)
     } else {
-        Style::default().fg(Color::Green)
+        theme::style(Role::Engaged)
     }
 }
 
@@ -196,34 +197,34 @@ pub fn draw(frame: &mut Frame, conn: &Conn) {
 fn header_block() -> Block<'static> {
     Block::default().borders(Borders::ALL).title(Span::styled(
         " Dira · Right Now ",
-        Style::default().add_modifier(Modifier::BOLD),
+        theme::style(Role::Accent).add_modifier(Modifier::BOLD),
     ))
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, s: &StatusView) {
     let h = Headline::from_status(s);
     let mut spans = vec![
-        Span::raw("today  "),
+        Span::styled("today  ", theme::style(Role::Muted)),
         Span::styled(
             format!("human {}", hms(h.human_seconds)),
-            Style::default().fg(Color::Cyan),
+            theme::style(Role::Engaged),
         ),
         Span::raw("   "),
         Span::styled(
             format!("agent {}", hms(h.agent_seconds)),
-            Style::default().fg(Color::Magenta),
+            theme::style(Role::Agent),
         ),
         Span::raw("   "),
         Span::styled(
             h.multiplier_label(),
-            Style::default().add_modifier(Modifier::BOLD),
+            theme::style(Role::Accent).add_modifier(Modifier::BOLD),
         ),
     ];
     if h.sync_pending > 0 {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
             format!("⇡ {} pending sync", h.sync_pending),
-            Style::default().fg(Color::Yellow),
+            theme::style(Role::Compute),
         ));
     }
     frame.render_widget(
@@ -236,7 +237,7 @@ fn draw_header_down(frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "daemon not running — retrying…",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            theme::style(Role::Negative).add_modifier(Modifier::BOLD),
         )))
         .block(header_block()),
         area,
@@ -281,7 +282,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "no active sessions",
-                Style::default().fg(Color::DarkGray),
+                theme::style(Role::Faint),
             ))
             .block(block),
             area,
@@ -296,7 +297,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
         Cell::from("AGENT"),
         Cell::from("STATE"),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(theme::style(Role::Muted).add_modifier(Modifier::BOLD));
 
     // The PROJECT column flexes to fill whatever's left after the fixed columns
     // (handle 11 + harness 11 + human 9 + agent 9 + state 8 = 48), the 5 inter-
@@ -347,18 +348,18 @@ fn draw_lanes(frame: &mut Frame, area: Rect, s: &StatusView) {
     let lines: Vec<Line> = lanes
         .iter()
         .map(|l| {
-            let color = if l.is_human {
-                Color::Cyan
+            let role = if l.is_human {
+                Role::Engaged
             } else {
-                Color::Green
+                Role::Agent
             };
             Line::from(vec![
                 Span::styled(
                     format!("{:<width$}", truncate(&l.label, label_w), width = label_w),
-                    Style::default().fg(color),
+                    theme::style(role),
                 ),
                 Span::raw(" "),
-                Span::styled(bar(l.seconds, max, bar_w), Style::default().fg(color)),
+                Span::styled(bar(l.seconds, max, bar_w), theme::style(role)),
                 Span::raw(format!(" {:>9}", hms(l.seconds))),
             ])
         })
@@ -372,11 +373,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
         .title(" Today by project ");
     if s.today.projects.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                "no time tracked",
-                Style::default().fg(Color::DarkGray),
-            ))
-            .block(block),
+            Paragraph::new(Span::styled("no time tracked", theme::style(Role::Faint))).block(block),
             area,
         );
         return;
@@ -386,7 +383,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
         Cell::from("HUMAN"),
         Cell::from("AGENT"),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(theme::style(Role::Muted).add_modifier(Modifier::BOLD));
     // PROJECT flexes to fill the width left after HUMAN (11) + AGENT (11), the 2
     // inter-column gaps and 2 borders.
     let project_w = (area.width as usize)
@@ -410,7 +407,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
             Cell::from(hms(s.today.total_human_seconds)),
             Cell::from(hms(s.today.total_agent_seconds)),
         ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
+        .style(theme::style(Role::Ink).add_modifier(Modifier::BOLD)),
     );
     let table = Table::new(
         rows,
@@ -432,15 +429,12 @@ fn draw_down_body(frame: &mut Frame, area: Rect, err: &str) {
     let lines = vec![
         Line::from(Span::styled(
             "Can't reach the daemon.",
-            Style::default().fg(Color::Red),
+            theme::style(Role::Negative),
         )),
         Line::from(Span::raw(
             "Start it with `dira daemon start`. Polling continues.",
         )),
-        Line::from(Span::styled(
-            truncate(err, 80),
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(truncate(err, 80), theme::style(Role::Faint))),
     ];
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -455,7 +449,7 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
             Span::styled("Ctrl-C", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" quit   live"),
         ]))
-        .style(Style::default().fg(Color::DarkGray)),
+        .style(theme::style(Role::Faint)),
         area,
     );
 }

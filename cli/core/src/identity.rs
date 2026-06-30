@@ -177,10 +177,11 @@ mod tests {
     use super::*;
     use std::sync::Once;
 
-    /// Serializes every test that reads or mutates `DIRA_DEVICE_SECRET`. The env
-    /// var is process-global and `cargo test` runs this module's tests in parallel
-    /// in one binary, so without this lock the env-override test could leak the
-    /// seed into a concurrent `load_or_create_unlinked` and skip its pubkey persist.
+    /// Serializes every test that reads or mutates `DIRA_DEVICE_SECRET` *or* the shared
+    /// mock keychain. Both are process-global and `cargo test` runs this module's tests
+    /// in parallel in one binary, so without this lock the env-override test could leak
+    /// the seed into a concurrent `load_or_create_unlinked`, or one test's keychain reset
+    /// could clobber another's mid-op — either of which skips the expected pubkey persist.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Acquire [`ENV_LOCK`]. A tokio mutex is used (not `std`) so the guard can be
@@ -199,14 +200,27 @@ mod tests {
         }
     }
 
-    /// Install keyring's in-memory mock credential store once per test process,
-    /// so tests never touch (or block on) the real OS keychain. This is the
-    /// documented test hook; production uses the platform-native store.
+    /// Install a *fresh, empty* keyring-core mock store as the process-global default,
+    /// so tests never touch (or block on) the real OS keychain — call it at the start of
+    /// every keychain-touching test.
+    ///
+    /// Unlike keyring 3's mock (a fresh credential per `Entry`), keyring-core's mock is a
+    /// single persistent store, so a secret written by one test would otherwise be read
+    /// back by the next and skip its mint-and-persist path. Resetting to an empty store
+    /// per test restores that isolation; callers serialize via [`env_lock`] so the reset
+    /// can't race a concurrent keychain op.
+    ///
+    /// keyring 4's `v1` `Entry` wrapper lazily installs the platform-native store on its
+    /// first `Entry::new`, which would clobber our mock. We force that one-time init now
+    /// with a throwaway entry (result ignored — it errors when no platform store exists,
+    /// e.g. headless CI, and never touches the keychain) so every later `Entry::new`
+    /// reuses the already-fired init and resolves against whichever mock we set here.
     fn use_mock_keychain() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+            let _ = keyring::Entry::new("dira-test-init", "dira-test-init");
         });
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
     }
 
     #[tokio::test]
@@ -241,6 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_rotated_key_swaps_pubkey() {
+        let _lock = env_lock().await;
         use_mock_keychain();
         let store = Store::open_in_memory().await.unwrap();
 

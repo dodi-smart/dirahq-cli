@@ -166,6 +166,10 @@ pub struct LiveSession {
     pub project: Option<String>,
     pub identity_email: Option<String>,
     pub label: Option<String>,
+    /// Activity classification + free-text note for manual sessions (surfaced live
+    /// in `dira status`/`watch` and on the synced rollup).
+    pub activity: Option<String>,
+    pub note: Option<String>,
     pub started_at: OffsetDateTime,
     pub last_event_at: OffsetDateTime,
     pub last_signal_at: Option<OffsetDateTime>,
@@ -235,6 +239,8 @@ impl SessionRegistry {
                 project: ev.project.clone(),
                 identity_email: ev.identity_email.clone(),
                 label: ev.label.clone(),
+                activity: ev.activity.clone(),
+                note: ev.note.clone(),
                 started_at: ev.at,
                 last_event_at: ev.at,
                 last_signal_at: None,
@@ -262,6 +268,12 @@ impl SessionRegistry {
         }
         if entry.label.is_none() && ev.label.is_some() {
             entry.label = ev.label.clone();
+        }
+        if entry.activity.is_none() && ev.activity.is_some() {
+            entry.activity = ev.activity.clone();
+        }
+        if entry.note.is_none() && ev.note.is_some() {
+            entry.note = ev.note.clone();
         }
         if ev.kind.is_human_signal() {
             // Engaged gap (human signals only): same rule over consecutive signals.
@@ -421,6 +433,7 @@ mod tests {
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
     }
 

@@ -208,7 +208,8 @@ pub async fn idle_ticker(state: AppState) {
                 s.project.clone(),
                 s.identity_email.clone(),
                 s.label.clone(),
-                None,
+                s.activity.clone(),
+                s.note.clone(),
             );
             // If the writer is gone the channel send errors; nothing else to do.
             let _ = state.tx.send(EventMsg::Raw(Box::new(ev))).await;

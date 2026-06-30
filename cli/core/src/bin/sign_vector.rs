@@ -40,6 +40,8 @@ fn main() {
             prompts: None,
             // Omitted-when-None on the wire, so the signing vector stays byte-identical.
             branch: None,
+            note: None,
+            label: None,
         }],
         token_usage: vec![],
         artifacts: vec![],

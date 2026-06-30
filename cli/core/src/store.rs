@@ -82,8 +82,8 @@ impl Store {
     pub async fn append(&self, ev: &RawEvent) -> Result<(), Error> {
         sqlx::query(
             "INSERT INTO events
-                (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(&ev.id)
         .bind(ev.at.format(&Rfc3339).map_err(Error::time)?)
@@ -97,6 +97,7 @@ impl Store {
         .bind(&ev.tool)
         .bind(&ev.label)
         .bind(&ev.activity)
+        .bind(&ev.note)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -825,6 +826,7 @@ fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
         tool: row.get("tool"),
         label: row.get("label"),
         activity: row.get("activity"),
+        note: row.get("note"),
     })
 }
 
@@ -847,6 +849,7 @@ mod tests {
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
     }
 
@@ -1083,6 +1086,7 @@ mod tests {
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
     }
 

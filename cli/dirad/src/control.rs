@@ -96,7 +96,40 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
         Request::IngestHook { harness, payload } => ingest_hook(state, harness, payload).await,
         Request::Nuke => nuke(state).await,
         Request::DaemonInfo => daemon_info(state),
+        Request::ResyncCursor { from } => resync_cursor(state, from).await,
     }
+}
+
+/// Rewind the sync cursor and trigger a flush so the daemon re-sends events to the
+/// cloud (`dira device resync`). `from = None` rewinds to the beginning (full
+/// re-send); `Some(id)` to that event id. Safe — the cloud dedups attestations by
+/// id and intervals by content, so a re-send never double-counts.
+async fn resync_cursor(state: &AppState, from: Option<String>) -> Response {
+    use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR};
+    let new_cursor = from.clone().unwrap_or_default();
+    if let Err(e) = state.store.meta_set(META_SYNC_CURSOR, &new_cursor).await {
+        return Response::Error {
+            message: format!("resync failed (set cursor): {e}"),
+        };
+    }
+    // A full rewind also re-sends artifacts (they ride their own rowid cursor).
+    if from.is_none() {
+        if let Err(e) = state.store.meta_set(META_ARTIFACTS_CURSOR, "").await {
+            return Response::Error {
+                message: format!("resync failed (reset artifacts cursor): {e}"),
+            };
+        }
+    }
+    let cursor_ref = Some(new_cursor.as_str()).filter(|s| !s.is_empty());
+    let pending = state
+        .store
+        .count_events_after(cursor_ref)
+        .await
+        .unwrap_or(0);
+    // Nudge the sync task to drain now rather than waiting for the backstop.
+    let _ = state.sync.trigger.try_send(());
+    tracing::info!(pending, from = ?from, "resync: cursor rewound, flush triggered");
+    Response::ResyncQueued { pending, from }
 }
 
 /// Build + runtime info for the running daemon (`dira version`). The version is

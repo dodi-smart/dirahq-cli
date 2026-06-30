@@ -130,6 +130,16 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
                      (`dira device link`); pausing sync until then"
                 );
             }
+            Err(SyncError::SchemaSkew(body)) => {
+                // Re-sending won't help — don't hot-loop the rejected batch. Back
+                // off long so the operator has time to upgrade the daemon or cloud.
+                backoff = MAX_BACKOFF;
+                tracing::error!(
+                    "sync: cloud rejected our contract version (unsupported_schema_version) — \
+                     upgrade the daemon or cloud to matching majors; pausing sync: {body}"
+                );
+                sleep(backoff).await;
+            }
             Err(SyncError::Fatal(e)) => {
                 backoff = next_backoff(backoff);
                 tracing::warn!("sync: error, backing off {backoff:?}: {e}");
@@ -164,6 +174,10 @@ enum SyncError {
     Transient(String),
     /// 401 unknown_device — the device isn't linked cloud-side; needs a re-link.
     ReLinkRequired,
+    /// The cloud rejected our contract major (`unsupported_schema_version`).
+    /// Re-sending the same batch can't help — pause with a clear message instead
+    /// of hot-looping until the operator upgrades the daemon or cloud.
+    SchemaSkew(String),
     /// Local error (DB, signing) — log and back off; not expected in steady state.
     Fatal(String),
 }
@@ -251,16 +265,17 @@ async fn flush(
             .map_err(|e| SyncError::Fatal(format!("load token rows: {e}")))?
     };
 
-    // 3. Build → sign → wrap. Never post-process the JCS payload after signing.
+    // 3. Build deterministic, capped sub-batches for the window. Each chunk derives
+    //    its own intervals/sessions (split only at idle breaks, so no counted gap is
+    //    lost); the final chunk also carries tokens/artifacts/partial rollups.
+    //    Chunking bounds request size and makes a from-scratch resync reproducible.
     //
-    // Phase 6c: also gather partial rollups for long-running un-ended sessions
-    // from the live registry, so a multi-day session contributes settled-ish wall
-    // time before its SessionEnd. Read-only here; the watermark is advanced only
-    // after the cloud accepts the batch (below) so a failed flush re-offers them.
+    //    Phase 6c: partial rollups for long-running un-ended sessions come from the
+    //    live registry; their watermark is advanced only after the final chunk acks.
     let now = time::OffsetDateTime::now_utc();
     let partials = partial_rollups(state, now);
     let partial_ids: Vec<String> = partials.iter().map(|p| p.session_id.clone()).collect();
-    let batch = dira_core::sync::build_batch_with_partials(
+    let chunks = dira_core::sync::build_chunked_batches(
         &events,
         &token_rows,
         &artifact_rows,
@@ -269,93 +284,175 @@ async fn flush(
         state.config.idle(),
         now,
     );
-    let sig = device_key
-        .sign_payload(&batch)
-        .map_err(|e| SyncError::Fatal(format!("sign: {e}")))?;
-    let envelope = Envelope {
-        schema_version: SCHEMA_VERSION.to_string(),
-        device_id: device_id.clone(),
-        payload: batch,
-        sig,
-    };
 
-    // 4. POST. Advance the cursor only on a 2xx ack.
+    // 4. POST each chunk in order; advance the event cursor to that chunk's high-water
+    //    only on its 2xx ack, so an interrupt mid-drain resumes from the last acked
+    //    chunk (and re-formed chunks over an identical event subset reproduce the same
+    //    batch id ⇒ the cloud dedups them). The final chunk's ack advances the
+    //    artifact cursor and marks partials sent.
     let url = format!("{}/api/v1/ingest", cloud_url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .json(&envelope)
-        .send()
-        .await
-        .map_err(|e| SyncError::Transient(format!("post ingest: {e}")))?;
+    let mut total_intervals = 0usize;
+    let mut total_sessions = 0usize;
+    let mut last_body = String::new();
+    for chunk in &chunks {
+        let sig = device_key
+            .sign_payload(&chunk.batch)
+            .map_err(|e| SyncError::Fatal(format!("sign: {e}")))?;
+        let envelope = Envelope {
+            schema_version: SCHEMA_VERSION.to_string(),
+            device_id: device_id.clone(),
+            payload: chunk.batch.clone(),
+            sig,
+        };
+        let resp = client
+            .post(&url)
+            .json(&envelope)
+            .send()
+            .await
+            .map_err(|e| SyncError::Transient(format!("post ingest: {e}")))?;
+        let status = resp.status();
 
-    let status = resp.status();
-    if status.is_success() {
-        // Advance both cursors only after the ack. Each is independent: an
-        // artifact-only flush still advances the event cursor to the current head
-        // (a no-op when unchanged) and vice-versa.
-        if let Some(u) = &until {
-            state
-                .store
-                .meta_set(META_SYNC_CURSOR, u)
-                .await
-                .map_err(|e| SyncError::Fatal(format!("advance cursor: {e}")))?;
-        }
-        if let Some(u) = art_until {
-            state
-                .store
-                .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
-                .await
-                .map_err(|e| SyncError::Fatal(format!("advance artifacts cursor: {e}")))?;
-        }
-        // Advance the partial-rollup watermarks now that the cloud accepted the
-        // batch, so an idle long session doesn't re-ship an identical partial every
-        // flush (it only re-ships once its active_seconds grows again). Best-effort:
-        // a poisoned lock just means the next flush re-offers the same partials.
-        if !partial_ids.is_empty() {
-            if let Ok(mut reg) = state.sessions.lock() {
-                reg.mark_partials_sent(&partial_ids);
+        if status.is_success() {
+            if let Some(ev) = &chunk.cursor_event_id {
+                state
+                    .store
+                    .meta_set(META_SYNC_CURSOR, ev)
+                    .await
+                    .map_err(|e| SyncError::Fatal(format!("advance cursor: {e}")))?;
             }
+            if chunk.is_last {
+                if let Some(u) = art_until {
+                    state
+                        .store
+                        .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
+                        .await
+                        .map_err(|e| SyncError::Fatal(format!("advance artifacts cursor: {e}")))?;
+                }
+                if !partial_ids.is_empty() {
+                    if let Ok(mut reg) = state.sessions.lock() {
+                        reg.mark_partials_sent(&partial_ids);
+                    }
+                }
+            }
+            total_intervals += chunk.batch.intervals.len();
+            total_sessions += chunk.batch.sessions.len();
+            last_body = resp.text().await.unwrap_or_default();
+            continue;
         }
-        // Parse the typed ack so we can log what the cloud actually did. Tolerant:
-        // an older cloud that returns an empty/absent body still yields a default
-        // ack (all zeros), so logging degrades gracefully rather than erroring.
-        let body = resp.text().await.unwrap_or_default();
-        let ack = parse_ingest_ack(&body);
-        tracing::info!(
-            events = events.len(),
-            artifacts = artifact_rows.len(),
-            partial_rollups = partial_ids.len(),
-            accepted = ack.accepted,
-            duplicates = ack.duplicates,
-            cursor = until.as_deref().unwrap_or(""),
-            "sync: flushed batch to cloud"
-        );
-        return Ok(FlushOutcome::Synced);
-    }
 
-    if status.as_u16() == 401 {
-        // Distinguish unknown_device (needs re-link) from a bad signature using a
-        // typed error body rather than a brittle substring match.
+        // Non-2xx: cursors for already-acked chunks stay advanced, so the next flush
+        // re-chunks only the remaining window. Classify why this chunk was rejected.
         let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 401 {
+            if is_unknown_device(&body) {
+                return Err(SyncError::ReLinkRequired);
+            }
+            return Err(SyncError::Fatal(format!("401 from ingest: {body}")));
+        }
+        if status.is_server_error() {
+            return Err(SyncError::Transient(format!("ingest {status}")));
+        }
+        // 4xx: unknown_device can arrive here (gateways map auth → 403); an
+        // unsupported contract major is a skew we pause on rather than hot-loop.
         if is_unknown_device(&body) {
             return Err(SyncError::ReLinkRequired);
         }
-        return Err(SyncError::Fatal(format!("401 from ingest: {body}")));
+        if is_unsupported_schema(&body) {
+            return Err(SyncError::SchemaSkew(body));
+        }
+        return Err(SyncError::Fatal(format!("ingest {status}: {body}")));
     }
 
-    if status.is_server_error() {
-        return Err(SyncError::Transient(format!("ingest {status}")));
+    // 5. Consume the advisory handshake from the last chunk's response: a changed
+    //    data epoch ⇒ the cloud's durable log was reset ⇒ re-send from scratch.
+    apply_handshake(state, &last_body).await?;
+
+    let ack = parse_ingest_ack(&last_body);
+    tracing::info!(
+        events = events.len(),
+        artifacts = artifact_rows.len(),
+        partial_rollups = partial_ids.len(),
+        chunks = chunks.len(),
+        intervals = total_intervals,
+        sessions = total_sessions,
+        accepted = ack.accepted,
+        duplicates = ack.duplicates,
+        cursor = until.as_deref().unwrap_or(""),
+        "sync: flushed batch(es) to cloud"
+    );
+    Ok(FlushOutcome::Synced)
+}
+
+/// Whether a non-2xx ingest error body is the typed `unsupported_schema_version`
+/// signal (the cloud rejects our contract major). Unparseable ⇒ not a skew.
+fn is_unsupported_schema(body: &str) -> bool {
+    serde_json::from_str::<IngestError>(body)
+        .map(|e| e.error == "unsupported_schema_version")
+        .unwrap_or(false)
+}
+
+/// Apply the advisory cloud→daemon handshake from an ingest response body.
+///
+/// - **Epoch**: if the cloud's `dataEpoch` differs from the one we last stored (and
+///   we *had* stored one), the cloud's durable log was reset → blank both cursors so
+///   the next flush re-sends from scratch, store the new epoch FIRST (so this fires
+///   exactly once), and nudge a flush. Safe & idempotent: re-sent batches dedup by
+///   id and intervals dedup by content, so a full re-send never double-counts.
+/// - **Watermark**: cache `syncedEventId` for an honest `dira device status`. Display
+///   only — never an automatic rewind (recovery is the cloud reconciler + a manual
+///   `dira device resync`).
+async fn apply_handshake(state: &AppState, body: &str) -> Result<(), SyncError> {
+    use dira_core::sync::{META_CLOUD_WATERMARK, META_LAST_EPOCH};
+    let resp = dira_core::sync::parse_ingest_response(body);
+
+    if let Some(epoch) = resp.sync.data_epoch.as_deref() {
+        let stored = state
+            .store
+            .meta_get(META_LAST_EPOCH)
+            .await
+            .map_err(|e| SyncError::Fatal(format!("read epoch: {e}")))?
+            .filter(|s| !s.is_empty());
+        match stored.as_deref() {
+            None => {
+                // First epoch we've seen — adopt it, no action.
+                state
+                    .store
+                    .meta_set(META_LAST_EPOCH, epoch)
+                    .await
+                    .map_err(|e| SyncError::Fatal(format!("store epoch: {e}")))?;
+            }
+            Some(prev) if prev != epoch => {
+                // Store the new epoch BEFORE resetting/triggering so this fires once.
+                state
+                    .store
+                    .meta_set(META_LAST_EPOCH, epoch)
+                    .await
+                    .map_err(|e| SyncError::Fatal(format!("store epoch: {e}")))?;
+                state
+                    .store
+                    .meta_set(META_SYNC_CURSOR, "")
+                    .await
+                    .map_err(|e| SyncError::Fatal(format!("reset cursor: {e}")))?;
+                state
+                    .store
+                    .meta_set(META_ARTIFACTS_CURSOR, "")
+                    .await
+                    .map_err(|e| SyncError::Fatal(format!("reset artifacts cursor: {e}")))?;
+                tracing::warn!(
+                    epoch = epoch,
+                    "sync: cloud data epoch changed (cloud was reset) — re-sending from scratch"
+                );
+                let _ = state.sync.trigger.try_send(());
+            }
+            _ => {} // unchanged epoch — nothing to do
+        }
     }
 
-    // 4xx other than 401: a client-side contract problem. A typed `unknown_device`
-    // can also arrive here (some gateways map auth failures to 403), so check it
-    // before treating as fatal. Otherwise log and back off — the same batch would
-    // just fail again.
-    let body = resp.text().await.unwrap_or_default();
-    if is_unknown_device(&body) {
-        return Err(SyncError::ReLinkRequired);
+    if let Some(wm) = resp.sync.synced_event_id.as_deref() {
+        // Display-only cache; never drives a rewind.
+        let _ = state.store.meta_set(META_CLOUD_WATERMARK, wm).await;
     }
-    Err(SyncError::Fatal(format!("ingest {status}: {body}")))
+    Ok(())
 }
 
 /// Gather partial-rollup descriptors for long-running un-ended sessions from the

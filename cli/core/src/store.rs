@@ -290,6 +290,8 @@ impl Store {
         for key in [
             crate::sync::META_SYNC_CURSOR,
             crate::sync::META_ARTIFACTS_CURSOR,
+            crate::sync::META_LAST_EPOCH,
+            crate::sync::META_CLOUD_WATERMARK,
         ] {
             sqlx::query(
                 "INSERT INTO meta (key, value) VALUES (?1, '')

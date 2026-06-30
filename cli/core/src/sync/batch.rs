@@ -143,6 +143,34 @@ pub fn build_batch_with_partials(
     idle: Duration,
     now: OffsetDateTime,
 ) -> AttestationBatch {
+    let batch_id = batch_id_for(events, artifact_rows);
+    assemble_batch(
+        events,
+        token_rows,
+        artifact_rows,
+        partials,
+        device_id,
+        idle,
+        now,
+        batch_id,
+    )
+}
+
+/// Assemble one [`AttestationBatch`] from a window of events/tokens/artifacts/
+/// partials with a caller-supplied `batch_id`. Shared by the single-window builder
+/// ([`build_batch_with_partials`]) and the chunked builder
+/// ([`build_chunked_batches`]) so the fact-derivation is identical either way.
+#[allow(clippy::too_many_arguments)]
+fn assemble_batch(
+    events: &[RawEvent],
+    token_rows: &[TokenRow],
+    artifact_rows: &[ArtifactRow],
+    partials: &[PartialSession],
+    device_id: &str,
+    idle: Duration,
+    now: OffsetDateTime,
+    batch_id: String,
+) -> AttestationBatch {
     let intervals = build_intervals(events, idle);
     let mut sessions = build_sessions(events, idle);
     // Drop degenerate sessions before shipping: no engaged time AND no agent
@@ -184,7 +212,7 @@ pub fn build_batch_with_partials(
     let artifacts = build_artifacts(artifact_rows);
 
     AttestationBatch {
-        batch_id: batch_id_for(events, artifact_rows),
+        batch_id,
         device_id: device_id.to_string(),
         generated_at: now.format(&Rfc3339).unwrap_or_default(),
         intervals,
@@ -192,6 +220,118 @@ pub fn build_batch_with_partials(
         token_usage,
         artifacts,
     }
+}
+
+/// Default soft cap on events per sync sub-batch (see [`build_chunked_batches`]).
+pub const CHUNK_EVENTS: usize = 1000;
+
+/// One deterministically-chunked sub-batch, paired with the bookkeeping the daemon
+/// needs to advance its cursors after the cloud acks it.
+pub struct ChunkBatch {
+    pub batch: AttestationBatch,
+    /// The highest event id this chunk covers — advance `META_SYNC_CURSOR` here on a
+    /// 2xx. `None` for an artifact/partial-only chunk (no events), where only the
+    /// artifact cursor moves.
+    pub cursor_event_id: Option<String>,
+    /// The final chunk carries the artifacts + partial rollups, so its ack also
+    /// advances the artifact cursor and marks partials sent.
+    pub is_last: bool,
+}
+
+/// Split a window of events into deterministic, size-bounded sub-batches **only at
+/// idle breaks** — points where consecutive events are more than `idle` apart.
+///
+/// This is the key to lossless chunking: a *counted* human gap is, by definition,
+/// ≤ `idle` between two human signals, so it can never contain a > `idle` break.
+/// Cutting only at > `idle` breaks therefore never splits a billable interval —
+/// each counted gap stays wholly within one chunk — while still bounding request
+/// size. A chunk grows to at least `CHUNK_EVENTS` events, then closes at the next
+/// idle break; a long continuous burst (no break) stays one chunk (it is genuinely
+/// indivisible without loss). The result is a pure function of `(events, idle)`, so
+/// a re-send reproduces identical chunk boundaries.
+fn chunk_ranges(events: &[RawEvent], idle: Duration, min_chunk: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    if events.is_empty() {
+        return ranges;
+    }
+    let min_chunk = min_chunk.max(1);
+    let mut start = 0usize;
+    for i in 1..events.len() {
+        let big_break = events[i].at - events[i - 1].at > idle;
+        if i - start >= min_chunk && big_break {
+            ranges.push((start, i - 1));
+            start = i;
+        }
+    }
+    ranges.push((start, events.len() - 1));
+    ranges
+}
+
+/// Build deterministic, capped sub-batches for a window. Each chunk derives its own
+/// intervals/sessions from its events (lossless thanks to [`chunk_ranges`]); the
+/// final chunk additionally carries the token rows, artifacts, and partial rollups
+/// (the cloud dedups tokens by id, artifacts by sha, sessions by id), so their
+/// cursors advance only once the whole window has drained.
+#[allow(clippy::too_many_arguments)]
+pub fn build_chunked_batches(
+    events: &[RawEvent],
+    token_rows: &[TokenRow],
+    artifact_rows: &[ArtifactRow],
+    partials: &[PartialSession],
+    device_id: &str,
+    idle: Duration,
+    now: OffsetDateTime,
+) -> Vec<ChunkBatch> {
+    if events.is_empty() {
+        // Artifact/partial-only flush — one batch, no event cursor to advance.
+        let batch = assemble_batch(
+            &[],
+            token_rows,
+            artifact_rows,
+            partials,
+            device_id,
+            idle,
+            now,
+            batch_id_for_chunk(&[], artifact_rows),
+        );
+        return vec![ChunkBatch {
+            batch,
+            cursor_event_id: None,
+            is_last: true,
+        }];
+    }
+
+    let ranges = chunk_ranges(events, idle, CHUNK_EVENTS);
+    let n = ranges.len();
+    ranges
+        .into_iter()
+        .enumerate()
+        .map(|(i, (s, e))| {
+            let is_last = i == n - 1;
+            let chunk = &events[s..=e];
+            let (toks, arts, parts): (&[TokenRow], &[ArtifactRow], &[PartialSession]) =
+                if is_last {
+                    (token_rows, artifact_rows, partials)
+                } else {
+                    (&[], &[], &[])
+                };
+            let batch = assemble_batch(
+                chunk,
+                toks,
+                arts,
+                parts,
+                device_id,
+                idle,
+                now,
+                batch_id_for_chunk(chunk, arts),
+            );
+            ChunkBatch {
+                batch,
+                cursor_event_id: chunk.last().map(|ev| ev.id.clone()),
+                is_last,
+            }
+        })
+        .collect()
 }
 
 /// Map stored artifact rows to the contract's [`ArtifactRef`]. The wire `id` is
@@ -277,7 +417,9 @@ fn build_intervals(events: &[RawEvent], idle: Duration) -> Vec<Interval> {
         }
 
         out.push(Interval {
-            id: Ulid::new().to_string(),
+            // Placeholder — the id is content-derived in a final pass below, AFTER
+            // coalescing settles each interval's started_at/ended_at.
+            id: String::new(),
             repo_canonical: a.project.clone(),
             identity_email: emails
                 .get(&a.session_id)
@@ -292,7 +434,50 @@ fn build_intervals(events: &[RawEvent], idle: Duration) -> Vec<Interval> {
             source_session: a.session_id.clone(),
         });
     }
+
+    // Content-derived ids: an interval IS a counted human gap, so deriving its id
+    // deterministically from its settled content (session + start + end + identity +
+    // repo) — rather than a random ULID — makes re-deriving the SAME gap (a resync,
+    // a re-chunk, a crash-retry) yield the SAME id. The cloud dedups intervals by
+    // content too (its authority), so this is the daemon half of defense-in-depth:
+    // no recovery path can ever double-count human_seconds. Computed last so the
+    // value reflects each interval's coalesced started_at/ended_at, not a pre-merge
+    // snapshot.
+    for iv in &mut out {
+        iv.id = interval_id(
+            &iv.source_session,
+            &iv.started_at,
+            &iv.ended_at,
+            &iv.identity_email,
+            iv.repo_canonical.as_deref(),
+        );
+    }
     out
+}
+
+/// Deterministic, content-derived interval id (a ULID-shaped 128-bit hash of the
+/// settled interval content). Stable across re-derivation — the basis for
+/// idempotent re-send/replay (see [`build_intervals`]).
+fn interval_id(
+    source_session: &str,
+    started_at: &str,
+    ended_at: &str,
+    identity_email: &str,
+    repo_canonical: Option<&str>,
+) -> String {
+    // Order is significant; `str::hash` writes a boundary terminator so distinct
+    // field splits never collide. Two FNV-1a passes give 128 bits, no extra dep.
+    let parts: [&str; 5] = [
+        source_session,
+        started_at,
+        ended_at,
+        identity_email,
+        repo_canonical.unwrap_or(""),
+    ];
+    let lo = fnv1a(&parts, 0xcbf29ce484222325);
+    let hi = fnv1a(&parts, 0x100000001b3);
+    let value = ((hi as u128) << 64) | lo as u128;
+    Ulid::from(value).to_string()
 }
 
 /// Per-session rollups, emitted only for sessions that have ended in this window.
@@ -470,6 +655,43 @@ fn batch_id_for(events: &[RawEvent], artifacts: &[ArtifactRow]) -> String {
     let hi = fnv1a(&ids, 0x100000001b3);
     let value = ((hi as u128) << 64) | lo as u128;
     Ulid::from(value).to_string()
+}
+
+/// Like [`batch_id_for`], but stamps the ULID's 48-bit timestamp with the chunk's
+/// **maximum covered event-id time** (the rest of the id stays the content hash).
+///
+/// This makes `max(batchId)` — the value the cloud keeps as a device's persisted
+/// watermark — monotonic in covered event time, so it becomes comparable to the
+/// daemon's event cursor and `dira device status` can say "in sync / cloud behind"
+/// honestly. Determinism is preserved: the same chunk event-set yields the same
+/// timestamp AND the same content hash. Falls back to the pure content hash for an
+/// artifact-only chunk (no events ⇒ no covered time).
+fn batch_id_for_chunk(events: &[RawEvent], artifacts: &[ArtifactRow]) -> String {
+    let mut ids: Vec<&str> = events
+        .iter()
+        .map(|e| e.id.as_str())
+        .chain(artifacts.iter().map(|a| a.sha.as_str()))
+        .collect();
+    ids.sort_unstable();
+    let lo = fnv1a(&ids, 0xcbf29ce484222325);
+    let hi = fnv1a(&ids, 0x100000001b3);
+    let content = ((hi as u128) << 64) | lo as u128;
+
+    // Highest event id in the chunk (events are ULIDs ⇒ lexicographic max = latest).
+    let max_ts_ms = events
+        .iter()
+        .map(|e| e.id.as_str())
+        .max()
+        .and_then(|id| Ulid::from_string(id).ok())
+        .map(|u| u.timestamp_ms());
+
+    match max_ts_ms {
+        // ULID = 48-bit timestamp (high) | 80-bit randomness (low). Stamp the time
+        // and keep the low 80 bits of the content hash as the "randomness".
+        Some(ts) => Ulid::from(((ts as u128) << 80) | (content & ((1u128 << 80) - 1)))
+            .to_string(),
+        None => Ulid::from(content).to_string(),
+    }
 }
 
 fn fnv1a(ids: &[&str], seed: u64) -> u64 {
@@ -896,6 +1118,79 @@ mod tests {
         assert!(
             batch.sessions.is_empty(),
             "no active time ⇒ nothing to settle"
+        );
+    }
+
+    #[test]
+    fn interval_ids_are_deterministic_and_content_derived() {
+        let events = vec![
+            ev("s1", 0, EventKind::UserPrompt, "p"),
+            ev("s1", 60, EventKind::UserPrompt, "p"),
+            ev("s1", 600, EventKind::UserPrompt, "p"),
+        ];
+        let a = build_intervals(&events, IDLE);
+        let b = build_intervals(&events, IDLE);
+        assert!(!a.is_empty());
+        let ids_a: Vec<&str> = a.iter().map(|i| i.id.as_str()).collect();
+        let ids_b: Vec<&str> = b.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids_a, ids_b,
+            "same content ⇒ same interval ids (idempotent re-send/replay)"
+        );
+        assert!(a.iter().all(|i| !i.id.is_empty()), "ids are filled in");
+    }
+
+    #[test]
+    fn chunk_ranges_split_only_at_idle_breaks() {
+        // Two tight clusters separated by a > idle gap.
+        let events = vec![
+            ev("s", 0, EventKind::UserPrompt, "p"),
+            ev("s", 10, EventKind::UserPrompt, "p"),
+            ev("s", 20, EventKind::UserPrompt, "p"),
+            // > IDLE (5 min) break here:
+            ev("s", 1000, EventKind::UserPrompt, "p"),
+            ev("s", 1010, EventKind::UserPrompt, "p"),
+        ];
+        // min_chunk = 2: the first cluster reaches the cap, then closes at the break.
+        assert_eq!(chunk_ranges(&events, IDLE, 2), vec![(0, 2), (3, 4)]);
+        // A tight cluster with no > idle break stays one chunk (indivisible w/o loss).
+        let tight = vec![
+            ev("s", 0, EventKind::UserPrompt, "p"),
+            ev("s", 5, EventKind::UserPrompt, "p"),
+            ev("s", 10, EventKind::UserPrompt, "p"),
+        ];
+        assert_eq!(chunk_ranges(&tight, IDLE, 1), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn chunked_build_preserves_all_intervals_no_dup() {
+        // A window spanning an idle break: the single-window build and the chunked
+        // build (split at the break) must yield the SAME interval id multiset — no
+        // counted gap is lost or duplicated across the chunk boundary.
+        let events = vec![
+            ev("s", 0, EventKind::UserPrompt, "p"),
+            ev("s", 60, EventKind::UserPrompt, "p"),
+            ev("s", 120, EventKind::UserPrompt, "p"),
+            // idle break (> 5 min):
+            ev("s", 2000, EventKind::UserPrompt, "p"),
+            ev("s", 2060, EventKind::UserPrompt, "p"),
+        ];
+        let mut single: Vec<String> =
+            build_intervals(&events, IDLE).into_iter().map(|i| i.id).collect();
+        single.sort();
+
+        let ranges = chunk_ranges(&events, IDLE, 2);
+        assert!(ranges.len() >= 2, "expected a split at the idle break");
+        let mut chunked: Vec<String> = ranges
+            .iter()
+            .flat_map(|(s, e)| build_intervals(&events[*s..=*e], IDLE))
+            .map(|i| i.id)
+            .collect();
+        chunked.sort();
+
+        assert_eq!(
+            single, chunked,
+            "chunked union == single window (lossless, no double count)"
         );
     }
 }

@@ -31,9 +31,12 @@
 //! access). The daemon re-reads `device_id` from `meta` every sync run, so the
 //! link takes effect without restarting the daemon.
 
+use crate::client;
 use anyhow::{anyhow, Context, Result};
 use dira_contract::{RotateKeyEnvelope, RotateKeyRequest};
+use dira_core::protocol::{Request, Response};
 use dira_core::signing::DeviceKey;
+use dira_core::sync::META_CLOUD_WATERMARK;
 use dira_core::{identity, Config, Store};
 use std::io::Write;
 use time::format_description::well_known::Rfc3339;
@@ -263,7 +266,57 @@ pub async fn status(config: &Config) -> Result<()> {
         None => println!("cursor:    (none — nothing synced yet)"),
     }
     println!("pending:   {pending} event(s) awaiting sync");
+
+    // Cloud coverage, from the watermark the daemon cached on its last flush.
+    let cloud_wm = store
+        .meta_get(META_CLOUD_WATERMARK)
+        .await?
+        .filter(|s| !s.is_empty());
+    let local_head = store.max_event_id().await?;
+    println!("{}", cloud_status_line(cloud_wm.as_deref(), local_head.as_deref(), pending));
     Ok(())
+}
+
+/// `dira device resync`: ask the daemon (over the control socket, so the live flush
+/// task acts) to rewind the sync cursor and re-send. The cloud dedups, so this can
+/// never double-count.
+pub async fn resync(config: &Config, from: Option<String>) -> Result<()> {
+    match client::send(&config.socket_path, &Request::ResyncCursor { from }).await? {
+        Response::ResyncQueued { pending, from } => {
+            match from {
+                Some(id) => println!("resync:    cursor rewound to {id}"),
+                None => println!("resync:    cursor rewound to the beginning (full re-send)"),
+            }
+            println!(
+                "pending:   {pending} event(s) will re-sync now — safe; the cloud dedups (no double counting)"
+            );
+            Ok(())
+        }
+        Response::Error { message } => Err(anyhow!("resync failed: {message}")),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// Honest one-line cloud-coverage summary for `device status`. Compares the cloud's
+/// cached watermark (a batch ULID, timestamp-stamped with the latest event it
+/// covers) against the local event head to judge drift. Pure, so it's unit-testable.
+fn cloud_status_line(cloud_wm: Option<&str>, local_head: Option<&str>, pending: u64) -> String {
+    let Some(wm) = cloud_wm else {
+        return "cloud:     (no handshake yet — sync at least once)".into();
+    };
+    // The cloud persisted noticeably less than the local head while nothing is
+    // queued ⇒ a silent gap the reconciler/epoch didn't cover; resync forces it.
+    let behind = matches!(
+        (Ulid::from_string(wm), local_head.and_then(|h| Ulid::from_string(h).ok())),
+        (Ok(w), Some(h)) if w.timestamp_ms() + 1000 < h.timestamp_ms()
+    ) && pending == 0;
+    if behind {
+        "cloud:     behind — cloud is missing data; run `dira device resync`".into()
+    } else if pending == 0 {
+        format!("cloud:     in sync (watermark {wm})")
+    } else {
+        format!("cloud:     {pending} event(s) queued for the next sync")
+    }
 }
 
 /// `dira device unlink`: locally unlink this device. Clears the cloud-assigned

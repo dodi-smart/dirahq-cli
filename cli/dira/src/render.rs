@@ -128,6 +128,16 @@ pub fn print(resp: &Response) -> bool {
             println!("dirad {version}");
             true
         }
+        // `dira device resync` prints its own summary; this is a generic fallback.
+        Response::ResyncQueued { pending, from } => {
+            match from {
+                Some(id) => println!("resync queued from {id} — {pending} event(s) will re-sync"),
+                None => {
+                    println!("resync queued from the beginning — {pending} event(s) will re-sync")
+                }
+            }
+            true
+        }
     }
 }
 

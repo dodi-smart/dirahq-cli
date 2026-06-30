@@ -48,6 +48,11 @@ pub enum Request {
     Nuke,
     /// Build + runtime info for the running daemon (`dira version`).
     DaemonInfo,
+    /// Manual escape hatch (`dira device resync`): rewind the sync cursor so the
+    /// daemon re-sends events to the cloud, then trigger a flush. `from = None`
+    /// rewinds to the beginning (full re-send); `Some(id)` rewinds to that event
+    /// id. Safe — the cloud dedups (no double counting).
+    ResyncCursor { from: Option<String> },
 }
 
 /// Which manual session(s) to stop.
@@ -101,6 +106,9 @@ pub enum Response {
     Report(Report),
     /// `Nuke`: how many rows were wiped from each stats table.
     Nuked { events: u64, tokens: u64 },
+    /// `ResyncCursor`: the cursor was rewound and a flush was triggered; `pending`
+    /// is how many events will now re-sync, from `from` (None = the beginning).
+    ResyncQueued { pending: u64, from: Option<String> },
     /// `DaemonInfo`: the running daemon's build + runtime info.
     DaemonInfo {
         /// Daemon binary version (`CARGO_PKG_VERSION`).

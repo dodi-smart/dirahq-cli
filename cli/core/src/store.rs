@@ -155,6 +155,42 @@ impl Store {
         rows.iter().map(row_to_event).collect()
     }
 
+    /// Human-signal "seed" for a sync flush: the already-synced human signals (id ≤
+    /// `cursor`) whose `at` falls in `[at_lo, at_hi]`, ordered by `at` ascending.
+    ///
+    /// These are gap ANCHORS for the next flush window — they let the interval build
+    /// count a counted gap that straddles the flush boundary, which the per-window
+    /// build otherwise drops (issue #21). They are read-only context, never re-emitted
+    /// as events and never advance the cursor. `cursor = None` ⇒ empty.
+    ///
+    /// The caller passes the window's human-signal `at`-span padded by one `idle` on
+    /// each side (`[min_window_at - idle, max_window_at + idle]`): a pre-cursor signal
+    /// can only bound a counted (≤ idle) gap with a window signal if it lies within
+    /// that band. Bounding by `at` (NOT id) is essential — the window is an id-range
+    /// but a gap is an `at`-relation, and `dira log` backdates `at` below the cursor,
+    /// so a relevant anchor can be a higher-id row an id-window would miss.
+    pub async fn human_signal_seed(
+        &self,
+        cursor: Option<&str>,
+        at_lo: OffsetDateTime,
+        at_hi: OffsetDateTime,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let Some(cursor) = cursor else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE id <= ?1 AND kind IN \
+             ('user_prompt','permission_decision','manual_start','manual_tick','manual_stop') \
+             AND at >= ?2 AND at <= ?3 ORDER BY at ASC",
+        )
+        .bind(cursor)
+        .bind(at_lo.format(&Rfc3339).map_err(Error::time)?)
+        .bind(at_hi.format(&Rfc3339).map_err(Error::time)?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_event).collect()
+    }
+
     /// The largest event id in the log, or `None` when the log is empty. This is
     /// the snapshot upper bound for a sync window (`until`).
     pub async fn max_event_id(&self) -> Result<Option<String>, Error> {
@@ -868,6 +904,75 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].kind, EventKind::SessionStart);
         assert_eq!(all[1].project.as_deref(), Some("github.com/acme/api"));
+    }
+
+    #[tokio::test]
+    async fn human_signal_seed_selects_by_at_within_idle() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mk = |id: &str, secs: i64, kind: EventKind| RawEvent {
+            id: id.to_string(),
+            at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs),
+            session_id: "s1".to_string(),
+            harness: Harness::ClaudeCode,
+            kind,
+            cwd: None,
+            project: Some("p".to_string()),
+            identity_email: Some("d@e.com".to_string()),
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+        };
+        // id-order != at-order: 01C has a HIGHER id but an OLDER `at` than 01B.
+        store
+            .append(&mk("01A", 0, EventKind::UserPrompt))
+            .await
+            .unwrap();
+        store
+            .append(&mk("01B", 1250, EventKind::UserPrompt))
+            .await
+            .unwrap(); // newest at
+        store
+            .append(&mk("01C", 1000, EventKind::UserPrompt))
+            .await
+            .unwrap(); // higher id, older at
+        store
+            .append(&mk("01D", 1240, EventKind::PreTool))
+            .await
+            .unwrap(); // non-human → ignored
+
+        let at = |secs: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs);
+        let seed = store
+            .human_signal_seed(Some("01D"), at(900), at(1300))
+            .await
+            .unwrap();
+
+        // Human signals with id ≤ 01D and at ∈ [900,1300]: 01C@1000 and 01B@1250;
+        // 01A@0 is out of band, PreTool 01D is non-human. Returned at-ASC — so the
+        // HIGHER-id 01C@1000 sorts before the LOWER-id 01B@1250 (at, not id, decides).
+        let ids: Vec<&str> = seed.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["01C", "01B"]);
+
+        // A far-backdated anchor (01A@0) is reachable when the band reaches it — this
+        // is the `dira log` case where the relevant pre-cursor signal is > idle from
+        // the cursor's newest signal but ≤ idle from a backdated window signal.
+        let far = store
+            .human_signal_seed(Some("01D"), at(-100), at(1300))
+            .await
+            .unwrap();
+        assert_eq!(
+            far.first().unwrap().id,
+            "01A",
+            "far anchor included when in band"
+        );
+
+        // No cursor ⇒ no seed.
+        assert!(store
+            .human_signal_seed(None, at(0), at(9999))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

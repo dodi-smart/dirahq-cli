@@ -147,35 +147,42 @@ pub fn build_batch_with_partials(
     idle: Duration,
     now: OffsetDateTime,
 ) -> AttestationBatch {
-    let batch_id = batch_id_for(events, artifact_rows);
     assemble_batch(
         events,
+        &[], // single-window build: no pre-cursor seed
         token_rows,
         artifact_rows,
         partials,
         device_id,
         idle,
         now,
-        batch_id,
     )
 }
 
 /// Assemble one [`AttestationBatch`] from a window of events/tokens/artifacts/
-/// partials with a caller-supplied `batch_id`. Shared by the single-window builder
-/// ([`build_batch_with_partials`]) and the chunked builder
+/// partials, deriving the `batch_id` internally from the events, artifacts, AND the
+/// built interval decomposition (see [`batch_id_for_chunk`]). Shared by the single-
+/// window builder ([`build_batch_with_partials`]) and the chunked builder
 /// ([`build_chunked_batches`]) so the fact-derivation is identical either way.
 #[allow(clippy::too_many_arguments)]
 fn assemble_batch(
     events: &[RawEvent],
+    // Gap anchors from before the window's cursor (see `build_intervals_seeded`).
+    // Empty for a single-window build and for every chunk after the first.
+    seed: &[RawEvent],
     token_rows: &[TokenRow],
     artifact_rows: &[ArtifactRow],
     partials: &[PartialSession],
     device_id: &str,
     idle: Duration,
     now: OffsetDateTime,
-    batch_id: String,
 ) -> AttestationBatch {
-    let intervals = build_intervals(events, idle);
+    let intervals = build_intervals_seeded(events, idle, seed);
+    // Compute the batch id AFTER the intervals exist, folding the interval
+    // decomposition in (see `batch_id_for_chunk`): a re-derivation that changes an
+    // interval's (start,end) split of the same minutes yields a DIFFERENT batch id so
+    // the cloud re-unpacks it, while a byte-identical rebuild stays stable (issue #21).
+    let batch_id = batch_id_for_chunk(events, artifact_rows, &intervals);
     let mut sessions = build_sessions(events, idle);
     // Drop degenerate sessions before shipping: no engaged time AND no agent
     // activity is empty noise (a bare SessionStart with nothing after it), so it
@@ -287,18 +294,22 @@ pub fn build_chunked_batches(
     device_id: &str,
     idle: Duration,
     now: OffsetDateTime,
+    // Human signals at/before the flush cursor within one idle-window of the
+    // boundary. Used only to recover the boundary-straddling gap in the FIRST chunk;
+    // later chunks open on `> idle` breaks by construction, so nothing straddles them.
+    seed: &[RawEvent],
 ) -> Vec<ChunkBatch> {
     if events.is_empty() {
         // Artifact/partial-only flush — one batch, no event cursor to advance.
         let batch = assemble_batch(
             &[],
+            &[], // no window events → no boundary gap to seed
             token_rows,
             artifact_rows,
             partials,
             device_id,
             idle,
             now,
-            batch_id_for_chunk(&[], artifact_rows),
         );
         return vec![ChunkBatch {
             batch,
@@ -315,21 +326,14 @@ pub fn build_chunked_batches(
         .map(|(i, (s, e))| {
             let is_last = i == n - 1;
             let chunk = &events[s..=e];
+            // Only the first chunk abuts the flush cursor, so only it seeds.
+            let chunk_seed: &[RawEvent] = if i == 0 { seed } else { &[] };
             let (toks, arts, parts): (&[TokenRow], &[ArtifactRow], &[PartialSession]) = if is_last {
                 (token_rows, artifact_rows, partials)
             } else {
                 (&[], &[], &[])
             };
-            let batch = assemble_batch(
-                chunk,
-                toks,
-                arts,
-                parts,
-                device_id,
-                idle,
-                now,
-                batch_id_for_chunk(chunk, arts),
-            );
+            let batch = assemble_batch(chunk, chunk_seed, toks, arts, parts, device_id, idle, now);
             ChunkBatch {
                 batch,
                 cursor_event_id: chunk.last().map(|ev| ev.id.clone()),
@@ -370,63 +374,91 @@ fn parse_artifact_kind(kind: &str) -> ArtifactKind {
     }
 }
 
-/// A human signal carrying the session it came from, so a counted gap can be
-/// attributed back to a `source_session` (which `accounting::Signal` omits).
-struct TaggedSignal {
-    at: OffsetDateTime,
-    project: Option<String>,
-    session_id: String,
+/// De-duplicated, idle-trimmed intervals — ONE per counted gap (no coalescing), so
+/// the set of `(source_session, start, end)` intervals is a pure function of the
+/// data, identical under every windowing (issue #21).
+/// Convenience wrapper for the empty-seed (single-window) case. Production always
+/// goes through `assemble_batch` → `build_intervals_seeded`; this is used by tests.
+#[cfg(test)]
+fn build_intervals(events: &[RawEvent], idle: Duration) -> Vec<Interval> {
+    build_intervals_seeded(events, idle, &[])
 }
 
-/// De-duplicated, idle-trimmed intervals, coalescing adjacent counted gaps that
-/// share the same `(project, source_session)`.
-fn build_intervals(events: &[RawEvent], idle: Duration) -> Vec<Interval> {
-    // Collect human signals tagged with their session, then sort exactly as
-    // `accounting::counted_gaps` does (by time, stable on ties) so our gap
-    // stream is identical to the reporting one — same de-duplicated seconds.
-    let mut tagged: Vec<TaggedSignal> = events
+/// Per-gap intervals over `events`, using `seed` — the human signals at/before the
+/// flush cursor that neighbour the window's `at`-span — as gap anchors.
+///
+/// A gap `[a, b)` is emitted unless BOTH endpoints are seed signals (a gap wholly
+/// within the seed was already emitted by an earlier window; re-counting it would
+/// double-bill). Any gap touching a window signal on either side is derived here. This
+/// recovers the ordinary boundary gap `[seed, first_window)` that the per-window build
+/// dropped, AND the backdated case where a `dira log` signal lands (by `at`) between
+/// two already-synced seed signals and re-splits their gap (issue #21). The `seed`
+/// must be selected by `at` (not event id): the window is an id-range but gaps are an
+/// `at`-relation, so a relevant earlier-by-`at` signal can be a higher-id row that
+/// `dira log` backdated (see `store::human_signal_seed`).
+fn build_intervals_seeded(events: &[RawEvent], idle: Duration, seed: &[RawEvent]) -> Vec<Interval> {
+    struct Sig {
+        at: OffsetDateTime,
+        project: Option<String>,
+        session_id: String,
+        /// Did this signal come from the window (`events`) rather than the seed?
+        from_window: bool,
+    }
+    // Collect human signals (seed first, then window), tagged with origin, then sort
+    // by time exactly as `accounting::counted_gaps` does (stable on ties).
+    let mut tagged: Vec<Sig> = seed
         .iter()
-        .filter(|e| e.kind.is_human_signal())
-        .map(|e| TaggedSignal {
+        .map(|e| (e, false))
+        .chain(events.iter().map(|e| (e, true)))
+        .filter(|(e, _)| e.kind.is_human_signal())
+        .map(|(e, from_window)| Sig {
             at: e.at,
             project: e.project.clone(),
             session_id: e.session_id.clone(),
+            from_window,
         })
         .collect();
     tagged.sort_by_key(|s| s.at);
 
-    // A resolved fallback email per session, used to satisfy the contract's
-    // non-empty `identity_email` requirement on each interval.
-    let emails = session_emails(events);
-    // First non-null activity per session (manual sessions classify their time —
-    // "meeting", "qa", … — which the cloud uses for billing assurance).
-    let activities = session_activities(events);
+    // Fallback email + first activity per session. Resolved over events ∪ seed so a
+    // seed-opened boundary gap keeps its opener session's identity even when that
+    // session has no event in this window. (Common case — empty seed — avoids the copy.)
+    let (emails, activities) = if seed.is_empty() {
+        (session_emails(events), session_activities(events))
+    } else {
+        let ctx: Vec<RawEvent> = seed.iter().chain(events.iter()).cloned().collect();
+        (session_emails(&ctx), session_activities(&ctx))
+    };
 
     let mut out: Vec<Interval> = Vec::new();
     for pair in tagged.windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
+        // Emit a gap unless BOTH endpoints are seed signals: a gap wholly within the
+        // seed was already emitted by an earlier window. A gap touching a window signal
+        // on EITHER side is (re-)derived now. That recovers the ordinary boundary gap
+        // [seed, window) AND the backdated case: `dira log` stamps a past `at`, so a
+        // window signal can land (by `at`) BETWEEN two already-synced seed signals and
+        // re-split the gap they used to bound — the new gaps each touch the window
+        // signal, so both are emitted and the cloud's overlap rebuild replaces the
+        // stale wider interval (issue #21).
+        if !a.from_window && !b.from_window {
+            continue;
+        }
         let delta = b.at - a.at;
         if delta <= Duration::ZERO || delta > idle {
             continue;
         }
         let human = (b.at - a.at).whole_seconds().max(0) as u64;
 
-        // Coalesce into the previous interval when it abuts and shares the same
-        // (project, source_session) — the same attribution key the gap opens on.
-        if let Some(last) = out.last_mut() {
-            if last.ended_at == fmt(a.at)
-                && last.repo_canonical == a.project
-                && last.source_session == a.session_id
-            {
-                last.ended_at = fmt(b.at);
-                last.human_seconds += human;
-                continue;
-            }
-        }
-
+        // One interval per counted gap — NO coalescing. Each interval's endpoints are
+        // a pair of globally-adjacent human signals, so the (session, start, end)
+        // content key is intrinsic to the data and identical under every windowing
+        // (incremental per-flush == one-shot). This is what makes the cloud's
+        // content-key dedup sound — a coalesced run's endpoints depend on where the
+        // flush boundary fell, so two windowings of the same minutes would decompose
+        // differently, never dedup, and overlap → double-bill (issue #21).
         out.push(Interval {
-            // Placeholder — the id is content-derived in a final pass below, AFTER
-            // coalescing settles each interval's started_at/ended_at.
+            // Placeholder — the id is content-derived in a final pass below.
             id: String::new(),
             repo_canonical: a.project.clone(),
             identity_email: emails
@@ -449,9 +481,8 @@ fn build_intervals(events: &[RawEvent], idle: Duration) -> Vec<Interval> {
     // repo) — rather than a random ULID — makes re-deriving the SAME gap (a resync,
     // a re-chunk, a crash-retry) yield the SAME id. The cloud dedups intervals by
     // content too (its authority), so this is the daemon half of defense-in-depth:
-    // no recovery path can ever double-count human_seconds. Computed last so the
-    // value reflects each interval's coalesced started_at/ended_at, not a pre-merge
-    // snapshot.
+    // no recovery path can ever double-count human_seconds. Computed in a final pass
+    // over the settled per-gap intervals.
     for iv in &mut out {
         iv.id = interval_id(
             &iv.source_session,
@@ -667,45 +698,32 @@ fn kind_of(harness: Harness) -> SessionKind {
     }
 }
 
-/// Deterministic batch id over the window's event-id range, so a crash-retry of
-/// the *same* window produces the *same* `batchId` and the cloud no-ops on it
-/// (idempotent ingest) instead of creating a duplicate attestation.
+/// Deterministic batch id over the window's events + artifact shas + INTERVAL
+/// decomposition, so a crash-retry of the *same* window (same events AND same
+/// interval split) produces the *same* `batchId` and the cloud no-ops on it
+/// (idempotent ingest), while a re-derivation that changes the interval split of the
+/// same minutes (the per-gap fix, issue #21) produces a DIFFERENT `batchId` and
+/// forces the cloud to re-unpack rather than dedup-and-drop it.
 ///
-/// Events are ULIDs, so the (min, max) id pair plus the count pins the window.
-/// We hash that into a 128-bit value and render it as a ULID for a wire id that
-/// is the right shape and collision-resistant across distinct windows.
-///
-/// Artifact shas are folded in too, so an *artifact-only* flush (no new events,
-/// e.g. a commit landed between sessions) still gets a distinct id rather than
-/// colliding with the empty-event hash and being dedup'd away by the cloud.
-fn batch_id_for(events: &[RawEvent], artifacts: &[ArtifactRow]) -> String {
-    // Two independent FNV-1a passes give us 128 bits without an extra dep.
+/// Events/artifacts are ULIDs/shas hashed into a 128-bit value rendered as a ULID.
+/// Artifact shas are folded so an *artifact-only* flush still gets a distinct id.
+/// The ULID's 48-bit timestamp is stamped with the chunk's **maximum covered event
+/// time**, so `max(batchId)` — the cloud's persisted device watermark — stays
+/// monotonic in covered event time and comparable to the daemon's event cursor.
+/// Falls back to the pure content hash for an artifact-only chunk (no covered time).
+fn batch_id_for_chunk(
+    events: &[RawEvent],
+    artifacts: &[ArtifactRow],
+    intervals: &[Interval],
+) -> String {
+    // Fold each interval's content id into the hash so a decomposition change (the
+    // per-gap fix, issue #21) produces a different batch id and forces a cloud re-
+    // unpack, while a byte-identical rebuild yields the same id (crash-retry dedup).
     let mut ids: Vec<&str> = events
         .iter()
         .map(|e| e.id.as_str())
         .chain(artifacts.iter().map(|a| a.sha.as_str()))
-        .collect();
-    ids.sort_unstable();
-    let lo = fnv1a(&ids, 0xcbf29ce484222325);
-    let hi = fnv1a(&ids, 0x100000001b3);
-    let value = ((hi as u128) << 64) | lo as u128;
-    Ulid::from(value).to_string()
-}
-
-/// Like [`batch_id_for`], but stamps the ULID's 48-bit timestamp with the chunk's
-/// **maximum covered event-id time** (the rest of the id stays the content hash).
-///
-/// This makes `max(batchId)` — the value the cloud keeps as a device's persisted
-/// watermark — monotonic in covered event time, so it becomes comparable to the
-/// daemon's event cursor and `dira device status` can say "in sync / cloud behind"
-/// honestly. Determinism is preserved: the same chunk event-set yields the same
-/// timestamp AND the same content hash. Falls back to the pure content hash for an
-/// artifact-only chunk (no events ⇒ no covered time).
-fn batch_id_for_chunk(events: &[RawEvent], artifacts: &[ArtifactRow]) -> String {
-    let mut ids: Vec<&str> = events
-        .iter()
-        .map(|e| e.id.as_str())
-        .chain(artifacts.iter().map(|a| a.sha.as_str()))
+        .chain(intervals.iter().map(|iv| iv.id.as_str()))
         .collect();
     ids.sort_unstable();
     let lo = fnv1a(&ids, 0xcbf29ce484222325);
@@ -860,20 +878,205 @@ mod tests {
     }
 
     #[test]
-    fn coalesces_adjacent_gaps_for_one_session() {
-        // One session, prompts at 0/30/60 — three signals, two abutting 30s gaps
-        // that share (project, session) and collapse into a single 60s interval.
+    fn emits_one_interval_per_gap_for_one_session() {
+        // One session, prompts at 0/30/60 — three signals, two abutting 30s gaps.
+        // The decomposition is one interval PER counted gap (no coalescing), so the
+        // set of (start,end) intervals is a pure function of the data and identical
+        // under every windowing — the invariant the cloud's content-key dedup needs
+        // (issue #21). Totals are unchanged; only the decomposition granularity is.
         let events = vec![
             ev("s1", 0, EventKind::UserPrompt, "p"),
             ev("s1", 30, EventKind::UserPrompt, "p"),
             ev("s1", 60, EventKind::UserPrompt, "p"),
         ];
         let batch = build_batch(&events, &[], &[], "d", IDLE, NOW);
-        assert_eq!(batch.intervals.len(), 1);
-        assert_eq!(batch.intervals[0].human_seconds, 60);
+        assert_eq!(batch.intervals.len(), 2, "one interval per counted gap");
+        assert_eq!(batch.intervals[0].human_seconds, 30);
+        assert_eq!(batch.intervals[1].human_seconds, 30);
+        // Half-open + contiguous: the first ends exactly where the second starts.
+        assert_eq!(batch.intervals[0].ended_at, batch.intervals[1].started_at);
         assert_eq!(batch.intervals[0].source_session, "s1");
         assert_eq!(batch.intervals[0].repo_canonical.as_deref(), Some("p"));
         assert_eq!(batch.intervals[0].identity_email, "dev@acme.com");
+        // Total still equals the deduped accounting truth.
+        let total: u64 = batch.intervals.iter().map(|i| i.human_seconds).sum();
+        assert_eq!(total, 60);
+    }
+
+    #[test]
+    fn seed_recovers_boundary_gap_and_is_windowing_invariant() {
+        // Signals 0,100,250,400 (all <= idle apart). Split into two flush windows at
+        // 100; the second window seeds with the pre-cursor signal @100. The union of
+        // the two windows' intervals must equal the one-shot build — same total AND
+        // the same (start,end) id multiset (issue #21 windowing-invariance).
+        let all = vec![
+            ev("s1", 0, EventKind::UserPrompt, "p"),
+            ev("s1", 100, EventKind::UserPrompt, "p"),
+            ev("s1", 250, EventKind::UserPrompt, "p"),
+            ev("s1", 400, EventKind::UserPrompt, "p"),
+        ];
+        let mut oneshot: Vec<String> = build_intervals(&all, IDLE)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        let oneshot_total: u64 = build_intervals(&all, IDLE)
+            .iter()
+            .map(|i| i.human_seconds)
+            .sum();
+        assert_eq!(oneshot_total, 400);
+
+        let w1 = build_intervals(&all[0..2], IDLE); // signals @0,@100
+        let seed = vec![all[1].clone()]; // pre-cursor signal @100
+        let w2 = build_intervals_seeded(&all[2..4], IDLE, &seed); // @250,@400 + seed @100
+
+        let inc_total: u64 = w1.iter().chain(&w2).map(|i| i.human_seconds).sum();
+        assert_eq!(
+            inc_total, 400,
+            "boundary gap [100,250) recovered via the seed"
+        );
+
+        let mut inc: Vec<String> = w1.iter().chain(&w2).map(|i| i.id.clone()).collect();
+        oneshot.sort();
+        inc.sort();
+        assert_eq!(oneshot, inc, "seeded incremental == one-shot decomposition");
+    }
+
+    #[test]
+    fn seed_selected_by_at_not_id_and_no_seed_internal_double_count() {
+        // Pre-cursor human signals at 1000 (session sX) and 1250 (sY); the window's
+        // first signal is at 1400 (sY). The TRUE boundary opener is 1250 (gap 150 <=
+        // idle) — anchoring on 1000 instead would give 400 > idle and drop the gap.
+        // And [1000,1250) must NOT be re-emitted: it belongs to the earlier window.
+        let seed = vec![
+            ev("sX", 1000, EventKind::UserPrompt, "p"),
+            ev("sY", 1250, EventKind::UserPrompt, "p"),
+        ];
+        let win = vec![ev("sY", 1400, EventKind::UserPrompt, "p")];
+        let out = build_intervals_seeded(&win, IDLE, &seed);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the boundary gap into the window signal is emitted"
+        );
+        assert_eq!(
+            out[0].human_seconds, 150,
+            "gap [1250,1400) anchors on the max-AT seed"
+        );
+        assert_eq!(out[0].source_session, "sY");
+    }
+
+    #[test]
+    fn seed_attributes_boundary_gap_to_opener_across_project_switch() {
+        // Window opens on a different session/project than the seed; the boundary gap
+        // is attributed to the OPENER (the seed signal), not the window signal.
+        let seed = vec![ev("sA", 100, EventKind::UserPrompt, "pA")];
+        let win = vec![ev("sB", 250, EventKind::UserPrompt, "pB")]; // gap 150 <= idle
+        let out = build_intervals_seeded(&win, IDLE, &seed);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source_session, "sA");
+        assert_eq!(out[0].repo_canonical.as_deref(), Some("pA"));
+        assert_eq!(out[0].human_seconds, 150);
+        assert!(
+            !out[0].identity_email.is_empty(),
+            "opener identity resolved from the seed"
+        );
+    }
+
+    #[test]
+    fn batch_id_changes_when_interval_decomposition_changes() {
+        // batch_id must fold the interval decomposition so a re-derivation that splits
+        // the same minutes differently forces the cloud to re-unpack instead of dedup-
+        // and-drop (issue #21 Part C); same input → same id (crash-retry dedup).
+        let events = vec![
+            ev("s1", 0, EventKind::UserPrompt, "p"),
+            ev("s1", 30, EventKind::UserPrompt, "p"),
+            ev("s1", 60, EventKind::UserPrompt, "p"),
+        ];
+        let full = build_intervals(&events, IDLE); // two per-gap intervals
+        assert_eq!(full.len(), 2);
+        let coarser = full[..1].to_vec(); // a DIFFERENT decomposition of the same events
+        let id_full = batch_id_for_chunk(&events, &[], &full);
+        let id_coarser = batch_id_for_chunk(&events, &[], &coarser);
+        assert_ne!(
+            id_full, id_coarser,
+            "decomposition change → different batch_id"
+        );
+        assert_eq!(
+            id_full,
+            batch_id_for_chunk(&events, &[], &full),
+            "byte-identical rebuild → same batch_id"
+        );
+    }
+
+    #[test]
+    fn empty_seed_equals_plain_build() {
+        let events = vec![
+            ev("s1", 0, EventKind::UserPrompt, "p"),
+            ev("s1", 30, EventKind::UserPrompt, "p"),
+            ev("s1", 60, EventKind::UserPrompt, "p"),
+        ];
+        let plain: Vec<String> = build_intervals(&events, IDLE)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        let seeded: Vec<String> = build_intervals_seeded(&events, IDLE, &[])
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(plain, seeded);
+    }
+
+    #[test]
+    fn retro_log_backdated_events_are_reconciled() {
+        // `dira log` backdates `at` below the sync cursor: a prior flush already sent
+        // L[1000,1200)=200, then a manual session is logged with M@1050,1150 (fresh,
+        // higher ids). Flush 2's window is {M@1050, M@1150}; the seed is [L@1000,
+        // L@1200]. The backdated M signals re-split the L gap into [1000,1050)(L),
+        // [1050,1150)(M), [1150,1200)(M) — each touches a window signal, so all three
+        // are emitted (the "either endpoint from window" rule). Ground truth = 200.
+        let seed = vec![
+            ev("L", 1000, EventKind::UserPrompt, "p"),
+            ev("L", 1200, EventKind::UserPrompt, "p"),
+        ];
+        let win = vec![
+            ev("M", 1050, EventKind::ManualStart, "p"),
+            ev("M", 1150, EventKind::ManualStop, "p"),
+        ];
+        let out = build_intervals_seeded(&win, IDLE, &seed);
+        let total: u64 = out.iter().map(|i| i.human_seconds).sum();
+        assert_eq!(total, 200, "backdated gap fully reconciled, no under-count");
+        // The re-split [1150,1200) is attributed to the manual session M (its opener).
+        assert!(
+            out.iter()
+                .any(|i| i.source_session == "M" && i.human_seconds == 50),
+            "the [1150,1200) gap is re-attributed to M"
+        );
+        // And no interval double-counts: total never exceeds the wall span 1000..1200.
+        assert!(total <= 200);
+    }
+
+    #[test]
+    fn far_backdated_log_gap_is_recovered_with_band_seed() {
+        // The pre-cursor signals L@800 and L@1200 are > idle apart (no synced L
+        // interval). `dira log` injects M@1050,1150. The seed band reaches back to
+        // L@800 (it is ≤ idle from the backdated M@1050), so the boundary gap
+        // [800,1050) is recovered. Ground truth = 250(L) + 100(M) + 50(M) = 400.
+        let seed = vec![
+            ev("L", 800, EventKind::UserPrompt, "p"),
+            ev("L", 1200, EventKind::UserPrompt, "p"),
+        ];
+        let win = vec![
+            ev("M", 1050, EventKind::ManualStart, "p"),
+            ev("M", 1150, EventKind::ManualStop, "p"),
+        ];
+        let out = build_intervals_seeded(&win, IDLE, &seed);
+        let total: u64 = out.iter().map(|i| i.human_seconds).sum();
+        assert_eq!(total, 400);
+        assert!(
+            out.iter()
+                .any(|i| i.source_session == "L" && i.human_seconds == 250),
+            "the far [800,1050) gap is anchored on L@800 and attributed to L"
+        );
     }
 
     #[test]

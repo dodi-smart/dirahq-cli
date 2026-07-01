@@ -275,14 +275,36 @@ async fn flush(
     let now = time::OffsetDateTime::now_utc();
     let partials = partial_rollups(state, now);
     let partial_ids: Vec<String> = partials.iter().map(|p| p.session_id.clone()).collect();
+    let idle = state.config.idle();
+    // Seed the first chunk's interval build with the already-synced human signals that
+    // neighbour the window's human-signal `at`-span (padded by one idle on each side),
+    // so a counted gap that straddles the flush boundary — including one re-split by a
+    // `dira log`-backdated signal — is recovered instead of dropped (issue #21). The
+    // band, not the cursor's newest signal, is the bound: a backdated window signal can
+    // be far below the cursor yet still form a ≤ idle gap with an old pre-cursor signal.
+    // Read-only: never re-emitted, never advances the cursor.
+    let human_ats: Vec<time::OffsetDateTime> = events
+        .iter()
+        .filter(|e| e.kind.is_human_signal())
+        .map(|e| e.at)
+        .collect();
+    let seed = match (human_ats.iter().min(), human_ats.iter().max()) {
+        (Some(&lo), Some(&hi)) => state
+            .store
+            .human_signal_seed(cursor.as_deref(), lo - idle, hi + idle)
+            .await
+            .map_err(|e| SyncError::Fatal(format!("read human-signal seed: {e}")))?,
+        _ => Vec::new(), // no human signals in the window → no gaps to anchor
+    };
     let chunks = dira_core::sync::build_chunked_batches(
         &events,
         &token_rows,
         &artifact_rows,
         &partials,
         &device_id,
-        state.config.idle(),
+        idle,
         now,
+        &seed,
     );
 
     // 4. POST each chunk in order; advance the event cursor to that chunk's high-water

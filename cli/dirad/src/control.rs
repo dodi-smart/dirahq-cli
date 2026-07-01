@@ -6,7 +6,7 @@
 
 use crate::events::{handle_of, manual_event, materialize_interval};
 use crate::state::{AppState, EventMsg};
-use dira_core::accounting::{self, Signal};
+use dira_core::accounting;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::project;
 use dira_core::protocol::{ReportScope, Request, Response, SessionView, StatusView, StopSelector};
@@ -435,9 +435,31 @@ fn build_session_views(
     let now = OffsetDateTime::now_utc();
     let idle = state.config.idle();
 
+    // De-duplicated human time attributed **per session** by the opening-signal
+    // policy — the exact global attribution `report::build` uses per project. The
+    // old path recomputed each session's human time from only *its own* signals, so
+    // a session holding fewer than two prompts within the idle window read 0; in
+    // parallel supervision (one prompt per session, then move on) that meant an
+    // "engaged" session routinely showed HUMAN 0s. Attributing across the merged
+    // timeline reconciles the per-session column to the TODAY total instead.
+    let human_signals: Vec<(OffsetDateTime, String)> = events
+        .iter()
+        .filter(|e| e.kind.is_human_signal())
+        .map(|e| (e.at, e.session_id.clone()))
+        .collect();
+    let human_by_session = accounting::per_key_seconds(&human_signals, idle);
+
     live.into_iter()
         .map(|s| {
-            let (human, agent) = session_seconds(events, &s.session_id, idle);
+            let human = human_by_session.get(&s.session_id).copied().unwrap_or(0);
+            let agent = session_agent_seconds(events, &s.session_id, idle);
+            // Two independent notions of "recent": `idle` tracks the last *human*
+            // signal (are you driving it?), `agent_active` tracks the last event of
+            // any kind (is its agent working?). The activity basis mirrors the
+            // presence heartbeat's "Right Now" idle, so a busy agent reads `active`
+            // rather than `idle` even when you last prompted it long ago.
+            let human_idle = s.is_idle(now, idle);
+            let agent_active = human_idle && (now - s.last_event_at) <= idle;
             SessionView {
                 handle: s.handle(),
                 session_id: s.session_id.clone(),
@@ -453,7 +475,8 @@ fn build_session_views(
                     .unwrap_or_default(),
                 human_seconds: human,
                 agent_seconds: agent,
-                idle: s.is_idle(now, idle),
+                idle: human_idle,
+                agent_active,
                 // Live tails for the `watch` dashboard: it grows the timers by
                 // `now - these` (clamped to idle) between polls.
                 last_activity_at: Some(fmt_ts(s.last_active_at.unwrap_or(s.last_event_at))),
@@ -470,52 +493,49 @@ fn fmt_ts(t: OffsetDateTime) -> String {
         .unwrap_or_default()
 }
 
-/// Per-session (non-deduped) human + agent seconds, for display only. The
-/// authoritative de-duplicated totals live in the report.
-fn session_seconds(events: &[RawEvent], session_id: &str, idle: Duration) -> (i64, i64) {
-    let mut signals = Vec::new();
-    let mut first = None;
-    let mut last = None;
+/// Per-session agent wall-clock seconds for display: the idle-trimmed active span
+/// over the session's own event timestamps ([`accounting::active_seconds`]) when it
+/// has any agent activity, else 0 — the same measure [`report::build`], the
+/// sync/rollup path, and the cloud use, so a session left open for hours between
+/// bursts of work reads as time actually worked, not its raw lifetime. Human time is
+/// deliberately *not* computed here: it is a global, de-duplicated measure
+/// attributed across all sessions (see [`accounting::per_key_seconds`] in
+/// [`build_session_views`]), which a single session viewed in isolation cannot
+/// reproduce.
+fn session_agent_seconds(events: &[RawEvent], session_id: &str, idle: Duration) -> i64 {
+    let mut times = Vec::new();
     let mut had_activity = false;
     for e in events.iter().filter(|e| e.session_id == session_id) {
-        first.get_or_insert(e.at);
-        last = Some(e.at);
-        if e.kind.is_human_signal() {
-            signals.push(Signal {
-                at: e.at,
-                project: e.project.clone(),
-            });
-        }
+        times.push(e.at);
         if e.kind.is_agent_activity() {
             had_activity = true;
         }
     }
-    let human = accounting::total_human_seconds(&signals, idle);
-    let agent = match (first, last, had_activity) {
-        (Some(f), Some(l), true) => (l - f).whole_seconds(),
-        _ => 0,
-    };
-    (human, agent)
+    if had_activity {
+        accounting::active_seconds(&times, idle)
+    } else {
+        0
+    }
 }
 
 /// The start of "today" for report windows, as a UTC instant.
 ///
 /// By default this is UTC midnight (`config.report_local_day == false`), which
-/// preserves the original Phase 1 behavior. When `report_local_day` is enabled
-/// the boundary is computed in the system local timezone via
-/// [`dira_core::config::start_of_day`]. Resolving the local offset can fail in a
-/// multithreaded process (`UtcOffset::current_local_offset` returns an error when
-/// it can't prove soundness); on failure we log at debug and fall back to UTC so
-/// reporting never breaks.
+/// preserves the original Phase 1 behavior. When `report_local_day` is enabled the
+/// boundary is computed in the system local timezone via
+/// [`dira_core::config::start_of_day`], using the offset captured at daemon startup
+/// ([`crate::local_offset`]) — resolving it per-request would fail in the
+/// multithreaded runtime. If no offset was captured we fall back to UTC so reporting
+/// never breaks.
 fn start_of_today(state: &AppState) -> OffsetDateTime {
     let now = OffsetDateTime::now_utc();
     if !state.config.report_local_day {
         return now.replace_time(time::Time::MIDNIGHT);
     }
-    match time::UtcOffset::current_local_offset() {
-        Ok(offset) => dira_core::config::start_of_day(now, offset),
-        Err(e) => {
-            tracing::debug!(error = %e, "local offset unavailable; using UTC day boundary");
+    match crate::local_offset() {
+        Some(offset) => dira_core::config::start_of_day(now, offset),
+        None => {
+            tracing::debug!("local offset unavailable; using UTC day boundary");
             now.replace_time(time::Time::MIDNIGHT)
         }
     }

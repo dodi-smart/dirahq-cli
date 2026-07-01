@@ -4,7 +4,7 @@
 
 use crate::format::{bar, hms, project_label, repo_short, truncate};
 use crate::theme::{self, Role};
-use dira_core::protocol::{any_engaged, SessionView, StatusView};
+use dira_core::protocol::{any_engaged, LiveState, SessionView, StatusView};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -112,7 +112,9 @@ fn live_tail(now: time::OffsetDateTime, ts: Option<time::OffsetDateTime>, idle: 
 /// the daemon's settled values whenever a fresh snapshot arrives.
 ///
 /// This is display-only: the daemon's `human_seconds`/`agent_seconds` stay the
-/// settled snapshot values; we add the open tail here. Idle sessions are frozen.
+/// settled snapshot values; we add the open tail here. Fully-idle sessions are
+/// frozen; an `active` session (agent working, no recent prompt) still grows its
+/// agent tail, but not the human tail.
 /// The "today" totals + per-project rollup are advanced consistently so the rows
 /// still sum to the total: agent grows by the sum of per-session agent tails;
 /// the de-duplicated human total grows by the single largest (most-recent) human
@@ -126,15 +128,24 @@ pub fn tick(s: &StatusView, now: time::OffsetDateTime, idle: i64) -> StatusView 
     let mut human_project: Option<Option<String>> = None;
 
     for sess in &mut s.active {
-        if sess.idle {
-            continue;
+        let state = sess.live_state();
+        if state == LiveState::Idle {
+            continue; // nothing recent — freeze both timers
         }
-        let h = live_tail(now, parse_ts(sess.last_human_at.as_deref()), idle);
-        sess.human_seconds += h;
-        if h > human_tail || human_project.is_none() {
-            human_tail = h;
-            human_project = Some(sess.project.clone());
+        // The human tail grows only while *you* are engaged; an agent working on
+        // its own (active, not engaged) accrues no human time, keeping the
+        // no-double-count base honest.
+        if state == LiveState::Engaged {
+            let h = live_tail(now, parse_ts(sess.last_human_at.as_deref()), idle);
+            sess.human_seconds += h;
+            if h > human_tail || human_project.is_none() {
+                human_tail = h;
+                human_project = Some(sess.project.clone());
+            }
         }
+        // The agent tail grows whenever the session is live — engaged *or* active —
+        // so a busy agent's lane keeps ticking even when you last prompted it long
+        // ago (previously it froze the moment the session went human-idle).
         if sess.kind != "manual" {
             let a = live_tail(now, parse_ts(sess.last_activity_at.as_deref()), idle);
             sess.agent_seconds += a;
@@ -159,12 +170,14 @@ pub fn tick(s: &StatusView, now: time::OffsetDateTime, idle: i64) -> StatusView 
     s
 }
 
-/// The colour for a session row / lane based on engagement.
-fn engaged_style(idle: bool) -> Style {
-    if idle {
-        theme::style(Role::Faint)
-    } else {
-        theme::style(Role::Engaged)
+/// The STATE label + colour for a session row, from its three-way live state:
+/// `engaged` (you're driving it, teal), `active` (its agent is working on its own,
+/// purple), or `idle` (nothing recent, faint).
+fn state_label_style(s: &SessionView) -> (&'static str, Style) {
+    match s.live_state() {
+        LiveState::Engaged => ("engaged", theme::style(Role::Engaged)),
+        LiveState::Active => ("active", theme::style(Role::Agent)),
+        LiveState::Idle => ("idle", theme::style(Role::Faint)),
     }
 }
 
@@ -311,14 +324,14 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
         .saturating_sub(48 + 5 + 2)
         .clamp(12, 200);
     let rows = active.iter().map(|sess| {
-        let style = engaged_style(sess.idle);
+        let (state, style) = state_label_style(sess);
         Row::new([
             Cell::from(truncate(&sess.handle, 10)),
             Cell::from(truncate(&sess.harness, 10)),
             Cell::from(truncate(&project_label(&sess.project), project_w)),
             Cell::from(hms(sess.human_seconds)),
             Cell::from(hms(sess.agent_seconds)),
-            Cell::from(if sess.idle { "idle" } else { "engaged" }),
+            Cell::from(state),
         ])
         .style(style)
     });
@@ -487,6 +500,9 @@ mod tests {
             human_seconds: 0,
             agent_seconds: agent,
             idle,
+            // Default the activity basis to match `idle` (engaged or fully idle);
+            // tests that exercise the `active` state set it explicitly.
+            agent_active: false,
             last_activity_at: None,
             last_human_at: None,
         }
@@ -595,5 +611,40 @@ mod tests {
         assert_eq!(human_sum, out.today.total_human_seconds);
         // The tail is clamped to idle: a tiny idle window caps the growth.
         assert_eq!(tick(&s, now, 2).active[0].agent_seconds, 102);
+    }
+
+    #[test]
+    fn tick_grows_active_agent_but_not_its_human_tail() {
+        use time::macros::datetime;
+        let now = datetime!(2026-06-27 10:00:10 UTC);
+        // Active: the agent worked 4s ago, but the last human prompt was long ago
+        // (human-idle). Its agent lane must keep ticking; its human tail must not.
+        let mut a = sess("a1", Some("acme/api"), 100, true); // idle (human) …
+        a.agent_active = true; // … but its agent is active
+        a.last_activity_at = Some("2026-06-27T10:00:06Z".into()); // 4s tail
+        a.last_human_at = Some("2026-06-27T09:00:00Z".into()); // an hour ago
+        let s = StatusView {
+            active: vec![a],
+            today: report(
+                10,
+                100,
+                vec![ProjectReport {
+                    project: Some("acme/api".into()),
+                    human_seconds: 10,
+                    agent_wall_seconds: 100,
+                }],
+            ),
+            sync_pending: 0,
+            hydrating: false,
+        };
+        let out = tick(&s, now, 300);
+        assert_eq!(out.active[0].agent_seconds, 104, "agent tail should grow");
+        assert_eq!(
+            out.active[0].human_seconds, 0,
+            "no human tail when not engaged"
+        );
+        // Totals: agent advances by the 4s tail; human is untouched.
+        assert_eq!(out.today.total_agent_seconds, 104);
+        assert_eq!(out.today.total_human_seconds, 10);
     }
 }

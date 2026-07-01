@@ -4,8 +4,7 @@
 //! stand up the same daemon; this binary just initializes tracing and calls
 //! [`dirad::run`].
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // The daemon takes no real CLI args, but answer `--version`/`-V` directly so
     // it can be inspected the same way as `dira` (e.g. by a service script).
     if std::env::args()
@@ -27,5 +26,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    dirad::run().await
+    // Resolve the system local UTC offset while the process is still single-threaded
+    // — before building the multithreaded tokio runtime. `current_local_offset()`
+    // errors once other threads exist, so this MUST run first for `report_local_day`
+    // to resolve a real local day boundary instead of always falling back to UTC.
+    dirad::init_local_offset();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(dirad::run())
 }

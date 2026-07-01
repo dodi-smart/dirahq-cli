@@ -143,20 +143,24 @@ pub struct PresenceHints {
 /// as each event is folded in, so the heartbeat reads them straight off the
 /// registry instead of re-scanning SQLite every tick:
 ///
-/// - `engaged_seconds` — de-duplicated, idle-trimmed human time for this session,
-///   the per-session analogue of [`dira_core::accounting::total_human_seconds`]
-///   over the session's own human signals.
+/// - `engaged_seconds` — de-duplicated, idle-trimmed human time attributed to this
+///   session by the opening-signal policy: each counted gap on the *merged*
+///   all-session signal timeline is credited to the session that opened it. So the
+///   per-session values sum to the deduped grand total
+///   ([`dira_core::accounting::total_human_seconds`]) and match
+///   [`dira_core::accounting::per_key_seconds`] keyed by session — a session with a
+///   single prompt is still credited for the gap it opens rather than reading 0.
+///   Attribution uses registry-level state, so it lives in [`SessionRegistry`].
 /// - `active_seconds` — idle-trimmed active wall time over *all* of the session's
 ///   event timestamps, the per-session analogue of
 ///   [`dira_core::accounting::active_seconds`].
 ///
-/// Both are computed by the exact same gap rule the batch scan uses: when an
-/// event arrives, add `gap = at - <previous timestamp of the same class>` to the
-/// running counter iff `0 < gap <= idle`. Accumulating consecutive in-window gaps
-/// telescopes to the same sum a one-shot sort-and-sum over the whole sequence
-/// produces, so the incremental value equals the accounting-core value (events
-/// arrive in non-decreasing `at` order on the writer path; the registry tracks the
-/// last-seen timestamp regardless). The cold-start hydrate replays the recent log
+/// Both are computed by the same gap rule the batch scan uses: add `gap = at -
+/// <previous timestamp>` to the running counter iff `0 < gap <= idle` — `active`
+/// against the session's own previous event, `engaged` against the previous human
+/// signal on the merged timeline. Accumulating consecutive in-window gaps telescopes
+/// to the same sum a one-shot sort-and-sum produces (events arrive in non-decreasing
+/// `at` order on the writer path). The cold-start hydrate replays the recent log
 /// through `observe`, so a daemon bounce reconstructs the same totals.
 #[derive(Debug, Clone)]
 pub struct LiveSession {
@@ -174,7 +178,10 @@ pub struct LiveSession {
     pub last_event_at: OffsetDateTime,
     pub last_signal_at: Option<OffsetDateTime>,
     pub ended: bool,
-    /// Rolling de-duplicated human-engaged seconds for this session (6b).
+    /// Rolling de-duplicated human-engaged seconds attributed to this session by the
+    /// opening-signal policy (the gaps this session *opened* on the merged, all-session
+    /// timeline). Maintained at the registry level so these per-session values sum to
+    /// the deduped grand total — see [`SessionRegistry::observe`].
     pub engaged_seconds: u64,
     /// Rolling idle-trimmed active wall seconds over all this session's events (6b).
     pub active_seconds: u64,
@@ -214,6 +221,13 @@ impl LiveSession {
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
     sessions: HashMap<String, LiveSession>,
+    /// `at` of the most recent human signal across *all* sessions, and the session
+    /// that fired it. Together they drive the de-duplicated, opening-signal
+    /// attribution of `engaged_seconds` (below): each counted gap is credited to the
+    /// session that *opened* it, so the per-session counters sum to the deduped grand
+    /// total instead of each counting its own signals in isolation.
+    last_human_signal_at: Option<OffsetDateTime>,
+    last_human_signal_session: Option<String>,
 }
 
 impl SessionRegistry {
@@ -276,13 +290,6 @@ impl SessionRegistry {
             entry.note = ev.note.clone();
         }
         if ev.kind.is_human_signal() {
-            // Engaged gap (human signals only): same rule over consecutive signals.
-            if let Some(prev) = entry.last_human_signal_at {
-                let gap = ev.at - prev;
-                if gap > Duration::ZERO && gap <= idle {
-                    entry.engaged_seconds += gap.whole_seconds() as u64;
-                }
-            }
             entry.last_human_signal_at = Some(ev.at);
             entry.last_signal_at = Some(ev.at);
         }
@@ -292,12 +299,37 @@ impl SessionRegistry {
         // on compaction mid-conversation, so a long session would otherwise vanish
         // from `active` even while it keeps working.
         entry.ended = matches!(ev.kind, EventKind::SessionEnd | EventKind::ManualStop);
+
+        // Engaged gap — de-duplicated across ALL sessions and attributed to the
+        // session that *opens* the gap (the v1 opening-signal policy, identical to
+        // `accounting::per_key_seconds` keyed by session). Maintained at the registry
+        // level (not per session) so the per-session `engaged_seconds` counters sum to
+        // the deduped grand total: a session with a single prompt still gets credited
+        // for the gap it opens, instead of reading 0 because it has no *second* signal
+        // of its own. Done in a fresh borrow so we can credit a different session than
+        // the one this event belongs to.
+        if ev.kind.is_human_signal() {
+            let prev = self.last_human_signal_at;
+            let opener = self.last_human_signal_session.clone();
+            if let (Some(prev_at), Some(opener)) = (prev, opener) {
+                let gap = ev.at - prev_at;
+                if gap > Duration::ZERO && gap <= idle {
+                    if let Some(op) = self.sessions.get_mut(&opener) {
+                        op.engaged_seconds += gap.whole_seconds() as u64;
+                    }
+                }
+            }
+            self.last_human_signal_at = Some(ev.at);
+            self.last_human_signal_session = Some(ev.session_id.clone());
+        }
     }
 
     /// Drop all live sessions. Called on `nuke` so the registry doesn't keep
     /// showing "active" sessions whose backing events were just wiped.
     pub fn clear(&mut self) {
         self.sessions.clear();
+        self.last_human_signal_at = None;
+        self.last_human_signal_session = None;
     }
 
     /// All sessions that have not ended.
@@ -610,5 +642,47 @@ mod tests {
         ]);
         // A single event ⇒ both zero.
         registry_counter_equals_accounting(&[(SessionStart, 0)]);
+    }
+
+    #[test]
+    fn engaged_seconds_are_deduped_and_attributed_across_sessions() {
+        // The parallel-supervision case: two sessions, ONE prompt each, interleaved.
+        // In isolation each session has a single signal, so the old per-session
+        // counter read 0 for both. With registry-level opening-signal attribution,
+        // each counted gap is credited to the session that opened it, so the
+        // per-session counters are non-zero and sum to the deduped grand total.
+        let p = Some("github.com/acme/api");
+        let mut reg = SessionRegistry::default();
+        reg.observe(&ev_at("s1", EventKind::UserPrompt, p, 0), IDLE); // opens 0..60
+        reg.observe(&ev_at("s2", EventKind::UserPrompt, p, 60), IDLE); // opens 60..120
+        reg.observe(&ev_at("s1", EventKind::UserPrompt, p, 120), IDLE); // last signal
+
+        let s1 = reg.sessions.get("s1").unwrap().engaged_seconds;
+        let s2 = reg.sessions.get("s2").unwrap().engaged_seconds;
+
+        // Cross-check against the one-shot accounting core: per-session values must
+        // equal per_key_seconds keyed by session, and sum to total_human_seconds.
+        let keyed: Vec<(OffsetDateTime, &str)> = [(0, "s1"), (60, "s2"), (120, "s1")]
+            .into_iter()
+            .map(|(secs, sid)| (OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs), sid))
+            .collect();
+        let by = accounting::per_key_seconds(&keyed, IDLE);
+        assert_eq!(s1 as i64, by[&"s1"]); // gap 0..60
+        assert_eq!(s2 as i64, by[&"s2"]); // gap 60..120
+        assert_eq!(s1, 60);
+        assert_eq!(s2, 60);
+
+        let signals: Vec<Signal> = [0i64, 60, 120]
+            .into_iter()
+            .map(|secs| Signal {
+                at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs),
+                project: p.map(str::to_string),
+            })
+            .collect();
+        assert_eq!(
+            s1 + s2,
+            accounting::total_human_seconds(&signals, IDLE) as u64,
+            "per-session engaged must sum to the deduped grand total",
+        );
     }
 }

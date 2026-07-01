@@ -7,7 +7,7 @@
 
 use crate::format::{bar as bar_cells, hms, project_label, repo_short, truncate};
 use crate::theme::{self, Role};
-use dira_core::protocol::{any_engaged, Response, SessionView, StatusView};
+use dira_core::protocol::{any_engaged, LiveState, Response, SessionView, StatusView};
 use dira_core::report::Report;
 
 /// The width the layout was originally hand-tuned for. Used as the fallback when
@@ -184,12 +184,15 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout) {
     println!("{}", theme::paint(&header, Role::Muted));
     for s in sessions {
         // Paint only the trailing STATE word so the fixed-width columns stay
-        // aligned (the colour escapes have zero display width).
-        let state = if s.idle {
-            theme::paint("idle", Role::Faint)
-        } else {
-            theme::paint("engaged", Role::Engaged)
+        // aligned (the colour escapes have zero display width). "engaged" (you're
+        // driving it) is teal like the human lane; "active" (its agent is working
+        // on its own) is purple like the agent lane; "idle" is faint.
+        let (label, role) = match s.live_state() {
+            LiveState::Engaged => ("engaged", Role::Engaged),
+            LiveState::Active => ("active", Role::Agent),
+            LiveState::Idle => ("idle", Role::Faint),
         };
+        let state = theme::paint(label, role);
         println!(
             "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
             truncate(&s.handle, 8),

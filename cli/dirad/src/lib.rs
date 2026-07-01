@@ -33,14 +33,37 @@ use crate::writer::QUEUE_CAPACITY;
 use dira_core::{Config, Store};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
-use time::{Duration, OffsetDateTime};
+use std::sync::{Arc, Mutex, OnceLock};
+use time::{Duration, OffsetDateTime, UtcOffset};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, OnceCell};
 use ulid::Ulid;
 
 /// Idle-ticker cadence; must be below the idle threshold so manual sessions accrue.
 pub const TICK_INTERVAL_SECS: u64 = 30;
+
+/// Process-wide local UTC offset, captured once at startup by [`init_local_offset`].
+static LOCAL_OFFSET: OnceLock<Option<UtcOffset>> = OnceLock::new();
+
+/// Resolve and cache the system local UTC offset for `report_local_day`.
+///
+/// **Must be called while the process is still single-threaded** — before the tokio
+/// runtime spawns worker threads. `time::UtcOffset::current_local_offset()` refuses
+/// to run once other threads exist (a `localtime_r`/`setenv` soundness guard), so
+/// calling it per-request inside the multithreaded daemon *always* errors and falls
+/// back to UTC. Capturing the offset at boot, when only the main thread exists, lets
+/// the report day boundary actually land on local midnight. Idempotent; later calls
+/// are ignored.
+pub fn init_local_offset() {
+    let _ = LOCAL_OFFSET.set(UtcOffset::current_local_offset().ok());
+}
+
+/// The local UTC offset captured at startup, or `None` when it was never resolved
+/// (never initialised, or resolution failed). Callers fall back to a UTC day
+/// boundary on `None`.
+pub fn local_offset() -> Option<UtcOffset> {
+    LOCAL_OFFSET.get().copied().flatten()
+}
 
 /// Assemble the shared [`AppState`] from an opened store + config.
 ///

@@ -146,7 +146,20 @@ pub struct SessionView {
     pub started_at: String,
     pub human_seconds: i64,
     pub agent_seconds: i64,
+    /// `true` when no *human* signal (prompt / permission / manual tick) has
+    /// arrived within the idle window — i.e. you are not currently driving this
+    /// session. This is the human-engagement basis and is deliberately blind to
+    /// agent activity: a session whose agent is churning away with no recent
+    /// prompt is still `idle` here (but see [`SessionView::agent_active`]).
     pub idle: bool,
+    /// `true` when this session saw activity of *any* kind — the agent's own tool
+    /// calls included — within the idle window. Distinct from `idle`: it lets the
+    /// live view surface an agent working on its own as `active` rather than
+    /// misreporting it as `idle`, matching the cloud's activity-based "Right Now".
+    /// Defaulted so a newer CLI stays wire-compatible with an older daemon (which
+    /// omits it → `false`, i.e. degrades to the prior engaged/idle-only view).
+    #[serde(default)]
+    pub agent_active: bool,
     /// RFC3339 timestamp of this session's last event of any kind, if live. Lets
     /// the `watch` dashboard grow the agent timer by `now - last_activity_at`
     /// (clamped to idle) between polls so it ticks smoothly. Display-only;
@@ -157,6 +170,35 @@ pub struct SessionView {
     /// engagement tail for the human timer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_human_at: Option<String>,
+}
+
+/// The live engagement state of a session for the STATE column, with precedence
+/// `engaged > active > idle`. "Engaged" means *you* signalled it recently;
+/// "active" means its agent is working but you haven't; "idle" means neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveState {
+    /// A human signal arrived within the idle window — you are driving it.
+    Engaged,
+    /// No recent human signal, but the agent has been active within the window.
+    Active,
+    /// Nothing — human or agent — within the idle window.
+    Idle,
+}
+
+impl SessionView {
+    /// Fold [`SessionView::idle`] and [`SessionView::agent_active`] into the
+    /// three-way [`LiveState`] the renderers display. Human engagement wins over
+    /// agent activity, so a session you just prompted reads `Engaged` even while
+    /// its agent runs.
+    pub fn live_state(&self) -> LiveState {
+        if !self.idle {
+            LiveState::Engaged
+        } else if self.agent_active {
+            LiveState::Active
+        } else {
+            LiveState::Idle
+        }
+    }
 }
 
 /// `status` payload: what's live plus today's rollup.
@@ -175,8 +217,70 @@ pub struct StatusView {
 }
 
 /// True when the operator is in the loop — at least one of these sessions has a
-/// recent human signal (not idle). Drives the "and you" marker in the CLI
-/// renderers, mirroring the cloud's engaged badge.
+/// recent *human* signal (`LiveState::Engaged`). Drives the "and you" marker in
+/// the CLI renderers, mirroring the cloud's engaged badge. Deliberately keyed off
+/// human engagement, not agent activity: an agent working alone is `active` but
+/// does not put *you* in the loop.
 pub fn any_engaged(sessions: &[SessionView]) -> bool {
-    sessions.iter().any(|s| !s.idle)
+    sessions
+        .iter()
+        .any(|s| s.live_state() == LiveState::Engaged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(idle: bool, agent_active: bool) -> SessionView {
+        SessionView {
+            handle: "h".into(),
+            session_id: "s".into(),
+            harness: "claude".into(),
+            kind: "agent".into(),
+            project: None,
+            label: None,
+            activity: None,
+            note: None,
+            started_at: "now".into(),
+            human_seconds: 0,
+            agent_seconds: 0,
+            idle,
+            agent_active,
+            last_activity_at: None,
+            last_human_at: None,
+        }
+    }
+
+    #[test]
+    fn live_state_prefers_engaged_then_active_then_idle() {
+        // Recent human signal → engaged, regardless of agent activity.
+        assert_eq!(view(false, false).live_state(), LiveState::Engaged);
+        assert_eq!(view(false, true).live_state(), LiveState::Engaged);
+        // No recent human signal but the agent is churning → active.
+        assert_eq!(view(true, true).live_state(), LiveState::Active);
+        // Nothing recent → idle.
+        assert_eq!(view(true, false).live_state(), LiveState::Idle);
+    }
+
+    #[test]
+    fn any_engaged_tracks_human_not_agent() {
+        // An agent working alone (active, not engaged) does not put you in the loop.
+        assert!(!any_engaged(&[view(true, true)]));
+        // A recent human signal does.
+        assert!(any_engaged(&[view(true, true), view(false, false)]));
+    }
+
+    #[test]
+    fn agent_active_defaults_false_from_older_daemon() {
+        // An older daemon omits `agent_active`; it must deserialize to `false` so a
+        // busy-agent session degrades to the prior engaged/idle-only view.
+        let json = r#"{
+            "handle":"h","session_id":"s","harness":"claude","kind":"agent",
+            "project":null,"started_at":"now","human_seconds":0,"agent_seconds":0,
+            "idle":true
+        }"#;
+        let v: SessionView = serde_json::from_str(json).unwrap();
+        assert!(!v.agent_active);
+        assert_eq!(v.live_state(), LiveState::Idle);
+    }
 }

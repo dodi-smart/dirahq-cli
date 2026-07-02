@@ -84,6 +84,21 @@ fn knob(key: &str) -> Option<&'static Knob> {
     KNOBS.iter().find(|k| k.key == key)
 }
 
+/// The "Settable keys" help block, rendered from [`KNOBS`] so `dira config set
+/// --help` can never drift from what [`set`] actually validates: adding a knob
+/// to the table updates the help (and the error message) in one place.
+pub(crate) fn knobs_after_help() -> String {
+    let mut s = String::from("Settable keys:\n");
+    for k in KNOBS {
+        s.push_str(&format!("  {:<26} {}\n", k.key, k.help));
+    }
+    s.push_str(
+        "\nDaemon-side changes take effect after a daemon restart\n\
+         (`dira daemon stop` then `dira daemon start`).",
+    );
+    s
+}
+
 /// The XDG path of the writable `config.toml`.
 fn config_path() -> Result<PathBuf> {
     let dirs =

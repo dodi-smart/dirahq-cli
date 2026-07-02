@@ -199,7 +199,10 @@ async fn status_carries_token_totals_and_cached_billing() {
     match dirad::control::dispatch(&state, Request::Status).await {
         Response::Status(view) => {
             let tokens = view.tokens.expect("token totals present");
-            assert_eq!(tokens.total_tokens, 10_000, "input+output+cache_read+cache_create");
+            assert_eq!(
+                tokens.total_tokens, 10_000,
+                "input+output+cache_read+cache_create"
+            );
             assert!(tokens.est_cost_usd > 0.0, "priced by the bundled table");
             let billing = view.billing.expect("cached billing attached");
             assert_eq!(billing.currency, "€");

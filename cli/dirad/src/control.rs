@@ -10,8 +10,7 @@ use dira_core::accounting;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::project;
 use dira_core::protocol::{
-    BillingView, ComputeView, ReportScope, Request, Response, SessionView, StatusView,
-    StopSelector,
+    BillingView, ComputeView, ReportScope, Request, Response, SessionView, StatusView, StopSelector,
 };
 use dira_core::report;
 use std::path::Path;

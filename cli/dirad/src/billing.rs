@@ -17,9 +17,7 @@
 use crate::state::AppState;
 use dira_contract::{BillingSummaryEnvelope, BillingSummaryRequest, SCHEMA_VERSION};
 use dira_core::identity;
-use dira_core::sync::{
-    parse_billing_summary_response, CachedBillingSummary, META_BILLING_SUMMARY,
-};
+use dira_core::sync::{parse_billing_summary_response, CachedBillingSummary, META_BILLING_SUMMARY};
 use std::time::{Duration as StdDuration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -83,7 +81,11 @@ async fn run(state: AppState) {
 /// One fetch attempt. Re-reads config + linkage each call so `dira device link`
 /// / a config change takes effect without a daemon restart. Holds no lock
 /// across the HTTP await.
-async fn fetch_once(state: &AppState, client: &reqwest::Client, last_attempt: &mut Option<Instant>) {
+async fn fetch_once(
+    state: &AppState,
+    client: &reqwest::Client,
+    last_attempt: &mut Option<Instant>,
+) {
     if let Some(t) = *last_attempt {
         if t.elapsed() < MIN_FETCH_GAP {
             return; // notify burst — the periodic tick will cover it
@@ -126,10 +128,7 @@ async fn fetch_once(state: &AppState, client: &reqwest::Client, last_attempt: &m
         sig,
     };
 
-    let url = format!(
-        "{}/api/v1/billing/summary",
-        cloud_url.trim_end_matches('/')
-    );
+    let url = format!("{}/api/v1/billing/summary", cloud_url.trim_end_matches('/'));
     match client.post(&url).json(&envelope).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body = resp.text().await.unwrap_or_default();

@@ -31,8 +31,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Active sessions + today's per-project human vs agent time.
-    Status,
+    /// Today's summary: engaged / agent / compute + the unbilled value.
+    Status {
+        /// Also show the PARALLEL lanes, ACTIVE SESSIONS table, and TODAY report.
+        #[arg(long, alias = "full")]
+        detailed: bool,
+    },
     /// Live auto-refreshing dashboard of the "Right Now" view (q/Esc to quit).
     #[command(alias = "top")]
     Watch {
@@ -266,9 +270,23 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    // `status` renders with a client-side flag (summary vs detailed), so it
+    // sends + renders here instead of the generic print path below.
+    if let Command::Status { detailed } = &cli.command {
+        let resp = client::send(&config.socket_path, &Request::Status).await?;
+        match resp {
+            Response::Status(s) => render::print_status(&s, *detailed),
+            other => {
+                if !render::print(&other) {
+                    std::process::exit(1);
+                }
+            }
+        }
+        return Ok(());
+    }
+
     // Commands that talk to the daemon.
     let req = match cli.command {
-        Command::Status => Request::Status,
         Command::Sessions => Request::Sessions,
         Command::Start {
             project,
@@ -335,7 +353,8 @@ async fn main() -> Result<()> {
             Request::Report { scope }
         }
         // already handled above
-        Command::Init { .. }
+        Command::Status { .. }
+        | Command::Init { .. }
         | Command::Watch { .. }
         | Command::Daemon { .. }
         | Command::Device { .. }

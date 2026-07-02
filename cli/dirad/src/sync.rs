@@ -110,7 +110,13 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
             continue;
         };
         match flush(&state, device_key, &client).await {
-            Ok(FlushOutcome::Synced) | Ok(FlushOutcome::Nothing) => {
+            Ok(FlushOutcome::Synced) => {
+                backoff = StdDuration::ZERO;
+                // Fresh facts just landed on the cloud — nudge the billing task
+                // to refresh the billable summary once they're unpacked.
+                state.billing_refresh.notify_one();
+            }
+            Ok(FlushOutcome::Nothing) => {
                 backoff = StdDuration::ZERO;
             }
             Ok(FlushOutcome::Skipped) => {

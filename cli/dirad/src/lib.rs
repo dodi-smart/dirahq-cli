@@ -18,6 +18,7 @@
 //! real daemon (bind a socket, drive `Ping`/`Status`) against the same code the
 //! binary runs.
 
+pub mod billing;
 pub mod capture;
 pub mod control;
 pub mod events;
@@ -93,6 +94,8 @@ pub async fn build_state(
         hydrated: Arc::new(AtomicBool::new(false)),
         repo_dirs: Arc::new(Mutex::new(HashMap::new())),
         presence_hints: Arc::new(crate::state::PresenceHints::default()),
+        billing: Arc::new(Mutex::new(None)),
+        billing_refresh: Arc::new(tokio::sync::Notify::new()),
     };
     Ok((state, rx, sync_rx))
 }
@@ -166,6 +169,8 @@ pub async fn run() -> anyhow::Result<()> {
     sync::spawn(state.clone(), sync_rx);
     // Live-presence heartbeat (ephemeral; no-ops until linked + cloud_url set).
     heartbeat::spawn(state.clone());
+    // Cloud billing-summary fetch (best-effort; no-ops until linked + cloud_url set).
+    billing::spawn(state.clone());
     // Best-effort schema-version handshake: warn if our contract version is
     // outside the cloud's supported range. Non-fatal; skipped when cloud_url is
     // unset. Run detached so it never delays startup.

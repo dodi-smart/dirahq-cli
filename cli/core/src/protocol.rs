@@ -214,6 +214,46 @@ pub struct StatusView {
     /// activity. Defaulted so older CLIs stay wire-compatible.
     #[serde(default)]
     pub hydrating: bool,
+    /// Today's token totals + local cost estimate, for the status compute row.
+    /// `None` from an older daemon (skew) or when the read fails — the renderer
+    /// omits the row. Defaulted + omitted-when-None so both directions of
+    /// dira↔dirad skew stay wire-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<ComputeView>,
+    /// The cloud-computed billable summary (last successful fetch, possibly
+    /// stale — see `fetched_at`). `None` when the device is unlinked, offline
+    /// since startup with no cache, or the daemon is older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<BillingView>,
+}
+
+/// Today's compute totals for the status summary. Defined here (not reusing the
+/// store's row type) so the wire protocol never depends on storage shapes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ComputeView {
+    /// All tokens through the pipe today: input + output + cache read/create.
+    pub total_tokens: u64,
+    /// Estimated USD cost from the bundled pricing table. A local estimate and
+    /// always a label — never a billing base (that's the cloud's job).
+    pub est_cost_usd: f64,
+}
+
+/// The cloud's billable rollup as attached to `status`. Mirrors
+/// [`crate::sync::BillingSummary`] but is defined here so the protocol doesn't
+/// depend on sync types; the daemon maps between them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BillingView {
+    /// Engaged hours of billable intervals in the period (raw, not rounded).
+    pub billable_hours: f64,
+    /// Policy-priced value of those intervals, in `currency`.
+    pub unbilled_amount: f64,
+    /// Currency symbol from the workspace policy, e.g. `"€"`.
+    pub currency: String,
+    /// The period the summary covers, e.g. `"week"`.
+    pub period: String,
+    /// RFC 3339 timestamp of the daemon's successful fetch — lets the renderer
+    /// flag a stale value ("as of 32m ago") instead of presenting it as live.
+    pub fetched_at: String,
 }
 
 /// True when the operator is in the loop — at least one of these sessions has a
@@ -268,6 +308,62 @@ mod tests {
         assert!(!any_engaged(&[view(true, true)]));
         // A recent human signal does.
         assert!(any_engaged(&[view(true, true), view(false, false)]));
+    }
+
+    #[test]
+    fn status_view_tolerates_older_daemon_without_tokens_or_billing() {
+        // An older daemon omits `tokens`/`billing`; both must deserialize to
+        // `None` so the new CLI simply omits the compute row and billable footer.
+        let json = r#"{
+            "active": [],
+            "today": {"projects":[],"total_human_seconds":0,"total_agent_seconds":0,"session_count":0},
+            "sync_pending": 0
+        }"#;
+        let v: StatusView = serde_json::from_str(json).unwrap();
+        assert!(v.tokens.is_none());
+        assert!(v.billing.is_none());
+        assert!(!v.hydrating);
+    }
+
+    #[test]
+    fn status_view_omits_absent_tokens_and_billing_on_the_wire() {
+        // `None` must not serialize its key, so an older CLI (serde: unknown
+        // fields ignored, but keep the payload minimal) sees the pre-field shape.
+        let v = StatusView {
+            active: vec![],
+            today: Report {
+                projects: vec![],
+                total_human_seconds: 0,
+                total_agent_seconds: 0,
+                session_count: 0,
+            },
+            sync_pending: 0,
+            hydrating: false,
+            tokens: None,
+            billing: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(!json.contains("tokens"));
+        assert!(!json.contains("billing"));
+
+        let v = StatusView {
+            tokens: Some(ComputeView {
+                total_tokens: 2_060_000,
+                est_cost_usd: 15.2,
+            }),
+            billing: Some(BillingView {
+                billable_hours: 10.4,
+                unbilled_amount: 1064.0,
+                currency: "€".into(),
+                period: "week".into(),
+                fetched_at: "2026-07-02T09:00:00Z".into(),
+            }),
+            ..v
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: StatusView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tokens.unwrap().total_tokens, 2_060_000);
+        assert_eq!(back.billing.unwrap().currency, "€");
     }
 
     #[test]

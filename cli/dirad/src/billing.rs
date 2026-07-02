@@ -16,10 +16,8 @@
 
 use crate::state::AppState;
 use dira_contract::{BillingSummaryEnvelope, BillingSummaryRequest, SCHEMA_VERSION};
-use dira_core::identity;
 use dira_core::sync::{parse_billing_summary_response, CachedBillingSummary, META_BILLING_SUMMARY};
 use std::time::{Duration as StdDuration, Instant};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// Slow refresh cadence — billing moves at human speed.
@@ -91,23 +89,15 @@ async fn fetch_once(
             return; // notify burst — the periodic tick will cover it
         }
     }
-    let Some(cloud_url) = state.config.cloud_url.clone() else {
-        return; // billing summary off until a cloud_url is configured
-    };
-    let device_id = match identity::device_id(&state.store).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return, // not linked yet
-        Err(e) => {
-            tracing::warn!("billing: read device_id failed: {e}");
-            return;
-        }
+    let Some((cloud_url, device_id)) = state.cloud_link("billing").await else {
+        return; // off until a cloud_url is configured and the device is linked
     };
     *last_attempt = Some(Instant::now());
 
     let now = OffsetDateTime::now_utc();
     let request = BillingSummaryRequest {
         device_id: device_id.clone(),
-        sent_at: now.format(&Rfc3339).unwrap_or_default(),
+        sent_at: crate::heartbeat::fmt_rfc3339(now),
         period: "week".to_string(),
     };
     let Some(device_key) = state.device_key().await else {
@@ -138,7 +128,7 @@ async fn fetch_once(
             };
             let cached = CachedBillingSummary {
                 summary,
-                fetched_at: now.format(&Rfc3339).unwrap_or_default(),
+                fetched_at: crate::heartbeat::fmt_rfc3339(now),
             };
             if let Ok(json) = serde_json::to_string(&cached) {
                 if let Err(e) = state.store.meta_set(META_BILLING_SUMMARY, &json).await {

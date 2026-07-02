@@ -28,14 +28,9 @@ pub struct BillingSummary {
     /// The period this covers, e.g. `"week"` (rolling 7 days).
     #[serde(default)]
     pub period: String,
-    /// RFC 3339 start/end of the period window.
-    #[serde(default)]
-    pub period_start: String,
-    #[serde(default)]
-    pub period_end: String,
-    /// RFC 3339 timestamp the cloud computed this at.
-    #[serde(default)]
-    pub as_of: String,
+    // The cloud also sends `periodStart`/`periodEnd`/`asOf`; serde ignores
+    // unknown fields, so they're deliberately not modeled until something
+    // reads them (staleness display uses the device-clock `fetched_at`).
 }
 
 /// The full 2xx body: `{ "status": "ok", "summary": { … } }`.
@@ -80,6 +75,8 @@ mod tests {
 
     #[test]
     fn parses_ok_body_with_summary() {
+        // The body carries periodStart/periodEnd/asOf too — unmodeled fields
+        // must be ignored, not rejected.
         let s = parse_billing_summary_response(
             r#"{"status":"ok","summary":{"billableHours":10.4,"unbilledAmount":1064,
                 "currency":"€","period":"week","periodStart":"a","periodEnd":"b","asOf":"c"}}"#,
@@ -117,7 +114,6 @@ mod tests {
                 unbilled_amount: 150.0,
                 currency: "€".into(),
                 period: "week".into(),
-                ..Default::default()
             },
             fetched_at: "2026-07-02T09:00:00Z".into(),
         };

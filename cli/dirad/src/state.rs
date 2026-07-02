@@ -89,6 +89,23 @@ impl AppState {
             .map_err(|e| tracing::warn!("device identity load failed: {e}"))
             .ok()
     }
+
+    /// The cloud-link gate every device→cloud task re-checks per tick:
+    /// `Some((cloud_url, device_id))` only when a cloud URL is configured AND
+    /// the device is linked. Re-reading both each call is the point — `dira
+    /// device link` / a config change takes effect without a daemon restart.
+    /// `task` names the caller in the read-failure log line.
+    pub async fn cloud_link(&self, task: &str) -> Option<(String, String)> {
+        let cloud_url = self.config.cloud_url.clone()?;
+        match dira_core::identity::device_id(&self.store).await {
+            Ok(Some(id)) => Some((cloud_url, id)),
+            Ok(None) => None, // not linked yet
+            Err(e) => {
+                tracing::warn!("{task}: read device_id failed: {e}");
+                None
+            }
+        }
+    }
 }
 
 /// Liveness timestamps the watchdog reads to tell a stalled task from a quiet one.

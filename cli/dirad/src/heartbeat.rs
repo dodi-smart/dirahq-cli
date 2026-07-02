@@ -378,6 +378,7 @@ fn to_presence_session(s: &LiveSession, now: OffsetDateTime, idle: Duration) -> 
 }
 
 /// RFC 3339 timestamp, matching the formatting used in `sync.rs` / `batch.rs`.
-fn fmt_rfc3339(t: OffsetDateTime) -> String {
+/// Crate-visible so sibling cloud tasks (`billing.rs`) share the one fallback.
+pub(crate) fn fmt_rfc3339(t: OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }

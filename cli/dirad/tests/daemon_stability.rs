@@ -191,7 +191,6 @@ async fn status_carries_token_totals_and_cached_billing() {
             unbilled_amount: 1064.0,
             currency: "€".into(),
             period: "week".into(),
-            ..Default::default()
         },
         fetched_at: "2026-07-02T09:00:00Z".into(),
     });

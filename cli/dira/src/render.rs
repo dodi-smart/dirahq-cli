@@ -6,8 +6,8 @@
 //! parse the plain output (and pipes, which fall back to 80) stay stable.
 
 use crate::format::{
-    bar as bar_cells, hms, hours_compact, money, project_label, repo_short, tokens_compact,
-    truncate, usd_approx,
+    bar as bar_cells, billing_line, hms, project_label, repo_short, tokens_compact, truncate,
+    usd_approx,
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{any_engaged, LiveState, Response, SessionView, StatusView};
@@ -148,7 +148,6 @@ pub fn print(resp: &Response) -> bool {
 /// Render `dira status`: the summary block always; the detail sections
 /// (ACTIVE SESSIONS / PARALLEL / TODAY) only under `--detailed`.
 pub fn print_status(s: &StatusView, detailed: bool) {
-    let layout = Layout::for_width(terminal_cols());
     // Hide degenerate sessions — a bare SessionStart with no engaged time and no
     // agent activity is noise (e.g. a project you opened but didn't work in).
     let active: Vec<SessionView> = s
@@ -163,6 +162,7 @@ pub fn print_status(s: &StatusView, detailed: bool) {
     }
 
     if detailed {
+        let layout = Layout::for_width(terminal_cols());
         println!();
         if !active.is_empty() {
             println!("{}", theme::paint("ACTIVE SESSIONS", Role::Muted));
@@ -281,22 +281,15 @@ fn summary_lines(s: &StatusView, active: &[SessionView], now: OffsetDateTime) ->
 
     // --- billable footer -------------------------------------------------------
     if let Some(b) = &s.billing {
-        let hours = theme::paint(
-            &format!("{} billable", hours_compact(b.billable_hours)),
-            Role::Engaged,
-        );
-        let arrow = theme::paint("→", Role::Muted);
-        let amount = theme::paint(&money(&b.currency, b.unbilled_amount), Role::Ink);
-        let period = match b.period.as_str() {
-            "week" | "" => "this week".to_string(),
-            other => format!("this {other}"),
-        };
-        let tail = theme::paint(&format!("unbilled, {period}"), Role::Muted);
+        let footer: String = billing_line(b)
+            .iter()
+            .map(|(text, role)| theme::paint(text, *role))
+            .collect();
         let stale = billing_age_suffix(&b.fetched_at, now)
             .map(|a| format!(" {}", theme::paint(&a, Role::Faint)))
             .unwrap_or_default();
         lines.push(String::new());
-        lines.push(format!("{hours} {arrow} {amount} {tail}{stale}"));
+        lines.push(format!("{footer}{stale}"));
     }
 
     lines
@@ -305,8 +298,7 @@ fn summary_lines(s: &StatusView, active: &[SessionView], now: OffsetDateTime) ->
 /// `Some("(as of 32m ago)")` when `fetched_at` parses and is older than the
 /// staleness threshold; `None` when fresh, absent, or unparseable.
 fn billing_age_suffix(fetched_at: &str, now: OffsetDateTime) -> Option<String> {
-    let t =
-        OffsetDateTime::parse(fetched_at, &time::format_description::well_known::Rfc3339).ok()?;
+    let t = crate::format::parse_ts(Some(fetched_at))?;
     let age = (now - t).whole_seconds();
     if age <= BILLING_STALE_AFTER_SECS {
         return None;

@@ -55,6 +55,85 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// Compact token count with 3 significant digits: `982`, `45.2K`, `2.06M`,
+/// `1.10B`. The renderer appends ` tok`; keeping the unit out of the helper
+/// lets the TUI reuse it in tighter spans. Rounding carries across units
+/// (`999_950` → `1.00M`, never `1000K`).
+pub fn tokens_compact(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let units = ["K", "M", "B", "T"];
+    let mut v = n as f64;
+    let mut idx = 0usize;
+    v /= 1_000.0;
+    while v >= 1_000.0 && idx + 1 < units.len() {
+        v /= 1_000.0;
+        idx += 1;
+    }
+    // 3 significant digits, with a carry check: 999.95 formats as "1000" at 0
+    // decimals, so it must be promoted to the next unit first.
+    if format_sig3(v) == "1000" && idx + 1 < units.len() {
+        v /= 1_000.0;
+        idx += 1;
+    }
+    format!("{}{}", format_sig3(v), units[idx])
+}
+
+/// `v` (in `[1, 1000)`) with 3 significant digits: `1.10`, `45.2`, `982`.
+fn format_sig3(v: f64) -> String {
+    if v >= 100.0 {
+        format!("{v:.0}")
+    } else if v >= 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// Approximate local USD cost label for the compute row: `~$15` at a dollar or
+/// more (rounded), `~$0.42` under a dollar, `~$0` for nothing. Always `~` and
+/// always `$` — this is the CLI's own estimate from the bundled pricing table,
+/// distinct from the cloud-priced billable amount (which carries the workspace
+/// policy currency).
+pub fn usd_approx(v: f64) -> String {
+    if v <= 0.0 {
+        "~$0".to_string()
+    } else if v < 0.995 {
+        format!("~${v:.2}")
+    } else {
+        format!("~${}", v.round() as i64)
+    }
+}
+
+/// Hours label matching the cloud's `hoursLabel`: whole hours drop the decimal
+/// (`14h`), otherwise one decimal (`10.4h`).
+pub fn hours_compact(h: f64) -> String {
+    let rounded = (h * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{}h", rounded as i64)
+    } else {
+        format!("{rounded:.1}h")
+    }
+}
+
+/// Money label matching the cloud's `money()`: currency symbol + the rounded
+/// amount with en-US thousands separators — `€1,064`, `$980`.
+pub fn money(currency: &str, amount: f64) -> String {
+    let n = amount.round() as i64;
+    let sign = if n < 0 { "-" } else { "" };
+    let digits = n.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    let lead = digits.len() % 3;
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (i + 3 - lead) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    format!("{sign}{currency}{grouped}")
+}
+
 /// Render a proportional bar of `width` columns for `value` relative to `max`,
 /// using filled (`█`) and empty (`░`) blocks — mirrors the daemon-status bars.
 /// A zero or negative `max` (or `width`) yields an all-empty bar, never a panic.
@@ -130,5 +209,53 @@ mod tests {
         assert_eq!(bar(10, 0, 5), "░░░░░");
         assert_eq!(bar(10, -1, 5), "░░░░░");
         assert_eq!(bar(10, 100, 0), "");
+    }
+
+    #[test]
+    fn tokens_compact_keeps_three_significant_digits() {
+        assert_eq!(tokens_compact(0), "0");
+        assert_eq!(tokens_compact(982), "982");
+        assert_eq!(tokens_compact(999), "999");
+        assert_eq!(tokens_compact(1_000), "1.00K");
+        assert_eq!(tokens_compact(45_200), "45.2K");
+        assert_eq!(tokens_compact(999_400), "999K");
+        assert_eq!(tokens_compact(2_060_000), "2.06M");
+        assert_eq!(tokens_compact(1_100_000_000), "1.10B");
+    }
+
+    #[test]
+    fn tokens_compact_carries_rounding_into_the_next_unit() {
+        // 999.95K rounds to "1000" at 0 decimals — must promote, not print 1000K.
+        assert_eq!(tokens_compact(999_950), "1.00M");
+        assert_eq!(tokens_compact(999_950_000), "1.00B");
+    }
+
+    #[test]
+    fn usd_approx_rounds_dollars_and_keeps_cents_below_one() {
+        assert_eq!(usd_approx(0.0), "~$0");
+        assert_eq!(usd_approx(-1.0), "~$0");
+        assert_eq!(usd_approx(0.42), "~$0.42");
+        assert_eq!(usd_approx(1.0), "~$1");
+        assert_eq!(usd_approx(15.2), "~$15");
+        assert_eq!(usd_approx(15.6), "~$16");
+    }
+
+    #[test]
+    fn hours_compact_matches_cloud_hours_label() {
+        assert_eq!(hours_compact(10.4), "10.4h");
+        assert_eq!(hours_compact(14.0), "14h");
+        assert_eq!(hours_compact(0.0), "0h");
+        // One decimal, rounded — 10.44 → 10.4, 10.45+ → 10.5 territory.
+        assert_eq!(hours_compact(10.44), "10.4h");
+        assert_eq!(hours_compact(9.96), "10h");
+    }
+
+    #[test]
+    fn money_groups_thousands_like_the_cloud() {
+        assert_eq!(money("€", 1064.0), "€1,064");
+        assert_eq!(money("$", 980.4), "$980");
+        assert_eq!(money("€", 0.0), "€0");
+        assert_eq!(money("$", 1_234_567.0), "$1,234,567");
+        assert_eq!(money("£", 999.5), "£1,000");
     }
 }

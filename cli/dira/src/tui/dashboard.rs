@@ -2,9 +2,11 @@
 //! watch` dashboard. Everything that turns a [`StatusView`] into displayable
 //! numbers lives here (and is unit-tested) so the draw code stays dumb.
 
-use crate::format::{bar, hms, project_label, repo_short, truncate};
+use crate::format::{
+    bar, hms, hours_compact, money, project_label, repo_short, tokens_compact, truncate, usd_approx,
+};
 use crate::theme::{self, Role};
-use dira_core::protocol::{any_engaged, LiveState, SessionView, StatusView};
+use dira_core::protocol::{any_engaged, BillingView, LiveState, SessionView, StatusView};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -238,6 +240,19 @@ fn draw_header(frame: &mut Frame, area: Rect, s: &StatusView) {
         spans.push(Span::raw("   "));
         spans.push(Span::styled("· and you", theme::style(Role::Engaged)));
     }
+    // Today's compute (tokens + local USD estimate), matching `dira status`'s
+    // ◇ row. Absent when zero or when an older daemon didn't send totals.
+    if let Some(t) = s.tokens.filter(|t| t.total_tokens > 0) {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!(
+                "{} tok {}",
+                tokens_compact(t.total_tokens),
+                usd_approx(t.est_cost_usd)
+            ),
+            theme::style(Role::Compute),
+        ));
+    }
     if h.sync_pending > 0 {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -273,8 +288,12 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
     } else {
         s.today.projects.len() as u16 + 4 // projects + header + total + borders
     };
+    let billing_h = if s.billing.is_some() { 1 } else { 0 };
     let sessions_need = s.active.len().max(1) as u16 + 3; // rows + header + borders
-    let sessions_cap = area.height.saturating_sub(lanes_h + rollup_h).max(3);
+    let sessions_cap = area
+        .height
+        .saturating_sub(lanes_h + rollup_h + billing_h)
+        .max(3);
     let sessions_h = sessions_need.min(sessions_cap).max(3);
 
     let chunks = Layout::new(
@@ -283,6 +302,7 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
             Constraint::Length(sessions_h), // active sessions table (content-sized)
             Constraint::Length(lanes_h),    // parallel lanes
             Constraint::Length(rollup_h),   // per-project rollup
+            Constraint::Length(billing_h),  // cloud billable footer (when known)
             Constraint::Min(0),             // slack falls to the bottom
         ],
     )
@@ -290,6 +310,32 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
     draw_sessions(frame, chunks[0], &s.active);
     draw_lanes(frame, chunks[1], s);
     draw_rollup(frame, chunks[2], s);
+    if let Some(b) = &s.billing {
+        draw_billing(frame, chunks[3], b);
+    }
+}
+
+/// The cloud billable footer, mirroring `dira status`'s summary footer:
+/// `10.4h billable → €1,064 unbilled, this week`.
+fn draw_billing(frame: &mut Frame, area: Rect, b: &BillingView) {
+    let period = match b.period.as_str() {
+        "week" | "" => "this week".to_string(),
+        other => format!("this {other}"),
+    };
+    let line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{} billable", hours_compact(b.billable_hours)),
+            theme::style(Role::Engaged),
+        ),
+        Span::styled(" → ", theme::style(Role::Muted)),
+        Span::styled(
+            money(&b.currency, b.unbilled_amount),
+            theme::style(Role::Ink).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" unbilled, {period}"), theme::style(Role::Muted)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
@@ -515,6 +561,8 @@ mod tests {
             today: report(600, 1800, vec![]),
             sync_pending: 3,
             hydrating: false,
+            tokens: None,
+            billing: None,
         };
         let h = Headline::from_status(&s);
         assert_eq!(h.human_seconds, 600);
@@ -550,6 +598,8 @@ mod tests {
             today: report(600, 1200, vec![]),
             sync_pending: 0,
             hydrating: false,
+            tokens: None,
+            billing: None,
         };
         let lanes = lanes(&s);
         assert_eq!(lanes.len(), 2);
@@ -589,6 +639,8 @@ mod tests {
             ),
             sync_pending: 0,
             hydrating: false,
+            tokens: None,
+            billing: None,
         };
         let out = tick(&s, now, 300);
         // Engaged agent grows by its 5s tail; idle session is untouched.
@@ -636,6 +688,8 @@ mod tests {
             ),
             sync_pending: 0,
             hydrating: false,
+            tokens: None,
+            billing: None,
         };
         let out = tick(&s, now, 300);
         assert_eq!(out.active[0].agent_seconds, 104, "agent tail should grow");

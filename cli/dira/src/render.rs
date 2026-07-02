@@ -5,10 +5,14 @@
 //! is byte-for-byte what it was before width-scaling landed, so scripts that
 //! parse the plain output (and pipes, which fall back to 80) stay stable.
 
-use crate::format::{bar as bar_cells, hms, project_label, repo_short, truncate};
+use crate::format::{
+    bar as bar_cells, hms, hours_compact, money, project_label, repo_short, tokens_compact,
+    truncate, usd_approx,
+};
 use crate::theme::{self, Role};
 use dira_core::protocol::{any_engaged, LiveState, Response, SessionView, StatusView};
 use dira_core::report::Report;
+use time::OffsetDateTime;
 
 /// The width the layout was originally hand-tuned for. Used as the fallback when
 /// stdout isn't a TTY (pipes/redirects) or the size probe fails, which keeps
@@ -96,7 +100,7 @@ pub fn print(resp: &Response) -> bool {
             true
         }
         Response::Status(s) => {
-            print_status(s, &Layout::for_width(terminal_cols()));
+            print_status(s, false);
             true
         }
         Response::Sessions { sessions } => {
@@ -141,7 +145,10 @@ pub fn print(resp: &Response) -> bool {
     }
 }
 
-fn print_status(s: &StatusView, layout: &Layout) {
+/// Render `dira status`: the summary block always; the detail sections
+/// (ACTIVE SESSIONS / PARALLEL / TODAY) only under `--detailed`.
+pub fn print_status(s: &StatusView, detailed: bool) {
+    let layout = Layout::for_width(terminal_cols());
     // Hide degenerate sessions — a bare SessionStart with no engaged time and no
     // agent activity is noise (e.g. a project you opened but didn't work in).
     let active: Vec<SessionView> = s
@@ -150,16 +157,23 @@ fn print_status(s: &StatusView, layout: &Layout) {
         .filter(|v| v.human_seconds > 0 || v.agent_seconds > 0)
         .cloned()
         .collect();
-    if active.is_empty() {
-        println!("{}", theme::paint("no active sessions", Role::Faint));
-    } else {
-        println!("{}", theme::paint("ACTIVE SESSIONS", Role::Muted));
-        print_sessions(&active, layout);
-        println!();
-        print_parallel(&active, &s.today, layout);
+
+    for line in summary_lines(s, &active, OffsetDateTime::now_utc()) {
+        println!("{line}");
     }
-    println!("{}", theme::paint("TODAY", Role::Muted));
-    print_report(&s.today, layout);
+
+    if detailed {
+        println!();
+        if !active.is_empty() {
+            println!("{}", theme::paint("ACTIVE SESSIONS", Role::Muted));
+            print_sessions(&active, &layout);
+            println!();
+            print_parallel(&active, &s.today, &layout);
+        }
+        println!("{}", theme::paint("TODAY", Role::Muted));
+        print_report(&s.today, &layout);
+    }
+
     if s.sync_pending > 0 {
         println!(
             "\n{}",
@@ -169,6 +183,142 @@ fn print_status(s: &StatusView, layout: &Layout) {
             )
         );
     }
+}
+
+/// A cloud-fetched billing value older than this reads as stale and gets an
+/// "(as of …)" suffix. Matches the daemon's refresh cadence.
+const BILLING_STALE_AFTER_SECS: i64 = 15 * 60;
+
+/// The status summary block, mirroring the concept layout:
+///
+/// ```text
+/// 3 active sessions · 1 you · 2.5× parallel
+///
+///   ● engaged   11h 54m    billable base
+///   ◆ agent     26h 41m    wall-clock
+///   ◇ compute   2.06M tok  ~$15 est
+///
+/// 10.4h billable → €1,064 unbilled, this week
+/// ```
+///
+/// Pure (no printing, `now` injected) so tests can assert exact bytes — under
+/// the test harness stdout isn't a TTY, `paint` passes through, and the
+/// asserted strings double as the piped-output spec. Padding happens *before*
+/// painting (the theme contract), so columns stay aligned in color too.
+///
+/// Omission rules: the compute row disappears when there are no tokens today
+/// (or an old daemon didn't send them); the billable footer disappears when
+/// there is no cloud summary (unlinked / never fetched). The compute estimate
+/// renders in `~$` (a local USD estimate from the bundled pricing table); the
+/// billable footer carries the workspace policy currency from the cloud —
+/// different quantities from different authorities, deliberately not unified.
+fn summary_lines(s: &StatusView, active: &[SessionView], now: OffsetDateTime) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    // --- header: `3 active sessions · 1 you · 2.5× parallel` -----------------
+    if active.is_empty() {
+        lines.push(theme::paint("no active sessions", Role::Faint));
+    } else {
+        let n = active.len();
+        let plural = if n == 1 { "" } else { "s" };
+        let mut head = theme::paint(&format!("{n} active session{plural}"), Role::Ink);
+        let you = active
+            .iter()
+            .filter(|v| v.live_state() == LiveState::Engaged)
+            .count();
+        if you > 0 {
+            head.push_str(&theme::paint(" · ", Role::Muted));
+            head.push_str(&theme::paint(&format!("{you} you"), Role::Engaged));
+        }
+        if s.today.total_human_seconds > 0 {
+            let mult = s.today.total_agent_seconds as f64 / s.today.total_human_seconds as f64;
+            head.push_str(&theme::paint(" · ", Role::Muted));
+            head.push_str(&theme::paint(&format!("{mult:.1}× parallel"), Role::Accent));
+        }
+        lines.push(head);
+    }
+
+    // --- metric rows ----------------------------------------------------------
+    let tokens = s.tokens.filter(|t| t.total_tokens > 0);
+    let mut rows: Vec<(char, &str, String, String, Role)> = Vec::new();
+    if s.today.total_human_seconds > 0 || s.today.total_agent_seconds > 0 || tokens.is_some() {
+        rows.push((
+            '●',
+            "engaged",
+            hms(s.today.total_human_seconds),
+            "billable base".to_string(),
+            Role::Engaged,
+        ));
+        rows.push((
+            '◆',
+            "agent",
+            hms(s.today.total_agent_seconds),
+            "wall-clock".to_string(),
+            Role::Agent,
+        ));
+    }
+    if let Some(t) = tokens {
+        // `◇` is hollow on purpose: compute is an estimate, not measured time.
+        rows.push((
+            '◇',
+            "compute",
+            format!("{} tok", tokens_compact(t.total_tokens)),
+            format!("{} est", usd_approx(t.est_cost_usd)),
+            Role::Compute,
+        ));
+    }
+    if !rows.is_empty() {
+        let value_w = rows.iter().map(|r| r.2.chars().count()).max().unwrap_or(0);
+        lines.push(String::new());
+        for (glyph, label, value, note, role) in rows {
+            // Pad the raw text, then paint each already-sized column.
+            let head = theme::paint(&format!("{glyph} {label:<8}"), role);
+            let val = theme::paint(&format!("{value:<value_w$}"), Role::Ink);
+            let note = theme::paint(&note, Role::Muted);
+            lines.push(format!("  {head} {val}  {note}"));
+        }
+    }
+
+    // --- billable footer -------------------------------------------------------
+    if let Some(b) = &s.billing {
+        let hours = theme::paint(
+            &format!("{} billable", hours_compact(b.billable_hours)),
+            Role::Engaged,
+        );
+        let arrow = theme::paint("→", Role::Muted);
+        let amount = theme::paint(&money(&b.currency, b.unbilled_amount), Role::Ink);
+        let period = match b.period.as_str() {
+            "week" | "" => "this week".to_string(),
+            other => format!("this {other}"),
+        };
+        let tail = theme::paint(&format!("unbilled, {period}"), Role::Muted);
+        let stale = billing_age_suffix(&b.fetched_at, now)
+            .map(|a| format!(" {}", theme::paint(&a, Role::Faint)))
+            .unwrap_or_default();
+        lines.push(String::new());
+        lines.push(format!("{hours} {arrow} {amount} {tail}{stale}"));
+    }
+
+    lines
+}
+
+/// `Some("(as of 32m ago)")` when `fetched_at` parses and is older than the
+/// staleness threshold; `None` when fresh, absent, or unparseable.
+fn billing_age_suffix(fetched_at: &str, now: OffsetDateTime) -> Option<String> {
+    let t =
+        OffsetDateTime::parse(fetched_at, &time::format_description::well_known::Rfc3339).ok()?;
+    let age = (now - t).whole_seconds();
+    if age <= BILLING_STALE_AFTER_SECS {
+        return None;
+    }
+    let label = if age < 3600 {
+        format!("{}m", age / 60)
+    } else if age < 86_400 {
+        format!("{}h", age / 3600)
+    } else {
+        format!("{}d", age / 86_400)
+    };
+    Some(format!("(as of {label} ago)"))
 }
 
 fn print_sessions(sessions: &[SessionView], layout: &Layout) {
@@ -358,5 +508,149 @@ mod tests {
         assert_eq!(bar(0.0, 10), "░░░░░░░░░░");
         assert_eq!(bar(1.0, 10), "██████████");
         assert_eq!(bar(0.5, 10), "█████░░░░░");
+    }
+
+    use dira_core::protocol::{BillingView, ComputeView};
+    use dira_core::report::Report;
+    use time::macros::datetime;
+
+    fn view(idle: bool, agent_active: bool) -> SessionView {
+        SessionView {
+            handle: "h".into(),
+            session_id: "s".into(),
+            harness: "claude".into(),
+            kind: "agent".into(),
+            project: Some("github.com/acme/api".into()),
+            label: None,
+            activity: None,
+            note: None,
+            started_at: "now".into(),
+            human_seconds: 60,
+            agent_seconds: 120,
+            idle,
+            agent_active,
+            last_activity_at: None,
+            last_human_at: None,
+        }
+    }
+
+    fn status(human: i64, agent: i64) -> StatusView {
+        StatusView {
+            active: vec![],
+            today: Report {
+                projects: vec![],
+                total_human_seconds: human,
+                total_agent_seconds: agent,
+                session_count: 1,
+            },
+            sync_pending: 0,
+            hydrating: false,
+            tokens: None,
+            billing: None,
+        }
+    }
+
+    const NOW: time::OffsetDateTime = datetime!(2026-07-02 10:00:00 UTC);
+
+    /// The full mockup case. These byte-exact assertions ARE the piped-output
+    /// spec: tests run without a TTY, so `paint` is a pass-through and the
+    /// strings below are exactly what a script sees from `dira status | cat`.
+    #[test]
+    fn summary_full_mockup_case() {
+        let mut s = status(42_840, 96_060); // 11h54m engaged, 26h41m agent
+        s.tokens = Some(ComputeView {
+            total_tokens: 2_060_000,
+            est_cost_usd: 15.2,
+        });
+        s.billing = Some(BillingView {
+            billable_hours: 10.4,
+            unbilled_amount: 1064.0,
+            currency: "€".into(),
+            period: "week".into(),
+            fetched_at: "2026-07-02T09:55:00Z".into(), // 5m ago — fresh
+        });
+        let active = vec![view(false, true), view(true, true), view(true, true)];
+        let lines = summary_lines(&s, &active, NOW);
+        assert_eq!(
+            lines,
+            vec![
+                "3 active sessions · 1 you · 2.2× parallel".to_string(),
+                String::new(),
+                "  ● engaged  11h 54m    billable base".to_string(),
+                "  ◆ agent    26h 41m    wall-clock".to_string(),
+                "  ◇ compute  2.06M tok  ~$15 est".to_string(),
+                String::new(),
+                "10.4h billable → €1,064 unbilled, this week".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn summary_omits_compute_row_without_tokens() {
+        let s = status(3600, 7200);
+        let active = vec![view(false, false)];
+        let lines = summary_lines(&s, &active, NOW);
+        assert_eq!(
+            lines,
+            vec![
+                "1 active session · 1 you · 2.0× parallel".to_string(),
+                String::new(),
+                "  ● engaged  1h 00m  billable base".to_string(),
+                "  ◆ agent    2h 00m  wall-clock".to_string(),
+            ]
+        );
+        // Zero tokens is the same as absent tokens.
+        let mut s = status(3600, 7200);
+        s.tokens = Some(ComputeView {
+            total_tokens: 0,
+            est_cost_usd: 0.0,
+        });
+        assert_eq!(summary_lines(&s, &active, NOW).len(), 4);
+    }
+
+    #[test]
+    fn summary_omits_billing_footer_and_multiplier_when_absent() {
+        // No billing → no footer; zero human time → no `×` (and no `you`).
+        let mut s = status(0, 7200);
+        s.tokens = Some(ComputeView {
+            total_tokens: 45_200,
+            est_cost_usd: 0.42,
+        });
+        let active = vec![view(true, true)];
+        let lines = summary_lines(&s, &active, NOW);
+        assert_eq!(
+            lines,
+            vec![
+                "1 active session".to_string(),
+                String::new(),
+                "  ● engaged  0s         billable base".to_string(),
+                "  ◆ agent    2h 00m     wall-clock".to_string(),
+                "  ◇ compute  45.2K tok  ~$0.42 est".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn summary_zero_day_shows_only_the_empty_header() {
+        let s = status(0, 0);
+        let lines = summary_lines(&s, &[], NOW);
+        assert_eq!(lines, vec!["no active sessions".to_string()]);
+    }
+
+    #[test]
+    fn summary_flags_a_stale_billing_fetch() {
+        let mut s = status(3600, 3600);
+        s.billing = Some(BillingView {
+            billable_hours: 8.0,
+            unbilled_amount: 980.0,
+            currency: "$".into(),
+            period: "week".into(),
+            fetched_at: "2026-07-02T09:28:00Z".into(), // 32m ago — stale
+        });
+        let lines = summary_lines(&s, &[view(false, false)], NOW);
+        assert_eq!(
+            lines.last().unwrap(),
+            "8h billable → $980 unbilled, this week (as of 32m ago)"
+        );
     }
 }

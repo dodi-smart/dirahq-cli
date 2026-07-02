@@ -3,7 +3,8 @@
 //! numbers lives here (and is unit-tested) so the draw code stays dumb.
 
 use crate::format::{
-    bar, hms, hours_compact, money, project_label, repo_short, tokens_compact, truncate, usd_approx,
+    bar, billing_line, hms, parse_ts, project_label, repo_short, tokens_compact, truncate,
+    usd_approx,
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{any_engaged, BillingView, LiveState, SessionView, StatusView};
@@ -89,11 +90,6 @@ pub fn lanes(s: &StatusView) -> Vec<Lane> {
         });
     }
     lanes
-}
-
-/// Parse an RFC3339 timestamp from the daemon; `None` if absent/unparseable.
-fn parse_ts(s: Option<&str>) -> Option<time::OffsetDateTime> {
-    time::OffsetDateTime::parse(s?, &time::format_description::well_known::Rfc3339).ok()
 }
 
 /// Seconds elapsed from `ts` to `now`, clamped to `[0, idle]`. The clamp matches
@@ -315,27 +311,18 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
     }
 }
 
-/// The cloud billable footer, mirroring `dira status`'s summary footer:
-/// `10.4h billable → €1,064 unbilled, this week`.
+/// The cloud billable footer — the same role-tagged segments `dira status`
+/// prints (see [`billing_line`]), mapped to spans with the amount bolded.
 fn draw_billing(frame: &mut Frame, area: Rect, b: &BillingView) {
-    let period = match b.period.as_str() {
-        "week" | "" => "this week".to_string(),
-        other => format!("this {other}"),
-    };
-    let line = Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            format!("{} billable", hours_compact(b.billable_hours)),
-            theme::style(Role::Engaged),
-        ),
-        Span::styled(" → ", theme::style(Role::Muted)),
-        Span::styled(
-            money(&b.currency, b.unbilled_amount),
-            theme::style(Role::Ink).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" unbilled, {period}"), theme::style(Role::Muted)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(billing_line(b).into_iter().map(|(text, role)| {
+        let style = match role {
+            Role::Ink => theme::style(role).add_modifier(Modifier::BOLD),
+            _ => theme::style(role),
+        };
+        Span::styled(text, style)
+    }));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {

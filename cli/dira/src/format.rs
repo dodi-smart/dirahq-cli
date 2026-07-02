@@ -3,6 +3,9 @@
 //! durations, projects and bars identically — the TUI is just another view over
 //! the same numbers.
 
+use crate::theme::Role;
+use dira_core::protocol::BillingView;
+
 /// Format seconds as `1h 30m` / `12m 05s` / `45s`. Negatives clamp to zero.
 pub fn hms(seconds: i64) -> String {
     let s = seconds.max(0);
@@ -132,6 +135,39 @@ pub fn money(currency: &str, amount: f64) -> String {
         grouped.push(ch);
     }
     format!("{sign}{currency}{grouped}")
+}
+
+/// Human label for a billing period on the wire: `"week"` (and the tolerant
+/// empty default) → `this week`; unknown periods degrade to `this <period>`.
+fn period_label(period: &str) -> String {
+    match period {
+        "week" | "" => "this week".to_string(),
+        other => format!("this {other}"),
+    }
+}
+
+/// The billable footer, `10.4h billable → €1,064 unbilled, this week`, as
+/// role-tagged segments (spacing included) so the plain renderer and the TUI
+/// compose the identical sentence from one definition: `render.rs` maps each
+/// segment through `theme::paint`, the dashboard through `Span::styled`.
+pub fn billing_line(b: &BillingView) -> Vec<(String, Role)> {
+    vec![
+        (
+            format!("{} billable", hours_compact(b.billable_hours)),
+            Role::Engaged,
+        ),
+        (" → ".to_string(), Role::Muted),
+        (money(&b.currency, b.unbilled_amount), Role::Ink),
+        (
+            format!(" unbilled, {}", period_label(&b.period)),
+            Role::Muted,
+        ),
+    ]
+}
+
+/// Parse an RFC 3339 timestamp from the daemon; `None` if absent/unparseable.
+pub fn parse_ts(s: Option<&str>) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(s?, &time::format_description::well_known::Rfc3339).ok()
 }
 
 /// Render a proportional bar of `width` columns for `value` relative to `max`,

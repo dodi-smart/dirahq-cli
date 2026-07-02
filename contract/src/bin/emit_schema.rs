@@ -30,5 +30,14 @@ fn main() -> std::io::Result<()> {
     std::fs::write(&rotate_out, rotate_json + "\n")?;
     eprintln!("wrote {}", rotate_out.display());
 
+    // The signed billing-summary request: a policy-free *query* envelope. The
+    // cloud validates it like presence; its money-carrying response is
+    // deliberately outside the contract (billing resolves late, in the cloud).
+    let billing = schemars::schema_for!(dira_contract::BillingSummaryEnvelope);
+    let billing_json = serde_json::to_string_pretty(&billing).expect("schema serializes");
+    let billing_out = dir.join("billing-summary.schema.json");
+    std::fs::write(&billing_out, billing_json + "\n")?;
+    eprintln!("wrote {}", billing_out.display());
+
     Ok(())
 }

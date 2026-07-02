@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.0.0";
+pub const SCHEMA_VERSION: &str = "1.1.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -451,6 +451,45 @@ pub struct RotateKeyEnvelope {
     pub sig: String,
 }
 
+/// A request for the device owner's billing summary, sent to
+/// `POST /api/v1/billing/summary`.
+///
+/// The request is a *query*, not a fact: it names the device asking, when it
+/// asked (freshness window, like presence), and the period it wants. It stays
+/// policy-free — no money, rate, or currency field. The cloud's *response*
+/// carries those, and is deliberately **not** part of this contract (billing is
+/// resolved late, in the cloud; the daemon parses the response tolerantly, see
+/// the module invariants).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingSummaryRequest {
+    /// ULID of the device asking (matches the envelope).
+    pub device_id: String,
+    /// RFC 3339 timestamp the request was assembled. The cloud rejects requests
+    /// outside its freshness window (`stale_request`), bounding replays.
+    pub sent_at: String,
+    /// The summary period, e.g. `"week"` (rolling 7 days ending now). A string,
+    /// not an enum, so new periods are additive without a schema major bump.
+    pub period: String,
+}
+
+/// A signed billing-summary request as it travels over the wire.
+///
+/// Mirrors [`Envelope`] exactly (same framing, same signing rule): the signature
+/// is computed over the canonical-JSON (RFC 8785) encoding of `payload` only.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingSummaryEnvelope {
+    /// Semver of this contract, e.g. `"1.1.0"`.
+    pub schema_version: String,
+    /// ULID of the device that produced and signed this request.
+    pub device_id: String,
+    /// The billing-summary request being attested to.
+    pub payload: BillingSummaryRequest,
+    /// `ed25519(JCS(payload))`, base64 (standard, no padding).
+    pub sig: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,11 +791,22 @@ mod tests {
             },
             sig: "sig".into(),
         };
+        let billing = BillingSummaryEnvelope {
+            schema_version: SCHEMA_VERSION.into(),
+            device_id: "d".into(),
+            payload: BillingSummaryRequest {
+                device_id: "d".into(),
+                sent_at: "t".into(),
+                period: "week".into(),
+            },
+            sig: "sig".into(),
+        };
 
         let mut keys = Vec::new();
         collect_keys(&serde_json::to_value(&envelope).unwrap(), &mut keys);
         collect_keys(&serde_json::to_value(&presence).unwrap(), &mut keys);
         collect_keys(&serde_json::to_value(&rotate).unwrap(), &mut keys);
+        collect_keys(&serde_json::to_value(&billing).unwrap(), &mut keys);
 
         for key in &keys {
             for tok in tokens(key) {
@@ -821,6 +871,28 @@ mod tests {
         assert!(!json.contains("sessionChangeId"));
         assert!(!json.contains("touchedPaths"));
         assert!(!json.contains("blobs"));
+    }
+
+    #[test]
+    fn billing_summary_envelope_roundtrips_camel_case() {
+        let env = BillingSummaryEnvelope {
+            schema_version: SCHEMA_VERSION.into(),
+            device_id: "01J0DEVICE".into(),
+            payload: BillingSummaryRequest {
+                device_id: "01J0DEVICE".into(),
+                sent_at: "2026-07-02T09:00:00Z".into(),
+                period: "week".into(),
+            },
+            sig: "deadbeef".into(),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"schemaVersion\""));
+        assert!(json.contains("\"deviceId\""));
+        assert!(json.contains("\"sentAt\""));
+        assert!(json.contains("\"period\":\"week\""));
+        let back: BillingSummaryEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.payload.period, "week");
+        assert_eq!(back.payload.device_id, "01J0DEVICE");
     }
 
     #[test]

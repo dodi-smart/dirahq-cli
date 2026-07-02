@@ -3,11 +3,15 @@
 //! this module is the pure, testable derivation.
 
 pub mod batch;
+pub mod billing;
 pub mod handshake;
 
 pub use batch::{
     build_batch, build_batch_with_partials, build_chunked_batches, est_cost, ArtifactRow,
     ChunkBatch, PartialSession, TokenRow, CHUNK_EVENTS,
+};
+pub use billing::{
+    parse_billing_summary_response, BillingSummary, CachedBillingSummary, META_BILLING_SUMMARY,
 };
 pub use handshake::{parse_ingest_response, IngestResponse, SyncBlock};
 

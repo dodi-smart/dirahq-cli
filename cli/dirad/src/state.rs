@@ -8,12 +8,13 @@ use crate::sync::SyncHandle;
 use dira_contract::{Harness, SessionKind};
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::signing::DeviceKey;
+use dira_core::sync::CachedBillingSummary;
 use dira_core::{Config, Store};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::{mpsc, Notify, OnceCell};
 
 /// A message bound for the writer task.
 #[derive(Debug)]
@@ -64,6 +65,14 @@ pub struct AppState {
     /// heartbeat (Phase 6): the heartbeat task writes these on each 2xx; nothing
     /// reads them yet. Held as atomics so a reader needs no lock.
     pub presence_hints: Arc<PresenceHints>,
+    /// The last successfully-fetched cloud billing summary, served on `status`.
+    /// Written by the billing task (which also persists it to the store's meta
+    /// table); `None` until the first fetch/hydrate — the renderers omit the
+    /// billable footer then. Never hold this lock across an await.
+    pub billing: Arc<Mutex<Option<CachedBillingSummary>>>,
+    /// Poked by the sync task after a successful flush so the billing task
+    /// refreshes shortly after new facts land on the cloud.
+    pub billing_refresh: Arc<Notify>,
 }
 
 impl AppState {

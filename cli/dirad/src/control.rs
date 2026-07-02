@@ -9,7 +9,10 @@ use crate::state::{AppState, EventMsg};
 use dira_core::accounting;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::project;
-use dira_core::protocol::{ReportScope, Request, Response, SessionView, StatusView, StopSelector};
+use dira_core::protocol::{
+    BillingView, ComputeView, ReportScope, Request, Response, SessionView, StatusView,
+    StopSelector,
+};
 use dira_core::report;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -363,11 +366,37 @@ async fn status(state: &AppState) -> Response {
         .count_events_after(cursor.as_deref())
         .await
         .unwrap_or(0);
+    // Today's compute totals for the summary row. Best-effort: a read failure
+    // (or an all-zero day) renders as "no compute row", never a failed status.
+    let tokens = state
+        .store
+        .token_totals_since(Some(since))
+        .await
+        .ok()
+        .map(|t| ComputeView {
+            total_tokens: t.input + t.output + t.cache_read + t.cache_create,
+            est_cost_usd: t.est_cost_usd,
+        });
+    // Last-known cloud billing summary (fetched + hydrated by the billing task).
+    let billing = state
+        .billing
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .map(|c| BillingView {
+            billable_hours: c.summary.billable_hours,
+            unbilled_amount: c.summary.unbilled_amount,
+            currency: c.summary.currency,
+            period: c.summary.period,
+            fetched_at: c.fetched_at,
+        });
     Response::Status(StatusView {
         active,
         today,
         sync_pending,
         hydrating: !state.hydrated.load(std::sync::atomic::Ordering::Relaxed),
+        tokens,
+        billing,
     })
 }
 

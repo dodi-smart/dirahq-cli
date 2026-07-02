@@ -149,6 +149,67 @@ async fn poisoned_sessions_mutex_still_serves_status_and_sessions() {
     }
 }
 
+/// `Status` must carry today's token totals (the ◇ compute row) and reflect the
+/// billing task's cached cloud summary, and both must be absent when there is
+/// nothing to show — the skew-safe `None` path the renderers rely on.
+#[tokio::test]
+async fn status_carries_token_totals_and_cached_billing() {
+    use dira_core::sync::{BillingSummary, CachedBillingSummary};
+    use dira_core::tokens::TokenTurn;
+    use time::format_description::well_known::Rfc3339;
+
+    let (state, _rx) = test_state().await;
+
+    // A fresh daemon: zero tokens today ⇒ Some(zero totals); no billing cache ⇒ None.
+    match dirad::control::dispatch(&state, Request::Status).await {
+        Response::Status(view) => {
+            assert_eq!(view.tokens.map(|t| t.total_tokens), Some(0));
+            assert!(view.billing.is_none(), "no billing cache yet");
+        }
+        other => panic!("expected Status, got {other:?}"),
+    }
+
+    // Record a token turn "now" (inside today's window) and seed the billing cache
+    // the way the billing task does.
+    let turn = TokenTurn {
+        id: "turn-1".into(),
+        at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
+        model: "claude-sonnet-4-5".into(),
+        input: 1_000,
+        output: 2_000,
+        cache_read: 3_000,
+        cache_create: 4_000,
+    };
+    state
+        .store
+        .upsert_token_usage(&turn, "s1", Some("github.com/acme/api"))
+        .await
+        .expect("upsert token usage");
+    *state.billing.lock().unwrap() = Some(CachedBillingSummary {
+        summary: BillingSummary {
+            billable_hours: 10.4,
+            unbilled_amount: 1064.0,
+            currency: "€".into(),
+            period: "week".into(),
+            ..Default::default()
+        },
+        fetched_at: "2026-07-02T09:00:00Z".into(),
+    });
+
+    match dirad::control::dispatch(&state, Request::Status).await {
+        Response::Status(view) => {
+            let tokens = view.tokens.expect("token totals present");
+            assert_eq!(tokens.total_tokens, 10_000, "input+output+cache_read+cache_create");
+            assert!(tokens.est_cost_usd > 0.0, "priced by the bundled table");
+            let billing = view.billing.expect("cached billing attached");
+            assert_eq!(billing.currency, "€");
+            assert_eq!(billing.unbilled_amount, 1064.0);
+            assert_eq!(billing.fetched_at, "2026-07-02T09:00:00Z");
+        }
+        other => panic!("expected Status, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn daemon_info_reports_version_schema_and_pid() {
     let (state, _rx) = test_state().await;

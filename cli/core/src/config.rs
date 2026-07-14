@@ -9,6 +9,11 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// The hosted dira cloud — the out-of-the-box sync target. Local dev and
+/// self-hosters override it per the layering above (`config.toml`'s
+/// `cloud_url`, or the `DIRA_CLOUD_URL` env var, which wins).
+pub const DEFAULT_CLOUD_URL: &str = "https://app.dirahq.sh";
+
 /// Daemon + CLI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -31,7 +36,11 @@ pub struct Config {
     /// (id ≤ sync cursor) are rolled up into `session_rollup_daily` and pruned
     /// by the daemon's maintenance task. Un-synced or recent events are kept.
     pub retention_days: u64,
-    /// Cloud ingest base URL (e.g. `http://localhost:3000`). Sync is off if unset.
+    /// Cloud ingest base URL. Defaults to the hosted cloud
+    /// ([`DEFAULT_CLOUD_URL`]); point it elsewhere for local dev or self-host
+    /// via `config.toml` or `DIRA_CLOUD_URL` (e.g. `http://localhost:3000`).
+    /// A URL alone never causes network traffic — every cloud task no-ops
+    /// until the device is linked (`dira device link`). Sync is off if unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_url: Option<String>,
     /// How often the daemon POSTs a live-presence heartbeat, in seconds.
@@ -97,7 +106,7 @@ impl Default for Config {
             idle_seconds: 300,
             coalesce_seconds: 45,
             retention_days: 14,
-            cloud_url: None,
+            cloud_url: Some(DEFAULT_CLOUD_URL.to_string()),
             heartbeat_interval_secs: 25,
             heartbeat_active_secs: 10,
             heartbeat_idle_secs: 90,
@@ -214,6 +223,26 @@ pub fn project_dirs() -> Option<ProjectDirs> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_cloud_url_is_the_hosted_cloud() {
+        assert_eq!(
+            Config::default().cloud_url.as_deref(),
+            Some(DEFAULT_CLOUD_URL),
+            "a fresh install must point at the hosted cloud out of the box",
+        );
+    }
+
+    #[test]
+    fn cloud_url_default_is_overridable_by_a_config_overlay() {
+        // Same layering `Config::load` uses (defaults → toml → env), with the
+        // toml layer inlined so the test touches no real XDG paths or env vars.
+        let c: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("cloud_url = \"http://localhost:3000\""))
+            .extract()
+            .unwrap();
+        assert_eq!(c.cloud_url.as_deref(), Some("http://localhost:3000"));
+    }
 
     #[test]
     fn defaults_keep_coalesce_below_idle() {

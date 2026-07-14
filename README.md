@@ -75,6 +75,23 @@ stdin→socket shim (`dira hook <harness>`); OpenCode has no command hooks, so i
 daemon's loopback `/hooks/opencode` route instead. Each harness's own hook vocabulary is
 normalized into Dira's shared event set in `cli/sources`.
 
+## Cloud sync (optional)
+
+The CLI/daemon point at the hosted cloud (`https://app.dirahq.sh`) out of the box, but
+**nothing is ever sent until you link the device** — unlinked, dira is fully offline.
+
+```sh
+dira device link             # enter the one-time code from the dashboard's Connections screen
+```
+
+The URL is ordinary layered config (defaults → `config.toml` → `DIRA_*` env, env wins),
+so pointing a checkout at a local or self-hosted cloud is one line:
+
+```sh
+DIRA_CLOUD_URL=http://localhost:3000 dira device link --code LOCALDEV1   # per-invocation
+dira config set cloud_url http://localhost:3000                          # persistent
+```
+
 ## Contract
 
 The wire schema is authored once in Rust (`/contract`) because the daemon is the producer.

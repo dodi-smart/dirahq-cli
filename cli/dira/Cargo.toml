@@ -27,3 +27,15 @@ ratatui.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 toml_edit.workspace = true
+
+[dev-dependencies]
+# Mock-cloud test server for `device.rs`'s two-phase rotation tests (WP-B1b) —
+# the same axum version `dirad` already runs in production, test-only here.
+axum.workspace = true
+# A successful two-phase rotation calls `dira_core::identity::promote_pending_key`,
+# which installs the new key via the same keychain-or-meta-fallback path
+# `dira_core::identity` uses in production. Mirrors
+# `dira_core::identity::tests::use_mock_keychain` so these tests never touch
+# the real OS keychain either.
+keyring.workspace = true
+keyring-core.workspace = true

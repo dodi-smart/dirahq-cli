@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
-use tokio::sync::{mpsc, Notify, OnceCell};
+use tokio::sync::{mpsc, Notify};
 
 /// A message bound for the writer task.
 #[derive(Debug)]
@@ -36,6 +36,13 @@ pub struct AppState {
     pub tx: mpsc::Sender<EventMsg>,
     pub sessions: Arc<Mutex<SessionRegistry>>,
     pub config: Config,
+    /// Shared `reqwest::Client` for every device→cloud task (heartbeat, sync,
+    /// billing, the schema handshake). Built ONCE in `build_state` with a pooled
+    /// keep-alive connection so repeat POSTs to the same cloud host reuse the
+    /// TCP/TLS connection instead of paying a fresh handshake every tick. Carries
+    /// no default timeout — each call site sets its own `RequestBuilder::timeout`
+    /// sized to that request (heartbeat/billing/handshake short, sync longer).
+    pub http: reqwest::Client,
     /// When this daemon process started, for `dira version` uptime reporting.
     pub started_at: std::time::Instant,
     /// Bearer token required on the loopback HTTP ingress.
@@ -48,7 +55,13 @@ pub struct AppState {
     /// on a keychain unlock prompt. The control socket binds and answers
     /// `Ping`/`Status` long before this resolves. Access via
     /// [`AppState::device_key`].
-    pub device_key: Arc<OnceCell<DeviceKey>>,
+    ///
+    /// An `RwLock<Option<..>>` rather than the former `OnceCell` (WP-B1b): a
+    /// completed key rotation must invalidate the cache so the very next
+    /// sync/heartbeat/billing tick signs with the newly-promoted key instead
+    /// of the dead old one — a `OnceCell` can only ever be set once. See
+    /// [`AppState::invalidate_device_key`].
+    pub device_key: Arc<tokio::sync::RwLock<Option<DeviceKey>>>,
     /// Writer/ticker liveness, for the watchdog supervisor (Commit 1).
     pub progress: Arc<ProgressTracker>,
     /// `false` until the background hydrate finishes replaying the recent log into
@@ -73,6 +86,15 @@ pub struct AppState {
     /// Poked by the sync task after a successful flush so the billing task
     /// refreshes shortly after new facts land on the cloud.
     pub billing_refresh: Arc<Notify>,
+    /// Fired at the same sites that already fire the sync trigger (writer,
+    /// control's manual resync, capture's commit-recorded path) so the heartbeat
+    /// loop can wake instantly out of a (potentially long, deep-idle) sleep
+    /// instead of waiting out its cadence (WP-A3). Uses `notify_waiters` — the
+    /// heartbeat loop spends nearly all its time parked in the
+    /// `select! { sleep, wake.notified() }`, so an edge fired while it's briefly
+    /// off doing a beat is the acceptable, rare miss (the sleep still bounds the
+    /// wait to at most one cadence, and jitter already keeps that bounded).
+    pub presence_wake: Arc<Notify>,
 }
 
 impl AppState {
@@ -80,14 +102,44 @@ impl AppState {
     /// only if loading the key fails (a logged, non-fatal condition — the device
     /// simply can't sign/sync yet). Kept off the startup critical path so a
     /// keychain prompt never delays control-socket readiness (Commit 2).
-    pub async fn device_key(&self) -> Option<&DeviceKey> {
-        self.device_key
-            .get_or_try_init(|| async {
-                dira_core::identity::load_or_create_unlinked(&self.store).await
-            })
-            .await
-            .map_err(|e| tracing::warn!("device identity load failed: {e}"))
-            .ok()
+    ///
+    /// Returns an owned clone (WP-B1b; `DeviceKey` is cheap to clone — see its
+    /// doc comment) rather than a borrow tied to the lock guard, so callers
+    /// don't hold the `RwLock` across their own signing/HTTP awaits.
+    pub async fn device_key(&self) -> Option<DeviceKey> {
+        // Fast path: already loaded.
+        {
+            let guard = self.device_key.read().await;
+            if let Some(k) = guard.as_ref() {
+                return Some(k.clone());
+            }
+        }
+        // Not loaded (or just invalidated by a promoted rotation) — load under
+        // the write lock, double-checking in case another caller raced us here.
+        let mut guard = self.device_key.write().await;
+        if let Some(k) = guard.as_ref() {
+            return Some(k.clone());
+        }
+        match dira_core::identity::load_or_create_unlinked(&self.store).await {
+            Ok(k) => {
+                let out = k.clone();
+                *guard = Some(k);
+                Some(out)
+            }
+            Err(e) => {
+                tracing::warn!("device identity load failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Discard the cached device key so the NEXT [`AppState::device_key`] call
+    /// reloads it from the store (WP-B1b). Call this immediately after
+    /// promoting a pending rotation key (`dira_core::identity::promote_pending_key`)
+    /// so every subsequent sync/heartbeat/billing tick picks up the newly-active
+    /// key without requiring a daemon restart.
+    pub async fn invalidate_device_key(&self) {
+        *self.device_key.write().await = None;
     }
 
     /// The cloud-link gate every device→cloud task re-checks per tick:
@@ -114,10 +166,50 @@ impl AppState {
 /// stored as an atomic so the supervisor reads it without a lock. `0` means
 /// "never progressed yet" (just-started). The writer marks progress on every
 /// drained message; the idle ticker marks on every tick.
-#[derive(Debug, Default)]
+///
+/// `started_at` (set at construction) is the watchdog's fallback baseline for
+/// the never-progressed case: a task that has made NO progress since daemon
+/// start is measured from `started_at`, so a hang inside a task's very first
+/// unit of work is just as detectable as one after years of uptime.
+#[derive(Debug)]
 pub struct ProgressTracker {
+    started_at: AtomicI64,
     writer_at: AtomicI64,
     ticker_at: AtomicI64,
+    /// Messages whose processing panicked and were caught + dropped by the
+    /// writer's per-message `catch_unwind` (WP-B7). Surfaced on `dira status`:
+    /// a nonzero count means the writer is silently shedding bad events even
+    /// though accrual for everything else kept running — worth investigating,
+    /// not itself an outage.
+    writer_panics: AtomicU64,
+    /// How many times the watchdog has observed the writer stalled (queue
+    /// backed up with no progress past the stall threshold). Distinct from
+    /// `writer_panics`: a stall means the writer isn't making progress at
+    /// all, not that it caught and recovered from a bad message.
+    writer_stalls: AtomicU64,
+    /// Sync flush attempts/successes/failures since daemon start (WP-B9),
+    /// mirroring the writer-health counters above. An "attempt" is every wake
+    /// that reaches `sync::flush` (whether or not it finds anything to send);
+    /// `successes + failures <= attempts` (a `Skipped` outcome — not
+    /// configured/linked yet — counts as neither).
+    flush_attempts: AtomicU64,
+    flush_successes: AtomicU64,
+    flush_failures: AtomicU64,
+}
+
+impl Default for ProgressTracker {
+    fn default() -> Self {
+        Self {
+            started_at: AtomicI64::new(Self::now()),
+            writer_at: AtomicI64::new(0),
+            ticker_at: AtomicI64::new(0),
+            writer_panics: AtomicU64::new(0),
+            writer_stalls: AtomicU64::new(0),
+            flush_attempts: AtomicU64::new(0),
+            flush_successes: AtomicU64::new(0),
+            flush_failures: AtomicU64::new(0),
+        }
+    }
 }
 
 impl ProgressTracker {
@@ -132,6 +224,14 @@ impl ProgressTracker {
     pub fn mark_ticker(&self) {
         self.ticker_at.store(Self::now(), Ordering::Relaxed);
     }
+    /// Record that one message's processing panicked and was dropped.
+    pub fn mark_writer_panic(&self) {
+        self.writer_panics.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that the watchdog observed the writer stalled.
+    pub fn mark_writer_stall(&self) {
+        self.writer_stalls.fetch_add(1, Ordering::Relaxed);
+    }
     /// Seconds since the writer last made progress, or `None` if it never has.
     pub fn writer_idle_secs(&self) -> Option<i64> {
         Self::elapsed(self.writer_at.load(Ordering::Relaxed))
@@ -139,6 +239,59 @@ impl ProgressTracker {
     /// Seconds since the idle ticker last ran, or `None` if it never has.
     pub fn ticker_idle_secs(&self) -> Option<i64> {
         Self::elapsed(self.ticker_at.load(Ordering::Relaxed))
+    }
+    /// Watchdog baseline: seconds since the writer last made progress, falling
+    /// back to seconds since daemon start when it never has — a hang on the
+    /// very first message must be as detectable as any later one.
+    pub fn writer_idle_or_start_secs(&self) -> i64 {
+        self.writer_idle_secs()
+            .unwrap_or_else(|| self.since_start_secs())
+    }
+    /// Watchdog baseline for the idle ticker; see [`Self::writer_idle_or_start_secs`].
+    pub fn ticker_idle_or_start_secs(&self) -> i64 {
+        self.ticker_idle_secs()
+            .unwrap_or_else(|| self.since_start_secs())
+    }
+    fn since_start_secs(&self) -> i64 {
+        (Self::now() - self.started_at.load(Ordering::Relaxed)).max(0)
+    }
+    /// Test-only: pretend the daemon started `secs` seconds earlier, so stall
+    /// thresholds can be crossed without real sleeps.
+    #[cfg(test)]
+    pub fn backdate_start_for_test(&self, secs: i64) {
+        self.started_at.store(Self::now() - secs, Ordering::Relaxed);
+    }
+    /// Total messages dropped to a caught per-message panic since daemon start.
+    pub fn writer_panics(&self) -> u64 {
+        self.writer_panics.load(Ordering::Relaxed)
+    }
+    /// Total times the watchdog has observed the writer stalled since daemon start.
+    pub fn writer_stalls(&self) -> u64 {
+        self.writer_stalls.load(Ordering::Relaxed)
+    }
+    /// Record that the sync task attempted a flush (WP-B9).
+    pub fn mark_flush_attempt(&self) {
+        self.flush_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that a flush attempt fully succeeded (accepted or a no-op tick).
+    pub fn mark_flush_success(&self) {
+        self.flush_successes.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that a flush attempt failed (any `SyncError` variant).
+    pub fn mark_flush_failure(&self) {
+        self.flush_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Total flush attempts since daemon start.
+    pub fn flush_attempts(&self) -> u64 {
+        self.flush_attempts.load(Ordering::Relaxed)
+    }
+    /// Total flush attempts that fully succeeded since daemon start.
+    pub fn flush_successes(&self) -> u64 {
+        self.flush_successes.load(Ordering::Relaxed)
+    }
+    /// Total flush attempts that failed since daemon start.
+    pub fn flush_failures(&self) -> u64 {
+        self.flush_failures.load(Ordering::Relaxed)
     }
     fn elapsed(at: i64) -> Option<i64> {
         if at == 0 {
@@ -358,6 +511,15 @@ impl SessionRegistry {
         self.last_human_signal_session = None;
     }
 
+    /// The newest event timestamp observed across ALL known sessions (active or
+    /// ended), or `None` if the registry has never observed a single event.
+    /// Used by the heartbeat's deep-idle predicate (WP-A3) as "the newest
+    /// activity" — a session that just ended still counts, so the daemon doesn't
+    /// snap to deep idle the instant the last session's final event lands.
+    pub fn last_activity_at(&self) -> Option<OffsetDateTime> {
+        self.sessions.values().map(|s| s.last_event_at).max()
+    }
+
     /// All sessions that have not ended.
     pub fn active(&self) -> Vec<LiveSession> {
         let mut v: Vec<LiveSession> = self
@@ -470,6 +632,60 @@ mod tests {
     use super::*;
     use dira_core::accounting::{self, Signal};
 
+    /// WP-B1b: `device_key()` caches on first load, and
+    /// `invalidate_device_key()` forces the NEXT call to reload rather than
+    /// keep serving the stale cached key — the mechanism `sync.rs`'s
+    /// `try_pending_key_flush` relies on after promoting a rotation.
+    ///
+    /// Uses `DIRA_DEVICE_SECRET` (never touches the OS keychain) so this is
+    /// safe to run in any environment; this is the only test in this binary
+    /// that calls `device_key()` without an explicit override, so the
+    /// process-global env var can't race a concurrent test.
+    #[tokio::test]
+    async fn device_key_reloads_after_invalidation() {
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                std::env::remove_var(dira_core::identity::ENV_DEVICE_SECRET);
+            }
+        }
+        let _clear = ClearEnv;
+
+        let first = dira_core::signing::DeviceKey::generate();
+        std::env::set_var(
+            dira_core::identity::ENV_DEVICE_SECRET,
+            first.secret_base64(),
+        );
+
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        let config = dira_core::Config::default();
+        let (state, _rx, _sync_rx) = crate::build_state(store, config).await.unwrap();
+
+        let loaded = state.device_key().await.expect("loads via env seed");
+        assert_eq!(loaded.public_base64(), first.public_base64());
+        // Cached: a second call returns the same key without re-reading env
+        // (env doesn't change between calls here, so this mainly proves the
+        // fast path doesn't error).
+        let cached = state.device_key().await.expect("cached read");
+        assert_eq!(cached.public_base64(), first.public_base64());
+
+        // Swap the env seed and invalidate — the NEXT call must pick up the
+        // NEW key, proving the cache doesn't silently keep serving the old one.
+        let second = dira_core::signing::DeviceKey::generate();
+        assert_ne!(first.public_base64(), second.public_base64());
+        std::env::set_var(
+            dira_core::identity::ENV_DEVICE_SECRET,
+            second.secret_base64(),
+        );
+        state.invalidate_device_key().await;
+
+        let reloaded = state
+            .device_key()
+            .await
+            .expect("reloads after invalidation");
+        assert_eq!(reloaded.public_base64(), second.public_base64());
+    }
+
     const IDLE: Duration = Duration::minutes(5);
 
     fn ev(session: &str, kind: EventKind, project: Option<&str>) -> RawEvent {
@@ -493,6 +709,35 @@ mod tests {
             activity: None,
             note: None,
         }
+    }
+
+    #[test]
+    fn last_activity_at_tracks_the_newest_event_including_ended_sessions() {
+        let repo = "github.com/acme/api";
+        let mut reg = SessionRegistry::default();
+        assert_eq!(
+            reg.last_activity_at(),
+            None,
+            "empty registry ⇒ no activity yet"
+        );
+
+        reg.observe(&ev_at("s1", EventKind::SessionStart, Some(repo), 0), IDLE);
+        assert_eq!(reg.last_activity_at(), Some(OffsetDateTime::UNIX_EPOCH));
+
+        // A later event on a second session moves the newest-activity mark.
+        reg.observe(&ev_at("s2", EventKind::SessionStart, Some(repo), 100), IDLE);
+        assert_eq!(
+            reg.last_activity_at(),
+            Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(100))
+        );
+
+        // Ending s2 still counts as the newest activity — a just-ended session
+        // must not make the registry look older than it is.
+        reg.observe(&ev_at("s2", EventKind::SessionEnd, Some(repo), 150), IDLE);
+        assert_eq!(
+            reg.last_activity_at(),
+            Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(150))
+        );
     }
 
     #[test]

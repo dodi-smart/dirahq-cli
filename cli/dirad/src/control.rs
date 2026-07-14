@@ -10,7 +10,8 @@ use dira_core::accounting;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::project;
 use dira_core::protocol::{
-    BillingView, ComputeView, ReportScope, Request, Response, SessionView, StatusView, StopSelector,
+    BillingView, ComputeView, ReportScope, Request, Response, SessionView, StatusView,
+    StopSelector, SyncHealthView, WriterHealthView,
 };
 use dira_core::report;
 use std::path::Path;
@@ -133,6 +134,8 @@ async fn resync_cursor(state: &AppState, from: Option<String>) -> Response {
         .unwrap_or(0);
     // Nudge the sync task to drain now rather than waiting for the backstop.
     let _ = state.sync.trigger.try_send(());
+    // A manual resync is user-initiated activity — wake the heartbeat too (WP-A3).
+    state.presence_wake.notify_waiters();
     tracing::info!(pending, from = ?from, "resync: cursor rewound, flush triggered");
     Response::ResyncQueued { pending, from }
 }
@@ -389,14 +392,52 @@ async fn status(state: &AppState) -> Response {
             period: c.summary.period,
             fetched_at: c.fetched_at,
         });
-    Response::Status(StatusView {
+    // Writer self-report (WP-B7): panics caught + dropped, watchdog stalls, and
+    // whether it looks wedged right now, using the same definition the
+    // supervisor's watchdog uses (`supervisor::writer_wedged`).
+    let writer_health = Some(WriterHealthView {
+        panics: state.progress.writer_panics(),
+        stalls: state.progress.writer_stalls(),
+        idle_secs: state.progress.writer_idle_secs(),
+        wedged: crate::supervisor::writer_wedged(state),
+    });
+    // Sync self-report (WP-B9): the persisted per-flush snapshot `sync.rs`
+    // writes after every attempt, plus the process-wide flush counters —
+    // mirrors the writer-health pattern above. Always `Some` (unlike
+    // `billing`), same as `writer_health`: a fresh daemon that has never
+    // flushed still reports a well-defined all-zero/all-`None` snapshot.
+    let sync_health = {
+        let persisted = state
+            .store
+            .meta_get(dira_core::sync::META_SYNC_HEALTH)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|j| dira_core::sync::parse_sync_health(&j))
+            .unwrap_or_default();
+        Some(SyncHealthView {
+            last_attempt_at: persisted.last_attempt_at,
+            last_success_at: persisted.last_success_at,
+            last_error_kind: persisted.last_error_kind,
+            consecutive_failures: persisted.consecutive_failures,
+            backoff_secs: persisted.backoff_secs,
+            cursor: persisted.cursor,
+            cloud_watermark: persisted.cloud_watermark,
+            flush_attempts: state.progress.flush_attempts(),
+            flush_successes: state.progress.flush_successes(),
+            flush_failures: state.progress.flush_failures(),
+        })
+    };
+    Response::Status(Box::new(StatusView {
         active,
         today,
         sync_pending,
         hydrating: !state.hydrated.load(std::sync::atomic::Ordering::Relaxed),
         tokens,
         billing,
-    })
+        writer_health,
+        sync_health,
+    }))
 }
 
 async fn sessions(state: &AppState) -> Response {

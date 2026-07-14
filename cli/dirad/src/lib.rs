@@ -24,9 +24,12 @@ pub mod control;
 pub mod events;
 pub mod heartbeat;
 pub mod http;
+pub mod jitter;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod writer;
 
 use crate::state::{AppState, EventMsg, ProgressTracker, SessionRegistry};
@@ -37,7 +40,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use time::{Duration, OffsetDateTime, UtcOffset};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::mpsc;
 use ulid::Ulid;
 
 /// Idle-ticker cadence; must be below the idle threshold so manual sessions accrue.
@@ -81,21 +84,35 @@ pub async fn build_state(
     let sessions = Arc::new(Mutex::new(SessionRegistry::default()));
     let (sync_handle, sync_rx) = sync::channel();
 
+    // One pooled HTTP client for every device→cloud task. Keep-alive so repeat
+    // POSTs (heartbeat/sync/billing) to the same cloud host reuse the connection
+    // instead of a fresh TCP/TLS handshake per tick. No default timeout — callers
+    // set a per-request timeout sized to that call. A build failure here now fails
+    // daemon startup outright rather than silently disabling whichever task used
+    // to build its own client.
+    let http = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(120))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build shared http client: {e}"))?;
+
     let state = AppState {
         store,
         tx,
         sessions,
         config,
+        http,
         started_at: std::time::Instant::now(),
         bearer: Arc::new(bearer),
         sync: sync_handle,
-        device_key: Arc::new(OnceCell::new()),
+        device_key: Arc::new(tokio::sync::RwLock::new(None)),
         progress: Arc::new(ProgressTracker::default()),
         hydrated: Arc::new(AtomicBool::new(false)),
         repo_dirs: Arc::new(Mutex::new(HashMap::new())),
         presence_hints: Arc::new(crate::state::PresenceHints::default()),
         billing: Arc::new(Mutex::new(None)),
         billing_refresh: Arc::new(tokio::sync::Notify::new()),
+        presence_wake: Arc::new(tokio::sync::Notify::new()),
     };
     Ok((state, rx, sync_rx))
 }
@@ -176,7 +193,10 @@ pub async fn run() -> anyhow::Result<()> {
     // unset. Run detached so it never delays startup.
     {
         let cloud_url = state.config.cloud_url.clone();
-        tokio::spawn(async move { sync::check_schema_handshake(cloud_url.as_deref()).await });
+        let http = state.http.clone();
+        tokio::spawn(
+            async move { sync::check_schema_handshake(&http, cloud_url.as_deref()).await },
+        );
     }
 
     serve_control(state.clone(), uds);
@@ -214,19 +234,48 @@ pub fn spawn_hydrate(state: AppState) {
     });
 }
 
+/// Deep-idle decimation for the repo-commit sweep: with zero active sessions
+/// and no recent activity, sweep only every Nth tick (10 × 30s ⇒ every ~5 min)
+/// instead of forking `git rev-parse` per known repo every 30s forever. Commits
+/// are never lost to the slower cadence — `capture::git_walk` walks the full
+/// `baseline..HEAD` range whenever it does run, and the moment events flow
+/// again the writer's own capture path fires immediately (and the daemon is no
+/// longer deep-idle, so the next tick sweeps too).
+const DEEP_IDLE_SWEEP_EVERY_N_TICKS: u32 = 10;
+
+/// Whether this tick runs the repo sweep. Pure so the decimation policy is
+/// unit-testable: an active daemon sweeps every tick; a deep-idle one only
+/// when enough ticks have accumulated since the last sweep.
+fn sweep_this_tick(deep_idle: bool, ticks_since_sweep: u32) -> bool {
+    !deep_idle || ticks_since_sweep >= DEEP_IDLE_SWEEP_EVERY_N_TICKS
+}
+
 /// Periodically emit a tick for each open manual session so it accrues
 /// continuously, and sweep every known repo for new commits (caught even when no
 /// agent events are flowing). Marks ticker progress for the watchdog each tick.
+///
+/// The tick itself stays at the fixed 30s cadence — an empty tick is just a
+/// timer fire, and both manual-session accrual and the watchdog's stall
+/// threshold depend on it — but the git sweep (the only part that forks
+/// subprocesses) is decimated while deep-idle; see [`sweep_this_tick`].
 ///
 /// Loops forever; the supervisor treats any *panic* as a fault and re-spawns it.
 pub async fn idle_ticker(state: AppState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(TICK_INTERVAL_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticks_since_sweep: u32 = 0;
     loop {
         interval.tick().await;
         state.progress.mark_ticker();
 
-        let manual = control::lock_recover(&state.sessions).active_manual();
+        let (manual, active_count, last_activity) = {
+            let reg = control::lock_recover(&state.sessions);
+            (
+                reg.active_manual(),
+                reg.active().len(),
+                reg.last_activity_at(),
+            )
+        };
         let now = OffsetDateTime::now_utc();
         for s in manual {
             let ev = events::manual_event(
@@ -242,6 +291,21 @@ pub async fn idle_ticker(state: AppState) {
             // If the writer is gone the channel send errors; nothing else to do.
             let _ = state.tx.send(EventMsg::Raw(Box::new(ev))).await;
         }
+
+        // Same deep-idle rule as the heartbeat (WP-A3). `None` last-activity
+        // (nothing observed since daemon start) counts as idle-forever: the
+        // only thing the slower sweep can delay is a commit made with no
+        // events flowing at all, by a few minutes, with git timestamps intact.
+        let idle_for = last_activity
+            .map(|at| (now - at).max(Duration::ZERO))
+            .unwrap_or(Duration::MAX);
+        let deep_idle =
+            heartbeat::is_deep_idle(active_count, idle_for, state.config.deep_idle_after());
+        if !sweep_this_tick(deep_idle, ticks_since_sweep) {
+            ticks_since_sweep += 1;
+            continue;
+        }
+        ticks_since_sweep = 0;
 
         // Sweep every known repo for new commits. The per-repo baseline check makes
         // an unchanged HEAD a cheap no-op, so this catches manual commits even when
@@ -271,12 +335,13 @@ const VACUUM_EVERY_N_SWEEPS: u64 = 24;
 /// the sync cursor's confirmation *and* older than the retention window, so
 /// un-synced or recent data is never lost.
 pub async fn maintenance(state: AppState) {
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(MAINTENANCE_INTERVAL_SECS));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let base = std::time::Duration::from_secs(MAINTENANCE_INTERVAL_SECS);
     let mut sweeps: u64 = 0;
     loop {
-        interval.tick().await;
+        // Jittered ±10% so many daemons don't all compact on the same wall-clock
+        // cadence; purely cosmetic here (this task never hits the network) but
+        // kept consistent with the other background timers.
+        tokio::time::sleep(jitter::jittered(base, jitter::DEFAULT_FRAC)).await;
         sweeps += 1;
 
         let cursor = state.store.sync_cursor().await.ok().flatten();
@@ -342,4 +407,25 @@ pub async fn resolve_bearer(store: &Store) -> anyhow::Result<String> {
     let token = Ulid::new().to_string();
     store.meta_set("bearer", &token).await?;
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sweep decimation policy: an active daemon sweeps every tick; a
+    /// deep-idle one only once `DEEP_IDLE_SWEEP_EVERY_N_TICKS` ticks have
+    /// accumulated — so a fully idle daemon stops forking `git rev-parse`
+    /// per repo every 30s, without ever stopping the sweep entirely.
+    #[test]
+    fn deep_idle_decimates_the_repo_sweep_but_never_stops_it() {
+        // Active: every tick sweeps, regardless of the counter.
+        assert!(sweep_this_tick(false, 0));
+        assert!(sweep_this_tick(false, DEEP_IDLE_SWEEP_EVERY_N_TICKS));
+        // Deep idle: skipped until the counter reaches the decimation factor…
+        assert!(!sweep_this_tick(true, 0));
+        assert!(!sweep_this_tick(true, DEEP_IDLE_SWEEP_EVERY_N_TICKS - 1));
+        // …then it MUST run (the sweep slows down, it never stops).
+        assert!(sweep_this_tick(true, DEEP_IDLE_SWEEP_EVERY_N_TICKS));
+    }
 }

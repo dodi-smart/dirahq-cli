@@ -38,6 +38,11 @@ ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 # `StreamExt::next` for crossterm's async `EventStream`; no executor pulled in.
 futures-util = { version = "0.3", default-features = false }
+# `FutureExt::catch_unwind` for the writer's per-message panic isolation
+# (dirad only, WP-B7). Needs the "std" feature that the minimal `futures-util`
+# above deliberately doesn't enable, so it's a separate full `futures` dep
+# rather than widening the crossterm-only entry.
+futures = "0.3"
 
 # Storage
 # `macros` provides `migrate!` + `query!`; we use runtime queries only, so builds
@@ -76,6 +81,9 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"
 thiserror = "2"
 anyhow = "1"
 directories = "6"
+# Timer jitter (dirad only): small, fast, non-cryptographic RNG for spreading
+# background POST timers so many daemons don't beat the cloud in lockstep.
+fastrand = "2"
 
 # Internal crates
 dira-contract = { path = "contract" }

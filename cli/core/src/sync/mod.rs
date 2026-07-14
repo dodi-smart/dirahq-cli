@@ -5,6 +5,8 @@
 pub mod batch;
 pub mod billing;
 pub mod handshake;
+pub mod health;
+pub mod ratelimit;
 
 pub use batch::{
     build_batch, build_batch_with_partials, build_chunked_batches, est_cost, ArtifactRow,
@@ -14,6 +16,8 @@ pub use billing::{
     parse_billing_summary_response, BillingSummary, CachedBillingSummary, META_BILLING_SUMMARY,
 };
 pub use handshake::{parse_ingest_response, IngestResponse, SyncBlock};
+pub use health::{parse_sync_health, SyncHealth, META_SYNC_HEALTH};
+pub use ratelimit::{parse_retry_after_body, parse_retry_after_secs};
 
 /// `meta` key: the last event id confirmed-synced to the cloud. The window for a
 /// flush is `(cursor, max_event_id]`. Lives here (rather than in the daemon) so

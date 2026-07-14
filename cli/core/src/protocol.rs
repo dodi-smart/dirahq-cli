@@ -95,8 +95,12 @@ pub enum Response {
     Error { message: String },
     /// Daemon is alive (`Ping`).
     Pong,
-    /// `Status`.
-    Status(StatusView),
+    /// `Status`. Boxed (WP-B9): `StatusView` grew past clippy's large-variant
+    /// threshold against the small `Ok`/`Pong`/etc. arms once `sync_health`
+    /// (WP-B9) joined `writer_health` (WP-B7) — the same fix `tui::Live`/
+    /// `PollResult` already applied for the same reason. One allocation per
+    /// `status` response, nowhere near a hot path.
+    Status(Box<StatusView>),
     /// `Sessions`.
     Sessions { sessions: Vec<SessionView> },
     /// `Start`.
@@ -225,6 +229,74 @@ pub struct StatusView {
     /// since startup with no cache, or the daemon is older than this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<BillingView>,
+    /// Writer-task health (WP-B7): panics caught + dropped at the message
+    /// grain, watchdog stall count, and whether it looks wedged right now.
+    /// `None` from an older daemon (skew) — the renderer omits the health
+    /// line then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_health: Option<WriterHealthView>,
+    /// Sync-task health (WP-B9): the last flush attempt's outcome, consecutive
+    /// failure count, current backoff, and cursor/watermark, plus process-wide
+    /// flush counters — the daemon's own honest view of "is sync actually
+    /// working" (a stalled sync and a quiet because-nothing-changed sync both
+    /// otherwise look identical from `sync_pending` alone). `None` from an
+    /// older daemon (skew) — the renderer omits the health line then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_health: Option<SyncHealthView>,
+}
+
+/// The writer task's self-reported health, attached to `status` (WP-B7). The
+/// writer catches and drops any panic tripped by a single message rather than
+/// dying, so `panics > 0` is an operator signal worth investigating — not
+/// itself an outage. `wedged` is the same definition the watchdog uses: no
+/// progress past the stall threshold while messages are backed up.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct WriterHealthView {
+    /// Messages whose processing panicked and were dropped since daemon start.
+    pub panics: u64,
+    /// How many times the watchdog has observed the writer stalled.
+    pub stalls: u64,
+    /// Seconds since the writer last drained a message, or `None` if it never
+    /// has (a fresh, still-hydrating daemon).
+    pub idle_secs: Option<i64>,
+    /// True when the writer currently looks wedged (no progress past the
+    /// stall threshold while messages are backed up).
+    pub wedged: bool,
+}
+
+/// The sync task's self-reported health, attached to `status` (WP-B9). Mirrors
+/// `dira_core::sync::SyncHealth` (the persisted snapshot `sync.rs` writes
+/// after every flush attempt) plus process-wide flush counters from
+/// `ProgressTracker` — defined here rather than reusing the sync-module type
+/// directly so the protocol doesn't depend on sync internals; the daemon maps
+/// between them. Every field defaults, so an old/short-written snapshot (or a
+/// daemon that has never yet attempted a flush) still renders sensibly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncHealthView {
+    /// RFC 3339 timestamp of the most recent flush attempt, or `None` before
+    /// the first one.
+    pub last_attempt_at: Option<String>,
+    /// RFC 3339 timestamp of the most recent flush that fully succeeded.
+    pub last_success_at: Option<String>,
+    /// A stable, short code for the most recent failure kind (e.g.
+    /// `"signature_rejected"`, `"unknown_device"`, `"transient"`), or `None`
+    /// right after a success / before the first attempt.
+    pub last_error_kind: Option<String>,
+    /// Consecutive failed flush attempts since the last success.
+    pub consecutive_failures: u32,
+    /// The backoff the sync loop is currently sleeping (or just slept) for,
+    /// in seconds. `0` in steady state.
+    pub backoff_secs: u64,
+    /// The sync cursor (last confirmed-synced event id) as of the snapshot.
+    pub cursor: Option<String>,
+    /// The cloud's last-reported persisted watermark, as of the snapshot.
+    pub cloud_watermark: Option<String>,
+    /// Total flush attempts since daemon start.
+    pub flush_attempts: u64,
+    /// Total flush attempts that fully succeeded since daemon start.
+    pub flush_successes: u64,
+    /// Total flush attempts that failed since daemon start.
+    pub flush_failures: u64,
 }
 
 /// Today's compute totals for the status summary. Defined here (not reusing the
@@ -323,6 +395,8 @@ mod tests {
         assert!(v.tokens.is_none());
         assert!(v.billing.is_none());
         assert!(!v.hydrating);
+        assert!(v.writer_health.is_none());
+        assert!(v.sync_health.is_none());
     }
 
     #[test]
@@ -341,10 +415,14 @@ mod tests {
             hydrating: false,
             tokens: None,
             billing: None,
+            writer_health: None,
+            sync_health: None,
         };
         let json = serde_json::to_string(&v).unwrap();
         assert!(!json.contains("tokens"));
         assert!(!json.contains("billing"));
+        assert!(!json.contains("writer_health"));
+        assert!(!json.contains("sync_health"));
 
         let v = StatusView {
             tokens: Some(ComputeView {
@@ -358,12 +436,32 @@ mod tests {
                 period: "week".into(),
                 fetched_at: "2026-07-02T09:00:00Z".into(),
             }),
+            writer_health: Some(WriterHealthView {
+                panics: 2,
+                stalls: 0,
+                idle_secs: Some(5),
+                wedged: false,
+            }),
+            sync_health: Some(SyncHealthView {
+                last_attempt_at: Some("2026-07-09T10:00:00Z".into()),
+                last_success_at: Some("2026-07-09T09:55:00Z".into()),
+                last_error_kind: None,
+                consecutive_failures: 0,
+                backoff_secs: 0,
+                cursor: Some("01J0EVENT".into()),
+                cloud_watermark: Some("01J0WATERMARK".into()),
+                flush_attempts: 10,
+                flush_successes: 9,
+                flush_failures: 1,
+            }),
             ..v
         };
         let json = serde_json::to_string(&v).unwrap();
         let back: StatusView = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tokens.unwrap().total_tokens, 2_060_000);
         assert_eq!(back.billing.unwrap().currency, "€");
+        assert_eq!(back.writer_health.unwrap().panics, 2);
+        assert_eq!(back.sync_health.unwrap().flush_attempts, 10);
     }
 
     #[test]

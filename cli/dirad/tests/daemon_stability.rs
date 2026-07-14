@@ -120,6 +120,92 @@ async fn slow_git_capture_does_not_stall_timer_accrual() {
     writer.abort();
 }
 
+/// (a2) Panic isolation (WP-B7): a message whose processing panics must be
+/// caught, dropped, and counted — the receiver and the loop must survive and
+/// keep accruing subsequent messages.
+///
+/// The panic is injected via the same `capture_fn` seam as the slow-git test
+/// above. It fires on the *first* commit-bearing event (`ManualStart`, which
+/// carries a repo) and, because of the per-repo capture throttle, never again
+/// for the same project within the test's real-time window — so exactly one
+/// panic is expected. Because the writer only calls `capture_fn` *after* the
+/// triggering event is durably appended and folded into the registry (see the
+/// accounting-ordering invariant documented on `writer::process_message`),
+/// this also proves that a panic in the best-effort tail of processing can't
+/// unwind the accounting-critical section that already ran for that event.
+#[tokio::test]
+async fn panicking_message_is_caught_and_writer_keeps_accruing() {
+    let (state, rx) = test_state().await;
+
+    fn panicking_capture(_state: &AppState, _cwd: &str, _canonical: &str) {
+        panic!("simulated panic in commit capture");
+    }
+
+    let writer_state = state.clone();
+    let writer = tokio::spawn(async move {
+        dirad::writer::writer_with(rx, writer_state, panicking_capture).await;
+    });
+
+    let base = OffsetDateTime::now_utc() - Duration::minutes(10);
+    // Triggers `panicking_capture` — its processing panics AFTER the store
+    // append and registry `observe()` for this event already ran.
+    state
+        .tx
+        .send(EventMsg::Raw(Box::new(manual_start_with_repo(
+            "panic-1", base,
+        ))))
+        .await
+        .unwrap();
+
+    // Subsequent, unrelated messages must still be stored and accrue normally —
+    // proof the writer loop didn't wedge or die.
+    for i in 1..=3 {
+        let at = base + Duration::seconds(30 * i);
+        state
+            .tx
+            .send(EventMsg::Raw(Box::new(manual_tick_with_repo(
+                "panic-1", at,
+            ))))
+            .await
+            .unwrap();
+    }
+
+    // Poll until the panic is recorded and the subsequent ticks have accrued.
+    let mut panics = 0u64;
+    let mut active = 0u64;
+    for _ in 0..200 {
+        panics = state.progress.writer_panics();
+        active = dirad::control::lock_recover(&state.sessions)
+            .active()
+            .into_iter()
+            .find(|s| s.session_id == "panic-1")
+            .map(|s| s.active_seconds)
+            .unwrap_or(0);
+        if panics >= 1 && active >= 90 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+    }
+
+    assert_eq!(panics, 1, "exactly one message's capture panicked");
+    assert_eq!(
+        active, 90,
+        "subsequent ManualTicks must keep accruing active_seconds after a caught panic"
+    );
+
+    // The store is durable across the panic: every appended event (including
+    // the one whose *capture* panicked) is present — the panic dropped nothing
+    // that had already been stored, and lost nothing downstream either.
+    let stored = state.store.events_since(None).await.expect("events_since");
+    assert_eq!(
+        stored.iter().filter(|e| e.session_id == "panic-1").count(),
+        4,
+        "ManualStart + 3 ManualTicks all durably stored despite the capture panic"
+    );
+
+    writer.abort();
+}
+
 /// (b) Poison tolerance: a poisoned sessions mutex must still serve
 /// `Status`/`Sessions` instead of panicking the control handler.
 #[tokio::test]

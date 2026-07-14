@@ -14,6 +14,13 @@ use serde::Serialize;
 use crate::Error;
 
 /// A device signing keypair.
+///
+/// `Clone` (WP-B1b): `AppState::device_key` caches this behind a `RwLock` so
+/// it can be reloaded after a promoted key rotation without holding the lock
+/// across every signing call — callers get their own owned copy per read.
+/// `ed25519_dalek::SigningKey` is itself `Clone` (it's just the 32-byte
+/// seed), so this is cheap.
+#[derive(Clone)]
 pub struct DeviceKey {
     signing: SigningKey,
 }

@@ -12,6 +12,11 @@
       "description": "The rotation request being attested to.",
       "$ref": "#/$defs/RotateKeyRequest"
     },
+    "schemaVersion": {
+      "description": "Semver of this contract, e.g. `\"1.1.0\"`. Empty string means a pre-1.1\nclient that predates this field; consumers must tolerate an absent or\nempty value rather than rejecting the rotation.",
+      "type": "string",
+      "default": ""
+    },
     "sig": {
       "description": "`ed25519_oldkey(JCS(payload))`, base64 (standard, no padding).",
       "type": "string"

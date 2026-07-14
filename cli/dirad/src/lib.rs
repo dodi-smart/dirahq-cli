@@ -190,13 +190,17 @@ pub async fn run() -> anyhow::Result<()> {
     billing::spawn(state.clone());
     // Best-effort schema-version handshake: warn if our contract version is
     // outside the cloud's supported range. Non-fatal; skipped when cloud_url is
-    // unset. Run detached so it never delays startup.
+    // unset OR the device is unlinked — cloud_url now DEFAULTS to the hosted
+    // cloud, and an unlinked daemon must stay fully offline (no phone-home,
+    // not even an anonymous GET /meta). Run detached so it never delays
+    // startup.
     {
-        let cloud_url = state.config.cloud_url.clone();
-        let http = state.http.clone();
-        tokio::spawn(
-            async move { sync::check_schema_handshake(&http, cloud_url.as_deref()).await },
-        );
+        let handshake_state = state.clone();
+        tokio::spawn(async move {
+            if let Some((cloud_url, _device_id)) = handshake_state.cloud_link("handshake").await {
+                sync::check_schema_handshake(&handshake_state.http, Some(&cloud_url)).await;
+            }
+        });
     }
 
     serve_control(state.clone(), uds);

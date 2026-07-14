@@ -194,5 +194,7 @@ pub async fn capture_commits(state: &AppState, cwd: &str, canonical: &str) {
     if recorded > 0 {
         tracing::info!(commits = recorded, repo = %canonical, "captured commits");
         let _ = state.sync.trigger.try_send(());
+        // A commit landing is activity — wake the heartbeat too (WP-A3).
+        state.presence_wake.notify_waiters();
     }
 }

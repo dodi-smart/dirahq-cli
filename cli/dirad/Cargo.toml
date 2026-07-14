@@ -28,3 +28,15 @@ tracing-subscriber.workspace = true
 ulid.workspace = true
 time.workspace = true
 anyhow.workspace = true
+fastrand.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+# `try_pending_key_flush`'s self-heal path calls
+# `dira_core::identity::{load_pending_key,promote_pending_key}`, which now
+# resolve the pending key's secret through the SAME keychain-or-meta-fallback
+# ladder the active key uses. Mirrors `dira_core::identity::tests::use_mock_keychain`
+# / `dira::test_support::use_mock_keychain` so these tests never touch the real
+# OS keychain either.
+keyring.workspace = true
+keyring-core.workspace = true

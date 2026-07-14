@@ -66,6 +66,19 @@ pub struct Config {
     /// resolution fails (it can in multithreaded contexts), it falls back to UTC.
     #[serde(default)]
     pub report_local_day: bool,
+    /// Seconds of zero-active-sessions quiet (no session ended/ticked and no
+    /// process activity) before the heartbeat considers the device "deep idle"
+    /// and slows to `presence_ttl_deep_idle_secs`'s cadence instead of the
+    /// ordinary idle band. An instant-wake `Notify` (fired at the same sites the
+    /// sync trigger fires) still lands a beat immediately the moment activity
+    /// resumes, so this only trades presence freshness for POST volume while the
+    /// device is truly quiet.
+    pub deep_idle_after_secs: u64,
+    /// The presence TTL the daemon advertises to the cloud while deep idle. `600`
+    /// is deliberately the cloud's clamp ceiling for a per-ping `presence_ttl_secs`
+    /// (see the cloud's presence-ack clamp), so no cloud-side change is needed to
+    /// honor it.
+    pub presence_ttl_deep_idle_secs: u64,
 }
 
 impl Default for Config {
@@ -91,6 +104,8 @@ impl Default for Config {
             presence_ttl_secs: 75,
             partial_rollup_after_secs: 3600,
             report_local_day: false,
+            deep_idle_after_secs: 900,
+            presence_ttl_deep_idle_secs: 600,
         }
     }
 }
@@ -165,6 +180,29 @@ impl Config {
     /// rollup, as a `Duration`. `0` disables partial rollups.
     pub fn partial_rollup_after(&self) -> time::Duration {
         time::Duration::seconds(self.partial_rollup_after_secs as i64)
+    }
+
+    /// The quiet window (as a `Duration`) past which a device with zero active
+    /// sessions is considered "deep idle" by the heartbeat (WP-A3). Floored at
+    /// 60s: a smaller quiet window would let a device flap into the deep-idle
+    /// TTL band (up to 600s) almost immediately after going idle, which is
+    /// squarely the kind of misconfiguration this clamp exists to prevent —
+    /// same pattern as [`Config::coalesce`] / [`Config::heartbeat_idle`].
+    pub fn deep_idle_after(&self) -> time::Duration {
+        time::Duration::seconds(self.deep_idle_after_secs.max(60) as i64)
+    }
+
+    /// The presence TTL advertised while deep idle, clamped to
+    /// `[presence_ttl_secs, 600]`. `600` is the cloud's clamp ceiling for a
+    /// per-ping `presence_ttl_secs` (see `presence_ttl_deep_idle_secs`'s field
+    /// doc); the floor at `presence_ttl_secs` prevents a misconfigured deep-idle
+    /// TTL from ever being SHORTER than the ordinary band's TTL, which would
+    /// make the (already tight) normal→deep-idle transition racier than it
+    /// needs to be. Clamped (not rejected) so a bad config degrades gracefully,
+    /// matching the other knobs on this type.
+    pub fn presence_ttl_deep_idle(&self) -> u64 {
+        let floor = self.presence_ttl_secs.clamp(1, 600);
+        self.presence_ttl_deep_idle_secs.clamp(floor, 600)
     }
 }
 
@@ -281,5 +319,47 @@ mod tests {
             ..Config::default()
         };
         assert!(c.heartbeat_idle() >= c.heartbeat_active());
+    }
+
+    #[test]
+    fn deep_idle_after_floored_at_60_seconds() {
+        let c = Config {
+            deep_idle_after_secs: 1,
+            ..Config::default()
+        };
+        assert_eq!(c.deep_idle_after(), time::Duration::seconds(60));
+    }
+
+    #[test]
+    fn deep_idle_after_passes_through_above_the_floor() {
+        let c = Config::default();
+        assert_eq!(c.deep_idle_after(), time::Duration::seconds(900));
+    }
+
+    #[test]
+    fn presence_ttl_deep_idle_clamped_to_600_ceiling() {
+        let c = Config {
+            presence_ttl_deep_idle_secs: 10_000,
+            ..Config::default()
+        };
+        assert_eq!(c.presence_ttl_deep_idle(), 600);
+    }
+
+    #[test]
+    fn presence_ttl_deep_idle_never_below_the_normal_ttl() {
+        // A misconfigured deep-idle TTL shorter than the normal band's TTL is
+        // clamped up to the normal TTL, not left racier than the normal band.
+        let c = Config {
+            presence_ttl_secs: 300,
+            presence_ttl_deep_idle_secs: 100,
+            ..Config::default()
+        };
+        assert_eq!(c.presence_ttl_deep_idle(), 300);
+    }
+
+    #[test]
+    fn presence_ttl_deep_idle_passes_through_in_range() {
+        let c = Config::default();
+        assert_eq!(c.presence_ttl_deep_idle(), 600);
     }
 }

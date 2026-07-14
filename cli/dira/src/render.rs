@@ -183,6 +183,60 @@ pub fn print_status(s: &StatusView, detailed: bool) {
             )
         );
     }
+
+    // Writer health (WP-B7): only surfaced when there's something to say — a
+    // healthy writer (no panics, no stalls, not wedged) prints nothing extra.
+    // Omitted entirely for an older daemon (`writer_health: None`, skew-safe).
+    if let Some(h) = s.writer_health {
+        if h.panics > 0 || h.stalls > 0 || h.wedged {
+            let mut line = format!("writer: {} panic(s) caught", h.panics);
+            if h.stalls > 0 {
+                line.push_str(&format!(", {} stall(s) flagged", h.stalls));
+            }
+            if h.wedged {
+                line.push_str(", currently WEDGED — restart the daemon");
+            }
+            println!("\n{}", theme::paint(&line, Role::Negative));
+        }
+    }
+
+    // Sync health (WP-B9): only surfaced when there's something to say — a
+    // healthy sync (no consecutive failures, no recorded error) prints
+    // nothing extra. Omitted entirely for an older daemon (`sync_health:
+    // None`, skew-safe).
+    if let Some(h) = &s.sync_health {
+        if let Some(line) = sync_health_line(h) {
+            println!("\n{}", theme::paint(&line, Role::Negative));
+        }
+    }
+}
+
+/// Build the `sync: …` status line for a [`SyncHealthView`], or `None` when
+/// there's nothing worth surfacing. Pure (no printing) so the gate is
+/// unit-testable.
+///
+/// `"skipped"` (the device isn't configured/linked — see
+/// `dirad::sync::record_health`) is a NEUTRAL kind, not a failure: it never
+/// increments `consecutive_failures`, so a never-linked daemon would
+/// otherwise print a permanent, red "0 consecutive failure(s) (skipped)"
+/// line on every `dira status`. Suppress it in exactly that
+/// skipped-with-zero-failures case; any OTHER combination (a real failure
+/// kind, or `consecutive_failures > 0`) still renders as before.
+fn sync_health_line(h: &dira_core::protocol::SyncHealthView) -> Option<String> {
+    if h.consecutive_failures == 0 && h.last_error_kind.as_deref() == Some("skipped") {
+        return None;
+    }
+    if h.consecutive_failures == 0 && h.last_error_kind.is_none() {
+        return None;
+    }
+    let mut line = format!("sync: {} consecutive failure(s)", h.consecutive_failures);
+    if let Some(kind) = &h.last_error_kind {
+        line.push_str(&format!(" ({kind})"));
+    }
+    if h.backoff_secs > 0 {
+        line.push_str(&format!(", backing off {}s", h.backoff_secs));
+    }
+    Some(line)
 }
 
 /// A cloud-fetched billing value older than this reads as stale and gets an
@@ -539,6 +593,8 @@ mod tests {
             hydrating: false,
             tokens: None,
             billing: None,
+            writer_health: None,
+            sync_health: None,
         }
     }
 
@@ -643,6 +699,49 @@ mod tests {
         assert_eq!(
             lines.last().unwrap(),
             "8h billable → $980 unbilled, this week (as of 32m ago)"
+        );
+    }
+
+    use dira_core::protocol::SyncHealthView;
+
+    fn sync_health(kind: Option<&str>, consecutive_failures: u32) -> SyncHealthView {
+        SyncHealthView {
+            last_attempt_at: Some("2026-07-09T10:00:00Z".into()),
+            last_error_kind: kind.map(str::to_string),
+            consecutive_failures,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sync_health_line_is_quiet_for_a_never_linked_daemon() {
+        // The bug this guards: a never-linked daemon skips every flush tick
+        // (kind "skipped", never a failure), which must NOT render as a red
+        // "0 consecutive failure(s) (skipped)" line on every `dira status`.
+        assert_eq!(sync_health_line(&sync_health(Some("skipped"), 0)), None);
+    }
+
+    #[test]
+    fn sync_health_line_is_quiet_when_fully_healthy() {
+        assert_eq!(sync_health_line(&sync_health(None, 0)), None);
+    }
+
+    #[test]
+    fn sync_health_line_still_reports_real_failures() {
+        assert_eq!(
+            sync_health_line(&sync_health(Some("transient"), 3)),
+            Some("sync: 3 consecutive failure(s) (transient)".to_string())
+        );
+    }
+
+    #[test]
+    fn sync_health_line_reports_skipped_if_failures_are_somehow_nonzero() {
+        // Defensive: `record_health`'s "skipped" path never increments
+        // `consecutive_failures`, but the render gate itself only special-cases
+        // the exact skipped-and-zero combination — anything else still shows.
+        assert_eq!(
+            sync_health_line(&sync_health(Some("skipped"), 2)),
+            Some("sync: 2 consecutive failure(s) (skipped)".to_string())
         );
     }
 }

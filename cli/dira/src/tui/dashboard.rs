@@ -550,6 +550,8 @@ mod tests {
             hydrating: false,
             tokens: None,
             billing: None,
+            writer_health: None,
+            sync_health: None,
         };
         let h = Headline::from_status(&s);
         assert_eq!(h.human_seconds, 600);
@@ -587,6 +589,8 @@ mod tests {
             hydrating: false,
             tokens: None,
             billing: None,
+            writer_health: None,
+            sync_health: None,
         };
         let lanes = lanes(&s);
         assert_eq!(lanes.len(), 2);
@@ -628,6 +632,8 @@ mod tests {
             hydrating: false,
             tokens: None,
             billing: None,
+            writer_health: None,
+            sync_health: None,
         };
         let out = tick(&s, now, 300);
         // Engaged agent grows by its 5s tail; idle session is untouched.
@@ -677,6 +683,8 @@ mod tests {
             hydrating: false,
             tokens: None,
             billing: None,
+            writer_health: None,
+            sync_health: None,
         };
         let out = tick(&s, now, 300);
         assert_eq!(out.active[0].agent_seconds, 104, "agent tail should grow");

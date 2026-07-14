@@ -78,6 +78,16 @@ const KNOBS: &[Knob] = &[
         kind: Kind::U64, // accepts 0/1 or true/false; parsed in set()
         help: "compute report day boundaries in local time (0/1); default 0 (UTC)",
     },
+    Knob {
+        key: "deep_idle_after_secs",
+        kind: Kind::U64,
+        help: "quiet time before the heartbeat goes deep idle; clamped to a 60s floor",
+    },
+    Knob {
+        key: "presence_ttl_deep_idle_secs",
+        kind: Kind::U64,
+        help: "presence TTL advertised while deep idle; clamped to [presence_ttl_secs, 600]",
+    },
 ];
 
 fn knob(key: &str) -> Option<&'static Knob> {

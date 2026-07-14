@@ -13,7 +13,9 @@ use crate::state::{AppState, EventMsg};
 use dira_contract::Harness;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::project::{self, Resolved};
+use futures::FutureExt as _;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc;
 use ulid::Ulid;
@@ -35,6 +37,17 @@ pub async fn writer(rx: mpsc::Receiver<EventMsg>, state: AppState) {
 /// Drain the ingest queue: enrich hook events with a resolved project (cached),
 /// append to the log, fold into the live registry, and trigger commit capture on
 /// commit-bearing events. `capture_fn` is the seam tests use to inject a slow git.
+///
+/// **Panic isolation (WP-B7).** This is the sole ingest receiver — it can't be
+/// re-spawned with a fresh channel (see `supervisor.rs`), so a bug tripped by
+/// one malformed/unusual message must never take down accrual for every other
+/// message. Each iteration wraps the entire per-message body — compute, the
+/// store append, and the coalescing/registry bookkeeping, all in
+/// [`process_message`] — in `catch_unwind`. A caught panic drops that one
+/// message, logs loudly, bumps `writer_panics`, and the loop moves straight on
+/// to the next message. See [`process_message`]'s doc comment for the
+/// accounting-ordering invariant this preserves between the store, the
+/// coalescing watermark, and the live registry.
 pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capture_fn: CaptureFn) {
     let mut cache: HashMap<String, Resolved> = HashMap::new();
     // Per-repo throttle so a burst of tool calls doesn't shell out to git on every
@@ -53,80 +66,239 @@ pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capt
     let mut events_ingested: u64 = 0;
     let mut events_coalesced: u64 = 0;
     while let Some(msg) = rx.recv().await {
-        // For Claude hooks at a turn boundary, remember the transcript so we can
-        // capture token usage after the event is logged (off the response path).
-        let transcript = match &msg {
-            EventMsg::Hook { norm, .. } if captures_tokens(norm.kind) => {
-                norm.transcript_path.clone()
-            }
-            _ => None,
+        // Cheap context captured BEFORE `msg` is consumed, so a caught panic
+        // below can still log which kind of event / session it was processing
+        // even though `process_message` took the message by value.
+        let (kind_hint, session_hint) = match &msg {
+            EventMsg::Raw(ev) => (ev.kind, ev.session_id.clone()),
+            EventMsg::Hook { norm, .. } => (norm.kind, norm.session_id.clone()),
         };
-        let ev = match msg {
-            EventMsg::Raw(ev) => *ev,
-            EventMsg::Hook { norm, harness, at } => enrich(norm, harness, at, &mut cache),
-        };
-        // Capture-time coalescing (Phase 2a): drop a tool-activity event when the
-        // session's last *stored* activity is younger than the coalesce window.
-        // Only the high-volume PreTool/PostTool pair is eligible — human signals,
-        // lifecycle, Stop, and CwdChanged are always stored. `coalesce < idle`
-        // (clamped in Config::coalesce) guarantees every surviving gap stays under
-        // the idle threshold, so accounting::active_seconds is preserved.
-        if !keep_event(&mut last_stored_activity, &ev, coalesce) {
+
+        let outcome = AssertUnwindSafe(process_message(
+            &state,
+            msg,
+            &mut cache,
+            &mut last_stored_activity,
+            coalesce,
+            idle,
+            capture_fn,
+            &mut throttle,
+            &mut events_ingested,
+            &mut events_coalesced,
+        ))
+        .catch_unwind()
+        .await;
+
+        if let Err(panic) = outcome {
+            state.progress.mark_writer_panic();
+            tracing::error!(
+                kind = ?kind_hint,
+                session = %session_hint,
+                panic = %panic_message(panic),
+                "writer: message processing panicked — event dropped, writer continues"
+            );
+        }
+    }
+}
+
+/// Process one drained message end-to-end: enrich (if a hook), decide
+/// capture-time coalescing, append to the store, fold into the live registry,
+/// and best-effort trigger sync / commit-capture / token-capture. Called from
+/// [`writer_with`] wrapped in `catch_unwind`.
+///
+/// **Accounting-ordering invariant (WP-B7).** The store append is the one
+/// durable, irreversible thing this function does, and everything before it —
+/// enrichment, project resolution, the coalescing *decision* — is pure
+/// computation over already-received data. The coalescing *watermark*
+/// (`last_stored_activity`) and the live registry (`observe`) are only ever
+/// mutated AFTER that append has already returned `Ok`, and with nothing
+/// fallible in between the append and those two in-memory updates. So a caught
+/// panic can only land in one of two places:
+///   - before the append: nothing persisted, the watermark/registry are
+///     untouched, and the message is cleanly dropped (no double-store, no
+///     stuck watermark); or
+///   - inside the trivial map-insert/registry-fold pair right after the
+///     append: not expected in practice (no fallible I/O, no `unwrap` on
+///     external input, just arithmetic + `HashMap` ops), and even if it did
+///     happen, it self-heals — the registry is a pure fold over the store's
+///     log, fully reconstructed by the hydrate replay on the next daemon
+///     restart (see `state.rs`'s `SessionRegistry::observe` docs).
+///
+/// Either way, a panic here can never cause a double-store or a silently-stuck
+/// coalescing watermark. Sync-trigger / commit-capture / token-capture run
+/// last, deliberately after the accounting-critical section: they're already
+/// best-effort and idempotent (a missed nudge or a dropped capture just
+/// retries on the next qualifying event), so they carry no ordering constraint.
+#[allow(clippy::too_many_arguments)]
+async fn process_message(
+    state: &AppState,
+    msg: EventMsg,
+    cache: &mut HashMap<String, Resolved>,
+    last_stored_activity: &mut HashMap<String, OffsetDateTime>,
+    coalesce: Duration,
+    idle: Duration,
+    capture_fn: CaptureFn,
+    throttle: &mut Throttle,
+    events_ingested: &mut u64,
+    events_coalesced: &mut u64,
+) {
+    // For Claude hooks at a turn boundary, remember the transcript so we can
+    // capture token usage after the event is logged (off the response path).
+    let transcript = match &msg {
+        EventMsg::Hook { norm, .. } if captures_tokens(norm.kind) => norm.transcript_path.clone(),
+        _ => None,
+    };
+    let ev = match msg {
+        EventMsg::Raw(ev) => *ev,
+        EventMsg::Hook { norm, harness, at } => enrich(norm, harness, at, cache),
+    };
+
+    // Capture-time coalescing (Phase 2a): drop a tool-activity event when the
+    // session's last *stored* activity is younger than the coalesce window.
+    // Only the high-volume PreTool/PostTool pair is eligible — human signals,
+    // lifecycle, Stop, and CwdChanged are always stored. `coalesce < idle`
+    // (clamped in Config::coalesce) guarantees every surviving gap stays under
+    // the idle threshold, so accounting::active_seconds is preserved.
+    //
+    // This is a READ-ONLY decision over `last_stored_activity` — see the
+    // ordering invariant above for why the watermark itself may only be
+    // mutated once the store append below has actually succeeded.
+    let watermark = match coalesce_decision(last_stored_activity, &ev, coalesce) {
+        Watermark::Drop => {
             // Dropped to capture-time coalescing. Approx queue depth = capacity
             // minus the free slots reported by the sender.
-            events_coalesced += 1;
+            *events_coalesced += 1;
             let queue_depth = QUEUE_CAPACITY.saturating_sub(state.tx.capacity());
             tracing::debug!(
-                events_coalesced,
+                events_coalesced = *events_coalesced,
                 queue_depth,
                 kind = ?ev.kind,
                 "ingest: coalesced tool-activity event"
             );
-            continue; // too soon since the last stored activity — drop it
+            return; // too soon since the last stored activity — drop it
         }
-        if let Err(e) = state.store.append(&ev).await {
-            tracing::warn!("append failed: {e}");
-            continue;
+        watermark => watermark,
+    };
+
+    if let Err(e) = state.store.append(&ev).await {
+        tracing::warn!("append failed: {e}");
+        return; // not stored — the watermark/registry stay untouched too
+    }
+    *events_ingested += 1;
+    // Watchdog progress: record that the writer drained a message just now, so
+    // the supervisor can tell a stalled writer from a quiet one.
+    state.progress.mark_writer();
+
+    // Apply the watermark and fold into the registry immediately after the
+    // append succeeds — nothing fallible runs between them. See the
+    // accounting-ordering invariant in this function's doc comment.
+    apply_watermark(last_stored_activity, watermark);
+    crate::control::lock_recover(&state.sessions).observe(&ev, idle);
+
+    // Periodic ingest heartbeat (6d): one info line per 256 stored events keeps
+    // the steady-state log quiet while still surfacing volume + the live
+    // coalescing ratio and an approximate queue depth.
+    if *events_ingested % 256 == 0 {
+        let queue_depth = QUEUE_CAPACITY.saturating_sub(state.tx.capacity());
+        tracing::info!(
+            events_ingested = *events_ingested,
+            events_coalesced = *events_coalesced,
+            queue_depth,
+            queue_capacity = QUEUE_CAPACITY,
+            "ingest: progress"
+        );
+    }
+    // Nudge the sync task on lifecycle boundaries — the points where a window
+    // becomes worth shipping (a session just ended, or an agent paused). The
+    // send is non-blocking; a full channel just means a flush is already
+    // pending, and the periodic backstop covers any missed nudge.
+    if triggers_sync(ev.kind) {
+        let _ = state.sync.trigger.try_send(());
+        // Wake the heartbeat instantly out of a (possibly deep-idle) sleep so
+        // this lifecycle boundary is reflected in presence without waiting out
+        // the cadence (WP-A3).
+        state.presence_wake.notify_waiters();
+    }
+    // Remember a working dir for this repo so the idle ticker can re-poll it,
+    // then capture commits at the points one likely just landed (a tool call
+    // returned, an agent paused, or a session/manual session closed). The
+    // capture is spawned detached + time-boxed, so it never blocks this loop.
+    if let (Some(cwd), Some(proj)) = (ev.cwd.as_deref(), ev.project.as_deref()) {
+        crate::control::lock_recover_map(&state.repo_dirs)
+            .insert(proj.to_string(), cwd.to_string());
+        if capture::captures_commits(ev.kind) && throttle.ready(proj) {
+            capture_fn(state, cwd, proj);
         }
-        events_ingested += 1;
-        // Watchdog progress: record that the writer drained a message just now, so
-        // the supervisor can tell a stalled writer from a quiet one.
-        state.progress.mark_writer();
-        // Periodic ingest heartbeat (6d): one info line per 256 stored events keeps
-        // the steady-state log quiet while still surfacing volume + the live
-        // coalescing ratio and an approximate queue depth.
-        if events_ingested % 256 == 0 {
-            let queue_depth = QUEUE_CAPACITY.saturating_sub(state.tx.capacity());
-            tracing::info!(
-                events_ingested,
-                events_coalesced,
-                queue_depth,
-                queue_capacity = QUEUE_CAPACITY,
-                "ingest: progress"
-            );
-        }
-        crate::control::lock_recover(&state.sessions).observe(&ev, idle);
-        // Nudge the sync task on lifecycle boundaries — the points where a window
-        // becomes worth shipping (a session just ended, or an agent paused). The
-        // send is non-blocking; a full channel just means a flush is already
-        // pending, and the periodic backstop covers any missed nudge.
-        if triggers_sync(ev.kind) {
-            let _ = state.sync.trigger.try_send(());
-        }
-        // Remember a working dir for this repo so the idle ticker can re-poll it,
-        // then capture commits at the points one likely just landed (a tool call
-        // returned, an agent paused, or a session/manual session closed). The
-        // capture is spawned detached + time-boxed, so it never blocks this loop.
-        if let (Some(cwd), Some(proj)) = (ev.cwd.as_deref(), ev.project.as_deref()) {
-            crate::control::lock_recover_map(&state.repo_dirs)
-                .insert(proj.to_string(), cwd.to_string());
-            if capture::captures_commits(ev.kind) && throttle.ready(proj) {
-                capture_fn(&state, cwd, proj);
+    }
+    if let Some(path) = transcript {
+        capture_tokens(state, &path, &ev.session_id, ev.project.as_deref()).await;
+    }
+}
+
+/// What (if anything) the coalescing watermark map needs once an event's fate
+/// is known. Computed by [`coalesce_decision`] (read-only) and applied by
+/// [`apply_watermark`] — split in two so [`process_message`] can run the store
+/// append between "decide" and "mutate" (the ordering invariant above).
+#[derive(Debug, Clone)]
+enum Watermark {
+    /// Too soon since this session's last stored activity — drop the event
+    /// before it ever reaches the store.
+    Drop,
+    /// Record `at` as this session's newest stored tool-activity timestamp.
+    Set(String, OffsetDateTime),
+    /// The session closed — forget its watermark so the map can't grow
+    /// unbounded over a long-lived daemon.
+    Clear(String),
+    /// Not a coalescing-eligible or lifecycle event — nothing to update.
+    None,
+}
+
+/// Read-only coalescing decision over `last` (the per-session last-*stored*-
+/// activity watermark). Mirrors the pre-WP-B7 `keep_event`'s logic exactly, but
+/// without the mutation — see [`Watermark`] for why that's split out.
+fn coalesce_decision(
+    last: &HashMap<String, OffsetDateTime>,
+    ev: &RawEvent,
+    coalesce: Duration,
+) -> Watermark {
+    if coalesces(ev.kind) && coalesce > Duration::ZERO {
+        if let Some(prev) = last.get(&ev.session_id) {
+            if ev.at - *prev < coalesce {
+                return Watermark::Drop;
             }
         }
-        if let Some(path) = transcript {
-            capture_tokens(&state, &path, &ev.session_id, ev.project.as_deref()).await;
+        Watermark::Set(ev.session_id.clone(), ev.at)
+    } else if matches!(ev.kind, EventKind::SessionEnd | EventKind::ManualStop) {
+        Watermark::Clear(ev.session_id.clone())
+    } else {
+        Watermark::None
+    }
+}
+
+/// Apply a [`Watermark`] decided by [`coalesce_decision`] to the map. Only ever
+/// called once the corresponding event is durably stored (or wasn't eligible
+/// for coalescing in the first place).
+fn apply_watermark(last: &mut HashMap<String, OffsetDateTime>, watermark: Watermark) {
+    match watermark {
+        Watermark::Set(session, at) => {
+            last.insert(session, at);
         }
+        Watermark::Clear(session) => {
+            last.remove(&session);
+        }
+        Watermark::None | Watermark::Drop => {}
+    }
+}
+
+/// Best-effort human-readable panic payload, for the loud `tracing::error!` on
+/// a caught per-message panic.
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -138,30 +310,6 @@ pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capt
 /// accounting and project resolution.
 fn coalesces(kind: EventKind) -> bool {
     matches!(kind, EventKind::PreTool | EventKind::PostTool)
-}
-
-/// Decide whether to store `ev`, updating the per-session last-stored-activity
-/// watermark in `last`. Returns `false` when a tool-activity event arrives within
-/// `coalesce` of the session's last *stored* activity (drop it). Non-activity
-/// events are always kept; a session-close event forgets its watermark so the map
-/// can't grow unbounded over a long-lived daemon. `coalesce == 0` disables
-/// coalescing entirely.
-fn keep_event(
-    last: &mut HashMap<String, OffsetDateTime>,
-    ev: &RawEvent,
-    coalesce: Duration,
-) -> bool {
-    if coalesces(ev.kind) && coalesce > Duration::ZERO {
-        if let Some(prev) = last.get(&ev.session_id) {
-            if ev.at - *prev < coalesce {
-                return false;
-            }
-        }
-        last.insert(ev.session_id.clone(), ev.at);
-    } else if matches!(ev.kind, EventKind::SessionEnd | EventKind::ManualStop) {
-        last.remove(&ev.session_id);
-    }
-    true
 }
 
 /// Hooks that mark the end of an agent turn — good points to (re-)read the
@@ -176,7 +324,11 @@ fn captures_tokens(kind: EventKind) -> bool {
 fn triggers_sync(kind: EventKind) -> bool {
     matches!(
         kind,
-        EventKind::SessionStart | EventKind::SessionEnd | EventKind::Stop | EventKind::ManualStop
+        EventKind::SessionStart
+            | EventKind::SessionEnd
+            | EventKind::ManualStart
+            | EventKind::ManualStop
+            | EventKind::Stop
     )
 }
 
@@ -342,6 +494,25 @@ mod tests {
         }
     }
 
+    /// Test-only compatibility shim reconstructing the pre-WP-B7 `keep_event`
+    /// signature/behavior (decide-and-mutate in one call) by composing
+    /// [`coalesce_decision`] + [`apply_watermark`], so the coalescing-policy
+    /// tests below exercise the exact same decision logic the production path
+    /// now runs, unmodified.
+    fn keep_event(
+        last: &mut HashMap<String, OffsetDateTime>,
+        ev: &RawEvent,
+        coalesce: Duration,
+    ) -> bool {
+        match coalesce_decision(last, ev, coalesce) {
+            Watermark::Drop => false,
+            watermark => {
+                apply_watermark(last, watermark);
+                true
+            }
+        }
+    }
+
     /// Tool-spam coalescing: 600 PostTool events 1s apart collapse to a handful
     /// of stored rows, yet `active_seconds` over the *stored* timestamps stays
     /// within the coalesce tolerance of the dense value. This is the Phase 2a
@@ -398,6 +569,26 @@ mod tests {
         // A Stop right after is also kept (agent pause is load-bearing).
         let stop = tool_ev("s", base + Duration::seconds(3), EventKind::Stop);
         assert!(keep_event(&mut last, &stop, coalesce));
+    }
+
+    /// Every session bookend must nudge sync AND wake the heartbeat out of a
+    /// (possibly deep-idle) sleep. `ManualStart` was missing: `dira start`
+    /// during deep idle left the heartbeat parked for up to the full deep-idle
+    /// cadence (~10 min) before presence reflected the new active session.
+    #[test]
+    fn all_session_bookends_trigger_sync_and_presence_wake() {
+        for kind in [
+            EventKind::SessionStart,
+            EventKind::SessionEnd,
+            EventKind::ManualStart,
+            EventKind::ManualStop,
+            EventKind::Stop,
+        ] {
+            assert!(
+                triggers_sync(kind),
+                "{kind:?} is a lifecycle boundary — it must nudge sync and wake presence"
+            );
+        }
     }
 
     #[test]

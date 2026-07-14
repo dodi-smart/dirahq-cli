@@ -9,6 +9,8 @@ mod duration;
 mod format;
 mod init;
 mod render;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod tui;
 

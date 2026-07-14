@@ -405,10 +405,8 @@ pub fn canonicalize_remote(url: &str) -> Option<String> {
         rest.trim_start_matches("git@").to_string()
     } else if let Some(rest) = stripped.strip_prefix("https://") {
         rest.to_string()
-    } else if let Some(rest) = stripped.strip_prefix("http://") {
-        rest.to_string()
     } else {
-        return None;
+        stripped.strip_prefix("http://")?.to_string()
     };
 
     // Drop any userinfo and port, keep host/owner/repo, require at least 3 parts.

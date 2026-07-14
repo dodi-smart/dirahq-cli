@@ -443,6 +443,11 @@ pub struct RotateKeyRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RotateKeyEnvelope {
+    /// Semver of this contract, e.g. `"1.1.0"`. Empty string means a pre-1.1
+    /// client that predates this field; consumers must tolerate an absent or
+    /// empty value rather than rejecting the rotation.
+    #[serde(default)]
+    pub schema_version: String,
     /// ULID of the device (matches `payload.device_id`).
     pub device_id: String,
     /// The rotation request being attested to.
@@ -783,6 +788,7 @@ mod tests {
             sig: "sig".into(),
         };
         let rotate = RotateKeyEnvelope {
+            schema_version: SCHEMA_VERSION.into(),
             device_id: "d".into(),
             payload: RotateKeyRequest {
                 device_id: "d".into(),
@@ -898,6 +904,7 @@ mod tests {
     #[test]
     fn rotate_key_envelope_roundtrips_camel_case() {
         let env = RotateKeyEnvelope {
+            schema_version: SCHEMA_VERSION.into(),
             device_id: "01J0DEVICE".into(),
             payload: RotateKeyRequest {
                 device_id: "01J0DEVICE".into(),
@@ -907,10 +914,30 @@ mod tests {
             sig: "deadbeef".into(),
         };
         let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"schemaVersion\""));
         assert!(json.contains("\"deviceId\""));
         assert!(json.contains("\"newPubkey\""));
         assert!(json.contains("\"rotatedAt\""));
         let back: RotateKeyEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schema_version, SCHEMA_VERSION);
         assert_eq!(back.payload.new_pubkey, "newpubkeyb64");
+    }
+
+    #[test]
+    fn rotate_key_envelope_defaults_schema_version_when_absent() {
+        // Pre-1.1 clients never sent `schemaVersion`; the cloud (and this
+        // struct) must still deserialize the envelope and treat it as empty.
+        let json = r#"{
+            "deviceId": "01J0DEVICE",
+            "payload": {
+                "deviceId": "01J0DEVICE",
+                "newPubkey": "newpubkeyb64",
+                "rotatedAt": "2026-06-29T10:00:00Z"
+            },
+            "sig": "deadbeef"
+        }"#;
+        let env: RotateKeyEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.schema_version, "");
+        assert_eq!(env.payload.new_pubkey, "newpubkeyb64");
     }
 }

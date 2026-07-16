@@ -191,7 +191,12 @@ pub enum Response {
     },
     /// `ZavetWiki` without a topic: the knowledge-base overview.
     ZavetWiki(Box<ZavetWikiView>),
-    /// `ZavetWhy` when the confident winner is a living spec.
+    /// `ZavetWhy` when the confident winner is a living spec. Skew note:
+    /// unlike the additive `specs` fields elsewhere, a NEW variant makes an
+    /// older `dira` error (not degrade) when a newer daemon answers with a
+    /// spec — accepted deliberately: the shapes genuinely differ, both
+    /// binaries ship from one workspace, and the failure is a clean error on
+    /// a query an old CLI couldn't render anyway.
     ZavetSpec(Box<ZavetSpecWhyView>),
     /// `ZavetSetMode`: the applied override (`on`/`off`) or `clear`.
     ZavetModeSet { repo: String, mode: String },

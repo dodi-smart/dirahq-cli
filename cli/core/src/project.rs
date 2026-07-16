@@ -73,8 +73,9 @@ pub fn commit_trailers(root: &Path, shas: &[String]) -> Vec<(String, Vec<(String
 
 /// Repo-relative paths added/modified/renamed-to by `sha` (deleted files
 /// excluded — the zavet layers never parse a deletion). `--root` covers the
-/// initial commit.
-fn changed_paths(root: &Path, sha: &str) -> Vec<String> {
+/// initial commit. One call serves every zavet path filter (see
+/// `crate::zavet::{is_decision_path, is_spec_path}`) — don't diff-tree twice.
+pub fn changed_paths(root: &Path, sha: &str) -> Vec<String> {
     let Some(out) = git(
         root,
         &[
@@ -98,37 +99,6 @@ fn changed_paths(root: &Path, sha: &str) -> Vec<String> {
                 _ => return None,
             };
             Some(path.to_string())
-        })
-        .collect()
-}
-
-/// The `.zavet/decisions/*.md` files added or modified by `sha`, as
-/// repo-relative paths.
-pub fn zavet_decision_changes(root: &Path, sha: &str) -> Vec<String> {
-    changed_paths(root, sha)
-        .into_iter()
-        .filter(|path| {
-            // Only real records (`D-*.md`): scaffolding like `.template.md`
-            // lives alongside them and must never be captured as a decision.
-            path.strip_prefix(crate::zavet::DECISIONS_DIR)
-                .is_some_and(|file| {
-                    !file.contains('/') && file.starts_with("D-") && file.ends_with(".md")
-                })
-        })
-        .collect()
-}
-
-/// The `.zavet/specs/*.md` files added or modified by `sha`, as repo-relative
-/// paths. Flat `<slug>.md` only — dot-prefixed files (`.spec-template.md`)
-/// and subdirectories are never captured as specs.
-pub fn zavet_spec_changes(root: &Path, sha: &str) -> Vec<String> {
-    changed_paths(root, sha)
-        .into_iter()
-        .filter(|path| {
-            path.strip_prefix(crate::zavet::SPECS_DIR)
-                .is_some_and(|file| {
-                    !file.contains('/') && !file.starts_with('.') && file.ends_with(".md")
-                })
         })
         .collect()
 }

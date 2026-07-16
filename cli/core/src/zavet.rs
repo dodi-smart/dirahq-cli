@@ -18,6 +18,22 @@ pub const DECISIONS_DIR: &str = ".zavet/decisions/";
 /// for prefix-stripping repo-relative paths).
 pub const SPECS_DIR: &str = ".zavet/specs/";
 
+/// Whether a repo-relative path is a real decision record (`D-*.md`, flat):
+/// scaffolding like `.template.md` lives alongside the records and must never
+/// be captured as a decision.
+pub fn is_decision_path(path: &str) -> bool {
+    path.strip_prefix(DECISIONS_DIR)
+        .is_some_and(|file| !file.contains('/') && file.starts_with("D-") && file.ends_with(".md"))
+}
+
+/// Whether a repo-relative path is a living spec (flat `<slug>.md`):
+/// dot-prefixed files (`.spec-template.md`) and subdirectories are never
+/// captured as specs.
+pub fn is_spec_path(path: &str) -> bool {
+    path.strip_prefix(SPECS_DIR)
+        .is_some_and(|file| !file.contains('/') && !file.starts_with('.') && file.ends_with(".md"))
+}
+
 /// The trailer keys zavet records (lowercase). Everything else in a commit
 /// footer (`Signed-off-by:`, `Co-authored-by:`, …) is ignored.
 pub const TRAILER_KEYS: &[&str] = &[
@@ -45,19 +61,14 @@ pub fn canonical_decision_id(s: &str) -> Option<String> {
 }
 
 /// The first `D-<digits>` decision reference in `s`, canonicalized, if any.
-/// Hand-rolled scan — not worth a regex dependency.
 pub fn scan_decision_ref(s: &str) -> Option<String> {
-    scan_refs(s, true).into_iter().next()
+    scan_all_decision_refs(s).into_iter().next()
 }
 
 /// EVERY `D-<digits>` decision reference in `s`, canonicalized, deduplicated,
 /// in order of first appearance. Spec bodies auto-link the decisions they
-/// mention through this.
+/// mention through this. Hand-rolled scan — not worth a regex dependency.
 pub fn scan_all_decision_refs(s: &str) -> Vec<String> {
-    scan_refs(s, false)
-}
-
-fn scan_refs(s: &str, first_only: bool) -> Vec<String> {
     let bytes = s.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -75,9 +86,6 @@ fn scan_refs(s: &str, first_only: bool) -> Vec<String> {
             if let Some(id) = canonical_decision_id(&s[i..j]) {
                 if !out.contains(&id) {
                     out.push(id);
-                }
-                if first_only {
-                    return out;
                 }
             }
             i = j;
@@ -156,7 +164,8 @@ fn parse_frontmatter(text: &str) -> Option<RawFrontmatter> {
     }
 
     let mut entries: Vec<(String, FmValue)> = Vec::new();
-    let mut pending_list: Option<(String, Vec<String>)> = None;
+    // Whether the LAST entry is a block list still accepting `- item` lines.
+    let mut in_list = false;
     let mut body_start: Option<usize> = None;
 
     // Byte offset scanning for the body: walk with offsets instead of a line
@@ -175,10 +184,12 @@ fn parse_frontmatter(text: &str) -> Option<RawFrontmatter> {
             break;
         }
 
-        if let Some((_, items)) = pending_list.as_mut() {
+        if in_list {
             let t = line.trim_start();
             if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("-\t")) {
-                items.push(item.trim().to_string());
+                if let Some((_, FmValue::List(items))) = entries.last_mut() {
+                    items.push(item.trim().to_string());
+                }
                 offset = next_offset;
                 continue;
             } else if line.starts_with(char::is_whitespace) && !t.is_empty() {
@@ -186,8 +197,7 @@ fn parse_frontmatter(text: &str) -> Option<RawFrontmatter> {
                 offset = next_offset;
                 continue;
             }
-            let (k, items) = pending_list.take().expect("checked above");
-            entries.push((k, FmValue::List(items)));
+            in_list = false;
         }
 
         if let Some((key, value)) = line.split_once(':') {
@@ -203,9 +213,10 @@ fn parse_frontmatter(text: &str) -> Option<RawFrontmatter> {
                     FmValue::List(inner.split(',').map(|i| i.trim().to_string()).collect()),
                 ));
             } else if structured.is_empty() {
-                // `key:` (bare or comment-only) opens a block list; if no
-                // `- item` lines follow it finalizes as an empty list.
-                pending_list = Some((key.to_string(), Vec::new()));
+                // `key:` (bare or comment-only) opens a block list; with no
+                // `- item` lines following it stays an empty list.
+                entries.push((key.to_string(), FmValue::List(Vec::new())));
+                in_list = true;
             } else {
                 entries.push((key.to_string(), FmValue::Scalar(value.to_string())));
             }
@@ -218,9 +229,6 @@ fn parse_frontmatter(text: &str) -> Option<RawFrontmatter> {
 
     if !closed {
         return None;
-    }
-    if let Some((k, items)) = pending_list.take() {
-        entries.push((k, FmValue::List(items)));
     }
     Some(RawFrontmatter {
         entries,
@@ -310,7 +318,11 @@ pub fn parse_spec(text: &str, path: &str) -> Option<ZavetSpecCapture> {
             ("date", FmValue::Scalar(v)) => cap.date = non_empty(unquote(decomment(v))),
             ("paths", FmValue::List(items)) => cap.paths.extend(clean_list(items)),
             ("decisions", FmValue::List(items)) => {
-                decisions.extend(clean_list(items).filter_map(|d| canonical_decision_id(&d)))
+                for id in clean_list(items).filter_map(|d| canonical_decision_id(&d)) {
+                    if !decisions.contains(&id) {
+                        decisions.push(id);
+                    }
+                }
             }
             _ => {}
         }
@@ -324,16 +336,12 @@ pub fn parse_spec(text: &str, path: &str) -> Option<ZavetSpecCapture> {
     cap.body_md = body_of(text, fm.body_start);
     if let Some(body) = &cap.body_md {
         for id in scan_all_decision_refs(body) {
-            decisions.push(id);
+            if !decisions.contains(&id) {
+                decisions.push(id);
+            }
         }
     }
-    let mut seen: Vec<String> = Vec::new();
-    for d in decisions {
-        if !seen.contains(&d) {
-            seen.push(d);
-        }
-    }
-    cap.decisions = seen;
+    cap.decisions = decisions;
     Some(cap)
 }
 

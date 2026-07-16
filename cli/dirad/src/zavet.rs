@@ -155,33 +155,39 @@ fn repo_workdir(state: &AppState, repo: &str, cwd: Option<&str>) -> Option<PathB
         .or_else(|| cwd.map(PathBuf::from))
 }
 
-/// Compute `stale_commits` for each spec: commits touching its paths after
-/// its `last_commit`, via git in `workdir` — one `spawn_blocking` for the
-/// whole batch. Specs without a `last_commit` or paths stay `None`/`Some(0)`
-/// as appropriate; no workdir means every spec reports `None` (unknown).
-async fn spec_staleness(workdir: Option<PathBuf>, specs: &[ZavetSpecRow]) -> Vec<Option<u64>> {
+/// A spec's `(last_commit, paths)` — what [`spec_staleness`] needs to know.
+fn staleness_input(s: &ZavetSpecRow) -> (Option<String>, Vec<String>) {
+    (s.last_commit.clone(), s.paths.clone())
+}
+
+/// Compute `stale_commits` for each `(last_commit, paths)` input: commits
+/// touching the paths after `last_commit`, via git in `workdir` — one
+/// `spawn_blocking` for the whole batch. Specs without a `last_commit` or
+/// paths stay `None`/`Some(0)` as appropriate; no workdir means every spec
+/// reports `None` (unknown).
+async fn spec_staleness(
+    workdir: Option<PathBuf>,
+    inputs: Vec<(Option<String>, Vec<String>)>,
+) -> Vec<Option<u64>> {
+    let n = inputs.len();
     let Some(dir) = workdir else {
-        return vec![None; specs.len()];
+        return vec![None; n];
     };
-    let inputs: Vec<(Option<String>, Vec<String>)> = specs
-        .iter()
-        .map(|s| (s.last_commit.clone(), s.paths.clone()))
-        .collect();
     tokio::task::spawn_blocking(move || {
         let root = dira_core::project::toplevel(&dir).unwrap_or(dir);
         inputs
-            .into_iter()
+            .iter()
             .map(|(last, paths)| {
-                let last = last?;
+                let last = last.as_deref()?;
                 if paths.is_empty() {
                     return Some(0);
                 }
-                Some(dira_core::project::commits_touching_since(&root, &last, &paths).len() as u64)
+                Some(dira_core::project::commits_touching_since(&root, last, paths).len() as u64)
             })
-            .collect()
+            .collect::<Vec<Option<u64>>>()
     })
     .await
-    .unwrap_or_else(|_| vec![None; specs.len()])
+    .unwrap_or_else(|_| vec![None; n])
 }
 
 fn decision_view(d: &ZavetDecisionRow) -> ZavetDecisionView {
@@ -437,7 +443,11 @@ pub async fn wiki(
         .iter()
         .map(decision_view)
         .partition(|d| d.status.as_deref().unwrap_or("active") == "active");
-    let staleness = spec_staleness(repo_workdir(state, &repo, cwd.as_deref()), &spec_rows).await;
+    let staleness = spec_staleness(
+        repo_workdir(state, &repo, cwd.as_deref()),
+        spec_rows.iter().map(staleness_input).collect(),
+    )
+    .await;
     let specs = spec_rows
         .iter()
         .zip(staleness)
@@ -486,13 +496,8 @@ pub async fn set_mode(
 }
 
 /// What a why query confidently resolved to.
-enum WhyWinner {
-    Decision(String),
-    Spec(String),
-}
-
-/// `Request::ZavetWhy` — the recorded knowledge plus its evidence. Session
-/// pricing (`sessions`, `total_*`) comes from [`price_sessions`].
+/// `Request::ZavetWhy` — resolve a query to the entity that answers it, then
+/// delegate to [`decision_why`]/[`spec_why`] for the detail + cost.
 pub async fn why(
     state: &AppState,
     query: String,
@@ -503,124 +508,129 @@ pub async fn why(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    // A decision id answers directly, and so does an exact spec slug. Free
-    // text ranks decisions AND specs with one confidence rule: the top entity
-    // answers in full iff its score at least doubles the runner-up — the best
-    // other entity (decision or spec) or the best orphan trailer, whichever is
-    // stronger (a sole hit trivially qualifies). Anything less confident
+    // Direct addressing first: a decision id, or an exact spec slug (slugs
+    // are the spec's identity, like ids — a whitespace-free query is checked
+    // against them before searching).
+    if let Some(id) = dira_core::zavet::canonical_decision_id(&query) {
+        return match state.store.zavet_decision_get(&repo, &id).await {
+            Ok(Some(d)) => decision_why(state, &repo, d, None).await,
+            Ok(None) => Response::Error {
+                message: format!("no captured decision `{id}` for {repo} (is it committed, and is the daemon watching this repo?)"),
+            },
+            Err(e) => Response::Error {
+                message: format!("zavet why failed: {e}"),
+            },
+        };
+    }
+    let slug = query.trim();
+    if !slug.is_empty() && !slug.contains(char::is_whitespace) {
+        if let Some(spec) = state
+            .store
+            .zavet_spec_get(&repo, slug)
+            .await
+            .unwrap_or(None)
+        {
+            return spec_why(state, &repo, spec, None, cwd.as_deref()).await;
+        }
+    }
+    // Free text ranks decisions AND specs with ONE confidence rule: the top
+    // entity answers in full iff its score at least doubles the runner-up —
+    // its own kind's second, the other kind's best, or the best orphan
+    // trailer, whichever is stronger (a sole hit trivially qualifies). Ties
+    // prefer decisions (records outrank documents). Anything less confident
     // returns the ranked matches rather than guessing; when only trailers
     // matched, the trailers ARE the answer. Zero is a clean pointer to the wiki.
-    let mut matched_query = None;
-    let winner = match dira_core::zavet::canonical_decision_id(&query) {
-        Some(id) => WhyWinner::Decision(id),
-        None => {
-            let slug = query.trim();
-            let direct_spec = if !slug.is_empty() && !slug.contains(char::is_whitespace) {
-                state
-                    .store
-                    .zavet_spec_get(&repo, slug)
-                    .await
-                    .unwrap_or(None)
-            } else {
-                None
-            };
-            match direct_spec {
-                Some(s) => WhyWinner::Spec(s.slug),
-                None => {
-                    let results = search(state, &repo, &query).await;
-                    if results.is_empty() {
-                        return Response::Error {
-                            message: format!(
-                                "nothing recorded matches `{query}` for {repo} — browse with `dira zavet wiki`, or record it via /zavet:decide"
-                            ),
-                        };
-                    }
-                    let d1 = results.decisions.first().map(|(_, s)| *s).unwrap_or(0);
-                    let s1 = results.specs.first().map(|(_, s)| *s).unwrap_or(0);
-                    let d2 = results.decisions.get(1).map(|(_, s)| *s).unwrap_or(0);
-                    let s2 = results.specs.get(1).map(|(_, s)| *s).unwrap_or(0);
-                    let best_trailer = results.trailers.first().map(|t| t.score).unwrap_or(0);
-                    let win = if d1 >= s1 {
-                        let runner_up = d2.max(s1).max(best_trailer);
-                        (d1 >= runner_up * 2 && d1 > 0)
-                            .then(|| WhyWinner::Decision(results.decisions[0].0.id.clone()))
-                    } else {
-                        let runner_up = s2.max(d1).max(best_trailer);
-                        (s1 >= runner_up * 2)
-                            .then(|| WhyWinner::Spec(results.specs[0].0.slug.clone()))
-                    };
-                    match win {
-                        Some(w) => {
-                            matched_query = Some(query.clone());
-                            w
-                        }
-                        None => {
-                            return Response::ZavetSearch {
-                                query,
-                                hits: results
-                                    .decisions
-                                    .iter()
-                                    .take(5)
-                                    .map(|(d, s)| search_hit(d, *s))
-                                    .collect(),
-                                specs: results
-                                    .specs
-                                    .iter()
-                                    .take(5)
-                                    .map(|(sp, s)| spec_search_hit(sp, *s))
-                                    .collect(),
-                                trailers: results.trailers,
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    let mut results = search(state, &repo, &query).await;
+    if results.is_empty() {
+        return Response::Error {
+            message: format!(
+                "nothing recorded matches `{query}` for {repo} — browse with `dira zavet wiki`, or record it via /zavet:decide"
+            ),
+        };
+    }
+    let d1 = results.decisions.first().map(|(_, s)| *s).unwrap_or(0);
+    let s1 = results.specs.first().map(|(_, s)| *s).unwrap_or(0);
+    let d2 = results.decisions.get(1).map(|(_, s)| *s).unwrap_or(0);
+    let s2 = results.specs.get(1).map(|(_, s)| *s).unwrap_or(0);
+    let best_trailer = results.trailers.first().map(|t| t.score).unwrap_or(0);
+    let (top, own_second, other_top, spec_wins) = if d1 >= s1 {
+        (d1, d2, s1, false)
+    } else {
+        (s1, s2, d1, true)
     };
-    let decision_id = match winner {
-        WhyWinner::Decision(id) => id,
-        WhyWinner::Spec(slug) => {
-            return spec_why(state, &repo, &slug, matched_query, cwd.as_deref()).await
-        }
-    };
-    let decision = match state.store.zavet_decision_get(&repo, &decision_id).await {
-        Ok(Some(d)) => d,
-        Ok(None) => {
-            return Response::Error {
-                message: format!("no captured decision `{decision_id}` for {repo} (is it committed, and is the daemon watching this repo?)"),
-            }
-        }
-        Err(e) => {
-            return Response::Error {
-                message: format!("zavet why failed: {e}"),
-            }
-        }
-    };
+    // `top > 0` guarantees the winning list is non-empty.
+    if top > 0 && top >= own_second.max(other_top).max(best_trailer) * 2 {
+        return if spec_wins {
+            let (spec, _) = results.specs.remove(0);
+            spec_why(state, &repo, spec, Some(query), cwd.as_deref()).await
+        } else {
+            let (decision, _) = results.decisions.remove(0);
+            decision_why(state, &repo, decision, Some(query)).await
+        };
+    }
+    Response::ZavetSearch {
+        query,
+        hits: results
+            .decisions
+            .iter()
+            .take(5)
+            .map(|(d, s)| search_hit(d, *s))
+            .collect(),
+        specs: results
+            .specs
+            .iter()
+            .take(5)
+            .map(|(sp, s)| spec_search_hit(sp, *s))
+            .collect(),
+        trailers: results.trailers,
+    }
+}
+
+/// Summed cost over priced session lines: `(human, agent, input, output)`.
+fn cost_totals(sessions: &[dira_core::protocol::ZavetSessionCostView]) -> (i64, i64, u64, u64) {
+    sessions.iter().fold((0, 0, 0, 0), |(h, a, i, o), s| {
+        (
+            h + s.human_seconds,
+            a + s.agent_seconds,
+            i + s.input_tokens,
+            o + s.output_tokens,
+        )
+    })
+}
+
+/// The decision detail `zavet why` answers with: the record, its evidence
+/// (commits, guard history, covering specs), and the cost panel.
+async fn decision_why(
+    state: &AppState,
+    repo: &str,
+    decision: ZavetDecisionRow,
+    matched_query: Option<String>,
+) -> Response {
+    let decision_id = decision.id.clone();
     // Reverse supersedes link: the decision that replaced this one, if captured.
     let superseded_by = state
         .store
-        .zavet_superseded_by(&repo, &decision_id)
+        .zavet_superseded_by(repo, &decision_id)
         .await
         .unwrap_or(None);
     let commits = state
         .store
-        .zavet_commits_for_decision(&repo, &decision_id)
+        .zavet_commits_for_decision(repo, &decision_id)
         .await
         .unwrap_or_default();
     let stats = state
         .store
-        .zavet_guard_event_stats(&repo, Some(&decision_id))
+        .zavet_guard_event_stats(repo, Some(&decision_id))
         .await
         .unwrap_or_default();
     let sessions = state
         .store
-        .zavet_sessions_for_decision(&repo, &decision_id)
+        .zavet_sessions_for_decision(repo, &decision_id)
         .await
         .unwrap_or_default();
-
     let specs = state
         .store
-        .zavet_specs_for_decision(&repo, &decision_id)
+        .zavet_specs_for_decision(repo, &decision_id)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -634,18 +644,20 @@ pub async fn why(
     let unattributed_guard_events = stats.iter().map(|s| s.unattributed).sum();
 
     let priced = price_sessions(state, &sessions).await;
+    let (total_human_seconds, total_agent_seconds, total_input_tokens, total_output_tokens) =
+        cost_totals(&priced);
     let view = ZavetWhyView {
-        repo: repo.clone(),
+        repo: repo.to_string(),
         matched_query,
         body_md: decision.body_md.clone(),
         decision: decision_view(&decision),
         superseded_by,
         commits: commit_views(commits),
         guard_stats: guard_stat_views(stats),
-        total_human_seconds: priced.iter().map(|l| l.human_seconds).sum(),
-        total_agent_seconds: priced.iter().map(|l| l.agent_seconds).sum(),
-        total_input_tokens: priced.iter().map(|l| l.input_tokens).sum(),
-        total_output_tokens: priced.iter().map(|l| l.output_tokens).sum(),
+        total_human_seconds,
+        total_agent_seconds,
+        total_input_tokens,
+        total_output_tokens,
         sessions: priced,
         unattributed_commits,
         unattributed_guard_events,
@@ -660,35 +672,21 @@ pub async fn why(
 async fn spec_why(
     state: &AppState,
     repo: &str,
-    slug: &str,
+    spec: ZavetSpecRow,
     matched_query: Option<String>,
     cwd: Option<&str>,
 ) -> Response {
-    let spec = match state.store.zavet_spec_get(repo, slug).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return Response::Error {
-                message: format!("no captured spec `{slug}` for {repo} (is it committed, and is the daemon watching this repo?)"),
-            }
-        }
-        Err(e) => {
-            return Response::Error {
-                message: format!("zavet why failed: {e}"),
-            }
-        }
-    };
     let commits = state
         .store
-        .zavet_commits_for_spec(repo, slug)
+        .zavet_commits_for_spec(repo, &spec.slug)
         .await
         .unwrap_or_default();
     let sessions = state
         .store
-        .zavet_sessions_for_spec(repo, slug)
+        .zavet_sessions_for_spec(repo, &spec.slug)
         .await
         .unwrap_or_default();
-    let specs_slice = std::slice::from_ref(&spec);
-    let stale = spec_staleness(repo_workdir(state, repo, cwd), specs_slice)
+    let stale = spec_staleness(repo_workdir(state, repo, cwd), vec![staleness_input(&spec)])
         .await
         .pop()
         .flatten();
@@ -697,16 +695,18 @@ async fn spec_why(
         .filter(|c| c.source_session.is_none())
         .count() as u64;
     let priced = price_sessions(state, &sessions).await;
+    let (total_human_seconds, total_agent_seconds, total_input_tokens, total_output_tokens) =
+        cost_totals(&priced);
     let view = ZavetSpecWhyView {
         repo: repo.to_string(),
         matched_query,
         body_md: spec.body_md.clone(),
         spec: spec_view(&spec, stale),
         commits: commit_views(commits),
-        total_human_seconds: priced.iter().map(|l| l.human_seconds).sum(),
-        total_agent_seconds: priced.iter().map(|l| l.agent_seconds).sum(),
-        total_input_tokens: priced.iter().map(|l| l.input_tokens).sum(),
-        total_output_tokens: priced.iter().map(|l| l.output_tokens).sum(),
+        total_human_seconds,
+        total_agent_seconds,
+        total_input_tokens,
+        total_output_tokens,
         sessions: priced,
         unattributed_commits,
     };

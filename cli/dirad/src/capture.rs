@@ -191,37 +191,40 @@ fn zavet_sweep(root: &Path, commits: &[CapturedCommit]) -> ZavetSweep {
     let mut decisions = Vec::new();
     let mut specs = Vec::new();
     // Oldest first, so within one walk the INTRODUCING commit lands first and
-    // the store's first-sight preservation keeps pointing at it.
+    // the store's first-sight preservation keeps pointing at it. One
+    // diff-tree per commit serves both the decision and the spec filter.
     for c in commits.iter().rev() {
-        for path in project::zavet_decision_changes(root, &c.sha) {
+        for path in project::changed_paths(root, &c.sha) {
+            let is_decision = dira_core::zavet::is_decision_path(&path);
+            if !is_decision && !dira_core::zavet::is_spec_path(&path) {
+                continue;
+            }
             let Some(text) = project::show_blob(root, &c.sha, &path) else {
                 continue;
             };
-            let Some(mut cap) = dira_core::zavet::parse_decision(&text, &path) else {
-                tracing::debug!(sha = %c.sha, path, "zavet: unparseable decision record skipped");
-                continue;
-            };
-            cap.content_hash = project::blob_oid(root, &c.sha, &path);
-            decisions.push(ZavetDecisionAt {
-                sha: c.sha.clone(),
-                authored_at: c.authored_at.clone(),
-                cap,
-            });
-        }
-        for path in project::zavet_spec_changes(root, &c.sha) {
-            let Some(text) = project::show_blob(root, &c.sha, &path) else {
-                continue;
-            };
-            let Some(mut cap) = dira_core::zavet::parse_spec(&text, &path) else {
-                tracing::debug!(sha = %c.sha, path, "zavet: unparseable spec skipped");
-                continue;
-            };
-            cap.content_hash = project::blob_oid(root, &c.sha, &path);
-            specs.push(ZavetSpecAt {
-                sha: c.sha.clone(),
-                authored_at: c.authored_at.clone(),
-                cap,
-            });
+            if is_decision {
+                let Some(mut cap) = dira_core::zavet::parse_decision(&text, &path) else {
+                    tracing::debug!(sha = %c.sha, path, "zavet: unparseable decision record skipped");
+                    continue;
+                };
+                cap.content_hash = project::blob_oid(root, &c.sha, &path);
+                decisions.push(ZavetDecisionAt {
+                    sha: c.sha.clone(),
+                    authored_at: c.authored_at.clone(),
+                    cap,
+                });
+            } else {
+                let Some(mut cap) = dira_core::zavet::parse_spec(&text, &path) else {
+                    tracing::debug!(sha = %c.sha, path, "zavet: unparseable spec skipped");
+                    continue;
+                };
+                cap.content_hash = project::blob_oid(root, &c.sha, &path);
+                specs.push(ZavetSpecAt {
+                    sha: c.sha.clone(),
+                    authored_at: c.authored_at.clone(),
+                    cap,
+                });
+            }
         }
     }
     ZavetSweep {

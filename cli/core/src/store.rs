@@ -1045,15 +1045,7 @@ impl Store {
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ZavetCommitRef {
-                sha: r.get("sha"),
-                message: r.get("message"),
-                authored_at: r.get("authored_at"),
-                source_session: r.get("source_session"),
-            })
-            .collect())
+        Ok(rows.iter().map(row_to_zavet_commit_ref).collect())
     }
 
     /// Every trailer of a repo — `(sha, key, value, decision_id)` — for search:
@@ -1409,15 +1401,7 @@ impl Store {
         .bind(slug)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ZavetCommitRef {
-                sha: r.get("sha"),
-                message: r.get("message"),
-                authored_at: r.get("authored_at"),
-                source_session: r.get("source_session"),
-            })
-            .collect())
+        Ok(rows.iter().map(row_to_zavet_commit_ref).collect())
     }
 
     /// The distinct session ids evidencing a spec: source sessions of its
@@ -1689,6 +1673,15 @@ fn row_to_zavet_spec(row: &sqlx::sqlite::SqliteRow) -> ZavetSpecRow {
         source_session: row.get("source_session"),
         paths: Vec::new(),
         decisions: Vec::new(),
+    }
+}
+
+fn row_to_zavet_commit_ref(row: &sqlx::sqlite::SqliteRow) -> ZavetCommitRef {
+    ZavetCommitRef {
+        sha: row.get("sha"),
+        message: row.get("message"),
+        authored_at: row.get("authored_at"),
+        source_session: row.get("source_session"),
     }
 }
 

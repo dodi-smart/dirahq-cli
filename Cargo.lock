@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "dira"
-version = "0.1.0-develop.7"
+version = "0.1.0-develop.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "dira-contract"
-version = "0.1.0-develop.7"
+version = "0.1.0-develop.8"
 dependencies = [
  "schemars",
  "serde",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "dira-core"
-version = "0.1.0-develop.7"
+version = "0.1.0-develop.8"
 dependencies = [
  "base64",
  "criterion",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "dira-sources"
-version = "0.1.0-develop.7"
+version = "0.1.0-develop.8"
 dependencies = [
  "dira-contract",
  "dira-core",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "dirad"
-version = "0.1.0-develop.7"
+version = "0.1.0-develop.8"
 dependencies = [
  "anyhow",
  "axum",

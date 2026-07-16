@@ -71,10 +71,10 @@ pub fn commit_trailers(root: &Path, shas: &[String]) -> Vec<(String, Vec<(String
         .collect()
 }
 
-/// The `.zavet/decisions/*.md` files added or modified by `sha`, as
-/// repo-relative paths. Deleted files are excluded (an append-only layer never
-/// deletes, and there is nothing to parse). `--root` covers the initial commit.
-pub fn zavet_decision_changes(root: &Path, sha: &str) -> Vec<String> {
+/// Repo-relative paths added/modified/renamed-to by `sha` (deleted files
+/// excluded — the zavet layers never parse a deletion). `--root` covers the
+/// initial commit.
+fn changed_paths(root: &Path, sha: &str) -> Vec<String> {
     let Some(out) = git(
         root,
         &[
@@ -97,13 +97,58 @@ pub fn zavet_decision_changes(root: &Path, sha: &str) -> Vec<String> {
                 'R' | 'C' => path.rsplit('\t').next()?,
                 _ => return None,
             };
-            // Only real records (`D-*.md`): scaffolding like `.template.md`
-            // lives alongside them and must never be captured as a decision.
-            let file = path.strip_prefix(crate::zavet::DECISIONS_DIR)?;
-            (!file.contains('/') && file.starts_with("D-") && file.ends_with(".md"))
-                .then(|| path.to_string())
+            Some(path.to_string())
         })
         .collect()
+}
+
+/// The `.zavet/decisions/*.md` files added or modified by `sha`, as
+/// repo-relative paths.
+pub fn zavet_decision_changes(root: &Path, sha: &str) -> Vec<String> {
+    changed_paths(root, sha)
+        .into_iter()
+        .filter(|path| {
+            // Only real records (`D-*.md`): scaffolding like `.template.md`
+            // lives alongside them and must never be captured as a decision.
+            path.strip_prefix(crate::zavet::DECISIONS_DIR)
+                .is_some_and(|file| {
+                    !file.contains('/') && file.starts_with("D-") && file.ends_with(".md")
+                })
+        })
+        .collect()
+}
+
+/// The `.zavet/specs/*.md` files added or modified by `sha`, as repo-relative
+/// paths. Flat `<slug>.md` only — dot-prefixed files (`.spec-template.md`)
+/// and subdirectories are never captured as specs.
+pub fn zavet_spec_changes(root: &Path, sha: &str) -> Vec<String> {
+    changed_paths(root, sha)
+        .into_iter()
+        .filter(|path| {
+            path.strip_prefix(crate::zavet::SPECS_DIR)
+                .is_some_and(|file| {
+                    !file.contains('/') && !file.starts_with('.') && file.ends_with(".md")
+                })
+        })
+        .collect()
+}
+
+/// Shas of commits after `since_sha` (exclusive) that touch any of
+/// `pathspecs` — zavet's spec-staleness primitive, computed at query time
+/// because no table stores per-commit paths. Globs go through git's own
+/// `:(glob)` magic so `**` behaves like the spec authored it. Best-effort:
+/// a git failure (unknown sha, unborn branch) yields an empty list.
+pub fn commits_touching_since(root: &Path, since_sha: &str, pathspecs: &[String]) -> Vec<String> {
+    if pathspecs.is_empty() {
+        return Vec::new();
+    }
+    let range = format!("{since_sha}..HEAD");
+    let mut args: Vec<String> = vec!["log".into(), "--format=%H".into(), range, "--".into()];
+    args.extend(pathspecs.iter().map(|p| format!(":(glob){p}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    git(root, &args)
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// The content of `path` as of `sha` (`git show sha:path`).

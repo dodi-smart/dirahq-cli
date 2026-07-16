@@ -1180,6 +1180,278 @@ impl Store {
         })
     }
 
+    /// Upsert a living spec captured from `commit_sha`. First-sight fields
+    /// (`first_commit`, `created_at`, `source_session`) are preserved on
+    /// conflict — provenance stays with the commit that INTRODUCED the spec.
+    /// Path globs and decision links are replaced wholesale in the same
+    /// transaction (both are derived from the living document).
+    pub async fn zavet_upsert_spec(
+        &self,
+        repo: &str,
+        cap: &ZavetSpecCapture,
+        commit_sha: &str,
+        authored_at: Option<&str>,
+        source_session: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO zavet_specs
+                (repo, slug, title, version, origin, verified, confidence, date,
+                 path, body_md, content_hash,
+                 first_commit, last_commit, created_at, updated_at, source_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?13, ?14)
+             ON CONFLICT(repo, slug) DO UPDATE SET
+                title = excluded.title,
+                version = excluded.version,
+                origin = excluded.origin,
+                verified = excluded.verified,
+                confidence = excluded.confidence,
+                date = excluded.date,
+                path = excluded.path,
+                body_md = excluded.body_md,
+                content_hash = excluded.content_hash,
+                last_commit = excluded.last_commit,
+                updated_at = excluded.updated_at",
+        )
+        .bind(repo)
+        .bind(&cap.slug)
+        .bind(&cap.title)
+        .bind(cap.version)
+        .bind(&cap.origin)
+        .bind(cap.verified)
+        .bind(&cap.confidence)
+        .bind(&cap.date)
+        .bind(&cap.path)
+        .bind(&cap.body_md)
+        .bind(&cap.content_hash)
+        .bind(commit_sha)
+        .bind(authored_at)
+        .bind(source_session)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM zavet_spec_paths WHERE repo = ?1 AND slug = ?2")
+            .bind(repo)
+            .bind(&cap.slug)
+            .execute(&mut *tx)
+            .await?;
+        for glob in &cap.paths {
+            sqlx::query(
+                "INSERT OR IGNORE INTO zavet_spec_paths (repo, slug, glob) VALUES (?1, ?2, ?3)",
+            )
+            .bind(repo)
+            .bind(&cap.slug)
+            .bind(glob)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DELETE FROM zavet_spec_decisions WHERE repo = ?1 AND slug = ?2")
+            .bind(repo)
+            .bind(&cap.slug)
+            .execute(&mut *tx)
+            .await?;
+        for id in &cap.decisions {
+            sqlx::query(
+                "INSERT OR IGNORE INTO zavet_spec_decisions (repo, slug, decision_id)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(repo)
+            .bind(&cap.slug)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// One spec with its paths and decision links, or `None`.
+    pub async fn zavet_spec_get(
+        &self,
+        repo: &str,
+        slug: &str,
+    ) -> Result<Option<ZavetSpecRow>, Error> {
+        let row = sqlx::query(
+            "SELECT repo, slug, title, version, origin, verified, confidence, date,
+                    path, body_md, content_hash,
+                    first_commit, last_commit, created_at, updated_at, source_session
+             FROM zavet_specs WHERE repo = ?1 AND slug = ?2",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let mut spec = row_to_zavet_spec(&row);
+        let paths = sqlx::query(
+            "SELECT glob FROM zavet_spec_paths WHERE repo = ?1 AND slug = ?2 ORDER BY glob",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await?;
+        spec.paths = paths.iter().map(|r| r.get::<String, _>("glob")).collect();
+        let links = sqlx::query(
+            "SELECT decision_id FROM zavet_spec_decisions
+             WHERE repo = ?1 AND slug = ?2 ORDER BY decision_id",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await?;
+        spec.decisions = links
+            .iter()
+            .map(|r| r.get::<String, _>("decision_id"))
+            .collect();
+        Ok(Some(spec))
+    }
+
+    /// All specs for a repo (with paths and decision links), ordered by slug.
+    /// Children come from two bulk queries grouped in memory, not per-spec
+    /// lookups.
+    pub async fn zavet_specs_list(&self, repo: &str) -> Result<Vec<ZavetSpecRow>, Error> {
+        let rows = sqlx::query(
+            "SELECT repo, slug, title, version, origin, verified, confidence, date,
+                    path, body_md, content_hash,
+                    first_commit, last_commit, created_at, updated_at, source_session
+             FROM zavet_specs WHERE repo = ?1 ORDER BY slug ASC",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let path_rows = sqlx::query(
+            "SELECT slug, glob FROM zavet_spec_paths WHERE repo = ?1 ORDER BY slug, glob",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut paths: HashMap<String, Vec<String>> = HashMap::new();
+        for r in &path_rows {
+            paths.entry(r.get("slug")).or_default().push(r.get("glob"));
+        }
+        let link_rows = sqlx::query(
+            "SELECT slug, decision_id FROM zavet_spec_decisions WHERE repo = ?1
+             ORDER BY slug, decision_id",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut links: HashMap<String, Vec<String>> = HashMap::new();
+        for r in &link_rows {
+            links
+                .entry(r.get("slug"))
+                .or_default()
+                .push(r.get("decision_id"));
+        }
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut s = row_to_zavet_spec(row);
+                if let Some(p) = paths.remove(&s.slug) {
+                    s.paths = p;
+                }
+                if let Some(d) = links.remove(&s.slug) {
+                    s.decisions = d;
+                }
+                s
+            })
+            .collect())
+    }
+
+    /// The specs that link a decision — the reverse direction, for
+    /// `zavet why D-NNNN`. `(slug, title)` pairs, ordered by slug.
+    pub async fn zavet_specs_for_decision(
+        &self,
+        repo: &str,
+        decision_id: &str,
+    ) -> Result<Vec<(String, Option<String>)>, Error> {
+        let rows = sqlx::query(
+            "SELECT s.slug AS slug, s.title AS title
+             FROM zavet_spec_decisions d
+             JOIN zavet_specs s ON s.repo = d.repo AND s.slug = d.slug
+             WHERE d.repo = ?1 AND d.decision_id = ?2
+             ORDER BY s.slug",
+        )
+        .bind(repo)
+        .bind(decision_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("slug"), r.get("title")))
+            .collect())
+    }
+
+    /// Commits linked to a spec: `Spec: <slug>` trailer commits plus the
+    /// spec's own first/last commits, newest first. Commits never captured
+    /// into `artifacts` still appear, with only their sha.
+    pub async fn zavet_commits_for_spec(
+        &self,
+        repo: &str,
+        slug: &str,
+    ) -> Result<Vec<ZavetCommitRef>, Error> {
+        let rows = sqlx::query(
+            "SELECT shas.sha AS sha, a.message AS message, a.authored_at AS authored_at,
+                    a.source_session AS source_session
+             FROM (
+                SELECT DISTINCT sha FROM zavet_trailers
+                    WHERE repo = ?1 AND key = 'spec' AND TRIM(value) = ?2
+                UNION
+                SELECT first_commit AS sha FROM zavet_specs
+                    WHERE repo = ?1 AND slug = ?2 AND first_commit IS NOT NULL
+                UNION
+                SELECT last_commit AS sha FROM zavet_specs
+                    WHERE repo = ?1 AND slug = ?2 AND last_commit IS NOT NULL
+             ) shas
+             LEFT JOIN artifacts a ON a.sha = shas.sha
+             ORDER BY a.authored_at DESC, shas.sha",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ZavetCommitRef {
+                sha: r.get("sha"),
+                message: r.get("message"),
+                authored_at: r.get("authored_at"),
+                source_session: r.get("source_session"),
+            })
+            .collect())
+    }
+
+    /// The distinct session ids evidencing a spec: source sessions of its
+    /// `Spec:`-trailer commits and of the commits that introduced/last touched
+    /// the file. The session set `zavet why` prices for a spec.
+    pub async fn zavet_sessions_for_spec(
+        &self,
+        repo: &str,
+        slug: &str,
+    ) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT s FROM (
+                SELECT a.source_session AS s FROM artifacts a
+                    JOIN zavet_trailers t ON t.sha = a.sha
+                    WHERE t.repo = ?1 AND t.key = 'spec' AND TRIM(t.value) = ?2
+                      AND a.source_session IS NOT NULL
+                UNION
+                SELECT a.source_session AS s FROM artifacts a
+                    WHERE a.source_session IS NOT NULL AND a.sha IN (
+                        SELECT first_commit FROM zavet_specs
+                            WHERE repo = ?1 AND slug = ?2 AND first_commit IS NOT NULL
+                        UNION
+                        SELECT last_commit FROM zavet_specs
+                            WHERE repo = ?1 AND slug = ?2 AND last_commit IS NOT NULL
+                    )
+             ) ORDER BY s",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("s")).collect())
+    }
+
     /// Capture-health counters for `dira zavet status`.
     pub async fn zavet_counts(&self, repo: &str) -> Result<ZavetCounts, Error> {
         let d = sqlx::query(
@@ -1198,11 +1470,16 @@ impl Store {
             .bind(repo)
             .fetch_one(&self.pool)
             .await?;
+        let s = sqlx::query("SELECT COUNT(*) AS n FROM zavet_specs WHERE repo = ?1")
+            .bind(repo)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(ZavetCounts {
             decisions_total: d.get::<i64, _>("total") as u64,
             decisions_active: d.get::<Option<i64>, _>("active").unwrap_or(0) as u64,
             trailers: t.get::<i64, _>("n") as u64,
             guard_events: g.get::<i64, _>("n") as u64,
+            specs_total: s.get::<i64, _>("n") as u64,
         })
     }
 }
@@ -1271,6 +1548,36 @@ pub struct ZavetDecisionCapture {
     pub verified: Option<bool>,
 }
 
+/// A living spec as parsed from a `.zavet/specs/*.md` blob at capture time —
+/// the input to [`Store::zavet_upsert_spec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetSpecCapture {
+    /// Filename stem — the spec's identity.
+    pub slug: String,
+    pub title: Option<String>,
+    /// Frontmatter `version` (bumped on regeneration); parse defaults to 1.
+    pub version: i64,
+    /// `designed` | `session` | `reverse-engineered`; parse defaults to the
+    /// most skeptical (`reverse-engineered`).
+    pub origin: String,
+    /// `true` only after a human confirms the spec matches the code.
+    pub verified: Option<bool>,
+    /// `low` | `med` | `high`; parse defaults to `low`.
+    pub confidence: String,
+    /// Frontmatter `date` (spec's own last-touched claim), verbatim.
+    pub date: Option<String>,
+    /// Git pathspecs the spec covers — the staleness domain.
+    pub paths: Vec<String>,
+    /// Linked decision ids: frontmatter `decisions:` ∪ body D-refs, canonical.
+    pub decisions: Vec<String>,
+    /// Repo-relative file path.
+    pub path: String,
+    /// Full spec body — LOCAL-ONLY, never crosses the wire (D-0001).
+    pub body_md: Option<String>,
+    /// Git blob sha of the file at the capturing commit.
+    pub content_hash: Option<String>,
+}
+
 /// A stored decision row plus its guard globs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZavetDecisionRow {
@@ -1336,6 +1643,53 @@ pub struct ZavetCounts {
     pub decisions_active: u64,
     pub trailers: u64,
     pub guard_events: u64,
+    pub specs_total: u64,
+}
+
+/// A stored spec row plus its path globs and decision links.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetSpecRow {
+    pub repo: String,
+    pub slug: String,
+    pub title: Option<String>,
+    pub version: i64,
+    pub origin: Option<String>,
+    pub verified: Option<bool>,
+    pub confidence: Option<String>,
+    pub date: Option<String>,
+    pub path: String,
+    pub body_md: Option<String>,
+    pub content_hash: Option<String>,
+    pub first_commit: Option<String>,
+    pub last_commit: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_session: Option<String>,
+    pub paths: Vec<String>,
+    pub decisions: Vec<String>,
+}
+
+fn row_to_zavet_spec(row: &sqlx::sqlite::SqliteRow) -> ZavetSpecRow {
+    ZavetSpecRow {
+        repo: row.get("repo"),
+        slug: row.get("slug"),
+        title: row.get("title"),
+        version: row.get("version"),
+        origin: row.get("origin"),
+        verified: row.get("verified"),
+        confidence: row.get("confidence"),
+        date: row.get("date"),
+        path: row.get("path"),
+        body_md: row.get("body_md"),
+        content_hash: row.get("content_hash"),
+        first_commit: row.get("first_commit"),
+        last_commit: row.get("last_commit"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        source_session: row.get("source_session"),
+        paths: Vec::new(),
+        decisions: Vec::new(),
+    }
 }
 
 fn row_to_zavet_decision(row: &sqlx::sqlite::SqliteRow) -> ZavetDecisionRow {
@@ -1976,6 +2330,158 @@ mod tests {
         assert_eq!(d.content_hash.as_deref(), Some("blob2"));
         // Guards were replaced wholesale, not accumulated.
         assert_eq!(d.guards, vec!["a/**".to_string()]);
+    }
+
+    fn spec(slug: &str, paths: &[&str], decisions: &[&str]) -> ZavetSpecCapture {
+        ZavetSpecCapture {
+            slug: slug.to_string(),
+            title: Some("Capture pipeline".into()),
+            version: 1,
+            origin: "session".into(),
+            verified: Some(false),
+            confidence: "high".into(),
+            date: Some("2026-07-16".into()),
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            decisions: decisions.iter().map(|s| s.to_string()).collect(),
+            path: format!(".zavet/specs/{slug}.md"),
+            body_md: Some("## Overview\nsweeps".into()),
+            content_hash: Some("blobS1".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn zavet_spec_upsert_preserves_first_sight_and_replaces_children() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_spec(
+                repo,
+                &spec(
+                    "capture-pipeline",
+                    &["cli/dirad/**", "cli/core/src/zavet.rs"],
+                    &["D-0001"],
+                ),
+                "shaS1",
+                Some("2026-07-01T00:00:00Z"),
+                Some("s1"),
+            )
+            .await
+            .unwrap();
+
+        // Second capture: later commit, other session, narrowed paths, relinked.
+        let mut cap = spec("capture-pipeline", &["cli/dirad/**"], &["D-0002"]);
+        cap.version = 2;
+        cap.confidence = "med".into();
+        cap.content_hash = Some("blobS2".into());
+        store
+            .zavet_upsert_spec(
+                repo,
+                &cap,
+                "shaS2",
+                Some("2026-07-16T00:00:00Z"),
+                Some("s2"),
+            )
+            .await
+            .unwrap();
+
+        let s = store
+            .zavet_spec_get(repo, "capture-pipeline")
+            .await
+            .unwrap()
+            .unwrap();
+        // First-sight provenance survives the update…
+        assert_eq!(s.first_commit.as_deref(), Some("shaS1"));
+        assert_eq!(s.created_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(s.source_session.as_deref(), Some("s1"));
+        // …while the living fields track the latest commit.
+        assert_eq!(s.last_commit.as_deref(), Some("shaS2"));
+        assert_eq!(s.version, 2);
+        assert_eq!(s.confidence.as_deref(), Some("med"));
+        assert_eq!(s.content_hash.as_deref(), Some("blobS2"));
+        // Paths and decision links were replaced wholesale, not accumulated.
+        assert_eq!(s.paths, vec!["cli/dirad/**".to_string()]);
+        assert_eq!(s.decisions, vec!["D-0002".to_string()]);
+
+        // Upserting the same capture again is a no-op (idempotent).
+        store
+            .zavet_upsert_spec(
+                repo,
+                &cap,
+                "shaS2",
+                Some("2026-07-16T00:00:00Z"),
+                Some("s2"),
+            )
+            .await
+            .unwrap();
+        let again = store
+            .zavet_spec_get(repo, "capture-pipeline")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, s);
+
+        let counts = store.zavet_counts(repo).await.unwrap();
+        assert_eq!(counts.specs_total, 1);
+    }
+
+    #[tokio::test]
+    async fn zavet_specs_list_bulk_loads_children_and_reverse_lookup_joins() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_spec(
+                repo,
+                &spec("auth-flow", &["src/auth/**"], &["D-0001"]),
+                "sA",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .zavet_upsert_spec(
+                repo,
+                &spec("capture-pipeline", &["cli/**"], &["D-0001", "D-0002"]),
+                "sB",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let list = store.zavet_specs_list(repo).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].slug, "auth-flow");
+        assert_eq!(list[0].paths, vec!["src/auth/**".to_string()]);
+        assert_eq!(list[0].decisions, vec!["D-0001".to_string()]);
+        assert_eq!(list[1].slug, "capture-pipeline");
+        assert_eq!(
+            list[1].decisions,
+            vec!["D-0001".to_string(), "D-0002".to_string()]
+        );
+
+        // Reverse: which specs cover D-0001 / D-0002?
+        let covering = store
+            .zavet_specs_for_decision(repo, "D-0001")
+            .await
+            .unwrap();
+        assert_eq!(
+            covering.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["auth-flow", "capture-pipeline"]
+        );
+        let covering = store
+            .zavet_specs_for_decision(repo, "D-0002")
+            .await
+            .unwrap();
+        assert_eq!(covering.len(), 1);
+        assert_eq!(covering[0].0, "capture-pipeline");
+        assert_eq!(covering[0].1.as_deref(), Some("Capture pipeline"));
+        // Another repo sees nothing.
+        assert!(store
+            .zavet_specs_for_decision("github.com/o/other", "D-0001")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

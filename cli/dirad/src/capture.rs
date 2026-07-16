@@ -90,10 +90,12 @@ struct GitWalk {
     /// same `spawn_blocking` so this extra git work never touches the hot path.
     signals: project::SessionSignals,
     /// Zavet knowledge captured from the walked commits (empty unless the repo
-    /// is zavet-active): per-sha trailer sets, and decision records parsed
-    /// from `.zavet/decisions/*.md` blobs touched by each commit.
+    /// is zavet-active): per-sha trailer sets, decision records parsed from
+    /// `.zavet/decisions/*.md` blobs, and living specs parsed from
+    /// `.zavet/specs/*.md` blobs touched by each commit.
     trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
     decisions: Vec<ZavetDecisionAt>,
+    specs: Vec<ZavetSpecAt>,
 }
 
 /// A decision record as of one commit, ready to upsert.
@@ -101,6 +103,13 @@ struct ZavetDecisionAt {
     sha: String,
     authored_at: Option<String>,
     cap: dira_core::store::ZavetDecisionCapture,
+}
+
+/// A living spec as of one commit, ready to upsert.
+struct ZavetSpecAt {
+    sha: String,
+    authored_at: Option<String>,
+    cap: dira_core::store::ZavetSpecCapture,
 }
 
 /// Run the blocking git walk for a repo: resolve HEAD, and (unless HEAD is
@@ -133,10 +142,10 @@ fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWa
         zavet.override_,
         crate::zavet::zavet_dir_exists(project::toplevel(root).as_deref().unwrap_or(root)),
     );
-    let (trailers, decisions) = if zavet_active && !commits.is_empty() {
+    let sweep = if zavet_active && !commits.is_empty() {
         zavet_sweep(root, &commits)
     } else {
-        (Vec::new(), Vec::new())
+        ZavetSweep::default()
     };
 
     Some(GitWalk {
@@ -144,8 +153,9 @@ fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWa
         commits,
         git_ref,
         signals,
-        trailers,
-        decisions,
+        trailers: sweep.trailers,
+        decisions: sweep.decisions,
+        specs: sweep.specs,
     })
 }
 
@@ -156,17 +166,20 @@ struct ZavetGate {
     override_: Option<bool>,
 }
 
+/// What one zavet sweep of a commit range yields.
+#[derive(Default)]
+struct ZavetSweep {
+    trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
+    decisions: Vec<ZavetDecisionAt>,
+    specs: Vec<ZavetSpecAt>,
+}
+
 /// The zavet portion of a walk: batched trailer parse over the walked shas,
-/// plus decision-record parsing for every `.zavet/decisions/*.md` blob touched
-/// by each commit. All plain `git log`/`diff-tree`/`show` subprocess calls —
-/// shares the walk's blocking budget.
-fn zavet_sweep(
-    root: &Path,
-    commits: &[CapturedCommit],
-) -> (
-    Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
-    Vec<ZavetDecisionAt>,
-) {
+/// plus decision-record and spec parsing for every `.zavet/decisions/*.md` /
+/// `.zavet/specs/*.md` blob touched by each commit. All plain
+/// `git log`/`diff-tree`/`show` subprocess calls — shares the walk's blocking
+/// budget.
+fn zavet_sweep(root: &Path, commits: &[CapturedCommit]) -> ZavetSweep {
     let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
     let trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)> =
         project::commit_trailers(root, &shas)
@@ -176,6 +189,7 @@ fn zavet_sweep(
             .collect();
 
     let mut decisions = Vec::new();
+    let mut specs = Vec::new();
     // Oldest first, so within one walk the INTRODUCING commit lands first and
     // the store's first-sight preservation keeps pointing at it.
     for c in commits.iter().rev() {
@@ -194,8 +208,27 @@ fn zavet_sweep(
                 cap,
             });
         }
+        for path in project::zavet_spec_changes(root, &c.sha) {
+            let Some(text) = project::show_blob(root, &c.sha, &path) else {
+                continue;
+            };
+            let Some(mut cap) = dira_core::zavet::parse_spec(&text, &path) else {
+                tracing::debug!(sha = %c.sha, path, "zavet: unparseable spec skipped");
+                continue;
+            };
+            cap.content_hash = project::blob_oid(root, &c.sha, &path);
+            specs.push(ZavetSpecAt {
+                sha: c.sha.clone(),
+                authored_at: c.authored_at.clone(),
+                cap,
+            });
+        }
     }
-    (trailers, decisions)
+    ZavetSweep {
+        trailers,
+        decisions,
+        specs,
+    }
 }
 
 /// Poll a repo for new commits and record them locally. Best-effort: a non-git
@@ -305,6 +338,23 @@ pub async fn capture_commits(state: &AppState, cwd: &str, canonical: &str) {
             tracing::warn!("zavet decision {} failed: {e}", d.cap.id);
         } else {
             tracing::info!(decision = %d.cap.id, repo = %canonical, "captured zavet decision");
+        }
+    }
+    for s in &walk.specs {
+        if let Err(e) = state
+            .store
+            .zavet_upsert_spec(
+                canonical,
+                &s.cap,
+                &s.sha,
+                s.authored_at.as_deref(),
+                source_session.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!("zavet spec {} failed: {e}", s.cap.slug);
+        } else {
+            tracing::info!(spec = %s.cap.slug, repo = %canonical, "captured zavet spec");
         }
     }
 

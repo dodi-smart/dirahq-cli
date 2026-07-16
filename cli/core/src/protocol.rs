@@ -183,11 +183,16 @@ pub enum Response {
     ZavetSearch {
         query: String,
         hits: Vec<ZavetSearchHit>,
+        /// Matching living specs, ranked with the same weights.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        specs: Vec<ZavetSpecHit>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         trailers: Vec<ZavetTrailerHit>,
     },
     /// `ZavetWiki` without a topic: the knowledge-base overview.
     ZavetWiki(Box<ZavetWikiView>),
+    /// `ZavetWhy` when the confident winner is a living spec.
+    ZavetSpec(Box<ZavetSpecWhyView>),
     /// `ZavetSetMode`: the applied override (`on`/`off`) or `clear`.
     ZavetModeSet { repo: String, mode: String },
 }
@@ -474,6 +479,73 @@ pub struct ZavetTrailerHit {
     pub score: u32,
 }
 
+/// One captured living spec (`.zavet/specs/<slug>.md`), with its computed
+/// staleness when the daemon had a working directory to ask git in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecView {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub version: i64,
+    /// `designed` | `session` | `reverse-engineered`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// `true` only after a human confirmed the spec matches the code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// `low` | `med` | `high`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    pub path: String,
+    /// Git pathspecs the spec covers — the staleness domain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Linked decision ids (spec-side links; decisions stay append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session: Option<String>,
+    /// Commits touching `paths` after `last_commit` — computed at query time
+    /// from git. `None` when no working directory was available to ask in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_commits: Option<u64>,
+}
+
+/// One ranked spec hit for a free-text `why`/`wiki` query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecHit {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// First plain-prose sentence of the spec body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    pub score: u32,
+}
+
+/// A `(slug, title)` pointer to a spec that links a decision — the reverse
+/// direction shown on `zavet why D-NNNN`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecRef {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 /// `dira zavet wiki` — the knowledge-base overview for a repo.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZavetWikiView {
@@ -481,10 +553,15 @@ pub struct ZavetWikiView {
     pub decisions_total: u64,
     pub trailers: u64,
     pub guard_events: u64,
+    #[serde(default)]
+    pub specs_total: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active: Vec<ZavetDecisionView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub superseded: Vec<ZavetDecisionView>,
+    /// Living specs with staleness + confidence badges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs: Vec<ZavetSpecView>,
     /// Latest captured trailers, newest first: `(sha, key, value)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent: Vec<(String, String, String)>,
@@ -542,6 +619,36 @@ pub struct ZavetWhyView {
     /// cost reads as an honest lower bound.
     pub unattributed_commits: u64,
     pub unattributed_guard_events: u64,
+    /// Specs that link this decision (the reverse of the spec-side links).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs: Vec<ZavetSpecRef>,
+}
+
+/// `dira zavet why <spec query>` — a living spec plus what it cost.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecWhyView {
+    pub repo: String,
+    /// When a free-text query resolved to this spec, what it matched on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_query: Option<String>,
+    pub spec: ZavetSpecView,
+    /// Full spec body (local-only data; shown, never synced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+    /// Commits linked via `Spec:` trailers plus the spec's own first/last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<ZavetCommitView>,
+    /// Priced sessions evidencing this spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<ZavetSessionCostView>,
+    /// Summed cost over `sessions`.
+    pub total_human_seconds: i64,
+    pub total_agent_seconds: i64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    /// Commits that could not be attributed to a session — the cost is an
+    /// honest lower bound.
+    pub unattributed_commits: u64,
 }
 
 /// True when the operator is in the loop — at least one of these sessions has a

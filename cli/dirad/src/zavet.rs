@@ -10,9 +10,10 @@ use crate::control::lock_recover;
 use crate::state::AppState;
 use dira_core::config::ZavetMode;
 use dira_core::protocol::{
-    Response, ZavetDecisionView, ZavetGuardStatView, ZavetStatusView, ZavetWhyView,
+    Response, ZavetDecisionView, ZavetGuardStatView, ZavetSpecView, ZavetSpecWhyView,
+    ZavetStatusView, ZavetWhyView,
 };
-use dira_core::store::ZavetDecisionRow;
+use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
 pub use dira_core::zavet::{parse_guard_event, GuardEventV1, ZAVET_DIR};
 use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
@@ -124,6 +125,65 @@ async fn query_repo(
     }
 }
 
+fn spec_view(s: &ZavetSpecRow, stale_commits: Option<u64>) -> ZavetSpecView {
+    ZavetSpecView {
+        slug: s.slug.clone(),
+        title: s.title.clone(),
+        version: s.version,
+        origin: s.origin.clone(),
+        verified: s.verified,
+        confidence: s.confidence.clone(),
+        date: s.date.clone(),
+        path: s.path.clone(),
+        paths: s.paths.clone(),
+        decisions: s.decisions.clone(),
+        first_commit: s.first_commit.clone(),
+        last_commit: s.last_commit.clone(),
+        created_at: s.created_at.clone(),
+        source_session: s.source_session.clone(),
+        stale_commits,
+    }
+}
+
+/// A working directory to ask git about `repo` in: the dir the daemon last
+/// observed for it, else the caller's `cwd`. `None` means staleness stays
+/// unknown — never guessed.
+fn repo_workdir(state: &AppState, repo: &str, cwd: Option<&str>) -> Option<PathBuf> {
+    crate::control::lock_recover_map(&state.repo_dirs)
+        .get(repo)
+        .map(PathBuf::from)
+        .or_else(|| cwd.map(PathBuf::from))
+}
+
+/// Compute `stale_commits` for each spec: commits touching its paths after
+/// its `last_commit`, via git in `workdir` — one `spawn_blocking` for the
+/// whole batch. Specs without a `last_commit` or paths stay `None`/`Some(0)`
+/// as appropriate; no workdir means every spec reports `None` (unknown).
+async fn spec_staleness(workdir: Option<PathBuf>, specs: &[ZavetSpecRow]) -> Vec<Option<u64>> {
+    let Some(dir) = workdir else {
+        return vec![None; specs.len()];
+    };
+    let inputs: Vec<(Option<String>, Vec<String>)> = specs
+        .iter()
+        .map(|s| (s.last_commit.clone(), s.paths.clone()))
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let root = dira_core::project::toplevel(&dir).unwrap_or(dir);
+        inputs
+            .into_iter()
+            .map(|(last, paths)| {
+                let last = last?;
+                if paths.is_empty() {
+                    return Some(0);
+                }
+                Some(dira_core::project::commits_touching_since(&root, &last, &paths).len() as u64)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|_| vec![None; specs.len()])
+}
+
 fn decision_view(d: &ZavetDecisionRow) -> ZavetDecisionView {
     ZavetDecisionView {
         id: d.id.clone(),
@@ -141,16 +201,19 @@ fn decision_view(d: &ZavetDecisionRow) -> ZavetDecisionView {
 }
 
 /// Ranked results for a free-text query: decisions (their attached trailers
-/// boost them) plus orphan commit trailers — micro-decisions with no record,
-/// which can be the entire answer for a question like "why is the timeout 10s".
+/// boost them), living specs (ranked with the same weights — their linked
+/// decision ids and path globs are searchable), plus orphan commit trailers —
+/// micro-decisions with no record, which can be the entire answer for a
+/// question like "why is the timeout 10s".
 struct ZavetSearchResults {
     decisions: Vec<(ZavetDecisionRow, u32)>,
+    specs: Vec<(ZavetSpecRow, u32)>,
     trailers: Vec<dira_core::protocol::ZavetTrailerHit>,
 }
 
 impl ZavetSearchResults {
     fn is_empty(&self) -> bool {
-        self.decisions.is_empty() && self.trailers.is_empty()
+        self.decisions.is_empty() && self.specs.is_empty() && self.trailers.is_empty()
     }
 }
 
@@ -159,6 +222,7 @@ async fn search(state: &AppState, repo: &str, query: &str) -> ZavetSearchResults
     if terms.is_empty() {
         return ZavetSearchResults {
             decisions: Vec::new(),
+            specs: Vec::new(),
             trailers: Vec::new(),
         };
     }
@@ -167,6 +231,7 @@ async fn search(state: &AppState, repo: &str, query: &str) -> ZavetSearchResults
         .zavet_decisions_list(repo)
         .await
         .unwrap_or_default();
+    let specs = state.store.zavet_specs_list(repo).await.unwrap_or_default();
     let all_trailers = state
         .store
         .zavet_all_trailers(repo)
@@ -193,6 +258,27 @@ async fn search(state: &AppState, repo: &str, query: &str) -> ZavetSearchResults
         .collect();
     hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
 
+    // Specs rank with the same weights: the slug fills the slug slot, path
+    // globs fill the guards slot, and the linked decision ids join the
+    // searchable trailer text (so "D-0001" finds the specs covering it).
+    let mut spec_hits: Vec<(ZavetSpecRow, u32)> = specs
+        .into_iter()
+        .filter_map(|s| {
+            let linked = s.decisions.join(" ");
+            let doc = dira_core::zavet::SearchDoc {
+                id: &s.slug,
+                title: s.title.as_deref(),
+                slug: Some(&s.slug),
+                body: s.body_md.as_deref(),
+                guards: &s.paths,
+                trailers: vec![linked.as_str()],
+            };
+            let score = dira_core::zavet::score(&doc, &terms);
+            (score > 0).then_some((s, score))
+        })
+        .collect();
+    spec_hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.slug.cmp(&b.0.slug)));
+
     // Orphan trailers (no decision ref) rank as hits of their own — a match
     // on an attached trailer already surfaces via its decision above.
     let mut trailers: Vec<dira_core::protocol::ZavetTrailerHit> = all_trailers
@@ -213,6 +299,7 @@ async fn search(state: &AppState, repo: &str, query: &str) -> ZavetSearchResults
 
     ZavetSearchResults {
         decisions: hits,
+        specs: spec_hits,
         trailers,
     }
 }
@@ -224,6 +311,18 @@ fn search_hit(d: &ZavetDecisionRow, score: u32) -> dira_core::protocol::ZavetSea
         status: d.status.clone(),
         verified: d.verified,
         excerpt: d.body_md.as_deref().and_then(dira_core::zavet::excerpt),
+        score,
+    }
+}
+
+fn spec_search_hit(s: &ZavetSpecRow, score: u32) -> dira_core::protocol::ZavetSpecHit {
+    dira_core::protocol::ZavetSpecHit {
+        slug: s.slug.clone(),
+        title: s.title.clone(),
+        origin: s.origin.clone(),
+        confidence: s.confidence.clone(),
+        verified: s.verified,
+        excerpt: s.body_md.as_deref().and_then(dira_core::zavet::excerpt),
         score,
     }
 }
@@ -295,7 +394,7 @@ pub async fn wiki(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _) = match query_repo(repo, cwd).await {
+    let (repo, _) = match query_repo(repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -309,12 +408,23 @@ pub async fn wiki(
                 .take(10)
                 .map(|(d, s)| search_hit(d, *s))
                 .collect(),
+            specs: results
+                .specs
+                .iter()
+                .take(5)
+                .map(|(sp, s)| spec_search_hit(sp, *s))
+                .collect(),
             trailers: results.trailers,
         };
     }
     let decisions = state
         .store
         .zavet_decisions_list(&repo)
+        .await
+        .unwrap_or_default();
+    let spec_rows = state
+        .store
+        .zavet_specs_list(&repo)
         .await
         .unwrap_or_default();
     let counts = state.store.zavet_counts(&repo).await.unwrap_or_default();
@@ -327,13 +437,21 @@ pub async fn wiki(
         .iter()
         .map(decision_view)
         .partition(|d| d.status.as_deref().unwrap_or("active") == "active");
+    let staleness = spec_staleness(repo_workdir(state, &repo, cwd.as_deref()), &spec_rows).await;
+    let specs = spec_rows
+        .iter()
+        .zip(staleness)
+        .map(|(s, stale)| spec_view(s, stale))
+        .collect();
     Response::ZavetWiki(Box::new(dira_core::protocol::ZavetWikiView {
         repo,
         decisions_total: counts.decisions_total,
         trailers: counts.trailers,
         guard_events: counts.guard_events,
+        specs_total: counts.specs_total,
         active,
         superseded,
+        specs,
         recent,
     }))
 }
@@ -367,57 +485,102 @@ pub async fn set_mode(
     }
 }
 
+/// What a why query confidently resolved to.
+enum WhyWinner {
+    Decision(String),
+    Spec(String),
+}
+
 /// `Request::ZavetWhy` — the recorded knowledge plus its evidence. Session
-/// pricing (`sessions`, `total_*`) is filled by [`price_why`].
+/// pricing (`sessions`, `total_*`) comes from [`price_sessions`].
 pub async fn why(
     state: &AppState,
     query: String,
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _) = match query_repo(repo, cwd).await {
+    let (repo, _) = match query_repo(repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    // A decision id answers directly; free text searches. One confidence rule:
-    // the top decision answers in full iff its score at least doubles the
-    // runner-up — the second decision or the best orphan trailer, whichever is
+    // A decision id answers directly, and so does an exact spec slug. Free
+    // text ranks decisions AND specs with one confidence rule: the top entity
+    // answers in full iff its score at least doubles the runner-up — the best
+    // other entity (decision or spec) or the best orphan trailer, whichever is
     // stronger (a sole hit trivially qualifies). Anything less confident
     // returns the ranked matches rather than guessing; when only trailers
     // matched, the trailers ARE the answer. Zero is a clean pointer to the wiki.
     let mut matched_query = None;
-    let decision_id = match dira_core::zavet::canonical_decision_id(&query) {
-        Some(id) => id,
+    let winner = match dira_core::zavet::canonical_decision_id(&query) {
+        Some(id) => WhyWinner::Decision(id),
         None => {
-            let results = search(state, &repo, &query).await;
-            if results.is_empty() {
-                return Response::Error {
-                    message: format!(
-                        "nothing recorded matches `{query}` for {repo} — browse with `dira zavet wiki`, or record it via /zavet:decide"
-                    ),
-                };
-            }
-            let second = results.decisions.get(1).map(|(_, s)| *s).unwrap_or(0);
-            let best_trailer = results.trailers.first().map(|t| t.score).unwrap_or(0);
-            let runner_up = second.max(best_trailer);
-            match results.decisions.first() {
-                Some((top, score)) if *score >= runner_up * 2 => {
-                    matched_query = Some(query.clone());
-                    top.id.clone()
-                }
-                _ => {
-                    return Response::ZavetSearch {
-                        query,
-                        hits: results
-                            .decisions
-                            .iter()
-                            .take(5)
-                            .map(|(d, s)| search_hit(d, *s))
-                            .collect(),
-                        trailers: results.trailers,
+            let slug = query.trim();
+            let direct_spec = if !slug.is_empty() && !slug.contains(char::is_whitespace) {
+                state
+                    .store
+                    .zavet_spec_get(&repo, slug)
+                    .await
+                    .unwrap_or(None)
+            } else {
+                None
+            };
+            match direct_spec {
+                Some(s) => WhyWinner::Spec(s.slug),
+                None => {
+                    let results = search(state, &repo, &query).await;
+                    if results.is_empty() {
+                        return Response::Error {
+                            message: format!(
+                                "nothing recorded matches `{query}` for {repo} — browse with `dira zavet wiki`, or record it via /zavet:decide"
+                            ),
+                        };
+                    }
+                    let d1 = results.decisions.first().map(|(_, s)| *s).unwrap_or(0);
+                    let s1 = results.specs.first().map(|(_, s)| *s).unwrap_or(0);
+                    let d2 = results.decisions.get(1).map(|(_, s)| *s).unwrap_or(0);
+                    let s2 = results.specs.get(1).map(|(_, s)| *s).unwrap_or(0);
+                    let best_trailer = results.trailers.first().map(|t| t.score).unwrap_or(0);
+                    let win = if d1 >= s1 {
+                        let runner_up = d2.max(s1).max(best_trailer);
+                        (d1 >= runner_up * 2 && d1 > 0)
+                            .then(|| WhyWinner::Decision(results.decisions[0].0.id.clone()))
+                    } else {
+                        let runner_up = s2.max(d1).max(best_trailer);
+                        (s1 >= runner_up * 2)
+                            .then(|| WhyWinner::Spec(results.specs[0].0.slug.clone()))
+                    };
+                    match win {
+                        Some(w) => {
+                            matched_query = Some(query.clone());
+                            w
+                        }
+                        None => {
+                            return Response::ZavetSearch {
+                                query,
+                                hits: results
+                                    .decisions
+                                    .iter()
+                                    .take(5)
+                                    .map(|(d, s)| search_hit(d, *s))
+                                    .collect(),
+                                specs: results
+                                    .specs
+                                    .iter()
+                                    .take(5)
+                                    .map(|(sp, s)| spec_search_hit(sp, *s))
+                                    .collect(),
+                                trailers: results.trailers,
+                            }
+                        }
                     }
                 }
             }
+        }
+    };
+    let decision_id = match winner {
+        WhyWinner::Decision(id) => id,
+        WhyWinner::Spec(slug) => {
+            return spec_why(state, &repo, &slug, matched_query, cwd.as_deref()).await
         }
     };
     let decision = match state.store.zavet_decision_get(&repo, &decision_id).await {
@@ -455,47 +618,126 @@ pub async fn why(
         .await
         .unwrap_or_default();
 
+    let specs = state
+        .store
+        .zavet_specs_for_decision(&repo, &decision_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(slug, title)| dira_core::protocol::ZavetSpecRef { slug, title })
+        .collect();
+
     let unattributed_commits = commits
         .iter()
         .filter(|c| c.source_session.is_none())
         .count() as u64;
     let unattributed_guard_events = stats.iter().map(|s| s.unattributed).sum();
 
-    let mut view = ZavetWhyView {
+    let priced = price_sessions(state, &sessions).await;
+    let view = ZavetWhyView {
         repo: repo.clone(),
         matched_query,
         body_md: decision.body_md.clone(),
         decision: decision_view(&decision),
         superseded_by,
-        commits: commits
-            .into_iter()
-            .map(|c| dira_core::protocol::ZavetCommitView {
-                sha: c.sha,
-                message: c.message,
-                authored_at: c.authored_at,
-                session_id: c.source_session,
-            })
-            .collect(),
+        commits: commit_views(commits),
         guard_stats: guard_stat_views(stats),
-        sessions: Vec::new(),
-        total_human_seconds: 0,
-        total_agent_seconds: 0,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
+        total_human_seconds: priced.iter().map(|l| l.human_seconds).sum(),
+        total_agent_seconds: priced.iter().map(|l| l.agent_seconds).sum(),
+        total_input_tokens: priced.iter().map(|l| l.input_tokens).sum(),
+        total_output_tokens: priced.iter().map(|l| l.output_tokens).sum(),
+        sessions: priced,
         unattributed_commits,
         unattributed_guard_events,
+        specs,
     };
-    price_why(state, &mut view, &sessions).await;
     Response::ZavetWhy(Box::new(view))
 }
 
-/// Fill a why-view's time panel: for each evidencing session, de-duplicated
-/// human seconds (global opening-signal attribution over the raw event log —
-/// the same math `dira report` uses), idle-trimmed agent seconds, and token
-/// sums; compacted history joins from the daily rollup. Totals are the sums.
-async fn price_why(state: &AppState, view: &mut ZavetWhyView, session_ids: &[String]) {
+/// The spec detail `zavet why` answers with when the winner is a living spec:
+/// the document, its badges and links, staleness, `Spec:`-trailer commits,
+/// and the same honestly-lower-bound cost panel decisions get.
+async fn spec_why(
+    state: &AppState,
+    repo: &str,
+    slug: &str,
+    matched_query: Option<String>,
+    cwd: Option<&str>,
+) -> Response {
+    let spec = match state.store.zavet_spec_get(repo, slug).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::Error {
+                message: format!("no captured spec `{slug}` for {repo} (is it committed, and is the daemon watching this repo?)"),
+            }
+        }
+        Err(e) => {
+            return Response::Error {
+                message: format!("zavet why failed: {e}"),
+            }
+        }
+    };
+    let commits = state
+        .store
+        .zavet_commits_for_spec(repo, slug)
+        .await
+        .unwrap_or_default();
+    let sessions = state
+        .store
+        .zavet_sessions_for_spec(repo, slug)
+        .await
+        .unwrap_or_default();
+    let specs_slice = std::slice::from_ref(&spec);
+    let stale = spec_staleness(repo_workdir(state, repo, cwd), specs_slice)
+        .await
+        .pop()
+        .flatten();
+    let unattributed_commits = commits
+        .iter()
+        .filter(|c| c.source_session.is_none())
+        .count() as u64;
+    let priced = price_sessions(state, &sessions).await;
+    let view = ZavetSpecWhyView {
+        repo: repo.to_string(),
+        matched_query,
+        body_md: spec.body_md.clone(),
+        spec: spec_view(&spec, stale),
+        commits: commit_views(commits),
+        total_human_seconds: priced.iter().map(|l| l.human_seconds).sum(),
+        total_agent_seconds: priced.iter().map(|l| l.agent_seconds).sum(),
+        total_input_tokens: priced.iter().map(|l| l.input_tokens).sum(),
+        total_output_tokens: priced.iter().map(|l| l.output_tokens).sum(),
+        sessions: priced,
+        unattributed_commits,
+    };
+    Response::ZavetSpec(Box::new(view))
+}
+
+fn commit_views(
+    commits: Vec<dira_core::store::ZavetCommitRef>,
+) -> Vec<dira_core::protocol::ZavetCommitView> {
+    commits
+        .into_iter()
+        .map(|c| dira_core::protocol::ZavetCommitView {
+            sha: c.sha,
+            message: c.message,
+            authored_at: c.authored_at,
+            session_id: c.source_session,
+        })
+        .collect()
+}
+
+/// Price an evidencing session set: for each session, de-duplicated human
+/// seconds (global opening-signal attribution over the raw event log — the
+/// same math `dira report` uses), idle-trimmed agent seconds, and token sums;
+/// compacted history joins from the daily rollup. Shared by decision and spec
+/// why views.
+async fn price_sessions(
+    state: &AppState,
+    session_ids: &[String],
+) -> Vec<dira_core::protocol::ZavetSessionCostView> {
     if session_ids.is_empty() {
-        return;
+        return Vec::new();
     }
     let events = state.store.events_since(None).await.unwrap_or_default();
     let idle = state.config.idle();
@@ -506,6 +748,7 @@ async fn price_why(state: &AppState, view: &mut ZavetWhyView, session_ids: &[Str
         .collect();
     let human_by_session = dira_core::accounting::per_key_seconds(&human_signals, idle);
 
+    let mut lines = Vec::with_capacity(session_ids.len());
     for sid in session_ids {
         let raw_human = human_by_session.get(sid).copied().unwrap_or(0);
         let raw_agent = crate::control::session_agent_seconds(&events, sid, idle);
@@ -514,19 +757,15 @@ async fn price_why(state: &AppState, view: &mut ZavetWhyView, session_ids: &[Str
             .zavet_session_totals(sid)
             .await
             .unwrap_or_default();
-        let line = dira_core::protocol::ZavetSessionCostView {
+        lines.push(dira_core::protocol::ZavetSessionCostView {
             session_id: sid.clone(),
             human_seconds: raw_human + hist.rollup_human_seconds,
             agent_seconds: raw_agent + hist.rollup_agent_seconds,
             input_tokens: hist.input_tokens,
             output_tokens: hist.output_tokens,
-        };
-        view.total_human_seconds += line.human_seconds;
-        view.total_agent_seconds += line.agent_seconds;
-        view.total_input_tokens += line.input_tokens;
-        view.total_output_tokens += line.output_tokens;
-        view.sessions.push(line);
+        });
     }
+    lines
 }
 
 #[cfg(test)]

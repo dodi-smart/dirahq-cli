@@ -67,6 +67,23 @@ budget:
   plus body, upserted by `(repo, id)` with first-sight provenance (the
   introducing commit, its author date, and its attributed session are
   preserved forever); `content_hash` is the git blob oid.
+- **Living specs** — `.zavet/specs/<slug>.md` files (flat, dot-prefixed
+  templates ignored; the filename stem is the identity), same first-sight
+  upsert by `(repo, slug)`. Frontmatter contract (shared with the plugin's
+  parser, inline `#` comments allowed on structured lines, never on `title`):
+  `title`, `version`, `origin` (`designed` | `session` | `reverse-engineered`),
+  `verified` (true only after a human confirms spec matches code),
+  `confidence` (`low` | `med` | `high`), `date`, `paths` (git pathspecs the
+  spec covers), `decisions` (optional links). Decision links are derived as
+  the frontmatter list ∪ every `D-NNNN` reference in the body, canonicalized —
+  links live on the spec side only, decisions stay append-only.
+
+**Staleness** is never materialized: no table stores per-commit paths, so it
+is computed at query time — `git log <last_commit>..HEAD -- :(glob)<path>…`
+counts the commits that touched a spec's declared paths after its last
+capture. The shellout runs in the repo directory the daemon last observed
+(falling back to the caller's cwd); with neither, staleness reads *unknown*,
+never guessed.
 
 **Attribution rule (everywhere):** the unique active session for the repo
 (`SessionRegistry::session_for_repo`) or NULL — never guessed. Unattributed
@@ -75,18 +92,23 @@ evidence still counts and is reported, so costs read as honest lower bounds.
 ## Query surface
 
 - `dira zavet status` — activation verdict (and why), capture health.
-- `dira zavet why <question or D-0042>` — answer "why?" from recorded
-  knowledge. A decision id answers directly; free text ("why are we polling
-  instead of a filesystem watcher") is searched across titles, slugs, guards,
-  bodies, and trailer values — one confident hit answers in full (annotated
-  with what it matched), several return ranked matches with excerpts. The
-  answer carries the record (title, status, supersedes chain, guards, body),
-  linked commits, guard-event history, and the **cost panel**: de-duplicated
-  human seconds (same accounting as `dira report`), idle-trimmed agent
-  seconds, and tokens per evidencing session, with totals.
+- `dira zavet why <question, D-0042, or spec slug>` — answer "why?" from
+  recorded knowledge. A decision id or an exact spec slug answers directly;
+  free text ("why are we polling instead of a filesystem watcher") ranks
+  decisions AND specs across titles, slugs, guards/paths, bodies, linked
+  decision ids, and trailer values — one confident hit (score ≥ 2× the
+  runner-up across both pools) answers in full, several return ranked
+  matches with excerpts. A decision answer carries the record, linked
+  commits, guard-event history, and its covering specs; a spec answer
+  carries the document, its origin/confidence/staleness badges, linked
+  decisions, and `Spec:`-trailer commits. Both end in the **cost panel**:
+  de-duplicated human seconds (same accounting as `dira report`),
+  idle-trimmed agent seconds, and tokens per evidencing session, with totals.
 - `dira zavet wiki [topic]` — browse the knowledge base: active + superseded
-  decisions with verification badges, capture counts, and the recent-trailer
-  chronicle; with a topic, ranked matches.
+  decisions with verification badges, the SPECS section (origin + confidence
+  badges, `⚠ stale · N commits` vs `✓ current`, covered paths, linked
+  decisions), capture counts, and the recent-trailer chronicle; with a topic,
+  ranked matches.
 - `dira zavet decisions` — captured decisions for the repo.
 - `dira zavet enable|disable|reset` — the per-repo override.
 
@@ -96,8 +118,8 @@ everywhere — recall never presents reconstructed rationale as fact.
 
 ## Privacy & cloud (M2 design note — not implemented)
 
-Decision bodies and trailer values are **local-only**, exactly like commit
-messages: the attestation wire contract is content-free by tested invariant
+Decision bodies, spec bodies, and trailer values are **local-only**, exactly
+like commit messages: the attestation wire contract is content-free by tested invariant
 (`wire_contract_carries_no_content_fields`), so zavet data can never ride
 `AttestationBatch`. The planned M2 channel is a separate `KnowledgeEnvelope`
 on its own endpoint with its own sync cursor and its own consent gate:

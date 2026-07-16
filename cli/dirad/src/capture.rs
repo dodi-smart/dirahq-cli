@@ -89,12 +89,28 @@ struct GitWalk {
     /// (`merge-base(upstream, HEAD)..HEAD`), computed once per walk inside the
     /// same `spawn_blocking` so this extra git work never touches the hot path.
     signals: project::SessionSignals,
+    /// Zavet knowledge captured from the walked commits (empty unless the repo
+    /// is zavet-active): per-sha trailer sets, and decision records parsed
+    /// from `.zavet/decisions/*.md` blobs touched by each commit.
+    trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
+    decisions: Vec<ZavetDecisionAt>,
+}
+
+/// A decision record as of one commit, ready to upsert.
+struct ZavetDecisionAt {
+    sha: String,
+    authored_at: Option<String>,
+    cap: dira_core::store::ZavetDecisionCapture,
 }
 
 /// Run the blocking git walk for a repo: resolve HEAD, and (unless HEAD is
 /// unchanged vs `baseline`) list the new commits + current branch. `None` when
 /// the dir isn't a git repo, HEAD is unchanged, or git is unavailable.
-fn git_walk(cwd: &str, baseline: Option<&str>) -> Option<GitWalk> {
+///
+/// `zavet` gates the knowledge sweep. The `.zavet/` dir probe for `auto` mode
+/// happens here (inside the same blocking budget) — the caller passes the knob
+/// + per-repo override pre-resolved, since the store is async.
+fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWalk> {
     let root = Path::new(cwd);
     let head = project::head_sha(root)?;
     if baseline == Some(head.as_str()) {
@@ -111,12 +127,75 @@ fn git_walk(cwd: &str, baseline: Option<&str>) -> Option<GitWalk> {
     // Cumulative session signals — best-effort, all-None on merge/detached HEAD,
     // missing upstream, or git failure. Runs here so it shares the blocking budget.
     let signals = project::session_signals(root);
+
+    let zavet_active = crate::zavet::effective_mode(
+        zavet.knob,
+        zavet.override_,
+        crate::zavet::zavet_dir_exists(project::toplevel(root).as_deref().unwrap_or(root)),
+    );
+    let (trailers, decisions) = if zavet_active && !commits.is_empty() {
+        zavet_sweep(root, &commits)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     Some(GitWalk {
         head,
         commits,
         git_ref,
         signals,
+        trailers,
+        decisions,
     })
+}
+
+/// The pre-resolved activation inputs for a walk (see [`git_walk`]).
+#[derive(Clone, Copy)]
+struct ZavetGate {
+    knob: dira_core::config::ZavetMode,
+    override_: Option<bool>,
+}
+
+/// The zavet portion of a walk: batched trailer parse over the walked shas,
+/// plus decision-record parsing for every `.zavet/decisions/*.md` blob touched
+/// by each commit. All plain `git log`/`diff-tree`/`show` subprocess calls —
+/// shares the walk's blocking budget.
+fn zavet_sweep(
+    root: &Path,
+    commits: &[CapturedCommit],
+) -> (
+    Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
+    Vec<ZavetDecisionAt>,
+) {
+    let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
+    let trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)> =
+        project::commit_trailers(root, &shas)
+            .into_iter()
+            .map(|(sha, raw)| (sha, dira_core::zavet::normalize_trailers(&raw)))
+            .filter(|(_, ts)| !ts.is_empty())
+            .collect();
+
+    let mut decisions = Vec::new();
+    // Oldest first, so within one walk the INTRODUCING commit lands first and
+    // the store's first-sight preservation keeps pointing at it.
+    for c in commits.iter().rev() {
+        for path in project::zavet_decision_changes(root, &c.sha) {
+            let Some(text) = project::show_blob(root, &c.sha, &path) else {
+                continue;
+            };
+            let Some(mut cap) = dira_core::zavet::parse_decision(&text, &path) else {
+                tracing::debug!(sha = %c.sha, path, "zavet: unparseable decision record skipped");
+                continue;
+            };
+            cap.content_hash = project::blob_oid(root, &c.sha, &path);
+            decisions.push(ZavetDecisionAt {
+                sha: c.sha.clone(),
+                authored_at: c.authored_at.clone(),
+                cap,
+            });
+        }
+    }
+    (trailers, decisions)
 }
 
 /// Poll a repo for new commits and record them locally. Best-effort: a non-git
@@ -138,11 +217,23 @@ pub async fn capture_commits(state: &AppState, cwd: &str, canonical: &str) {
         }
     };
 
+    // Zavet activation inputs, resolved before the blocking walk (the store is
+    // async): the global knob plus the per-repo override. One meta read for
+    // active repos; the `.zavet/` dir probe itself runs inside the walk.
+    let zavet = ZavetGate {
+        knob: state.config.modules.zavet,
+        override_: state
+            .store
+            .zavet_override_get(canonical)
+            .await
+            .unwrap_or(None),
+    };
+
     // The blocking git work, off the runtime worker and time-boxed.
     let walk = {
         let cwd = cwd.to_string();
         let baseline = baseline.clone();
-        let join = tokio::task::spawn_blocking(move || git_walk(&cwd, baseline.as_deref()));
+        let join = tokio::task::spawn_blocking(move || git_walk(&cwd, baseline.as_deref(), zavet));
         match tokio::time::timeout(CAPTURE_TIMEOUT, join).await {
             Ok(Ok(walk)) => walk,
             Ok(Err(e)) => {
@@ -188,6 +279,35 @@ pub async fn capture_commits(state: &AppState, cwd: &str, canonical: &str) {
             Err(e) => tracing::warn!("record commit {} failed: {e}", c.sha),
         }
     }
+    // Persist the zavet sweep (no-ops when the repo isn't zavet-active). All
+    // idempotent — a re-walk re-records nothing.
+    for (sha, trailers) in &walk.trailers {
+        if let Err(e) = state
+            .store
+            .zavet_record_trailers(Some(canonical), sha, trailers)
+            .await
+        {
+            tracing::warn!("zavet trailers for {sha} failed: {e}");
+        }
+    }
+    for d in &walk.decisions {
+        if let Err(e) = state
+            .store
+            .zavet_upsert_decision(
+                canonical,
+                &d.cap,
+                &d.sha,
+                d.authored_at.as_deref(),
+                source_session.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!("zavet decision {} failed: {e}", d.cap.id);
+        } else {
+            tracing::info!(decision = %d.cap.id, repo = %canonical, "captured zavet decision");
+        }
+    }
+
     if let Err(e) = state.store.repo_baseline_set(canonical, &walk.head).await {
         tracing::warn!("repo baseline set failed for {canonical}: {e}");
     }

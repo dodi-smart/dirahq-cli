@@ -103,6 +103,16 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
         Request::Nuke => nuke(state).await,
         Request::DaemonInfo => daemon_info(state),
         Request::ResyncCursor { from } => resync_cursor(state, from).await,
+        Request::IngestZavet { payload } => crate::zavet::ingest(state, payload).await,
+        Request::ZavetStatus { cwd, repo } => crate::zavet::status(state, cwd, repo).await,
+        Request::ZavetWhy { query, cwd, repo } => crate::zavet::why(state, query, cwd, repo).await,
+        Request::ZavetWiki { topic, cwd, repo } => {
+            crate::zavet::wiki(state, topic, cwd, repo).await
+        }
+        Request::ZavetDecisions { cwd, repo } => crate::zavet::decisions(state, cwd, repo).await,
+        Request::ZavetSetMode { cwd, repo, mode } => {
+            crate::zavet::set_mode(state, cwd, repo, mode).await
+        }
     }
 }
 
@@ -571,7 +581,7 @@ fn fmt_ts(t: OffsetDateTime) -> String {
 /// attributed across all sessions (see [`accounting::per_key_seconds`] in
 /// [`build_session_views`]), which a single session viewed in isolation cannot
 /// reproduce.
-fn session_agent_seconds(events: &[RawEvent], session_id: &str, idle: Duration) -> i64 {
+pub(crate) fn session_agent_seconds(events: &[RawEvent], session_id: &str, idle: Duration) -> i64 {
     let mut times = Vec::new();
     let mut had_activity = false;
     for e in events.iter().filter(|e| e.session_id == session_id) {

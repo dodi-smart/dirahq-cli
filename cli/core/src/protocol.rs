@@ -59,6 +59,46 @@ pub enum Request {
     /// rewinds to the beginning (full re-send); `Some(id)` rewinds to that event
     /// id. Safe — the cloud dedups (no double counting).
     ResyncCursor { from: Option<String> },
+    /// Forward a raw zavet guard event (from the `dira zavet emit` shim — the
+    /// plugin's fire-and-forget channel). Parsed permissively daemon-side so
+    /// the event schema can evolve without protocol churn; the daemon resolves
+    /// the repo from the payload's `cwd` and never trusts a caller-supplied
+    /// repo identity.
+    IngestZavet { payload: serde_json::Value },
+    /// Zavet activation + capture health for a repo (resolved from `repo`, or
+    /// `cwd`, or the daemon's own cwd — same ladder as `Start`).
+    ZavetStatus {
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// Answer "why?" from recorded knowledge (`dira zavet why`). `query` is a
+    /// decision id (`D-0042`) or free text; free text is searched across
+    /// titles, slugs, guards, bodies, and trailers — a single confident hit
+    /// answers in full, several return ranked matches.
+    ZavetWhy {
+        query: String,
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// Browse the knowledge base (`dira zavet wiki`): overview without a
+    /// topic, ranked matches with one.
+    ZavetWiki {
+        topic: Option<String>,
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// List a repo's captured decisions.
+    ZavetDecisions {
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// Set or clear the per-repo zavet override (`dira zavet enable|disable`).
+    /// `mode` is `on`, `off`, or `clear`.
+    ZavetSetMode {
+        cwd: Option<String>,
+        repo: Option<String>,
+        mode: String,
+    },
 }
 
 /// Which manual session(s) to stop.
@@ -130,6 +170,26 @@ pub enum Response {
         /// Seconds since the daemon started.
         uptime_seconds: u64,
     },
+    /// `ZavetStatus`. Boxed like `Status` to keep small arms small.
+    ZavetStatus(Box<ZavetStatusView>),
+    /// `ZavetWhy`.
+    ZavetWhy(Box<ZavetWhyView>),
+    /// `ZavetDecisions`.
+    ZavetDecisions { decisions: Vec<ZavetDecisionView> },
+    /// `ZavetWhy` with an ambiguous free-text query: ranked matches instead
+    /// of a single answer. Also `ZavetWiki` with a topic. `trailers` are
+    /// matching orphan commit trailers — micro-decisions that never got a
+    /// record; they can be the whole answer when `hits` is empty.
+    ZavetSearch {
+        query: String,
+        hits: Vec<ZavetSearchHit>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        trailers: Vec<ZavetTrailerHit>,
+    },
+    /// `ZavetWiki` without a topic: the knowledge-base overview.
+    ZavetWiki(Box<ZavetWikiView>),
+    /// `ZavetSetMode`: the applied override (`on`/`off`) or `clear`.
+    ZavetModeSet { repo: String, mode: String },
 }
 
 /// A live or recent session as shown by `status` / `sessions`.
@@ -326,6 +386,162 @@ pub struct BillingView {
     /// RFC 3339 timestamp of the daemon's successful fetch — lets the renderer
     /// flag a stale value ("as of 32m ago") instead of presenting it as live.
     pub fetched_at: String,
+}
+
+/// Zavet activation + capture health for one repo (`dira zavet status`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetStatusView {
+    /// Canonical repo the view describes.
+    pub repo: String,
+    /// The resolved activation verdict.
+    pub active: bool,
+    /// The global `modules.zavet` knob (`auto`/`on`/`off`).
+    pub knob: String,
+    /// Per-repo override, if set (`on`/`off`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_mode: Option<String>,
+    /// Whether the repo carries `.zavet/` at its toplevel (the `auto` probe);
+    /// `None` when the daemon has no working dir for the repo yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zavet_dir: Option<bool>,
+    pub decisions_total: u64,
+    pub decisions_active: u64,
+    pub trailers: u64,
+    pub guard_events: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_stats: Vec<ZavetGuardStatView>,
+}
+
+/// Per-kind guard-event tallies with the honest unattributed count.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetGuardStatView {
+    pub kind: String,
+    pub total: u64,
+    pub unattributed: u64,
+}
+
+/// One captured decision (list row; `zavet why` carries the body separately).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetDecisionView {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session: Option<String>,
+    /// `recorded` | `reverse-engineered` (absent = recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Explicit verification flag; `Some(false)` renders as an unverified
+    /// hypothesis, never as fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+}
+
+/// One ranked hit for a free-text `why`/`wiki` query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSearchHit {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// First plain-prose sentence of the record body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    pub score: u32,
+}
+
+/// One matching orphan commit trailer — a micro-decision with no record.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetTrailerHit {
+    pub sha: String,
+    /// Normalized trailer key (`why`, `constraint`, …).
+    pub key: String,
+    pub value: String,
+    pub score: u32,
+}
+
+/// `dira zavet wiki` — the knowledge-base overview for a repo.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetWikiView {
+    pub repo: String,
+    pub decisions_total: u64,
+    pub trailers: u64,
+    pub guard_events: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active: Vec<ZavetDecisionView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<ZavetDecisionView>,
+    /// Latest captured trailers, newest first: `(sha, key, value)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<(String, String, String)>,
+}
+
+/// A commit linked to a decision.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetCommitView {
+    pub sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Per-session cost line for a decision (`zavet why`'s time panel).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSessionCostView {
+    pub session_id: String,
+    pub human_seconds: i64,
+    pub agent_seconds: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// `dira zavet why <id>` — the recorded knowledge plus what it cost.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetWhyView {
+    pub repo: String,
+    /// When a free-text query resolved to this decision, what it matched on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_query: Option<String>,
+    pub decision: ZavetDecisionView,
+    /// Full record body (local-only data; shown, never synced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+    /// The decision that replaced this one, if any (reverse `supersedes` link).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<ZavetCommitView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_stats: Vec<ZavetGuardStatView>,
+    /// Priced sessions evidencing this decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<ZavetSessionCostView>,
+    /// Summed cost over `sessions`.
+    pub total_human_seconds: i64,
+    pub total_agent_seconds: i64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    /// Evidence that could not be attributed to a session — reported so the
+    /// cost reads as an honest lower bound.
+    pub unattributed_commits: u64,
+    pub unattributed_guard_events: u64,
 }
 
 /// True when the operator is in the loop — at least one of these sessions has a

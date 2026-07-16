@@ -24,6 +24,8 @@ base64.workspace = true
 keyring.workspace = true
 
 [dev-dependencies]
+# `figment::Jail` (env-isolated config tests) is gated behind its `test` feature.
+figment = { workspace = true, features = ["test"] }
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true }

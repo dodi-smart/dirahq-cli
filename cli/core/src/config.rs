@@ -14,6 +14,44 @@ use std::path::PathBuf;
 /// `cloud_url`, or the `DIRA_CLOUD_URL` env var, which wins).
 pub const DEFAULT_CLOUD_URL: &str = "https://app.dirahq.sh";
 
+/// Activation mode for the zavet knowledge module.
+///
+/// `Auto` activates zavet per repo based on the presence of a `.zavet/`
+/// directory at the git toplevel, so a committed knowledge layer lights up
+/// for every dira user of that repo without individual opt-in. A per-repo
+/// override (`dira zavet enable|disable`, stored in the daemon's meta table)
+/// beats this global knob either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ZavetMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl ZavetMode {
+    /// The knob value as spelled in `config.toml` (and echoed by status views).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ZavetMode::Auto => "auto",
+            ZavetMode::On => "on",
+            ZavetMode::Off => "off",
+        }
+    }
+}
+
+/// Optional per-machine module toggles (`[modules]` in `config.toml`).
+///
+/// Engagement tracking is dira's core and has no toggle; modules listed here
+/// are the optional layers on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Modules {
+    /// The zavet knowledge module (guard events, trailer + decision capture).
+    #[serde(default)]
+    pub zavet: ZavetMode,
+}
+
 /// Daemon + CLI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -88,6 +126,11 @@ pub struct Config {
     /// (see the cloud's presence-ack clamp), so no cloud-side change is needed to
     /// honor it.
     pub presence_ttl_deep_idle_secs: u64,
+    /// Optional module toggles. Absent from older configs — defaults keep
+    /// today's behavior (zavet in `auto`, dormant unless a repo carries
+    /// `.zavet/`). Env override: `DIRA_MODULES__ZAVET=auto|on|off`.
+    #[serde(default)]
+    pub modules: Modules,
 }
 
 impl Default for Config {
@@ -115,6 +158,7 @@ impl Default for Config {
             report_local_day: false,
             deep_idle_after_secs: 900,
             presence_ttl_deep_idle_secs: 600,
+            modules: Modules::default(),
         }
     }
 }
@@ -302,6 +346,45 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(c.heartbeat_active(), time::Duration::seconds(1));
+    }
+
+    #[test]
+    fn zavet_mode_defaults_to_auto() {
+        // Absent [modules] table (every pre-zavet config) must resolve to
+        // auto — dormant unless a repo carries .zavet/.
+        assert_eq!(Config::default().modules.zavet, ZavetMode::Auto);
+        let c: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("idle_seconds = 120"))
+            .extract()
+            .unwrap();
+        assert_eq!(c.modules.zavet, ZavetMode::Auto);
+    }
+
+    // `Jail::expect_with`'s closure returns `Result<_, figment::Error>` (208
+    // bytes) — the API's shape, not ours to box.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn zavet_mode_layers_from_toml_and_env() {
+        let c: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[modules]\nzavet = \"off\""))
+            .extract()
+            .unwrap();
+        assert_eq!(c.modules.zavet, ZavetMode::Off);
+        // Env wins over toml, same mapping Config::load installs
+        // (DIRA_MODULES__ZAVET -> modules.zavet).
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DIRA_MODULES__ZAVET", "on");
+            let c: Config = Figment::from(Serialized::defaults(Config::default()))
+                .merge(Toml::string("[modules]\nzavet = \"off\""))
+                .merge(
+                    Env::prefixed("DIRA_")
+                        .map(|k| k.as_str().to_lowercase().replace("__", ".").into()),
+                )
+                .extract()
+                .unwrap();
+            assert_eq!(c.modules.zavet, ZavetMode::On);
+            Ok(())
+        });
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod signing;
 pub mod store;
 pub mod sync;
 pub mod tokens;
+pub mod zavet;
 
 pub use config::Config;
 pub use model::{EventKind, RawEvent};

@@ -36,6 +36,13 @@ justfile      task runner
 The **Dira cloud** — the hosted verify/billing/policy/dashboard service — is a proprietary
 service in a separate repository and is not part of this project.
 
+The **[zavet plugin](https://github.com/dodi-smart/dirahq-zavet)** — the repo-local
+knowledge layer (decision records, guard hooks, commit-trailer conventions) — is its own
+product in its own repository. dira ships the optional integration only: repos that carry
+`.zavet/` get their decisions, trailers, and guard events captured and correlated with
+session time (`dira zavet why D-0042` = the decision *and* what it cost). See
+[docs/zavet.md](docs/zavet.md).
+
 ## Quick start
 
 ```sh

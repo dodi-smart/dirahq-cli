@@ -10,7 +10,10 @@ use crate::format::{
     usd_approx,
 };
 use crate::theme::{self, Role};
-use dira_core::protocol::{any_engaged, LiveState, Response, SessionView, StatusView};
+use dira_core::protocol::{
+    any_engaged, LiveState, Response, SessionView, StatusView, ZavetDecisionView,
+    ZavetGuardStatView, ZavetStatusView, ZavetWhyView,
+};
 use dira_core::report::Report;
 use time::OffsetDateTime;
 
@@ -142,6 +145,479 @@ pub fn print(resp: &Response) -> bool {
             }
             true
         }
+        Response::ZavetStatus(v) => {
+            print_zavet_status(v);
+            true
+        }
+        Response::ZavetWhy(v) => {
+            print_zavet_why(v);
+            true
+        }
+        Response::ZavetDecisions { decisions } => {
+            print_zavet_decisions(decisions);
+            true
+        }
+        Response::ZavetSearch {
+            query,
+            hits,
+            trailers,
+        } => {
+            print_zavet_search(query, hits, trailers);
+            true
+        }
+        Response::ZavetWiki(v) => {
+            print_zavet_wiki(v);
+            true
+        }
+        Response::ZavetModeSet { repo, mode } => {
+            match mode.as_str() {
+                "clear" => println!("zavet override cleared for {repo} (follows modules.zavet)"),
+                m => println!("zavet forced {m} for {repo}"),
+            }
+            true
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// zavet — knowledge-module renderers. Same design language as `dira status`:
+// glyph metric rows, `·` separators, Muted CAPS section headers, Faint empty
+// states, and pad-then-paint so SGR bytes never break column alignment.
+// ---------------------------------------------------------------------------
+
+/// A `key · key · key` line painted Muted.
+fn dots(parts: &[String]) -> String {
+    theme::paint(&parts.join(" · "), Role::Muted)
+}
+
+/// The `[status]`/verification badges for a decision, pre-painted.
+fn zavet_badges(status: Option<&str>, origin: Option<&str>, verified: Option<bool>) -> String {
+    let status = status.unwrap_or("active");
+    let mut parts = vec![theme::paint(
+        status,
+        if status == "active" {
+            Role::Engaged
+        } else {
+            Role::Faint
+        },
+    )];
+    if dira_core::zavet::is_unverified(origin, verified) {
+        // Amber, deliberately loud: this is a hypothesis, not recorded fact.
+        parts.push(theme::paint("unverified — hypothesis", Role::Compute));
+    }
+    parts.join(&theme::paint(" · ", Role::Muted))
+}
+
+/// Guard-event tallies as one dotted line (`3 shown · 1 override`), the
+/// `guard_` kind prefix stripped.
+fn guard_stats_line(stats: &[ZavetGuardStatView]) -> String {
+    stats
+        .iter()
+        .map(|s| format!("{} {}", s.total, s.kind.trim_start_matches("guard_")))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The first 9 characters of a sha (shorter values pass through whole).
+fn short_sha(s: &str) -> &str {
+    &s[..s.len().min(9)]
+}
+
+/// Render `dira zavet status`: verdict line, reason, metric rows.
+fn print_zavet_status(v: &ZavetStatusView) {
+    let verdict = if v.active {
+        theme::paint("active", Role::Engaged)
+    } else {
+        theme::paint("inactive", Role::Faint)
+    };
+    println!(
+        "{} {} {} {}",
+        theme::paint("zavet", Role::Knowledge),
+        verdict,
+        theme::paint("·", Role::Muted),
+        theme::paint(&v.repo, Role::Ink),
+    );
+    let mut why = vec![format!("mode {}", v.knob)];
+    if let Some(o) = &v.override_mode {
+        why.push(format!("override {o}"));
+    }
+    if let Some(dir) = v.zavet_dir {
+        why.push(if dir { ".zavet/ present" } else { "no .zavet/" }.to_string());
+    }
+    println!("{}", dots(&why));
+
+    println!();
+    let shown = guard_stats_line(&v.guard_stats);
+    let rows: [(char, &str, String, String, Role); 3] = [
+        (
+            '◆',
+            "decisions",
+            v.decisions_total.to_string(),
+            format!("{} active", v.decisions_active),
+            Role::Knowledge,
+        ),
+        (
+            '▪',
+            "trailers",
+            v.trailers.to_string(),
+            "micro-decisions in commit footers".to_string(),
+            Role::Ink,
+        ),
+        (
+            '●',
+            "guards",
+            v.guard_events.to_string(),
+            if shown.is_empty() {
+                "no events yet".to_string()
+            } else {
+                shown
+            },
+            Role::Engaged,
+        ),
+    ];
+    let value_w = rows.iter().map(|r| r.2.chars().count()).max().unwrap_or(0);
+    for (glyph, label, value, note, role) in rows {
+        println!(
+            "{} {}   {}",
+            theme::paint(&format!("{glyph} {label:<10}"), role),
+            theme::paint(&format!("{value:>value_w$}"), Role::Ink),
+            theme::paint(&note, Role::Muted),
+        );
+    }
+}
+
+/// Render `dira zavet decisions`: an aligned table, guards underneath.
+fn print_zavet_decisions(decisions: &[ZavetDecisionView]) {
+    if decisions.is_empty() {
+        println!(
+            "{}",
+            theme::paint(
+                "no captured decisions yet — record one with /zavet:decide, or run /zavet:backfill for an existing codebase",
+                Role::Faint
+            )
+        );
+        return;
+    }
+    println!(
+        "{}",
+        theme::paint(&format!("  {:<9}{:<12}TITLE", "ID", "STATUS"), Role::Muted)
+    );
+    for d in decisions {
+        let status = d.status.as_deref().unwrap_or("active");
+        println!(
+            "  {}{}{}",
+            theme::paint(&format!("{:<9}", d.id), Role::Knowledge),
+            theme::paint(
+                &format!("{status:<12}"),
+                if status == "active" {
+                    Role::Engaged
+                } else {
+                    Role::Faint
+                }
+            ),
+            theme::paint(
+                &truncate(d.title.as_deref().unwrap_or("(untitled)"), 46),
+                Role::Ink
+            ),
+        );
+        if !d.guards.is_empty() {
+            println!(
+                "  {}",
+                theme::paint(
+                    &format!("{:<9}guards {}", "", d.guards.join(" · ")),
+                    Role::Faint
+                )
+            );
+        }
+    }
+}
+
+/// Render `dira zavet why`: the knowledge first, then evidence, then cost.
+fn print_zavet_why(v: &ZavetWhyView) {
+    let d = &v.decision;
+    println!(
+        "{} {} {}",
+        theme::paint(&d.id, Role::Knowledge),
+        theme::paint("·", Role::Muted),
+        theme::paint(d.title.as_deref().unwrap_or("(untitled)"), Role::Ink),
+    );
+    if let Some(q) = &v.matched_query {
+        println!("{}", theme::paint(&format!("matched \"{q}\""), Role::Faint));
+    }
+    println!(
+        "{} {} {}",
+        zavet_badges(d.status.as_deref(), d.origin.as_deref(), d.verified),
+        theme::paint("·", Role::Muted),
+        theme::paint(&d.path, Role::Faint),
+    );
+    if let Some(s) = &d.supersedes {
+        println!("{}", theme::paint(&format!("supersedes {s}"), Role::Muted));
+    }
+    if let Some(s) = &v.superseded_by {
+        println!(
+            "{}",
+            theme::paint(
+                &format!("superseded by {s} — read that instead"),
+                Role::Negative
+            )
+        );
+    }
+    if !d.guards.is_empty() {
+        println!(
+            "{} {}",
+            theme::paint("guards", Role::Muted),
+            theme::paint(&d.guards.join(" · "), Role::Ink),
+        );
+    }
+
+    if let Some(body) = &v.body_md {
+        println!();
+        for line in body.lines() {
+            if let Some(h) = line.strip_prefix("## ") {
+                println!("  {}", theme::paint(h, Role::Knowledge));
+            } else {
+                println!("  {line}");
+            }
+        }
+    }
+
+    if !v.commits.is_empty() {
+        println!("\n{}", theme::paint("COMMITS", Role::Muted));
+        for c in &v.commits {
+            let sha = short_sha(&c.sha);
+            let day = c.authored_at.as_deref().map(|t| &t[..t.len().min(10)]);
+            let sess = match &c.session_id {
+                Some(s) => theme::paint(&format!("● {}", &s[..s.len().min(8)]), Role::Engaged),
+                None => theme::paint("unattributed", Role::Faint),
+            };
+            println!(
+                "  {}  {}  {} {}",
+                theme::paint(sha, Role::Faint),
+                theme::paint(
+                    &truncate(c.message.as_deref().unwrap_or("(not captured)"), 42),
+                    Role::Ink
+                ),
+                theme::paint(day.unwrap_or(""), Role::Muted),
+                sess,
+            );
+        }
+    }
+
+    if !v.guard_stats.is_empty() {
+        println!("\n{}", theme::paint("GUARDS", Role::Muted));
+        println!(
+            "  {}",
+            theme::paint(&guard_stats_line(&v.guard_stats), Role::Ink)
+        );
+    }
+
+    println!("\n{}", theme::paint("COST", Role::Muted));
+    if v.sessions.is_empty() {
+        println!(
+            "  {}",
+            theme::paint("no attributed sessions yet — cost unknown", Role::Faint)
+        );
+    } else {
+        if v.sessions.len() > 1 {
+            for s in &v.sessions {
+                println!(
+                    "  {}  {}  {}  {}",
+                    theme::paint(
+                        &format!("{:<10}", &s.session_id[..s.session_id.len().min(8)]),
+                        Role::Muted
+                    ),
+                    theme::paint(&format!("● {}", hms(s.human_seconds)), Role::Engaged),
+                    theme::paint(&format!("◆ {}", hms(s.agent_seconds)), Role::Agent),
+                    theme::paint(
+                        &format!("◇ {} tok", tokens_compact(s.input_tokens + s.output_tokens)),
+                        Role::Compute
+                    ),
+                );
+            }
+        }
+        println!(
+            "  {}   {}   {}",
+            theme::paint(
+                &format!("● engaged {}", hms(v.total_human_seconds)),
+                Role::Engaged
+            ),
+            theme::paint(
+                &format!("◆ agent {}", hms(v.total_agent_seconds)),
+                Role::Agent
+            ),
+            theme::paint(
+                &format!(
+                    "◇ compute {} tok",
+                    tokens_compact(v.total_input_tokens + v.total_output_tokens)
+                ),
+                Role::Compute
+            ),
+        );
+        let n = v.sessions.len();
+        let plural = if n == 1 { "" } else { "s" };
+        println!(
+            "  {}",
+            theme::paint(&format!("across {n} session{plural}"), Role::Muted)
+        );
+    }
+    if v.unattributed_commits > 0 || v.unattributed_guard_events > 0 {
+        println!(
+            "  {}",
+            theme::paint(
+                &format!(
+                    "honest lower bound — unattributed: {} commit(s), {} guard event(s)",
+                    v.unattributed_commits, v.unattributed_guard_events
+                ),
+                Role::Faint
+            )
+        );
+    }
+}
+
+/// Render ranked matches for a free-text `why`/`wiki <topic>` query: decision
+/// records first, then matching micro-decisions (orphan commit trailers).
+fn print_zavet_search(
+    query: &str,
+    hits: &[dira_core::protocol::ZavetSearchHit],
+    trailers: &[dira_core::protocol::ZavetTrailerHit],
+) {
+    if hits.is_empty() && trailers.is_empty() {
+        println!(
+            "{}",
+            theme::paint(
+                &format!("nothing recorded matches \"{query}\""),
+                Role::Faint
+            )
+        );
+        return;
+    }
+    let n = hits.len() + trailers.len();
+    let plural = if n == 1 { "" } else { "es" };
+    println!(
+        "{} {}",
+        theme::paint(&format!("{n} match{plural}"), Role::Ink),
+        theme::paint(&format!("for \"{query}\""), Role::Muted),
+    );
+    if !hits.is_empty() {
+        println!();
+        for h in hits {
+            println!(
+                "  {}  {} {}",
+                theme::paint(&format!("{:<8}", h.id), Role::Knowledge),
+                theme::paint(
+                    &truncate(h.title.as_deref().unwrap_or("(untitled)"), 52),
+                    Role::Ink
+                ),
+                zavet_badges(h.status.as_deref(), None, h.verified),
+            );
+            if let Some(e) = &h.excerpt {
+                println!(
+                    "  {}",
+                    theme::paint(&format!("{:<8}  {}", "", truncate(e, 60)), Role::Faint)
+                );
+            }
+        }
+    }
+    if !trailers.is_empty() {
+        println!(
+            "\n{}",
+            theme::paint("MICRO-DECISIONS (commit trailers)", Role::Muted)
+        );
+        for t in trailers {
+            println!(
+                "  {}  {} {}",
+                theme::paint(short_sha(&t.sha), Role::Faint),
+                theme::paint(&format!("{}:", t.key), Role::Knowledge),
+                theme::paint(&truncate(&t.value, 56), Role::Ink),
+            );
+        }
+        println!(
+            "  {}",
+            theme::paint("full context: git show <sha>", Role::Faint)
+        );
+    }
+    if let Some(top) = hits.first() {
+        println!(
+            "\n{}",
+            theme::paint(
+                &format!("full record + cost: dira zavet why {}", top.id),
+                Role::Faint
+            )
+        );
+    }
+}
+
+/// Render `dira zavet wiki`: the knowledge-base overview.
+fn print_zavet_wiki(v: &dira_core::protocol::ZavetWikiView) {
+    println!(
+        "{} {} {}",
+        theme::paint("ZAVET", Role::Knowledge),
+        theme::paint("·", Role::Muted),
+        theme::paint(&v.repo, Role::Ink),
+    );
+    let plural = |n: u64, s: &str| format!("{n} {s}{}", if n == 1 { "" } else { "s" });
+    println!(
+        "{}",
+        dots(&[
+            plural(v.decisions_total, "decision"),
+            plural(v.trailers, "trailer"),
+            plural(v.guard_events, "guard event"),
+        ])
+    );
+
+    let section = |title: &str, list: &[ZavetDecisionView]| {
+        if list.is_empty() {
+            return;
+        }
+        println!("\n{}", theme::paint(title, Role::Muted));
+        for d in list {
+            let verified = if dira_core::zavet::is_unverified(d.origin.as_deref(), d.verified) {
+                theme::paint("○ unverified", Role::Compute)
+            } else {
+                theme::paint("✓", Role::Engaged)
+            };
+            println!(
+                "  {}  {} {}",
+                theme::paint(&format!("{:<8}", d.id), Role::Knowledge),
+                theme::paint(
+                    &truncate(d.title.as_deref().unwrap_or("(untitled)"), 52),
+                    Role::Ink
+                ),
+                verified,
+            );
+            if !d.guards.is_empty() {
+                println!(
+                    "  {}",
+                    theme::paint(
+                        &format!("{:<8}  guards {}", "", d.guards.join(" · ")),
+                        Role::Faint
+                    )
+                );
+            }
+        }
+    };
+    section("ACTIVE DECISIONS", &v.active);
+    section("SUPERSEDED", &v.superseded);
+
+    if !v.recent.is_empty() {
+        println!("\n{}", theme::paint("RECENT KNOWLEDGE", Role::Muted));
+        for (sha, key, value) in &v.recent {
+            println!(
+                "  {}  {}  {}",
+                theme::paint(short_sha(sha), Role::Faint),
+                theme::paint(&format!("{key:<11}"), Role::Knowledge),
+                theme::paint(&truncate(value, 52), Role::Ink),
+            );
+        }
+    }
+    if v.decisions_total == 0 {
+        println!(
+            "\n{}",
+            theme::paint(
+                "empty knowledge base — /zavet:decide records a decision, /zavet:backfill reverse-engineers an existing codebase",
+                Role::Faint
+            )
+        );
     }
 }
 

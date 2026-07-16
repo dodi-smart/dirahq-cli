@@ -26,6 +26,12 @@ pub enum Role {
     Accent,
     /// Token compute / estimated cost. Amber `#e5a53b`.
     Compute,
+    /// Zavet knowledge — decisions, guards, recorded rationale. Rose `#e87ca0`:
+    /// the third point of the brand triad (teal ≈166° human time, purple ≈249°
+    /// agent time, rose ≈332° what that time produced), so a `zavet why` cost
+    /// panel fuses all three. Deliberately NOT amber — amber means compute and
+    /// sits next to zavet content in every cost line.
+    Knowledge,
     /// Device-signed attribution. Blue `#7fa6e0`. Reserved for the assurance
     /// tiers (anchored/attributed/unverified) once the CLI surfaces them, kept
     /// here so the palette stays the single source of truth alongside the cloud.
@@ -48,6 +54,7 @@ impl Role {
             Role::Engaged => (0x1f, 0xd6, 0xae),
             Role::Agent | Role::Accent => (0x90, 0x79, 0xff),
             Role::Compute => (0xe5, 0xa5, 0x3b),
+            Role::Knowledge => (0xe8, 0x7c, 0xa0),
             Role::Attributed => (0x7f, 0xa6, 0xe0),
             Role::Ink => (0xec, 0xea, 0xf2),
             Role::Muted => (0x8b, 0x87, 0x99),
@@ -64,6 +71,9 @@ impl Role {
             Role::Engaged => Color::Cyan,
             Role::Agent | Role::Accent => Color::Magenta,
             Role::Compute => Color::Yellow,
+            // Bright magenta: closest ANSI-16 to rose, still distinct from the
+            // agent/accent purple's plain magenta.
+            Role::Knowledge => Color::LightMagenta,
             Role::Attributed => Color::Blue,
             Role::Ink => Color::White,
             Role::Muted => Color::Gray,
@@ -78,6 +88,7 @@ impl Role {
             Role::Engaged => 36,              // cyan
             Role::Agent | Role::Accent => 35, // magenta
             Role::Compute => 33,              // yellow
+            Role::Knowledge => 95,            // bright magenta (rose fallback)
             Role::Attributed => 34,           // blue
             Role::Ink => 97,                  // bright white
             Role::Muted => 37,                // white

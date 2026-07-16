@@ -29,6 +29,9 @@ futures-util.workspace = true
 toml_edit.workspace = true
 
 [dev-dependencies]
+# `config_cmd`'s round-trip test re-layers a written config.toml the same way
+# `Config::load` does.
+figment.workspace = true
 # Mock-cloud test server for `device.rs`'s two-phase rotation tests (WP-B1b) —
 # the same axum version `dirad` already runs in production, test-only here.
 axum.workspace = true

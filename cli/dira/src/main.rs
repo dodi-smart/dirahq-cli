@@ -370,6 +370,87 @@ Examples:
   dira version               CLI + daemon build, wire schema, uptime — and a
                              warning when the CLI and daemon builds differ")]
     Version,
+    /// Zavet knowledge module: what the tracked time produced, and why.
+    #[command(
+        long_about = "\
+Zavet is dira's knowledge sibling: repos that carry a .zavet/ directory (see
+the zavet plugin, github.com/dodi-smart/dirahq-zavet) record decisions as
+append-only markdown with guard globs, and commits carry Why:/Refs: trailers.
+The daemon captures those alongside its ordinary git polling and correlates
+them with sessions, so every decision has both recall and a time cost.
+Activation: modules.zavet knob (auto = repos with .zavet/), overridable per
+repo with enable/disable.",
+        after_help = "\
+Examples:
+  dira zavet status          is zavet active here? capture health
+  dira zavet why D-0042      the decision — and what it cost
+  dira zavet decisions       every captured decision in this repo
+  dira zavet enable          force-on for this repo (beats the global knob)"
+    )]
+    Zavet {
+        #[command(subcommand)]
+        action: ZavetAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZavetAction {
+    /// Activation + capture health for this repo.
+    Status {
+        /// Canonical repo (e.g. github.com/org/repo); default: resolve from cwd.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Answer "why?" — by decision id or plain question — with what it cost.
+    #[command(after_help = "\
+Examples:
+  dira zavet why D-0042      one decision: record, guards, commits, time cost
+  dira zavet why polling instead of a filesystem watcher
+                             free text — searches titles, bodies, trailers;
+                             a confident match answers, several list matches
+  dira zavet why D-0042 --project github.com/org/repo")]
+    Why {
+        /// A decision id (D-0042) or a plain-language question.
+        #[arg(value_name = "QUESTION", required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Browse the knowledge base: overview, or search a topic.
+    #[command(after_help = "\
+Examples:
+  dira zavet wiki            active + superseded decisions, recent knowledge
+  dira zavet wiki polling    ranked matches with excerpts")]
+    Wiki {
+        /// Optional topic to search for.
+        #[arg(value_name = "TOPIC", num_args = 0..)]
+        topic: Vec<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// List the captured decisions for this repo.
+    Decisions {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Force zavet ON for this repo (overrides the global modules.zavet knob).
+    Enable {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Force zavet OFF for this repo.
+    Disable {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Clear the per-repo override (fall back to the global knob).
+    Reset {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Emit shim: read one guard-event JSON on stdin and forward it to the
+    /// daemon (fire-and-forget; always exits 0). Wired by the zavet plugin.
+    Emit,
 }
 
 #[derive(Subcommand)]
@@ -493,6 +574,9 @@ async fn main() -> Result<()> {
             };
         }
         Command::Hook { harness } => return forward_hook(&config, harness).await,
+        Command::Zavet {
+            action: ZavetAction::Emit,
+        } => return forward_zavet_event(&config).await,
         Command::Nuke { yes } => return nuke(&config, *yes).await,
         Command::Version => return print_version(&config).await,
         Command::Device { action } => {
@@ -591,6 +675,37 @@ async fn main() -> Result<()> {
             };
             Request::Report { scope }
         }
+        Command::Zavet { action } => match action {
+            ZavetAction::Status { project } => Request::ZavetStatus { cwd, repo: project },
+            ZavetAction::Why { query, project } => Request::ZavetWhy {
+                query: query.join(" "),
+                cwd,
+                repo: project,
+            },
+            ZavetAction::Wiki { topic, project } => Request::ZavetWiki {
+                topic: Some(topic.join(" ")).filter(|t| !t.trim().is_empty()),
+                cwd,
+                repo: project,
+            },
+            ZavetAction::Decisions { project } => Request::ZavetDecisions { cwd, repo: project },
+            ZavetAction::Enable { project } => Request::ZavetSetMode {
+                cwd,
+                repo: project,
+                mode: "on".into(),
+            },
+            ZavetAction::Disable { project } => Request::ZavetSetMode {
+                cwd,
+                repo: project,
+                mode: "off".into(),
+            },
+            ZavetAction::Reset { project } => Request::ZavetSetMode {
+                cwd,
+                repo: project,
+                mode: "clear".into(),
+            },
+            // handled client-side above
+            ZavetAction::Emit => unreachable!(),
+        },
         // already handled above
         Command::Status { .. }
         | Command::Init { .. }
@@ -612,9 +727,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Forward a hook payload from stdin to the daemon. Must never break the agent
-/// loop: any failure (daemon down, bad JSON) exits 0 silently.
-async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
+/// Forward a JSON payload from stdin to the daemon, wrapped into a request by
+/// `wrap`. Hook shims are fire-and-forget and must never break the agent loop:
+/// any failure (daemon down, bad JSON, old daemon) exits 0 silently, and the
+/// send is bounded so a wedged daemon can't stall the caller.
+async fn forward_stdin(
+    config: &Config,
+    wrap: impl FnOnce(serde_json::Value) -> Request,
+) -> Result<()> {
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         return Ok(());
@@ -623,17 +743,28 @@ async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    let req = Request::IngestHook {
-        harness: harness.to_string(),
-        payload,
-    };
-    // Bounded so a wedged daemon can't stall the agent.
+    let req = wrap(payload);
     let _ = tokio::time::timeout(
         std::time::Duration::from_millis(500),
         client::send(&config.socket_path, &req),
     )
     .await;
     Ok(())
+}
+
+/// Forward a harness hook payload from stdin to the daemon.
+async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
+    let harness = harness.to_string();
+    forward_stdin(config, move |payload| Request::IngestHook {
+        harness,
+        payload,
+    })
+    .await
+}
+
+/// Forward a zavet guard event from stdin to the daemon.
+async fn forward_zavet_event(config: &Config) -> Result<()> {
+    forward_stdin(config, |payload| Request::IngestZavet { payload }).await
 }
 
 /// Print the CLI version (and wire schema), then best-effort query the running
@@ -723,7 +854,15 @@ mod tests {
     #[test]
     fn help_carries_examples_for_flagship_commands() {
         let mut cmd = Cli::command();
-        for name in ["status", "log", "completions", "stop", "init", "device"] {
+        for name in [
+            "status",
+            "log",
+            "completions",
+            "stop",
+            "init",
+            "device",
+            "zavet",
+        ] {
             let sub = cmd
                 .find_subcommand_mut(name)
                 .unwrap_or_else(|| panic!("subcommand {name} exists"))

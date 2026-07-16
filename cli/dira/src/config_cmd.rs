@@ -32,6 +32,8 @@ enum Kind {
     Str,
     /// A non-negative integer of seconds/days.
     U64,
+    /// One of a fixed set of lowercase values.
+    Enum(&'static [&'static str]),
 }
 
 /// The keys `dira config set` understands. Keeping this as an explicit table (vs.
@@ -88,6 +90,11 @@ const KNOBS: &[Knob] = &[
         kind: Kind::U64,
         help: "presence TTL advertised while deep idle; clamped to [presence_ttl_secs, 600]",
     },
+    Knob {
+        key: "modules.zavet",
+        kind: Kind::Enum(&["auto", "on", "off"]),
+        help: "zavet knowledge module: auto (active when a repo has .zavet/), on, off",
+    },
 ];
 
 fn knob(key: &str) -> Option<&'static Knob> {
@@ -132,7 +139,12 @@ pub fn get(config: &Config, key: Option<&str>) -> Result<()> {
         .ok_or_else(|| anyhow!("config did not serialize to an object"))?;
 
     if let Some(k) = key {
-        match map.get(k) {
+        // Dotted keys (`modules.zavet`) traverse into nested tables.
+        let mut cur = Some(&value);
+        for seg in k.split('.') {
+            cur = cur.and_then(|v| v.get(seg));
+        }
+        match cur {
             Some(v) => {
                 println!("{}", render_json_scalar(v));
                 Ok(())
@@ -187,13 +199,31 @@ pub fn set(config: &Config, key: &str, raw: &str) -> Result<()> {
     let mut doc: DocumentMut = existing
         .parse()
         .with_context(|| format!("parse existing {}", path.display()))?;
-    doc[key] = item;
+    assign(&mut doc, key, item);
     std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
 
     println!("set {key} = {raw}");
     println!("wrote {}", path.display());
     println!("note: restart the daemon for daemon-side changes to take effect (`dira daemon stop` then `dira daemon start`)");
     Ok(())
+}
+
+/// Write `item` at `key` in the document, where a dotted key (`modules.zavet`)
+/// addresses a nested table — toml_edit creates intermediate tables implicitly.
+fn assign(doc: &mut DocumentMut, key: &str, item: toml_edit::Item) {
+    let mut segs: Vec<&str> = key.split('.').collect();
+    let last = segs.pop().expect("knob keys are non-empty");
+    let mut cur = doc.as_item_mut();
+    for seg in segs {
+        // Materialize intermediate segments as real `[table]`s (indexing alone
+        // would create an inline table on assignment). `map_or`, not
+        // `is_none_or`: the latter is stable only since 1.82 and MSRV is 1.80.
+        if cur.get(seg).map_or(true, toml_edit::Item::is_none) {
+            cur[seg] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        cur = &mut cur[seg];
+    }
+    cur[last] = item;
 }
 
 /// Parse `raw` per the knob's kind and enforce validation, returning the TOML item
@@ -229,6 +259,13 @@ fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_ed
                 Ok(value(n as i64))
             }
             Kind::Str => Ok(value(raw.trim())),
+            Kind::Enum(allowed) => {
+                let v = raw.trim().to_ascii_lowercase();
+                if !allowed.contains(&v.as_str()) {
+                    bail!("{key} must be one of: {} (got `{raw}`)", allowed.join(", "));
+                }
+                Ok(value(v))
+            }
         },
     }
 }
@@ -339,6 +376,43 @@ mod tests {
         assert!(out.contains("idle_seconds = 300"));
         assert!(out.contains("cloud_url = \"https://old\""));
         assert!(out.contains("retention_days = 30"));
+    }
+
+    #[test]
+    fn modules_zavet_accepts_only_the_three_modes() {
+        let knob = knob("modules.zavet").unwrap();
+        assert!(parse_and_validate(&cfg(), knob, "auto").is_ok());
+        assert!(parse_and_validate(&cfg(), knob, "ON").is_ok()); // case-folded
+        assert!(parse_and_validate(&cfg(), knob, "off").is_ok());
+        assert!(parse_and_validate(&cfg(), knob, "maybe").is_err());
+    }
+
+    #[test]
+    fn dotted_key_writes_a_nested_table_and_preserves_the_rest() {
+        let original = "# my config\nidle_seconds = 300\n";
+        let mut doc: DocumentMut = original.parse().unwrap();
+        assign(&mut doc, "modules.zavet", value("on"));
+        let out = doc.to_string();
+        assert!(out.contains("# my config"));
+        assert!(out.contains("idle_seconds = 300"));
+        assert!(out.contains("[modules]"));
+        assert!(out.contains("zavet = \"on\""));
+        // And the round-trip parses back into Config with the mode applied.
+        use figment::providers::Format as _;
+        let cfg: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(figment::providers::Toml::string(&out))
+                .extract()
+                .unwrap();
+        assert_eq!(cfg.modules.zavet, dira_core::config::ZavetMode::On);
+    }
+
+    #[test]
+    fn get_resolves_dotted_keys() {
+        // The same traversal `get` uses, against the serialized config.
+        let v = serde_json::to_value(cfg()).unwrap();
+        let got = v.get("modules").and_then(|m| m.get("zavet")).unwrap();
+        assert_eq!(got, &serde_json::json!("auto"));
     }
 
     #[test]

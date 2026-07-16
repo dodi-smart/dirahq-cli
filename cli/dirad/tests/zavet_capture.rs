@@ -161,6 +161,170 @@ async fn capture_records_decisions_and_trailers_idempotently() {
     assert_eq!(commits.len(), 2);
 }
 
+const SPEC: &str = r#"---
+title: Commit capture pipeline
+version: 1
+origin: session          # designed | session | reverse-engineered
+verified: false
+confidence: high         # low | med | high
+date: 2026-07-16
+paths:
+  - src/capture/**
+decisions: [D-0001]
+---
+
+## Overview
+The sweep walks new commits oldest-first, per D-1.
+
+## Open Questions
+- none
+"#;
+
+#[tokio::test]
+async fn capture_records_specs_and_computes_staleness() {
+    let state = test_state().await;
+    let repo = setup_repo();
+    let p = repo.path();
+    let cwd = p.display().to_string();
+    let canonical = "github.com/acme/api";
+
+    std::fs::create_dir_all(p.join(".zavet/specs")).unwrap();
+    std::fs::write(p.join(".zavet/specs/capture-pipeline.md"), SPEC).unwrap();
+    // The dot-prefixed template next to the specs must NOT be captured.
+    std::fs::write(p.join(".zavet/.spec-template.md"), SPEC).unwrap();
+    std::fs::write(p.join(".zavet/specs/.spec-template.md"), SPEC).unwrap();
+    git(p, &["add", "-A"]);
+    git(
+        p,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "docs: spec the capture pipeline\n\nSpec: capture-pipeline",
+        ],
+    );
+
+    dirad::capture::capture_commits(&state, &cwd, canonical).await;
+
+    let s = state
+        .store
+        .zavet_spec_get(canonical, "capture-pipeline")
+        .await
+        .unwrap()
+        .expect("spec captured");
+    assert_eq!(s.title.as_deref(), Some("Commit capture pipeline"));
+    assert_eq!(s.origin.as_deref(), Some("session"));
+    assert_eq!(s.confidence.as_deref(), Some("high"));
+    assert_eq!(s.verified, Some(false));
+    assert_eq!(s.paths, vec!["src/capture/**"]);
+    // Frontmatter list ∪ the body's `D-1` ref, canonicalized + deduped.
+    assert_eq!(s.decisions, vec!["D-0001"]);
+    assert!(s.content_hash.is_some());
+    let first_commit = s.first_commit.clone().expect("first commit recorded");
+    let counts = state.store.zavet_counts(canonical).await.unwrap();
+    assert_eq!(counts.specs_total, 1, "templates must not be ingested");
+    assert!(state
+        .store
+        .zavet_spec_get(canonical, ".spec-template")
+        .await
+        .unwrap()
+        .is_none());
+
+    // The reverse link: D-0001 knows which spec covers it.
+    let covering = state
+        .store
+        .zavet_specs_for_decision(canonical, "D-0001")
+        .await
+        .unwrap();
+    assert_eq!(covering.len(), 1);
+    assert_eq!(covering[0].0, "capture-pipeline");
+
+    // A commit touching a covered path — the spec goes stale.
+    std::fs::create_dir_all(p.join("src/capture")).unwrap();
+    std::fs::write(p.join("src/capture/poll.rs"), "fn poll() {}").unwrap();
+    git(p, &["add", "-A"]);
+    git(
+        p,
+        &["commit", "-q", "-m", "feat: rework poll\n\nRefs: D-0001"],
+    );
+    dirad::capture::capture_commits(&state, &cwd, canonical).await;
+
+    let resp = dirad::control::dispatch(
+        &state,
+        dira_core::protocol::Request::ZavetWiki {
+            topic: None,
+            cwd: Some(cwd.clone()),
+            repo: Some(canonical.into()),
+        },
+    )
+    .await;
+    let w = match resp {
+        dira_core::protocol::Response::ZavetWiki(w) => w,
+        other => panic!("expected ZavetWiki, got {other:?}"),
+    };
+    assert_eq!(w.specs_total, 1);
+    assert_eq!(w.specs.len(), 1);
+    assert_eq!(w.specs[0].slug, "capture-pipeline");
+    assert_eq!(
+        w.specs[0].stale_commits,
+        Some(1),
+        "the poll.rs commit touches src/capture/** after the spec's capture"
+    );
+    assert_eq!(w.specs[0].decisions, vec!["D-0001"]);
+
+    // Updating the spec moves the living fields, keeps first-sight
+    // provenance, and resets staleness.
+    let updated = SPEC
+        .replace("version: 1", "version: 2")
+        .replace("decisions: [D-0001]", "decisions: [D-0001, D-0002]");
+    std::fs::write(p.join(".zavet/specs/capture-pipeline.md"), updated).unwrap();
+    git(p, &["add", "-A"]);
+    git(
+        p,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "docs: refresh capture spec\n\nSpec: capture-pipeline",
+        ],
+    );
+    dirad::capture::capture_commits(&state, &cwd, canonical).await;
+
+    let s = state
+        .store
+        .zavet_spec_get(canonical, "capture-pipeline")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.version, 2);
+    assert_eq!(s.first_commit.as_deref(), Some(first_commit.as_str()));
+    assert_ne!(s.last_commit.as_deref(), Some(first_commit.as_str()));
+    assert_eq!(
+        s.decisions,
+        vec!["D-0001", "D-0002"],
+        "links replaced wholesale"
+    );
+
+    let resp = dirad::control::dispatch(
+        &state,
+        dira_core::protocol::Request::ZavetWiki {
+            topic: None,
+            cwd: Some(cwd),
+            repo: Some(canonical.into()),
+        },
+    )
+    .await;
+    let w = match resp {
+        dira_core::protocol::Response::ZavetWiki(w) => w,
+        other => panic!("expected ZavetWiki, got {other:?}"),
+    };
+    assert_eq!(
+        w.specs[0].stale_commits,
+        Some(0),
+        "refreshing the spec resets staleness"
+    );
+}
+
 #[tokio::test]
 async fn repos_without_zavet_capture_commits_but_no_knowledge() {
     let state = test_state().await;

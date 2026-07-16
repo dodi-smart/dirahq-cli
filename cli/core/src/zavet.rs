@@ -1,8 +1,9 @@
-//! Pure parsing for the zavet knowledge layer: decision-record frontmatter and
-//! lore-protocol commit trailers. No IO — the daemon's capture path feeds this
-//! from `git show`/`git log` output, and a future CI mode reuses it verbatim.
+//! Pure parsing for the zavet knowledge layer: decision-record and spec
+//! frontmatter plus lore-protocol commit trailers. No IO — the daemon's
+//! capture path feeds this from `git show`/`git log` output, and a future CI
+//! mode reuses it verbatim.
 
-use crate::store::{ZavetDecisionCapture, ZavetTrailer};
+use crate::store::{ZavetDecisionCapture, ZavetSpecCapture, ZavetTrailer};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -12,6 +13,10 @@ pub const ZAVET_DIR: &str = ".zavet";
 /// Where decision records live inside the repo (trailing slash included, for
 /// prefix-stripping repo-relative paths).
 pub const DECISIONS_DIR: &str = ".zavet/decisions/";
+
+/// Where living feature specs live inside the repo (trailing slash included,
+/// for prefix-stripping repo-relative paths).
+pub const SPECS_DIR: &str = ".zavet/specs/";
 
 /// The trailer keys zavet records (lowercase). Everything else in a commit
 /// footer (`Signed-off-by:`, `Co-authored-by:`, …) is ignored.
@@ -42,7 +47,19 @@ pub fn canonical_decision_id(s: &str) -> Option<String> {
 /// The first `D-<digits>` decision reference in `s`, canonicalized, if any.
 /// Hand-rolled scan — not worth a regex dependency.
 pub fn scan_decision_ref(s: &str) -> Option<String> {
+    scan_refs(s, true).into_iter().next()
+}
+
+/// EVERY `D-<digits>` decision reference in `s`, canonicalized, deduplicated,
+/// in order of first appearance. Spec bodies auto-link the decisions they
+/// mention through this.
+pub fn scan_all_decision_refs(s: &str) -> Vec<String> {
+    scan_refs(s, false)
+}
+
+fn scan_refs(s: &str, first_only: bool) -> Vec<String> {
     let bytes = s.as_bytes();
+    let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i + 2 < bytes.len() {
         if bytes[i] == b'D'
@@ -55,11 +72,20 @@ pub fn scan_decision_ref(s: &str) -> Option<String> {
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            return canonical_decision_id(&s[i..j]);
+            if let Some(id) = canonical_decision_id(&s[i..j]) {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+                if first_only {
+                    return out;
+                }
+            }
+            i = j;
+            continue;
         }
         i += 1;
     }
-    None
+    out
 }
 
 /// Filter raw `key: value` trailer pairs down to the zavet allowlist,
@@ -104,28 +130,37 @@ pub fn parse_trailer_block(block: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Parse a decision record file into a [`ZavetDecisionCapture`].
-///
-/// The frontmatter dialect is a deliberate YAML subset — plain scalars plus
-/// inline (`[a, b]`) or block (`- a`) string lists for `guards` — matching
-/// what the zavet plugin's templates emit. Malformed documents yield `None`
-/// (capture is best-effort); unknown keys are ignored. `content_hash` is left
-/// empty for the caller (it comes from git, not the text).
-pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
-    let mut lines = text.lines();
-    if lines.next()?.trim_end() != "---" {
+/// One parsed frontmatter entry: a scalar `key: value` or a string list
+/// (inline `[a, b]` or block `- a`). Values are raw (trimmed, still quoted /
+/// possibly comment-suffixed) — consumers clean per key, because `title` is
+/// free text while structured keys allow inline `# comments`.
+enum FmValue {
+    Scalar(String),
+    List(Vec<String>),
+}
+
+struct RawFrontmatter {
+    entries: Vec<(String, FmValue)>,
+    body_start: Option<usize>,
+}
+
+/// Walk the `---`-fenced frontmatter shared by decision records and specs.
+/// The dialect is a deliberate YAML subset — plain scalars plus inline
+/// (`[a, b]`) or block (`- a`) string lists — matching what the zavet
+/// plugin's templates emit. A document without a closed fence yields `None`
+/// (capture is best-effort); unknown keys pass through for consumers to
+/// ignore.
+fn parse_frontmatter(text: &str) -> Option<RawFrontmatter> {
+    if text.lines().next()?.trim_end() != "---" {
         return None;
     }
 
-    let mut cap = ZavetDecisionCapture {
-        path: path.to_string(),
-        ..Default::default()
-    };
-    let mut in_guards = false;
+    let mut entries: Vec<(String, FmValue)> = Vec::new();
+    let mut pending_list: Option<(String, Vec<String>)> = None;
     let mut body_start: Option<usize> = None;
 
-    // Byte offset scanning for the body: re-walk with char indices instead of
-    // the iterator so we can slice the remainder after the closing `---`.
+    // Byte offset scanning for the body: walk with offsets instead of a line
+    // iterator so we can slice the remainder after the closing `---`.
     let mut offset = text.find('\n').map(|i| i + 1).unwrap_or(text.len());
     let mut closed = false;
     while offset <= text.len() {
@@ -140,52 +175,39 @@ pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
             break;
         }
 
-        if in_guards {
+        if let Some((_, items)) = pending_list.as_mut() {
             let t = line.trim_start();
             if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("-\t")) {
-                let g = unquote(item.trim());
-                if !g.is_empty() {
-                    cap.guards.push(g.to_string());
-                }
+                items.push(item.trim().to_string());
                 offset = next_offset;
                 continue;
             } else if line.starts_with(char::is_whitespace) && !t.is_empty() {
-                // Indented non-list content under guards: tolerate, skip.
+                // Indented non-list content under a list key: tolerate, skip.
                 offset = next_offset;
                 continue;
             }
-            in_guards = false;
+            let (k, items) = pending_list.take().expect("checked above");
+            entries.push((k, FmValue::List(items)));
         }
 
         if let Some((key, value)) = line.split_once(':') {
             let key = key.trim();
             let value = value.trim();
-            match key {
-                "id" => cap.id = unquote(value).to_string(),
-                "title" => cap.title = non_empty(unquote(value)),
-                "status" => cap.status = non_empty(unquote(value)),
-                "supersedes" => cap.supersedes = non_empty(unquote(value)),
-                "origin" => cap.origin = non_empty(unquote(value)),
-                "verified" => {
-                    cap.verified = match unquote(value).to_ascii_lowercase().as_str() {
-                        "true" | "yes" => Some(true),
-                        "false" | "no" => Some(false),
-                        _ => None,
-                    }
-                }
-                "guards" => {
-                    if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-                        cap.guards.extend(
-                            inner
-                                .split(',')
-                                .map(|g| unquote(g.trim()).to_string())
-                                .filter(|g| !g.is_empty()),
-                        );
-                    } else if value.is_empty() {
-                        in_guards = true;
-                    }
-                }
-                _ => {} // unknown keys (origin, verified, tags, …) are fine
+            let structured = decomment(value);
+            if let Some(inner) = structured
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+            {
+                entries.push((
+                    key.to_string(),
+                    FmValue::List(inner.split(',').map(|i| i.trim().to_string()).collect()),
+                ));
+            } else if structured.is_empty() {
+                // `key:` (bare or comment-only) opens a block list; if no
+                // `- item` lines follow it finalizes as an empty list.
+                pending_list = Some((key.to_string(), Vec::new()));
+            } else {
+                entries.push((key.to_string(), FmValue::Scalar(value.to_string())));
             }
         }
         if next_offset > text.len() {
@@ -197,18 +219,138 @@ pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
     if !closed {
         return None;
     }
+    if let Some((k, items)) = pending_list.take() {
+        entries.push((k, FmValue::List(items)));
+    }
+    Some(RawFrontmatter {
+        entries,
+        body_start,
+    })
+}
+
+fn body_of(text: &str, body_start: Option<usize>) -> Option<String> {
+    body_start
+        .and_then(|s| text.get(s..))
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
+/// Parse a decision record file into a [`ZavetDecisionCapture`].
+///
+/// Malformed documents yield `None` (capture is best-effort); unknown keys
+/// are ignored. `content_hash` is left empty for the caller (it comes from
+/// git, not the text).
+pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
+    let fm = parse_frontmatter(text)?;
+    let mut cap = ZavetDecisionCapture {
+        path: path.to_string(),
+        ..Default::default()
+    };
+    for (key, value) in &fm.entries {
+        match (key.as_str(), value) {
+            ("id", FmValue::Scalar(v)) => cap.id = unquote(decomment(v)).to_string(),
+            ("title", FmValue::Scalar(v)) => cap.title = non_empty(unquote(v)),
+            ("status", FmValue::Scalar(v)) => cap.status = non_empty(unquote(decomment(v))),
+            ("supersedes", FmValue::Scalar(v)) => cap.supersedes = non_empty(unquote(decomment(v))),
+            ("origin", FmValue::Scalar(v)) => cap.origin = non_empty(unquote(decomment(v))),
+            ("verified", FmValue::Scalar(v)) => cap.verified = parse_bool(v),
+            ("guards", FmValue::List(items)) => cap.guards.extend(clean_list(items)),
+            _ => {} // unknown keys (tags, …) are fine
+        }
+    }
     // Ids are stored canonical (`D-1` → `D-0001`); a frontmatter id that
     // doesn't canonicalize (`D-x7`, missing) rejects the whole document.
     cap.id = canonical_decision_id(&cap.id)?;
-    cap.body_md = body_start
-        .and_then(|s| text.get(s..))
-        .map(|b| b.trim().to_string())
-        .filter(|b| !b.is_empty());
+    cap.body_md = body_of(text, fm.body_start);
     if cap.status.is_none() {
         cap.status = Some("active".to_string());
     }
     cap.slug = slug_of(path, &cap.id);
     Some(cap)
+}
+
+/// Parse a living spec file into a [`ZavetSpecCapture`].
+///
+/// The slug is the filename stem (the identity — dira captures the directory
+/// by name); dot-prefixed files (templates) reject. `decisions` is the
+/// frontmatter list ∪ every `D-NNNN` reference in the body, canonicalized and
+/// deduplicated — links live on the spec side only, decisions stay
+/// append-only. Missing `origin`/`confidence` default to the most skeptical
+/// values (`reverse-engineered`, `low`): an unlabeled spec never renders more
+/// trustworthy than a labeled one.
+pub fn parse_spec(text: &str, path: &str) -> Option<ZavetSpecCapture> {
+    let slug = spec_slug_of(path)?;
+    let fm = parse_frontmatter(text)?;
+    let mut cap = ZavetSpecCapture {
+        slug,
+        path: path.to_string(),
+        version: 1,
+        ..Default::default()
+    };
+    let mut decisions: Vec<String> = Vec::new();
+    for (key, value) in &fm.entries {
+        match (key.as_str(), value) {
+            ("title", FmValue::Scalar(v)) => cap.title = non_empty(unquote(v)),
+            ("version", FmValue::Scalar(v)) => {
+                if let Ok(n) = unquote(decomment(v)).parse::<i64>() {
+                    cap.version = n;
+                }
+            }
+            ("origin", FmValue::Scalar(v)) => {
+                if let Some(o) = non_empty(unquote(decomment(v))) {
+                    cap.origin = o;
+                }
+            }
+            ("verified", FmValue::Scalar(v)) => cap.verified = parse_bool(v),
+            ("confidence", FmValue::Scalar(v)) => {
+                if let Some(c) = non_empty(unquote(decomment(v))) {
+                    cap.confidence = c;
+                }
+            }
+            ("date", FmValue::Scalar(v)) => cap.date = non_empty(unquote(decomment(v))),
+            ("paths", FmValue::List(items)) => cap.paths.extend(clean_list(items)),
+            ("decisions", FmValue::List(items)) => {
+                decisions.extend(clean_list(items).filter_map(|d| canonical_decision_id(&d)))
+            }
+            _ => {}
+        }
+    }
+    if cap.origin.is_empty() {
+        cap.origin = "reverse-engineered".to_string();
+    }
+    if cap.confidence.is_empty() {
+        cap.confidence = "low".to_string();
+    }
+    cap.body_md = body_of(text, fm.body_start);
+    if let Some(body) = &cap.body_md {
+        for id in scan_all_decision_refs(body) {
+            decisions.push(id);
+        }
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for d in decisions {
+        if !seen.contains(&d) {
+            seen.push(d);
+        }
+    }
+    cap.decisions = seen;
+    Some(cap)
+}
+
+/// Clean raw list items: strip inline comments and quotes, drop empties.
+fn clean_list<'a>(items: &'a [String]) -> impl Iterator<Item = String> + 'a {
+    items
+        .iter()
+        .map(|i| unquote(decomment(i)).to_string())
+        .filter(|i| !i.is_empty())
+}
+
+fn parse_bool(v: &str) -> Option<bool> {
+    match unquote(decomment(v)).to_ascii_lowercase().as_str() {
+        "true" | "yes" => Some(true),
+        "false" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 /// A guard event as parsed (permissively) from the plugin's schema-v1 payload.
@@ -352,6 +494,35 @@ fn slug_of(path: &str, id: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// `.zavet/specs/capture-pipeline.md` → `capture-pipeline`. The filename IS
+/// the spec's identity; dot-prefixed stems (templates) reject.
+fn spec_slug_of(path: &str) -> Option<String> {
+    let file = path.rsplit('/').next()?;
+    let stem = file.strip_suffix(".md")?;
+    (!stem.is_empty() && !stem.starts_with('.')).then(|| stem.to_string())
+}
+
+/// Strip an inline `# comment` (a `#` preceded by whitespace) from an
+/// unquoted structured value — the same dialect the plugin's awk parser
+/// speaks. Quoted values pass through untouched; `title` never goes through
+/// this (free text: "Fix #123 handling" keeps its `#`).
+fn decomment(s: &str) -> &str {
+    let t = s.trim();
+    if t.starts_with('"') || t.starts_with('\'') {
+        return t;
+    }
+    if t.starts_with('#') {
+        return "";
+    }
+    let bytes = t.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i] == b'#' && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+            return t[..i].trim_end();
+        }
+    }
+    t
+}
+
 fn unquote(s: &str) -> &str {
     let s = s.trim();
     s.strip_prefix('"')
@@ -409,6 +580,66 @@ mod tests {
         ] {
             assert_eq!(parse_decision(doc, "x.md"), None, "doc: {doc:?}");
         }
+    }
+
+    const SPEC: &str = "---\ntitle: Zavet capture pipeline\nversion: 2\norigin: session          # designed | session | reverse-engineered\nverified: false          # true only after human review\nconfidence: high         # low | med | high\ndate: 2026-07-16\npaths:                   # git pathspecs\n  - cli/dirad/src/capture.rs\n  - \"cli/core/src/zavet.rs\"\ndecisions: [D-1, D-0042]      # optional\n---\n\n## Overview\nOldest-first sweep per D-7; see also D-0042 again.\n\n## Open Questions\n- none\n";
+
+    #[test]
+    fn parses_a_full_spec_with_inline_comments() {
+        let cap = parse_spec(SPEC, ".zavet/specs/capture-pipeline.md").unwrap();
+        assert_eq!(cap.slug, "capture-pipeline");
+        assert_eq!(cap.title.as_deref(), Some("Zavet capture pipeline"));
+        assert_eq!(cap.version, 2);
+        assert_eq!(cap.origin, "session");
+        assert_eq!(cap.verified, Some(false));
+        assert_eq!(cap.confidence, "high");
+        assert_eq!(cap.date.as_deref(), Some("2026-07-16"));
+        assert_eq!(
+            cap.paths,
+            vec!["cli/dirad/src/capture.rs", "cli/core/src/zavet.rs"]
+        );
+        // frontmatter list ∪ body refs, canonicalized, deduped, in order.
+        assert_eq!(cap.decisions, vec!["D-0001", "D-0042", "D-0007"]);
+        assert!(cap.body_md.unwrap().starts_with("## Overview"));
+    }
+
+    #[test]
+    fn spec_defaults_are_the_most_skeptical() {
+        let cap = parse_spec("---\ntitle: X\n---\nbody", ".zavet/specs/x.md").unwrap();
+        assert_eq!(cap.origin, "reverse-engineered");
+        assert_eq!(cap.confidence, "low");
+        assert_eq!(cap.version, 1);
+        assert_eq!(cap.verified, None);
+        assert!(cap.paths.is_empty());
+        assert!(cap.decisions.is_empty());
+    }
+
+    #[test]
+    fn spec_slug_comes_from_the_filename_and_templates_reject() {
+        assert!(parse_spec("---\n---\nbody", ".zavet/specs/.spec-template.md").is_none());
+        assert!(parse_spec("---\n---\nbody", ".zavet/specs/.md").is_none());
+        assert!(parse_spec("no frontmatter", ".zavet/specs/x.md").is_none());
+        assert!(parse_spec("---\nnever closed", ".zavet/specs/x.md").is_none());
+        let cap = parse_spec("---\n---\nbody", ".zavet/specs/auth-flow.md").unwrap();
+        assert_eq!(cap.slug, "auth-flow");
+    }
+
+    #[test]
+    fn decision_titles_keep_hashes_but_structured_values_decomment() {
+        let doc = "---\nid: D-1\ntitle: Fix #123 handling\nstatus: active # hmm\nguards: [a/**] # inline comment\n---\nbody";
+        let cap = parse_decision(doc, ".zavet/decisions/D-0001.md").unwrap();
+        assert_eq!(cap.title.as_deref(), Some("Fix #123 handling"));
+        assert_eq!(cap.status.as_deref(), Some("active"));
+        assert_eq!(cap.guards, vec!["a/**"]);
+    }
+
+    #[test]
+    fn scan_all_refs_collects_deduped_in_order() {
+        assert_eq!(
+            scan_all_decision_refs("D-7 then D-0042, D-7 again; CMD-9 no"),
+            vec!["D-0007", "D-0042"]
+        );
+        assert!(scan_all_decision_refs("nothing here").is_empty());
     }
 
     #[test]
@@ -540,6 +771,12 @@ mod tests {
         #[test]
         fn parse_decision_never_panics(text in ".{0,400}", path in "[a-zA-Z0-9./-]{0,40}") {
             let _ = parse_decision(&text, &path);
+        }
+
+        #[test]
+        fn parse_spec_never_panics(text in ".{0,400}", path in "[a-zA-Z0-9./-]{0,40}") {
+            let _ = parse_spec(&text, &path);
+            let _ = scan_all_decision_refs(&text);
         }
 
         #[test]

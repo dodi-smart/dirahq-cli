@@ -237,6 +237,154 @@ async fn short_trailer_refs_join_zero_padded_decisions() {
 }
 
 #[tokio::test]
+async fn zavet_why_resolves_specs_and_links_both_ways() {
+    let state = test_state().await;
+    // A decision plus the living spec that links it.
+    let decision = ZavetDecisionCapture {
+        id: "D-0001".into(),
+        title: Some("Poll git instead of watching the filesystem".into()),
+        status: Some("active".into()),
+        path: ".zavet/decisions/D-0001-poll.md".into(),
+        body_md: Some("## Decision\nPoll on events.".into()),
+        ..Default::default()
+    };
+    state
+        .store
+        .zavet_upsert_decision(REPO, &decision, "sha1", None, None)
+        .await
+        .unwrap();
+    let spec = dira_core::store::ZavetSpecCapture {
+        slug: "capture-pipeline".into(),
+        title: Some("Commit capture pipeline".into()),
+        version: 1,
+        origin: "session".into(),
+        verified: Some(false),
+        confidence: "high".into(),
+        date: Some("2026-07-16".into()),
+        paths: vec!["src/capture/**".into()],
+        decisions: vec!["D-0001".into()],
+        path: ".zavet/specs/capture-pipeline.md".into(),
+        body_md: Some("## Overview\nThe sweep batches trailer parsing.".into()),
+        content_hash: None,
+    };
+    state
+        .store
+        .zavet_upsert_spec(REPO, &spec, "shaS", None, Some("s1"))
+        .await
+        .unwrap();
+    // A commit carrying `Spec: capture-pipeline` evidences the spec.
+    let c = dira_core::project::CapturedCommit {
+        sha: "sha3".into(),
+        authored_at: None,
+        author_email: None,
+        author_name: None,
+        message: "feat: extend sweep".into(),
+        additions: 1,
+        deletions: 0,
+        patch_id: None,
+    };
+    state
+        .store
+        .record_commit(&c, Some(REPO), None, Some("s1"), None)
+        .await
+        .unwrap();
+    state
+        .store
+        .zavet_record_trailers(
+            Some(REPO),
+            "sha3",
+            &[ZavetTrailer {
+                key: "spec".into(),
+                value: "capture-pipeline".into(),
+                decision_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+    // An exact slug answers directly with the spec detail.
+    let resp = dirad::control::dispatch(
+        &state,
+        Request::ZavetWhy {
+            query: "capture-pipeline".into(),
+            cwd: None,
+            repo: Some(REPO.into()),
+        },
+    )
+    .await;
+    let v = match resp {
+        Response::ZavetSpec(v) => v,
+        other => panic!("expected ZavetSpec, got {other:?}"),
+    };
+    assert_eq!(v.matched_query, None, "a slug lookup is not a search");
+    assert_eq!(v.spec.slug, "capture-pipeline");
+    assert_eq!(v.spec.decisions, vec!["D-0001"]);
+    assert!(v.body_md.as_deref().unwrap().contains("batches"));
+    assert!(
+        v.commits.iter().any(|c| c.sha == "sha3"),
+        "the Spec: trailer commit must evidence the spec, got {:?}",
+        v.commits
+    );
+    assert_eq!(v.sessions.len(), 1, "s1 evidences the spec via sha3");
+
+    // Free text whose vocabulary only the spec carries resolves to it.
+    let resp = dirad::control::dispatch(
+        &state,
+        Request::ZavetWhy {
+            query: "how does the capture pipeline sweep batch trailers".into(),
+            cwd: None,
+            repo: Some(REPO.into()),
+        },
+    )
+    .await;
+    match resp {
+        Response::ZavetSpec(v) => {
+            assert_eq!(v.spec.slug, "capture-pipeline");
+            assert!(v.matched_query.is_some());
+        }
+        other => panic!("expected ZavetSpec, got {other:?}"),
+    }
+
+    // The decision detail carries the reverse link to its covering spec.
+    let resp = dirad::control::dispatch(
+        &state,
+        Request::ZavetWhy {
+            query: "D-0001".into(),
+            cwd: None,
+            repo: Some(REPO.into()),
+        },
+    )
+    .await;
+    match resp {
+        Response::ZavetWhy(v) => {
+            assert_eq!(v.specs.len(), 1);
+            assert_eq!(v.specs[0].slug, "capture-pipeline");
+        }
+        other => panic!("expected ZavetWhy, got {other:?}"),
+    }
+
+    // A query balanced between the decision and the spec (one strong title
+    // term each, no 2x winner) returns ranked matches from BOTH pools
+    // instead of guessing.
+    let resp = dirad::control::dispatch(
+        &state,
+        Request::ZavetWhy {
+            query: "pipeline filesystem".into(),
+            cwd: None,
+            repo: Some(REPO.into()),
+        },
+    )
+    .await;
+    match resp {
+        Response::ZavetSearch { hits, specs, .. } => {
+            assert!(!hits.is_empty(), "the decision should surface");
+            assert!(!specs.is_empty(), "the spec should surface");
+        }
+        other => panic!("expected mixed ZavetSearch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn zavet_why_for_an_unknown_decision_is_a_clean_error() {
     let state = test_state().await;
     let resp = dirad::control::dispatch(

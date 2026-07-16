@@ -32,6 +32,10 @@ fastrand.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+# Throwaway dirs for `zavet`'s activation-probe and capture tests.
+tempfile.workspace = true
+# `zavet::parse_guard_event` must never panic on arbitrary plugin input.
+proptest.workspace = true
 # `try_pending_key_flush`'s self-heal path calls
 # `dira_core::identity::{load_pending_key,promote_pending_key}`, which now
 # resolve the pending key's secret through the SAME keychain-or-meta-fallback

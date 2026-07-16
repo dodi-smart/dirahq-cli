@@ -35,6 +35,87 @@ pub fn resolve(cwd: &Path) -> Resolved {
     }
 }
 
+/// The repo toplevel for `cwd`, if inside a git work tree.
+pub fn toplevel(cwd: &Path) -> Option<std::path::PathBuf> {
+    git(cwd, &["rev-parse", "--show-toplevel"]).map(std::path::PathBuf::from)
+}
+
+/// Raw trailer pairs for each of `shas`, in one batched `git log --no-walk`
+/// call: `%x1e`-separated records of `SHA%x1f<trailers, unfolded>`. Commits
+/// with no trailers return an empty list. Best-effort — a git failure yields
+/// an empty map.
+pub fn commit_trailers(root: &Path, shas: &[String]) -> Vec<(String, Vec<(String, String)>)> {
+    if shas.is_empty() {
+        return Vec::new();
+    }
+    let mut args: Vec<&str> = vec![
+        "log",
+        "--no-walk=unsorted",
+        "--no-color",
+        "--pretty=format:%H%x1f%(trailers:only,unfold)%x1e",
+    ];
+    args.extend(shas.iter().map(String::as_str));
+    let Some(out) = git(root, &args) else {
+        return Vec::new();
+    };
+    out.split('\u{1e}')
+        .filter_map(|record| {
+            let record = record.trim_start_matches(['\n', '\r']);
+            let (sha, block) = record.split_once('\u{1f}')?;
+            let sha = sha.trim();
+            if sha.is_empty() {
+                return None;
+            }
+            Some((sha.to_string(), crate::zavet::parse_trailer_block(block)))
+        })
+        .collect()
+}
+
+/// The `.zavet/decisions/*.md` files added or modified by `sha`, as
+/// repo-relative paths. Deleted files are excluded (an append-only layer never
+/// deletes, and there is nothing to parse). `--root` covers the initial commit.
+pub fn zavet_decision_changes(root: &Path, sha: &str) -> Vec<String> {
+    let Some(out) = git(
+        root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "--root",
+            sha,
+        ],
+    ) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| {
+            let (status, path) = line.split_once('\t')?;
+            // A(dded)/M(odified)/R(enamed; path is "old\tnew" — take the new).
+            let path = match status.chars().next()? {
+                'A' | 'M' => path,
+                'R' | 'C' => path.rsplit('\t').next()?,
+                _ => return None,
+            };
+            // Only real records (`D-*.md`): scaffolding like `.template.md`
+            // lives alongside them and must never be captured as a decision.
+            let file = path.strip_prefix(crate::zavet::DECISIONS_DIR)?;
+            (!file.contains('/') && file.starts_with("D-") && file.ends_with(".md"))
+                .then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// The content of `path` as of `sha` (`git show sha:path`).
+pub fn show_blob(root: &Path, sha: &str, path: &str) -> Option<String> {
+    git(root, &["show", &format!("{sha}:{path}")])
+}
+
+/// The blob object id of `path` as of `sha` — zavet's `content_hash`.
+pub fn blob_oid(root: &Path, sha: &str, path: &str) -> Option<String> {
+    git(root, &["rev-parse", &format!("{sha}:{path}")])
+}
+
 /// A commit captured from `git log`, ready to record locally and ship as an
 /// [`dira_contract::ArtifactRef`]. Metadata only — no diff or file contents.
 #[derive(Debug, Clone, PartialEq, Eq)]

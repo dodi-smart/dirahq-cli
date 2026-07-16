@@ -1,0 +1,572 @@
+//! Pure parsing for the zavet knowledge layer: decision-record frontmatter and
+//! lore-protocol commit trailers. No IO — the daemon's capture path feeds this
+//! from `git show`/`git log` output, and a future CI mode reuses it verbatim.
+
+use crate::store::{ZavetDecisionCapture, ZavetTrailer};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+/// Name of the repo-layer directory the zavet plugin scaffolds.
+pub const ZAVET_DIR: &str = ".zavet";
+
+/// Where decision records live inside the repo (trailing slash included, for
+/// prefix-stripping repo-relative paths).
+pub const DECISIONS_DIR: &str = ".zavet/decisions/";
+
+/// The trailer keys zavet records (lowercase). Everything else in a commit
+/// footer (`Signed-off-by:`, `Co-authored-by:`, …) is ignored.
+pub const TRAILER_KEYS: &[&str] = &[
+    "why",
+    "rejected",
+    "constraint",
+    "refs",
+    "supersedes",
+    "spec",
+];
+
+/// Normalize something that looks like a decision id (`d-42`, `D-0042`) to the
+/// zero-padded canonical form, or `None` when it isn't one. Every ingestion
+/// point runs ids through this, so `D-7` in a trailer and `D-0007` in a record
+/// frontmatter land in the store as the same key. Numbers above 9999 keep
+/// their natural width (`{:04}` only pads).
+pub fn canonical_decision_id(s: &str) -> Option<String> {
+    let q = s.trim();
+    let digits = q
+        .strip_prefix("D-")
+        .or_else(|| q.strip_prefix("d-"))
+        .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))?;
+    let n: u64 = digits.parse().ok()?;
+    Some(format!("D-{n:04}"))
+}
+
+/// The first `D-<digits>` decision reference in `s`, canonicalized, if any.
+/// Hand-rolled scan — not worth a regex dependency.
+pub fn scan_decision_ref(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'D'
+            && bytes[i + 1] == b'-'
+            && bytes[i + 2].is_ascii_digit()
+            // A word boundary on the left so e.g. `CMD-1` doesn't count.
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            return canonical_decision_id(&s[i..j]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Filter raw `key: value` trailer pairs down to the zavet allowlist,
+/// normalizing keys to lowercase and extracting the first decision reference.
+pub fn normalize_trailers(raw: &[(String, String)]) -> Vec<ZavetTrailer> {
+    raw.iter()
+        .filter_map(|(k, v)| {
+            let key = k.trim().to_ascii_lowercase();
+            if !TRAILER_KEYS.contains(&key.as_str()) {
+                return None;
+            }
+            let value = v.trim().to_string();
+            if value.is_empty() {
+                return None;
+            }
+            let decision_id = scan_decision_ref(&value);
+            Some(ZavetTrailer {
+                key,
+                value,
+                decision_id,
+            })
+        })
+        .collect()
+}
+
+/// Parse one raw git trailer block (as `%(trailers:only,unfold)` emits it —
+/// one `Key: value` per line) into raw pairs, tolerating junk lines.
+pub fn parse_trailer_block(block: &str) -> Vec<(String, String)> {
+    block
+        .lines()
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            let k = k.trim();
+            // Trailer keys are single tokens (git enforces `token: value`);
+            // a colon in prose (e.g. "note: see above" inside a body) would
+            // have been excluded by `trailers:only` already.
+            if k.is_empty() || k.contains(char::is_whitespace) {
+                return None;
+            }
+            Some((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Parse a decision record file into a [`ZavetDecisionCapture`].
+///
+/// The frontmatter dialect is a deliberate YAML subset — plain scalars plus
+/// inline (`[a, b]`) or block (`- a`) string lists for `guards` — matching
+/// what the zavet plugin's templates emit. Malformed documents yield `None`
+/// (capture is best-effort); unknown keys are ignored. `content_hash` is left
+/// empty for the caller (it comes from git, not the text).
+pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
+    let mut lines = text.lines();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+
+    let mut cap = ZavetDecisionCapture {
+        path: path.to_string(),
+        ..Default::default()
+    };
+    let mut in_guards = false;
+    let mut body_start: Option<usize> = None;
+
+    // Byte offset scanning for the body: re-walk with char indices instead of
+    // the iterator so we can slice the remainder after the closing `---`.
+    let mut offset = text.find('\n').map(|i| i + 1).unwrap_or(text.len());
+    let mut closed = false;
+    while offset <= text.len() {
+        let rest = &text[offset..];
+        let line_end = rest.find('\n').map(|i| offset + i).unwrap_or(text.len());
+        let line = &text[offset..line_end];
+        let next_offset = line_end.saturating_add(1).min(text.len() + 1);
+
+        if line.trim_end() == "---" {
+            closed = true;
+            body_start = Some(line_end + 1);
+            break;
+        }
+
+        if in_guards {
+            let t = line.trim_start();
+            if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("-\t")) {
+                let g = unquote(item.trim());
+                if !g.is_empty() {
+                    cap.guards.push(g.to_string());
+                }
+                offset = next_offset;
+                continue;
+            } else if line.starts_with(char::is_whitespace) && !t.is_empty() {
+                // Indented non-list content under guards: tolerate, skip.
+                offset = next_offset;
+                continue;
+            }
+            in_guards = false;
+        }
+
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim();
+            let value = value.trim();
+            match key {
+                "id" => cap.id = unquote(value).to_string(),
+                "title" => cap.title = non_empty(unquote(value)),
+                "status" => cap.status = non_empty(unquote(value)),
+                "supersedes" => cap.supersedes = non_empty(unquote(value)),
+                "origin" => cap.origin = non_empty(unquote(value)),
+                "verified" => {
+                    cap.verified = match unquote(value).to_ascii_lowercase().as_str() {
+                        "true" | "yes" => Some(true),
+                        "false" | "no" => Some(false),
+                        _ => None,
+                    }
+                }
+                "guards" => {
+                    if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                        cap.guards.extend(
+                            inner
+                                .split(',')
+                                .map(|g| unquote(g.trim()).to_string())
+                                .filter(|g| !g.is_empty()),
+                        );
+                    } else if value.is_empty() {
+                        in_guards = true;
+                    }
+                }
+                _ => {} // unknown keys (origin, verified, tags, …) are fine
+            }
+        }
+        if next_offset > text.len() {
+            break;
+        }
+        offset = next_offset;
+    }
+
+    if !closed {
+        return None;
+    }
+    // Ids are stored canonical (`D-1` → `D-0001`); a frontmatter id that
+    // doesn't canonicalize (`D-x7`, missing) rejects the whole document.
+    cap.id = canonical_decision_id(&cap.id)?;
+    cap.body_md = body_start
+        .and_then(|s| text.get(s..))
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty());
+    if cap.status.is_none() {
+        cap.status = Some("active".to_string());
+    }
+    cap.slug = slug_of(path, &cap.id);
+    Some(cap)
+}
+
+/// A guard event as parsed (permissively) from the plugin's schema-v1 payload.
+/// Unknown fields are ignored and unknown `kind`s stored verbatim, so a plugin
+/// newer than the consumer degrades to "recorded, filtered at query time".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardEventV1 {
+    pub kind: String,
+    pub decision_id: String,
+    pub cwd: String,
+    pub file_path: Option<String>,
+    /// RFC 3339, already validated; `None` means "stamp at receive time".
+    pub ts: Option<String>,
+}
+
+/// Parse a guard event, returning `None` (never an error — the emitting shim
+/// is fire-and-forget) when required fields are missing or malformed. The
+/// decision id is canonicalized; one that doesn't canonicalize rejects the
+/// event.
+pub fn parse_guard_event(payload: &serde_json::Value) -> Option<GuardEventV1> {
+    let kind = payload.get("kind")?.as_str()?.trim();
+    let decision_id = payload.get("decision_id")?.as_str()?.trim();
+    let cwd = payload.get("cwd")?.as_str()?.trim();
+    if kind.is_empty() || cwd.is_empty() {
+        return None;
+    }
+    let decision_id = canonical_decision_id(decision_id)?;
+    let file_path = payload
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // A ts that doesn't parse falls back to receive time rather than storing
+    // junk in the `at` ordering column.
+    let ts = payload
+        .get("ts")
+        .and_then(|v| v.as_str())
+        .filter(|s| OffsetDateTime::parse(s, &Rfc3339).is_ok())
+        .map(str::to_string);
+    Some(GuardEventV1 {
+        kind: kind.to_string(),
+        decision_id,
+        cwd: cwd.to_string(),
+        file_path,
+        ts,
+    })
+}
+
+/// Whether a decision renders as "unverified — hypothesis": explicitly marked
+/// `verified: false`, or reverse-engineered and never confirmed by a human.
+/// A reverse-engineered record with `verified: true` counts as verified.
+pub fn is_unverified(origin: Option<&str>, verified: Option<bool>) -> bool {
+    verified == Some(false) || (origin == Some("reverse-engineered") && verified != Some(true))
+}
+
+/// Lowercased alphanumeric query terms, with filler words dropped so
+/// "why are we polling instead of having a filesystem watcher" searches for
+/// `polling filesystem watcher`.
+pub fn tokenize_query(query: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for", "from",
+        "have", "having", "how", "in", "instead", "is", "it", "no", "not", "of", "on", "or", "our",
+        "should", "that", "the", "then", "there", "this", "to", "use", "using", "we", "what",
+        "when", "where", "which", "why", "with", "you",
+    ];
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|t| t.len() >= 2 && !STOP.contains(&t.as_str()))
+        .collect()
+}
+
+/// One decision's searchable text, assembled by the caller from the store.
+pub struct SearchDoc<'a> {
+    pub id: &'a str,
+    pub title: Option<&'a str>,
+    pub slug: Option<&'a str>,
+    pub body: Option<&'a str>,
+    pub guards: &'a [String],
+    /// Values of trailers referencing this decision.
+    pub trailers: Vec<&'a str>,
+}
+
+/// Relevance of `doc` for the tokenized `terms` — a weighted contains-count
+/// (title 5, slug 4, trailers 2, guards 2, body 1). Zero means "no term
+/// matched anywhere". Grep-grade on purpose: single-repo scale, no index.
+pub fn score(doc: &SearchDoc<'_>, terms: &[String]) -> u32 {
+    let title = doc.title.map(str::to_ascii_lowercase).unwrap_or_default();
+    let slug = doc.slug.map(str::to_ascii_lowercase).unwrap_or_default();
+    let body = doc.body.map(str::to_ascii_lowercase).unwrap_or_default();
+    let guards = doc.guards.join(" ").to_ascii_lowercase();
+    let trailers = doc.trailers.join(" ").to_ascii_lowercase();
+    let mut total = 0;
+    for term in terms {
+        let t = term.as_str();
+        if title.contains(t) {
+            total += 5;
+        }
+        if slug.contains(t) {
+            total += 4;
+        }
+        if trailers.contains(t) {
+            total += 2;
+        }
+        if guards.contains(t) {
+            total += 2;
+        }
+        if body.contains(t) {
+            total += 1;
+        }
+    }
+    total
+}
+
+/// Relevance of an orphan commit trailer (a micro-decision with no record)
+/// for the tokenized `terms`: matched terms × 2 — the same weight [`score`]
+/// gives trailers attached to a decision, kept here so the ranking weights
+/// live in one file.
+pub fn score_trailer(key: &str, value: &str, terms: &[String]) -> u32 {
+    let text = format!("{key} {value}").to_ascii_lowercase();
+    terms.iter().filter(|t| text.contains(t.as_str())).count() as u32 * 2
+}
+
+/// A short plain-prose excerpt of a record body: the first non-heading,
+/// non-list, non-empty line (usually the sentence under `## Decision`).
+pub fn excerpt(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
+        .map(str::to_string)
+}
+
+/// `D-0001-poll-not-watch.md` → `poll-not-watch`.
+fn slug_of(path: &str, id: &str) -> Option<String> {
+    let file = path.rsplit('/').next()?;
+    let stem = file.strip_suffix(".md")?;
+    stem.strip_prefix(id)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    s.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(s)
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DOC: &str = "---\nid: D-0042\ntitle: \"Poll git, don't watch\"\nstatus: active\nguards:\n  - cli/dirad/src/capture.rs\n  - \"cli/core/src/project.rs\"\nsupersedes: D-0007\norigin: recorded\nverified: true\n---\n\n## Decision\nPoll on events.\n\n## Why\nWatchers add failure modes.\n";
+
+    #[test]
+    fn parses_a_full_record() {
+        let cap = parse_decision(DOC, ".zavet/decisions/D-0042-poll.md").unwrap();
+        assert_eq!(cap.id, "D-0042");
+        assert_eq!(cap.slug.as_deref(), Some("poll"));
+        assert_eq!(cap.title.as_deref(), Some("Poll git, don't watch"));
+        assert_eq!(cap.status.as_deref(), Some("active"));
+        assert_eq!(cap.supersedes.as_deref(), Some("D-0007"));
+        assert_eq!(
+            cap.guards,
+            vec!["cli/dirad/src/capture.rs", "cli/core/src/project.rs"]
+        );
+        let body = cap.body_md.unwrap();
+        assert!(body.starts_with("## Decision"));
+        assert!(body.contains("Watchers add failure modes."));
+    }
+
+    #[test]
+    fn parses_inline_guard_lists_and_defaults_status() {
+        let doc = "---\nid: D-0001\nguards: [a/**, \"b.rs\"]\n---\nbody";
+        let cap = parse_decision(doc, ".zavet/decisions/D-0001.md").unwrap();
+        assert_eq!(cap.guards, vec!["a/**", "b.rs"]);
+        assert_eq!(cap.status.as_deref(), Some("active"));
+        assert_eq!(cap.slug, None); // no slug segment in the filename
+    }
+
+    #[test]
+    fn malformed_documents_yield_none() {
+        for doc in [
+            "no frontmatter at all",
+            "---\nid: D-0001\nnever closed",
+            "---\ntitle: no id\n---\nbody",
+            "---\nid: NOTDECISION\n---\nbody",
+            "---\nid: D-x7\n---\nbody", // non-canonicalizable id
+            "",
+        ] {
+            assert_eq!(parse_decision(doc, "x.md"), None, "doc: {doc:?}");
+        }
+    }
+
+    #[test]
+    fn frontmatter_ids_are_stored_canonical() {
+        let cap = parse_decision("---\nid: D-1\n---\nbody", ".zavet/decisions/D-0001.md").unwrap();
+        assert_eq!(cap.id, "D-0001");
+    }
+
+    #[test]
+    fn canonical_id_pads_and_rejects() {
+        assert_eq!(canonical_decision_id("D-7").as_deref(), Some("D-0007"));
+        assert_eq!(canonical_decision_id("d-42").as_deref(), Some("D-0042"));
+        assert_eq!(canonical_decision_id(" D-0042 ").as_deref(), Some("D-0042"));
+        assert_eq!(canonical_decision_id("D-12345").as_deref(), Some("D-12345"));
+        for bad in ["D-", "D-x7", "D-7x", "poll", "", "D-7 D-8"] {
+            assert_eq!(canonical_decision_id(bad), None, "input: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn trailer_normalization_filters_and_extracts_refs() {
+        let raw = vec![
+            ("Why".to_string(), "polling beats watching".to_string()),
+            ("Refs".to_string(), "D-0042 and D-0007".to_string()),
+            ("Signed-off-by".to_string(), "A <a@b.c>".to_string()),
+            ("REJECTED".to_string(), "notify crate".to_string()),
+            ("Constraint".to_string(), "".to_string()), // empty value dropped
+        ];
+        let ts = normalize_trailers(&raw);
+        assert_eq!(ts.len(), 3);
+        assert_eq!(ts[0].key, "why");
+        assert_eq!(ts[0].decision_id, None);
+        assert_eq!(ts[1].key, "refs");
+        assert_eq!(ts[1].decision_id.as_deref(), Some("D-0042")); // first ref wins
+        assert_eq!(ts[2].key, "rejected");
+    }
+
+    #[test]
+    fn decision_ref_scan_requires_word_boundary_and_digits() {
+        assert_eq!(scan_decision_ref("see D-0042 there"), Some("D-0042".into()));
+        // Short refs canonicalize, so `Refs: D-7` joins a record `D-0007`.
+        assert_eq!(scan_decision_ref("D-7"), Some("D-0007".into()));
+        assert_eq!(scan_decision_ref("CMD-123"), None);
+        assert_eq!(scan_decision_ref("D-"), None);
+        assert_eq!(scan_decision_ref("nothing"), None);
+    }
+
+    #[test]
+    fn unverified_rule_is_exact() {
+        // (origin, verified) -> unverified?
+        let cases = [
+            (None, None, false),
+            (None, Some(true), false),
+            (None, Some(false), true),
+            (Some("recorded"), None, false),
+            (Some("reverse-engineered"), None, true),
+            (Some("reverse-engineered"), Some(false), true),
+            // A human confirmed the hypothesis: verified wins.
+            (Some("reverse-engineered"), Some(true), false),
+        ];
+        for (origin, verified, want) in cases {
+            assert_eq!(
+                is_unverified(origin, verified),
+                want,
+                "origin={origin:?} verified={verified:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn trailer_block_parsing_tolerates_junk() {
+        let block = "Why: because\nRefs: D-1\nnot a trailer line\nBad Key: spaces\n";
+        let raw = parse_trailer_block(block);
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw[0], ("Why".to_string(), "because".to_string()));
+    }
+
+    #[test]
+    fn guard_event_accepts_v1_and_tolerates_unknowns() {
+        let ev = parse_guard_event(&serde_json::json!({
+            "v": 1,
+            "kind": "guard_shown",
+            "decision_id": "D-0042",
+            "file_path": "src/auth.rs",
+            "cwd": "/repo",
+            "ts": "2026-07-15T12:00:00Z",
+            "meta": {"future": true},
+            "unknown_field": [1, 2, 3],
+        }))
+        .unwrap();
+        assert_eq!(ev.kind, "guard_shown");
+        assert_eq!(ev.decision_id, "D-0042");
+        assert_eq!(ev.ts.as_deref(), Some("2026-07-15T12:00:00Z"));
+        // Unknown kinds are stored verbatim, not rejected (plugin newer than
+        // daemon); short ids canonicalize on the way in.
+        let ev = parse_guard_event(&serde_json::json!({
+            "v": 9, "kind": "guard_hyperdrive", "decision_id": "D-1", "cwd": "/r",
+        }))
+        .unwrap();
+        assert_eq!(ev.kind, "guard_hyperdrive");
+        assert_eq!(ev.decision_id, "D-0001");
+    }
+
+    #[test]
+    fn guard_event_rejects_missing_or_malformed_requireds() {
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"kind": "guard_shown", "cwd": "/r"}), // no decision_id
+            serde_json::json!({"kind": "guard_shown", "decision_id": "nope", "cwd": "/r"}),
+            serde_json::json!({"kind": "guard_shown", "decision_id": "D-", "cwd": "/r"}),
+            serde_json::json!({"kind": "guard_shown", "decision_id": "D-x7", "cwd": "/r"}),
+            serde_json::json!({"kind": "", "decision_id": "D-1", "cwd": "/r"}),
+            serde_json::json!({"kind": "guard_shown", "decision_id": "D-1"}), // no cwd
+            serde_json::json!({"kind": 7, "decision_id": "D-1", "cwd": "/r"}),
+        ] {
+            assert_eq!(parse_guard_event(&payload), None, "payload: {payload}");
+        }
+        // A junk ts degrades to receive-time, not rejection.
+        let ev = parse_guard_event(&serde_json::json!({
+            "kind": "guard_shown", "decision_id": "D-1", "cwd": "/r", "ts": "yesterday-ish",
+        }))
+        .unwrap();
+        assert_eq!(ev.ts, None);
+    }
+
+    proptest::proptest! {
+        /// The parsers must never panic on arbitrary input — malformed docs
+        /// return `None`/empty, byte-offset math stays in bounds.
+        #[test]
+        fn parse_decision_never_panics(text in ".{0,400}", path in "[a-zA-Z0-9./-]{0,40}") {
+            let _ = parse_decision(&text, &path);
+        }
+
+        #[test]
+        fn trailer_scan_never_panics(s in ".{0,200}") {
+            let _ = scan_decision_ref(&s);
+            let _ = parse_trailer_block(&s);
+            let _ = canonical_decision_id(&s);
+        }
+
+        /// The guard-event parser must never panic on arbitrary plugin input —
+        /// worst case it returns `None` (the shim is fire-and-forget either way).
+        #[test]
+        fn guard_event_never_panics_on_arbitrary_json(
+            kind in proptest::option::of(".*"),
+            decision in proptest::option::of(".*"),
+            cwd in proptest::option::of(".*"),
+            ts in proptest::option::of(".*"),
+            extra_key in "[a-z_]{0,12}",
+            extra_num in proptest::num::i64::ANY,
+        ) {
+            let mut obj = serde_json::Map::new();
+            if let Some(k) = kind { obj.insert("kind".into(), k.into()); }
+            if let Some(d) = decision { obj.insert("decision_id".into(), d.into()); }
+            if let Some(c) = cwd { obj.insert("cwd".into(), c.into()); }
+            if let Some(t) = ts { obj.insert("ts".into(), t.into()); }
+            if !extra_key.is_empty() { obj.insert(extra_key, extra_num.into()); }
+            let _ = parse_guard_event(&serde_json::Value::Object(obj));
+        }
+    }
+}

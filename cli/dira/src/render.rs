@@ -160,13 +160,18 @@ pub fn print(resp: &Response) -> bool {
         Response::ZavetSearch {
             query,
             hits,
+            specs,
             trailers,
         } => {
-            print_zavet_search(query, hits, trailers);
+            print_zavet_search(query, hits, specs, trailers);
             true
         }
         Response::ZavetWiki(v) => {
             print_zavet_wiki(v);
+            true
+        }
+        Response::ZavetSpec(v) => {
+            print_zavet_spec_why(v);
             true
         }
         Response::ZavetModeSet { repo, mode } => {
@@ -221,6 +226,39 @@ fn guard_stats_line(stats: &[ZavetGuardStatView]) -> String {
 /// The first 9 characters of a sha (shorter values pass through whole).
 fn short_sha(s: &str) -> &str {
     &s[..s.len().min(9)]
+}
+
+/// The `origin · confidence` provenance line for a spec, pre-painted, plus
+/// the verification badge (`verified: true` is the only verified state — the
+/// origin badge tells the reader HOW the spec was produced).
+fn spec_badges(origin: Option<&str>, confidence: Option<&str>, verified: Option<bool>) -> String {
+    let mut parts = Vec::new();
+    if let Some(o) = origin {
+        parts.push(theme::paint(o, Role::Faint));
+    }
+    if let Some(c) = confidence {
+        parts.push(theme::paint(&format!("confidence {c}"), Role::Faint));
+    }
+    if verified == Some(true) {
+        parts.push(theme::paint("✓ verified", Role::Engaged));
+    } else {
+        // Amber, deliberately loud: no human confirmed spec-matches-code yet.
+        parts.push(theme::paint("○ unverified", Role::Compute));
+    }
+    parts.join(&theme::paint(" · ", Role::Muted))
+}
+
+/// The staleness badge: commits touched the spec's paths after its last
+/// capture. `None` (no working dir to ask git in) renders nothing.
+fn spec_staleness_badge(stale_commits: Option<u64>) -> Option<String> {
+    match stale_commits {
+        Some(0) => Some(theme::paint("✓ current", Role::Engaged)),
+        Some(n) => Some(theme::paint(
+            &format!("⚠ stale · {n} commit{}", if n == 1 { "" } else { "s" }),
+            Role::Compute,
+        )),
+        None => None,
+    }
 }
 
 /// Render `dira zavet status`: verdict line, reason, metric rows.
@@ -369,6 +407,19 @@ fn print_zavet_why(v: &ZavetWhyView) {
             theme::paint(&d.guards.join(" · "), Role::Ink),
         );
     }
+    if !v.specs.is_empty() {
+        let refs = v
+            .specs
+            .iter()
+            .map(|s| s.slug.clone())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        println!(
+            "{} {}",
+            theme::paint("specs", Role::Muted),
+            theme::paint(&refs, Role::Knowledge),
+        );
+    }
 
     if let Some(body) = &v.body_md {
         println!();
@@ -411,15 +462,39 @@ fn print_zavet_why(v: &ZavetWhyView) {
         );
     }
 
+    let unattributed = (v.unattributed_commits > 0 || v.unattributed_guard_events > 0).then(|| {
+        format!(
+            "honest lower bound — unattributed: {} commit(s), {} guard event(s)",
+            v.unattributed_commits, v.unattributed_guard_events
+        )
+    });
+    print_zavet_cost(
+        &v.sessions,
+        v.total_human_seconds,
+        v.total_agent_seconds,
+        v.total_input_tokens + v.total_output_tokens,
+        unattributed.as_deref(),
+    );
+}
+
+/// The COST panel shared by decision and spec why views: per-session lines
+/// when more than one, totals, and the honest-lower-bound note.
+fn print_zavet_cost(
+    sessions: &[dira_core::protocol::ZavetSessionCostView],
+    total_human_seconds: i64,
+    total_agent_seconds: i64,
+    total_tokens: u64,
+    unattributed_note: Option<&str>,
+) {
     println!("\n{}", theme::paint("COST", Role::Muted));
-    if v.sessions.is_empty() {
+    if sessions.is_empty() {
         println!(
             "  {}",
             theme::paint("no attributed sessions yet — cost unknown", Role::Faint)
         );
     } else {
-        if v.sessions.len() > 1 {
-            for s in &v.sessions {
+        if sessions.len() > 1 {
+            for s in sessions {
                 println!(
                     "  {}  {}  {}  {}",
                     theme::paint(
@@ -438,50 +513,127 @@ fn print_zavet_why(v: &ZavetWhyView) {
         println!(
             "  {}   {}   {}",
             theme::paint(
-                &format!("● engaged {}", hms(v.total_human_seconds)),
+                &format!("● engaged {}", hms(total_human_seconds)),
                 Role::Engaged
             ),
             theme::paint(
-                &format!("◆ agent {}", hms(v.total_agent_seconds)),
+                &format!("◆ agent {}", hms(total_agent_seconds)),
                 Role::Agent
             ),
             theme::paint(
-                &format!(
-                    "◇ compute {} tok",
-                    tokens_compact(v.total_input_tokens + v.total_output_tokens)
-                ),
+                &format!("◇ compute {} tok", tokens_compact(total_tokens)),
                 Role::Compute
             ),
         );
-        let n = v.sessions.len();
+        let n = sessions.len();
         let plural = if n == 1 { "" } else { "s" };
         println!(
             "  {}",
             theme::paint(&format!("across {n} session{plural}"), Role::Muted)
         );
     }
-    if v.unattributed_commits > 0 || v.unattributed_guard_events > 0 {
-        println!(
-            "  {}",
-            theme::paint(
-                &format!(
-                    "honest lower bound — unattributed: {} commit(s), {} guard event(s)",
-                    v.unattributed_commits, v.unattributed_guard_events
-                ),
-                Role::Faint
-            )
-        );
+    if let Some(note) = unattributed_note {
+        println!("  {}", theme::paint(note, Role::Faint));
     }
 }
 
+/// Render `dira zavet why <spec>`: the living document first, then its
+/// evidence, then cost — the spec twin of [`print_zavet_why`].
+fn print_zavet_spec_why(v: &dira_core::protocol::ZavetSpecWhyView) {
+    let s = &v.spec;
+    println!(
+        "{} {} {}",
+        theme::paint(&s.slug, Role::Knowledge),
+        theme::paint("·", Role::Muted),
+        theme::paint(s.title.as_deref().unwrap_or("(untitled)"), Role::Ink),
+    );
+    if let Some(q) = &v.matched_query {
+        println!("{}", theme::paint(&format!("matched \"{q}\""), Role::Faint));
+    }
+    let mut badges = spec_badges(s.origin.as_deref(), s.confidence.as_deref(), s.verified);
+    if let Some(stale) = spec_staleness_badge(s.stale_commits) {
+        badges.push_str(&theme::paint(" · ", Role::Muted));
+        badges.push_str(&stale);
+    }
+    println!(
+        "{} {} {}",
+        badges,
+        theme::paint("·", Role::Muted),
+        theme::paint(&s.path, Role::Faint),
+    );
+    if !s.paths.is_empty() {
+        println!(
+            "{} {}",
+            theme::paint("paths", Role::Muted),
+            theme::paint(&s.paths.join(" · "), Role::Ink),
+        );
+    }
+    if !s.decisions.is_empty() {
+        println!(
+            "{} {}",
+            theme::paint("decisions", Role::Muted),
+            theme::paint(&s.decisions.join(" · "), Role::Knowledge),
+        );
+    }
+
+    if let Some(body) = &v.body_md {
+        println!();
+        for line in body.lines() {
+            if let Some(h) = line.strip_prefix("## ") {
+                println!("  {}", theme::paint(h, Role::Knowledge));
+            } else {
+                println!("  {line}");
+            }
+        }
+    }
+
+    if !v.commits.is_empty() {
+        println!("\n{}", theme::paint("COMMITS", Role::Muted));
+        for c in &v.commits {
+            let sha = short_sha(&c.sha);
+            let day = c.authored_at.as_deref().map(|t| &t[..t.len().min(10)]);
+            let sess = match &c.session_id {
+                Some(s) => theme::paint(&format!("● {}", &s[..s.len().min(8)]), Role::Engaged),
+                None => theme::paint("unattributed", Role::Faint),
+            };
+            println!(
+                "  {}  {}  {} {}",
+                theme::paint(sha, Role::Faint),
+                theme::paint(
+                    &truncate(c.message.as_deref().unwrap_or("(not captured)"), 42),
+                    Role::Ink
+                ),
+                theme::paint(day.unwrap_or(""), Role::Muted),
+                sess,
+            );
+        }
+    }
+
+    let unattributed = (v.unattributed_commits > 0).then(|| {
+        format!(
+            "honest lower bound — unattributed: {} commit(s)",
+            v.unattributed_commits
+        )
+    });
+    print_zavet_cost(
+        &v.sessions,
+        v.total_human_seconds,
+        v.total_agent_seconds,
+        v.total_input_tokens + v.total_output_tokens,
+        unattributed.as_deref(),
+    );
+}
+
 /// Render ranked matches for a free-text `why`/`wiki <topic>` query: decision
-/// records first, then matching micro-decisions (orphan commit trailers).
+/// records first, then living specs, then matching micro-decisions (orphan
+/// commit trailers).
 fn print_zavet_search(
     query: &str,
     hits: &[dira_core::protocol::ZavetSearchHit],
+    specs: &[dira_core::protocol::ZavetSpecHit],
     trailers: &[dira_core::protocol::ZavetTrailerHit],
 ) {
-    if hits.is_empty() && trailers.is_empty() {
+    if hits.is_empty() && specs.is_empty() && trailers.is_empty() {
         println!(
             "{}",
             theme::paint(
@@ -491,7 +643,7 @@ fn print_zavet_search(
         );
         return;
     }
-    let n = hits.len() + trailers.len();
+    let n = hits.len() + specs.len() + trailers.len();
     let plural = if n == 1 { "" } else { "es" };
     println!(
         "{} {}",
@@ -518,6 +670,29 @@ fn print_zavet_search(
             }
         }
     }
+    if !specs.is_empty() {
+        println!(
+            "\n{}",
+            theme::paint("SPECS (living documents)", Role::Muted)
+        );
+        for s in specs {
+            println!(
+                "  {}  {} {}",
+                theme::paint(&format!("{:<18}", truncate(&s.slug, 18)), Role::Knowledge),
+                theme::paint(
+                    &truncate(s.title.as_deref().unwrap_or("(untitled)"), 42),
+                    Role::Ink
+                ),
+                spec_badges(s.origin.as_deref(), s.confidence.as_deref(), s.verified),
+            );
+            if let Some(e) = &s.excerpt {
+                println!(
+                    "  {}",
+                    theme::paint(&format!("{:<18}  {}", "", truncate(e, 50)), Role::Faint)
+                );
+            }
+        }
+    }
     if !trailers.is_empty() {
         println!(
             "\n{}",
@@ -536,11 +711,16 @@ fn print_zavet_search(
             theme::paint("full context: git show <sha>", Role::Faint)
         );
     }
-    if let Some(top) = hits.first() {
+    let follow_up = match (hits.first(), specs.first()) {
+        (Some(top), _) => Some(top.id.clone()),
+        (None, Some(s)) => Some(s.slug.clone()),
+        (None, None) => None,
+    };
+    if let Some(target) = follow_up {
         println!(
             "\n{}",
             theme::paint(
-                &format!("full record + cost: dira zavet why {}", top.id),
+                &format!("full record + cost: dira zavet why {target}"),
                 Role::Faint
             )
         );
@@ -556,14 +736,15 @@ fn print_zavet_wiki(v: &dira_core::protocol::ZavetWikiView) {
         theme::paint(&v.repo, Role::Ink),
     );
     let plural = |n: u64, s: &str| format!("{n} {s}{}", if n == 1 { "" } else { "s" });
-    println!(
-        "{}",
-        dots(&[
-            plural(v.decisions_total, "decision"),
-            plural(v.trailers, "trailer"),
-            plural(v.guard_events, "guard event"),
-        ])
-    );
+    let mut summary = vec![
+        plural(v.decisions_total, "decision"),
+        plural(v.trailers, "trailer"),
+        plural(v.guard_events, "guard event"),
+    ];
+    if v.specs_total > 0 {
+        summary.push(plural(v.specs_total, "spec"));
+    }
+    println!("{}", dots(&summary));
 
     let section = |title: &str, list: &[ZavetDecisionView]| {
         if list.is_empty() {
@@ -598,6 +779,44 @@ fn print_zavet_wiki(v: &dira_core::protocol::ZavetWikiView) {
     };
     section("ACTIVE DECISIONS", &v.active);
     section("SUPERSEDED", &v.superseded);
+
+    if !v.specs.is_empty() {
+        println!("\n{}", theme::paint("SPECS", Role::Muted));
+        for s in &v.specs {
+            let mut line = format!(
+                "  {}  {}",
+                theme::paint(&format!("{:<18}", truncate(&s.slug, 18)), Role::Knowledge),
+                theme::paint(
+                    &truncate(s.title.as_deref().unwrap_or("(untitled)"), 38),
+                    Role::Ink
+                ),
+            );
+            line.push(' ');
+            line.push_str(&spec_badges(
+                s.origin.as_deref(),
+                s.confidence.as_deref(),
+                s.verified,
+            ));
+            if let Some(badge) = spec_staleness_badge(s.stale_commits) {
+                line.push_str(&theme::paint(" · ", Role::Muted));
+                line.push_str(&badge);
+            }
+            println!("{line}");
+            let mut under: Vec<String> = Vec::new();
+            if !s.paths.is_empty() {
+                under.push(format!("paths {}", s.paths.join(" · ")));
+            }
+            if !s.decisions.is_empty() {
+                under.push(format!("decisions {}", s.decisions.join(" · ")));
+            }
+            if !under.is_empty() {
+                println!(
+                    "  {}",
+                    theme::paint(&format!("{:<18}  {}", "", under.join("  ·  ")), Role::Faint)
+                );
+            }
+        }
+    }
 
     if !v.recent.is_empty() {
         println!("\n{}", theme::paint("RECENT KNOWLEDGE", Role::Muted));

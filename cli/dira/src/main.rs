@@ -384,6 +384,7 @@ repo with enable/disable.",
 Examples:
   dira zavet status          is zavet active here? capture health
   dira zavet why D-0042      the decision — and what it cost
+  dira zavet wiki            decisions + living specs, staleness badges
   dira zavet decisions       every captured decision in this repo
   dira zavet enable          force-on for this repo (beats the global knob)"
     )]
@@ -405,12 +406,14 @@ enum ZavetAction {
     #[command(after_help = "\
 Examples:
   dira zavet why D-0042      one decision: record, guards, commits, time cost
+  dira zavet why capture-pipeline
+                             a living spec by slug: document, staleness, cost
   dira zavet why polling instead of a filesystem watcher
-                             free text — searches titles, bodies, trailers;
+                             free text — searches decisions AND specs;
                              a confident match answers, several list matches
   dira zavet why D-0042 --project github.com/org/repo")]
     Why {
-        /// A decision id (D-0042) or a plain-language question.
+        /// A decision id (D-0042), a spec slug, or a plain-language question.
         #[arg(value_name = "QUESTION", required = true, num_args = 1..)]
         query: Vec<String>,
         #[arg(long)]
@@ -419,7 +422,8 @@ Examples:
     /// Browse the knowledge base: overview, or search a topic.
     #[command(after_help = "\
 Examples:
-  dira zavet wiki            active + superseded decisions, recent knowledge
+  dira zavet wiki            decisions, living specs (staleness + confidence),
+                             recent knowledge
   dira zavet wiki polling    ranked matches with excerpts")]
     Wiki {
         /// Optional topic to search for.

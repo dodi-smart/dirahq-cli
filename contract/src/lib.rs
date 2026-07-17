@@ -566,7 +566,9 @@ impl KnowledgeBatch {
     /// Downgrade this batch to the metadata tier in place: every consent-gated
     /// content field is cleared and the tier label follows. This is what the
     /// daemon applies when the cloud answers `content_not_allowed` — sync never
-    /// wedges, content never leaves without both consents.
+    /// wedges, content never leaves without both consents. `batchId` is NOT
+    /// touched: it is content-derived (and tier-sensitive), so the producer
+    /// must recompute it after stripping before re-sending.
     pub fn strip_content(&mut self) {
         for d in &mut self.decisions {
             d.body_md = None;

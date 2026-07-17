@@ -10,22 +10,26 @@
 //! - `knowledge_disabled` (403): the workspace opted out — back off at the
 //!   ceiling with a clear health kind; nothing is wrong locally.
 //! - `content_not_allowed` (400): the batch carried content the workspace has
-//!   not opted into — rebuild the same window at the metadata tier and retry
-//!   once. Sync never wedges; content never lands without both consents.
+//!   not opted into — strip the same window down to the metadata tier
+//!   ([`dira_contract::KnowledgeBatch::strip_content`]) and retry once. Sync
+//!   never wedges; content never lands without both consents.
 //!
 //! A 404 means the cloud predates the endpoint — treated as quietly skipped
 //! (health kind `endpoint_missing`), not an error worth logging loudly.
 
 use crate::state::AppState;
-use crate::sync::retry_after_from_headers;
+use crate::sync::{
+    next_backoff, record_channel_health, retry_after_from_headers, transient_wait, HealthChannel,
+    MAX_BACKOFF,
+};
 use dira_contract::{KnowledgeEnvelope, KnowledgeRepoStats, SCHEMA_VERSION};
 use dira_core::identity;
 use dira_core::signing::DeviceKey;
 use dira_core::sync::knowledge::{
-    build_knowledge_batches, parse_knowledge_response, KnowledgeChunk, KnowledgeTier,
-    KNOWLEDGE_CHUNK_ITEMS, META_KNOWLEDGE_DECISION_CURSOR, META_KNOWLEDGE_GUARD_CURSOR,
-    META_KNOWLEDGE_HEALTH, META_KNOWLEDGE_SPEC_CURSOR, META_KNOWLEDGE_STATS_PREFIX,
-    META_KNOWLEDGE_TRAILER_CURSOR,
+    build_knowledge_batches, knowledge_batch_id, parse_knowledge_response, KnowledgeChunk,
+    KnowledgeTier, KNOWLEDGE_CHUNK_ITEMS, META_KNOWLEDGE_DECISION_CURSOR,
+    META_KNOWLEDGE_GUARD_CURSOR, META_KNOWLEDGE_HEALTH, META_KNOWLEDGE_SPEC_CURSOR,
+    META_KNOWLEDGE_STATS_PREFIX, META_KNOWLEDGE_TRAILER_CURSOR,
 };
 use dira_core::{config::KnowledgeSyncMode, project};
 use std::collections::HashSet;
@@ -38,8 +42,6 @@ const DEBOUNCE: StdDuration = StdDuration::from_secs(3);
 /// Backstop cadence — slower than attestations; knowledge moves at commit
 /// speed, not event speed.
 const BACKSTOP: StdDuration = StdDuration::from_secs(120);
-/// Cap for exponential backoff after a failure.
-const MAX_BACKOFF: StdDuration = StdDuration::from_secs(300);
 /// HTTP timeout for a single knowledge chunk POST.
 const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 /// Rolling window for the per-repo coverage/capture snapshot.
@@ -102,109 +104,82 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
                 consecutive_failures = 0;
                 record_health(&state, Some(kind), 0, 0).await;
             }
-            Err(KError::Transient {
-                message,
-                retry_after,
-            }) => {
-                backoff = retry_after
-                    .unwrap_or_else(|| next_backoff(backoff))
-                    .min(MAX_BACKOFF);
-                consecutive_failures += 1;
-                tracing::warn!(
-                    "knowledge sync: transient failure, backing off {backoff:?}: {message}"
-                );
-                record_health(
-                    &state,
-                    Some("transient"),
-                    consecutive_failures,
-                    backoff.as_secs(),
-                )
-                .await;
-                sleep(backoff).await;
-            }
-            Err(KError::ReLinkRequired) => {
-                backoff = StdDuration::ZERO;
-                consecutive_failures += 1;
-                tracing::error!(
-                    "knowledge sync: cloud rejected device (unknown_device) — re-link required"
-                );
-                record_health(
-                    &state,
-                    Some("unknown_device"),
-                    consecutive_failures,
-                    backoff.as_secs(),
-                )
-                .await;
-            }
-            Err(KError::SignatureRejected) => {
-                // The attestation task owns the pending-key self-heal (WP-B1b);
-                // a rotation it promotes invalidates the shared cached key, so
-                // this task recovers on its next tick without duplicating that
-                // machinery here. Until then, ceiling backoff.
-                backoff = MAX_BACKOFF;
-                consecutive_failures += 1;
-                tracing::error!(
-                    "knowledge sync: signature rejected — waiting for the attestation task's \
-                     key recovery (or `dira device link`)"
-                );
-                record_health(
-                    &state,
-                    Some("signature_rejected"),
-                    consecutive_failures,
-                    backoff.as_secs(),
-                )
-                .await;
-                sleep(backoff).await;
-            }
-            Err(KError::Disabled) => {
-                // Workspace-level opt-out — not a local failure; long quiet backoff.
-                backoff = MAX_BACKOFF;
-                consecutive_failures = 0;
-                tracing::info!(
-                    "knowledge sync: workspace has knowledge sync disabled (knowledge_disabled) \
-                     — enable it in the dashboard's Connections screen to start receiving"
-                );
-                record_health(&state, Some("knowledge_disabled"), 0, backoff.as_secs()).await;
-                sleep(backoff).await;
-            }
-            Err(KError::SchemaSkew(body)) => {
-                backoff = MAX_BACKOFF;
-                consecutive_failures += 1;
-                tracing::error!(
-                    "knowledge sync: cloud rejected our contract version — upgrade daemon or \
-                     cloud: {body}"
-                );
-                record_health(
-                    &state,
-                    Some("schema_skew"),
-                    consecutive_failures,
-                    backoff.as_secs(),
-                )
-                .await;
-                sleep(backoff).await;
-            }
-            Err(KError::Fatal(e)) => {
-                backoff = next_backoff(backoff);
-                consecutive_failures += 1;
-                tracing::warn!("knowledge sync: error, backing off {backoff:?}: {e}");
-                record_health(
-                    &state,
-                    Some("fatal"),
-                    consecutive_failures,
-                    backoff.as_secs(),
-                )
-                .await;
+            Err(err) => {
+                // One shared failure tail: each arm only picks its health kind
+                // and wait (logging at its own level); the health/backoff
+                // bookkeeping below is identical for all of them.
+                let (kind, wait) = match &err {
+                    KError::Transient {
+                        message,
+                        retry_after,
+                    } => {
+                        let wait = transient_wait(*retry_after, backoff);
+                        tracing::warn!(
+                            "knowledge sync: transient failure, backing off {wait:?}: {message}"
+                        );
+                        ("transient", wait)
+                    }
+                    KError::ReLinkRequired => {
+                        tracing::error!(
+                            "knowledge sync: cloud rejected device (unknown_device) — re-link \
+                             required"
+                        );
+                        ("unknown_device", StdDuration::ZERO)
+                    }
+                    KError::SignatureRejected => {
+                        // The attestation task owns the pending-key self-heal
+                        // (WP-B1b); a rotation it promotes invalidates the
+                        // shared cached key, so this task recovers on its next
+                        // tick without duplicating that machinery here. Until
+                        // then, ceiling backoff.
+                        tracing::error!(
+                            "knowledge sync: signature rejected — waiting for the attestation \
+                             task's key recovery (or `dira device link`)"
+                        );
+                        ("signature_rejected", MAX_BACKOFF)
+                    }
+                    KError::ContentNotAllowed => {
+                        // Consumed inside `flush_knowledge` (the downgrade
+                        // retry); reaching here would be a bug — treat as fatal.
+                        tracing::warn!(
+                            "knowledge sync: content_not_allowed escaped the downgrade path"
+                        );
+                        ("fatal", next_backoff(backoff))
+                    }
+                    KError::Disabled => {
+                        // Workspace-level opt-out — not a local failure; long
+                        // quiet backoff.
+                        tracing::info!(
+                            "knowledge sync: workspace has knowledge sync disabled \
+                             (knowledge_disabled) — enable it in the dashboard's Connections \
+                             screen to start receiving"
+                        );
+                        ("knowledge_disabled", MAX_BACKOFF)
+                    }
+                    KError::SchemaSkew(body) => {
+                        tracing::error!(
+                            "knowledge sync: cloud rejected our contract version — upgrade \
+                             daemon or cloud: {body}"
+                        );
+                        ("schema_skew", MAX_BACKOFF)
+                    }
+                    KError::Fatal(e) => {
+                        let wait = next_backoff(backoff);
+                        tracing::warn!("knowledge sync: error, backing off {wait:?}: {e}");
+                        ("fatal", wait)
+                    }
+                };
+                backoff = wait;
+                // A workspace opt-out is not a local failure; everything else is.
+                consecutive_failures = if matches!(err, KError::Disabled) {
+                    0
+                } else {
+                    consecutive_failures + 1
+                };
+                record_health(&state, Some(kind), consecutive_failures, backoff.as_secs()).await;
                 sleep(backoff).await;
             }
         }
-    }
-}
-
-fn next_backoff(prev: StdDuration) -> StdDuration {
-    if prev.is_zero() {
-        StdDuration::from_secs(5)
-    } else {
-        (prev * 2).min(MAX_BACKOFF)
     }
 }
 
@@ -225,6 +200,10 @@ enum KError {
     },
     ReLinkRequired,
     SignatureRejected,
+    /// 400 `content_not_allowed`: the batch carried content the workspace has
+    /// not opted into. Consumed inside [`flush_knowledge`] (the metadata
+    /// downgrade-and-retry); never escapes to the run loop.
+    ContentNotAllowed,
     /// 403 `knowledge_disabled`: the workspace opted out.
     Disabled,
     SchemaSkew(String),
@@ -304,44 +283,44 @@ async fn flush_knowledge(
     }
 
     match post_chunks(state, device_key, client, &cloud_url, &chunks).await {
-        Err(KError::Transient {
-            message,
-            retry_after,
-        }) if message == CONTENT_NOT_ALLOWED_MARKER => {
-            let _ = retry_after;
-            // The workspace accepts metadata only — downgrade THIS window and
-            // retry once. Re-sent metadata-only chunks that overlap already-
-            // accepted ones dedup by batch id / natural keys.
-            if tier == KnowledgeTier::Full {
-                tracing::warn!(
-                    "knowledge sync: workspace has not opted into content — re-sending this \
-                     window at the metadata tier (set [sync] knowledge = \"metadata\" locally, \
-                     or opt the workspace in, to silence this)"
-                );
-                let stripped = build_knowledge_batches(
-                    &device_id,
-                    &now,
-                    KnowledgeTier::Metadata,
-                    &decisions,
-                    &specs,
-                    &trailers,
-                    &guard_events,
-                    Vec::new(),
-                );
-                post_chunks(state, device_key, client, &cloud_url, &stripped).await
-            } else {
-                Err(KError::Fatal(
-                    "cloud answered content_not_allowed to a metadata-tier batch".into(),
-                ))
+        Err(KError::ContentNotAllowed) if tier == KnowledgeTier::Full => {
+            // The workspace accepts metadata only — downgrade THIS window in
+            // place ([`KnowledgeBatch::strip_content`]) and retry once. The
+            // batch id is tier-sensitive, so it is recomputed after the strip;
+            // the stats snapshot is dropped from the retry (it never was part
+            // of the window's identity — the next TTL pass re-sends it).
+            // Re-sent metadata-only chunks that overlap already-accepted ones
+            // dedup by batch id / natural keys.
+            tracing::warn!(
+                "knowledge sync: workspace has not opted into content — re-sending this \
+                 window at the metadata tier (set [sync] knowledge = \"metadata\" locally, \
+                 or opt the workspace in, to silence this)"
+            );
+            let stripped: Vec<KnowledgeChunk> = chunks
+                .iter()
+                .map(|chunk| {
+                    let mut chunk = chunk.clone();
+                    chunk.batch.strip_content();
+                    chunk.batch.repo_stats.clear();
+                    chunk.batch.batch_id = knowledge_batch_id(&chunk.batch);
+                    chunk
+                })
+                .collect();
+            match post_chunks(state, device_key, client, &cloud_url, &stripped).await {
+                Err(KError::ContentNotAllowed) => Err(metadata_rejected()),
+                other => other,
             }
         }
+        Err(KError::ContentNotAllowed) => Err(metadata_rejected()),
         other => other,
     }
 }
 
-/// Internal marker distinguishing `content_not_allowed` inside the transient
-/// plumbing without another enum variant leaking into the run loop.
-const CONTENT_NOT_ALLOWED_MARKER: &str = "\u{1}content_not_allowed";
+/// The cloud answered `content_not_allowed` to a batch that already carried no
+/// content — nothing left to strip, so surface it as a plain fatal error.
+fn metadata_rejected() -> KError {
+    KError::Fatal("cloud answered content_not_allowed to a metadata-tier batch".into())
+}
 
 async fn post_chunks(
     state: &AppState,
@@ -392,10 +371,7 @@ async fn post_chunks(
                 "unknown_device" => KError::ReLinkRequired,
                 "bad_signature" => KError::SignatureRejected,
                 "knowledge_disabled" => KError::Disabled,
-                "content_not_allowed" => KError::Transient {
-                    message: CONTENT_NOT_ALLOWED_MARKER.to_string(),
-                    retry_after: None,
-                },
+                "content_not_allowed" => KError::ContentNotAllowed,
                 "unsupported_schema_version" => KError::SchemaSkew(body),
                 _ => KError::Fatal(format!("cloud answered {status}: {body}")),
             });
@@ -537,46 +513,32 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
     out
 }
 
+/// The knowledge channel's [`HealthChannel`] keys: it reuses the attestation
+/// channel's [`dira_core::sync::SyncHealth`] shape (`cursor` carries the
+/// decision watermark; `cloud_watermark` is unused here).
+const KNOWLEDGE_HEALTH_CHANNEL: HealthChannel = HealthChannel {
+    log: "knowledge sync",
+    health_key: META_KNOWLEDGE_HEALTH,
+    cursor_key: META_KNOWLEDGE_DECISION_CURSOR,
+    watermark_key: None,
+};
+
 /// Persist the knowledge channel's health snapshot to
-/// [`META_KNOWLEDGE_HEALTH`], reusing the attestation channel's
-/// [`dira_core::sync::SyncHealth`] shape (`cursor` carries the decision
-/// watermark; `cloud_watermark` is unused here).
+/// [`META_KNOWLEDGE_HEALTH`] (see [`record_channel_health`]).
 async fn record_health(
     state: &AppState,
     error_kind: Option<&str>,
     consecutive_failures: u32,
     backoff_secs: u64,
 ) {
-    use dira_core::sync::parse_sync_health;
-    let now = crate::heartbeat::fmt_rfc3339(time::OffsetDateTime::now_utc());
-    let mut health = state
-        .store
-        .meta_get(META_KNOWLEDGE_HEALTH)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|j| parse_sync_health(&j))
-        .unwrap_or_default();
-    health.last_attempt_at = Some(now.clone());
-    health.consecutive_failures = consecutive_failures;
-    health.backoff_secs = backoff_secs;
-    health.cursor = state
-        .store
-        .meta_get(META_KNOWLEDGE_DECISION_CURSOR)
-        .await
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
-    match error_kind {
-        None => {
-            health.last_success_at = Some(now);
-            health.last_error_kind = None;
-        }
-        Some(kind) => health.last_error_kind = Some(kind.to_string()),
-    }
-    if let Ok(json) = serde_json::to_string(&health) {
-        let _ = state.store.meta_set(META_KNOWLEDGE_HEALTH, &json).await;
-    }
+    record_channel_health(
+        state,
+        &KNOWLEDGE_HEALTH_CHANNEL,
+        error_kind,
+        consecutive_failures,
+        backoff_secs,
+    )
+    .await;
 }
 
 #[cfg(test)]

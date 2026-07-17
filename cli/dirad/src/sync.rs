@@ -36,8 +36,9 @@ pub use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR};
 const DEBOUNCE: StdDuration = StdDuration::from_secs(3);
 /// Backstop cadence: flush even with no triggers (and retry after failures).
 const BACKSTOP: StdDuration = StdDuration::from_secs(90);
-/// Cap for exponential backoff after a network/5xx failure.
-const MAX_BACKOFF: StdDuration = StdDuration::from_secs(300);
+/// Cap for exponential backoff after a network/5xx failure. Shared with the
+/// knowledge sync task, which rides the same [`next_backoff`] ladder.
+pub(crate) const MAX_BACKOFF: StdDuration = StdDuration::from_secs(300);
 /// HTTP timeout for a single ingest chunk POST. Longer than the other
 /// device→cloud calls — a batch can carry a chunk's worth of intervals/sessions.
 const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -409,7 +410,9 @@ async fn try_reloaded_key_flush(state: &AppState, rejected: &DeviceKey) -> bool 
     }
 }
 
-fn next_backoff(current: StdDuration) -> StdDuration {
+/// One exponential-backoff ladder for BOTH device→cloud channels (attestation
+/// and knowledge sync): 2s seed, doubling, capped at [`MAX_BACKOFF`].
+pub(crate) fn next_backoff(current: StdDuration) -> StdDuration {
     let next = if current.is_zero() {
         StdDuration::from_secs(2)
     } else {
@@ -418,42 +421,60 @@ fn next_backoff(current: StdDuration) -> StdDuration {
     next.min(MAX_BACKOFF)
 }
 
-/// The wait to sleep before retrying a [`SyncError::Transient`] failure: the
-/// cloud's `retry_after` (from a 429) when present, else the usual exponential
+/// The wait to sleep before retrying a transient failure: the cloud's
+/// `retry_after` (from a 429) when present, else the usual exponential
 /// ladder off `current` — either way capped at [`MAX_BACKOFF`] so a
 /// misbehaving/huge `Retry-After` can't wedge sync indefinitely. Pure, so the
 /// cap and the override-vs-ladder choice are unit-testable without a network.
-fn transient_wait(retry_after: Option<StdDuration>, current: StdDuration) -> StdDuration {
+pub(crate) fn transient_wait(
+    retry_after: Option<StdDuration>,
+    current: StdDuration,
+) -> StdDuration {
     retry_after
         .unwrap_or_else(|| next_backoff(current))
         .min(MAX_BACKOFF)
 }
 
-/// Persist a compact sync-health snapshot to `META_SYNC_HEALTH`, for `dira
+/// Which channel a health snapshot belongs to: its `meta` keys plus the log
+/// prefix. Both sync tasks persist the same [`dira_core::sync::SyncHealth`]
+/// shape through [`record_channel_health`]; only the keys differ.
+pub(crate) struct HealthChannel {
+    /// Log prefix, e.g. `"sync"` / `"knowledge sync"`.
+    pub log: &'static str,
+    /// `meta` key holding the JSON health snapshot.
+    pub health_key: &'static str,
+    /// `meta` key whose value is surfaced as `health.cursor`.
+    pub cursor_key: &'static str,
+    /// `meta` key surfaced as `health.cloud_watermark`, when the channel has one.
+    pub watermark_key: Option<&'static str>,
+}
+
+/// Persist a compact health snapshot for one sync channel, for `dira
 /// status`/`dira device status` to render (WP-B9 adds the rendering; this is
 /// the write side). `error_kind = None` records a success (stamps
 /// `last_success_at`, clears `last_error_kind`); `Some(kind)` records a
 /// non-success tick of that kind and leaves `last_success_at` untouched —
 /// `kind` is either a failure category (bumps `consecutive_failures`, passed
-/// in by the caller) or `"skipped"` (not configured/linked; the caller keeps
-/// `consecutive_failures` at 0, since skipping isn't a failure).
+/// in by the caller) or a quiet non-failure (`"skipped"`, `"off"`, …; the
+/// caller keeps `consecutive_failures` at 0).
 ///
 /// Best-effort and read-modify-write over the single JSON blob: a read/parse/
 /// write failure is logged and otherwise ignored — health is diagnostic, it
-/// must never gate or fail a flush. Called on every flush outcome (`run`'s
-/// `match` arms) so `last_attempt_at` never lags `flush_attempts`.
-async fn record_health(
+/// must never gate or fail a flush. Called on every flush outcome (the `run`
+/// loops' `match` arms) so `last_attempt_at` never lags.
+pub(crate) async fn record_channel_health(
     state: &AppState,
+    channel: &HealthChannel,
     error_kind: Option<&str>,
     consecutive_failures: u32,
     backoff_secs: u64,
 ) {
-    use dira_core::sync::{parse_sync_health, META_CLOUD_WATERMARK, META_SYNC_HEALTH};
+    use dira_core::sync::parse_sync_health;
 
     let now = crate::heartbeat::fmt_rfc3339(time::OffsetDateTime::now_utc());
     let mut health = state
         .store
-        .meta_get(META_SYNC_HEALTH)
+        .meta_get(channel.health_key)
         .await
         .ok()
         .flatten()
@@ -465,18 +486,20 @@ async fn record_health(
     health.backoff_secs = backoff_secs;
     health.cursor = state
         .store
-        .meta_get(META_SYNC_CURSOR)
+        .meta_get(channel.cursor_key)
         .await
         .ok()
         .flatten()
         .filter(|s| !s.is_empty());
-    health.cloud_watermark = state
-        .store
-        .meta_get(META_CLOUD_WATERMARK)
-        .await
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
+    if let Some(watermark_key) = channel.watermark_key {
+        health.cloud_watermark = state
+            .store
+            .meta_get(watermark_key)
+            .await
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+    }
     match error_kind {
         None => {
             health.last_success_at = Some(now);
@@ -487,12 +510,38 @@ async fn record_health(
 
     match serde_json::to_string(&health) {
         Ok(json) => {
-            if let Err(e) = state.store.meta_set(META_SYNC_HEALTH, &json).await {
-                tracing::debug!("sync: persist health snapshot failed: {e}");
+            if let Err(e) = state.store.meta_set(channel.health_key, &json).await {
+                tracing::debug!("{}: persist health snapshot failed: {e}", channel.log);
             }
         }
-        Err(e) => tracing::debug!("sync: serialize health snapshot failed: {e}"),
+        Err(e) => tracing::debug!("{}: serialize health snapshot failed: {e}", channel.log),
     }
+}
+
+/// The attestation channel's [`HealthChannel`] keys.
+const SYNC_HEALTH_CHANNEL: HealthChannel = HealthChannel {
+    log: "sync",
+    health_key: dira_core::sync::META_SYNC_HEALTH,
+    cursor_key: META_SYNC_CURSOR,
+    watermark_key: Some(dira_core::sync::META_CLOUD_WATERMARK),
+};
+
+/// Persist the attestation channel's health snapshot to `META_SYNC_HEALTH`
+/// (see [`record_channel_health`] for the semantics).
+async fn record_health(
+    state: &AppState,
+    error_kind: Option<&str>,
+    consecutive_failures: u32,
+    backoff_secs: u64,
+) {
+    record_channel_health(
+        state,
+        &SYNC_HEALTH_CHANNEL,
+        error_kind,
+        consecutive_failures,
+        backoff_secs,
+    )
+    .await;
 }
 
 /// What a flush did, for backoff bookkeeping.

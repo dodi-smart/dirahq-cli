@@ -153,7 +153,12 @@ fn event_to_wire(row: &ZavetGuardEventSyncRow) -> KnowledgeGuardEvent {
 /// same items under a NEW id so the cloud re-unpacks with content.
 /// `repo_stats` deliberately does not participate — it is a snapshot, not a
 /// cursor stream, and must not change the identity of the covered window.
-fn knowledge_batch_id(batch: &KnowledgeBatch) -> String {
+///
+/// Public so the daemon can recompute the id after downgrading a batch in
+/// place with [`KnowledgeBatch::strip_content`] (the `content_not_allowed`
+/// retry): the tier participates in the id, so the stripped re-send must not
+/// reuse the full-tier id.
+pub fn knowledge_batch_id(batch: &KnowledgeBatch) -> String {
     let mut ids: Vec<String> = Vec::new();
     for d in &batch.decisions {
         ids.push(format!(

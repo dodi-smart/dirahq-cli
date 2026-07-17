@@ -699,7 +699,8 @@ mod tests {
             cloud_url: Some(cloud.base_url().to_string()),
             ..Default::default()
         };
-        let (state, _rx, _sync_rx) = crate::build_state(store, config).await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
         state
     }
 

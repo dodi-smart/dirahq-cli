@@ -306,7 +306,9 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
 /// Parse a `Retry-After` response header (seconds form) into a [`StdDuration`].
 /// `None` when the header is absent or not a plain integer — the cloud never
 /// sends the HTTP-date form (see `dira_core::sync::parse_retry_after_secs`).
-fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<StdDuration> {
+pub(crate) fn retry_after_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<StdDuration> {
     headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
@@ -859,52 +861,14 @@ fn is_unsupported_schema(body: &str) -> bool {
 /// branch. Returns `true` exactly when THIS call is the one that triggered the
 /// cursor blank, so the caller can gate its own cursor-advance logic on it.
 async fn apply_handshake(state: &AppState, body: &str) -> Result<bool, SyncError> {
-    use dira_core::sync::{META_CLOUD_WATERMARK, META_LAST_EPOCH};
+    use dira_core::sync::META_CLOUD_WATERMARK;
     let resp = dira_core::sync::parse_ingest_response(body);
     let mut reset = false;
 
     if let Some(epoch) = resp.sync.data_epoch.as_deref() {
-        let stored = state
-            .store
-            .meta_get(META_LAST_EPOCH)
+        reset = note_data_epoch(state, epoch)
             .await
-            .map_err(|e| SyncError::Fatal(format!("read epoch: {e}")))?
-            .filter(|s| !s.is_empty());
-        match stored.as_deref() {
-            None => {
-                // First epoch we've seen — adopt it, no action.
-                state
-                    .store
-                    .meta_set(META_LAST_EPOCH, epoch)
-                    .await
-                    .map_err(|e| SyncError::Fatal(format!("store epoch: {e}")))?;
-            }
-            Some(prev) if prev != epoch => {
-                // Store the new epoch BEFORE resetting/triggering so this fires once.
-                state
-                    .store
-                    .meta_set(META_LAST_EPOCH, epoch)
-                    .await
-                    .map_err(|e| SyncError::Fatal(format!("store epoch: {e}")))?;
-                state
-                    .store
-                    .meta_set(META_SYNC_CURSOR, "")
-                    .await
-                    .map_err(|e| SyncError::Fatal(format!("reset cursor: {e}")))?;
-                state
-                    .store
-                    .meta_set(META_ARTIFACTS_CURSOR, "")
-                    .await
-                    .map_err(|e| SyncError::Fatal(format!("reset artifacts cursor: {e}")))?;
-                tracing::warn!(
-                    epoch = epoch,
-                    "sync: cloud data epoch changed (cloud was reset) — re-sending from scratch"
-                );
-                let _ = state.sync.trigger.try_send(());
-                reset = true;
-            }
-            _ => {} // unchanged epoch — nothing to do
-        }
+            .map_err(SyncError::Fatal)?;
     }
 
     if let Some(wm) = resp.sync.synced_event_id.as_deref() {
@@ -912,6 +876,70 @@ async fn apply_handshake(state: &AppState, body: &str) -> Result<bool, SyncError
         let _ = state.store.meta_set(META_CLOUD_WATERMARK, wm).await;
     }
     Ok(reset)
+}
+
+/// Adopt/compare the cloud's `dataEpoch`. On a CHANGE (the cloud's durable log
+/// was reset), blank every sync cursor — both attestation cursors AND the four
+/// knowledge cursors — and nudge both tasks, so the whole device re-sends from
+/// scratch as one coherent wipe-and-resync. Shared by the attestation ack path
+/// ([`apply_handshake`]) and the knowledge ack path
+/// (`crate::knowledge_sync::post_chunks`): whichever channel sees the new
+/// epoch first resets both. Returns `true` exactly when THIS call performed
+/// the reset.
+pub(crate) async fn note_data_epoch(state: &AppState, epoch: &str) -> Result<bool, String> {
+    use dira_core::sync::knowledge::{
+        META_KNOWLEDGE_DECISION_CURSOR, META_KNOWLEDGE_GUARD_CURSOR, META_KNOWLEDGE_SPEC_CURSOR,
+        META_KNOWLEDGE_TRAILER_CURSOR,
+    };
+    use dira_core::sync::META_LAST_EPOCH;
+
+    let stored = state
+        .store
+        .meta_get(META_LAST_EPOCH)
+        .await
+        .map_err(|e| format!("read epoch: {e}"))?
+        .filter(|s| !s.is_empty());
+    match stored.as_deref() {
+        None => {
+            // First epoch we've seen — adopt it, no action.
+            state
+                .store
+                .meta_set(META_LAST_EPOCH, epoch)
+                .await
+                .map_err(|e| format!("store epoch: {e}"))?;
+            Ok(false)
+        }
+        Some(prev) if prev != epoch => {
+            // Store the new epoch BEFORE resetting/triggering so this fires once.
+            state
+                .store
+                .meta_set(META_LAST_EPOCH, epoch)
+                .await
+                .map_err(|e| format!("store epoch: {e}"))?;
+            for key in [
+                META_SYNC_CURSOR,
+                META_ARTIFACTS_CURSOR,
+                META_KNOWLEDGE_DECISION_CURSOR,
+                META_KNOWLEDGE_SPEC_CURSOR,
+                META_KNOWLEDGE_TRAILER_CURSOR,
+                META_KNOWLEDGE_GUARD_CURSOR,
+            ] {
+                state
+                    .store
+                    .meta_set(key, "")
+                    .await
+                    .map_err(|e| format!("reset {key}: {e}"))?;
+            }
+            tracing::warn!(
+                epoch = epoch,
+                "sync: cloud data epoch changed (cloud was reset) — re-sending from scratch"
+            );
+            let _ = state.sync.trigger.try_send(());
+            let _ = state.knowledge_sync.trigger.try_send(());
+            Ok(true)
+        }
+        _ => Ok(false), // unchanged epoch — nothing to do
+    }
 }
 
 /// Gather partial-rollup descriptors for long-running un-ended sessions from the
@@ -1156,7 +1184,8 @@ mod tests {
             cloud_url: Some(cloud.base_url().to_string()),
             ..Default::default()
         };
-        let (state, _rx, _sync_rx) = crate::build_state(store, config).await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
         state
     }
 
@@ -1217,7 +1246,7 @@ mod tests {
             cloud_url: Some(cloud.base_url().to_string()),
             ..Default::default()
         };
-        let (state, _rx, sync_rx) = crate::build_state(store, config).await.unwrap();
+        let (state, _rx, sync_rx, _knowledge_rx) = crate::build_state(store, config).await.unwrap();
         let trigger = state.sync.trigger.clone();
 
         let started = std::time::Instant::now();
@@ -1354,7 +1383,8 @@ mod tests {
             idle_seconds: 5,
             ..Default::default()
         };
-        let (state, _rx, _sync_rx) = crate::build_state(store, config).await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
 
         // Three idle-separated bursts (idle_seconds = 5, gap = 30s) so
         // `chunk_ranges` closes exactly 3 chunks: two full CHUNK_EVENTS bursts,
@@ -1547,7 +1577,8 @@ mod tests {
             idle_seconds: 5,
             ..Default::default()
         };
-        let (state, _rx, _sync_rx) = crate::build_state(store, config).await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
         let key = DeviceKey::generate();
 
         // Attempt 1: chunk 1 (the packed burst) acks 2xx; chunk 2 (the tail)
@@ -1655,7 +1686,8 @@ mod tests {
             cloud_url: Some(cloud.base_url().to_string()),
             ..Default::default()
         };
-        let (state, _rx, _sync_rx) = crate::build_state(store, config).await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
         let key = DeviceKey::generate();
 
         // Flush window 1: L1, L2 — a plain, unseeded, single [L1,L2) interval.
@@ -2088,7 +2120,8 @@ mod tests {
     async fn unconfigured_state() -> AppState {
         let store = dira_core::Store::open_in_memory().await.unwrap();
         let config = dira_core::Config::default();
-        let (state, _rx, _sync_rx) = crate::build_state(store, config).await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
         state
     }
 

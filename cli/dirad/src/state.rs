@@ -49,6 +49,8 @@ pub struct AppState {
     pub bearer: Arc<String>,
     /// Handle to the background cloud-sync task (trigger channel).
     pub sync: SyncHandle,
+    /// Handle to the knowledge sync task (M2; consent-gated, own cursors).
+    pub knowledge_sync: crate::knowledge_sync::KnowledgeSyncHandle,
     /// This device's signing key, used to sign attestation batches. Loaded
     /// **lazily** off the startup critical path: the key is only needed for
     /// sync/signing, never to answer a control request, and loading it can block
@@ -659,7 +661,8 @@ mod tests {
 
         let store = dira_core::Store::open_in_memory().await.unwrap();
         let config = dira_core::Config::default();
-        let (state, _rx, _sync_rx) = crate::build_state(store, config).await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
 
         let loaded = state.device_key().await.expect("loads via env seed");
         assert_eq!(loaded.public_base64(), first.public_base64());

@@ -121,6 +121,102 @@ pub fn commits_touching_since(root: &Path, since_sha: &str, pathspecs: &[String]
         .unwrap_or_default()
 }
 
+/// Recent-window activity for the knowledge repo-stats snapshot: distinct
+/// non-`.zavet/` paths touched inside the rolling window, plus the shas of the
+/// non-merge commits that touched at least one such path ("non-trivial").
+/// One `git log --name-only` pass; `.zavet/` files are knowledge, not code,
+/// so they count toward neither the coverage denominator nor triviality.
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeActivity {
+    pub paths: Vec<String>,
+    pub nontrivial_commits: Vec<String>,
+}
+
+pub fn knowledge_activity(root: &Path, window_days: u32) -> KnowledgeActivity {
+    let since = format!("--since={window_days}.days");
+    let out = match git(
+        root,
+        &[
+            "log",
+            "--no-merges",
+            &since,
+            "--format=%x01%H",
+            "--name-only",
+        ],
+    ) {
+        Some(out) => out,
+        None => return KnowledgeActivity::default(),
+    };
+    let mut paths: Vec<String> = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut commits: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    let mut current_counts = false;
+    for line in out.lines() {
+        if let Some(sha) = line.strip_prefix('\u{1}') {
+            if let (Some(sha), true) = (current.take(), current_counts) {
+                commits.push(sha);
+            }
+            current = Some(sha.to_string());
+            current_counts = false;
+            continue;
+        }
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(".zavet/") {
+            continue;
+        }
+        current_counts = true;
+        if seen_paths.insert(line.to_string()) {
+            paths.push(line.to_string());
+        }
+    }
+    if let (Some(sha), true) = (current, current_counts) {
+        commits.push(sha);
+    }
+    KnowledgeActivity {
+        paths,
+        nontrivial_commits: commits,
+    }
+}
+
+/// Distinct non-`.zavet/` paths touched inside the rolling window AND matching
+/// one of `pathspecs` (git `:(glob)` semantics — the same dialect the
+/// staleness query uses). The knowledge coverage numerator.
+pub fn paths_touched_since_days(
+    root: &Path,
+    window_days: u32,
+    pathspecs: &[String],
+) -> Vec<String> {
+    if pathspecs.is_empty() {
+        return Vec::new();
+    }
+    let since = format!("--since={window_days}.days");
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "--no-merges".into(),
+        since,
+        "--format=".into(),
+        "--name-only".into(),
+        "--".into(),
+    ];
+    args.extend(pathspecs.iter().map(|p| format!(":(glob){p}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out_paths = Vec::new();
+    if let Some(out) = git(root, &args) {
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(".zavet/") {
+                continue;
+            }
+            if seen.insert(line.to_string()) {
+                out_paths.push(line.to_string());
+            }
+        }
+    }
+    out_paths
+}
+
 /// The content of `path` as of `sha` (`git show sha:path`).
 pub fn show_blob(root: &Path, sha: &str, path: &str) -> Option<String> {
     git(root, &["show", &format!("{sha}:{path}")])

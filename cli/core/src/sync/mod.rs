@@ -6,6 +6,7 @@ pub mod batch;
 pub mod billing;
 pub mod handshake;
 pub mod health;
+pub mod knowledge;
 pub mod ratelimit;
 
 pub use batch::{

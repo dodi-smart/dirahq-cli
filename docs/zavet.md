@@ -116,21 +116,33 @@ Records with `origin: reverse-engineered` / `verified: false` (the
 `/zavet:backfill` output) render as amber *unverified — hypothesis* badges
 everywhere — recall never presents reconstructed rationale as fact.
 
-## Privacy & cloud (M2 design note — not implemented)
+## Privacy & cloud (M2 — the knowledge channel)
 
-Decision bodies, spec bodies, and trailer values are **local-only**, exactly
-like commit messages: the attestation wire contract is content-free by tested invariant
-(`wire_contract_carries_no_content_fields`), so zavet data can never ride
-`AttestationBatch`. The planned M2 channel is a separate `KnowledgeEnvelope`
-on its own endpoint with its own sync cursor and its own consent gate:
+Zavet data never rides `AttestationBatch`: the attestation wire stays
+content-free by tested invariant (`wire_contract_carries_no_content_fields`).
+M2 ships the separate **`KnowledgeEnvelope`** — same JCS/Ed25519 framing, its
+own endpoint (`POST /api/v1/knowledge`), its own four sync cursors, and its
+own **double consent gate**:
 
-- metadata-only by default: decision ids, status, guard globs, trailer keys +
-  decision refs, `content_hash` — enough for dashboards to show structure,
-  cost, and guard telemetry without any prose;
-- full content (`body_md`, trailer values) only behind an explicit opt-in knob;
-- idempotent ingestion keyed by `content_hash` + commit sha, so
-  wipe-and-resync reproduces cloud state.
+- **Producer knob** — `[sync] knowledge = "off" | "metadata" | "full"` in
+  `config.toml` (or `DIRA_SYNC__KNOWLEDGE`). Default **off**: zavet works
+  fully on the machine, nothing leaves it. `metadata` ships decision ids,
+  slugs, titles, status, guard globs, spec paths, trailer keys + decision
+  refs, guard events, shas (`recordSha` = the git blob oid), and per-repo
+  coverage/capture counts — enough for dashboards to show structure, cost,
+  and guard telemetry without any prose. `full` adds the consent-gated
+  content fields (`bodyMd`, trailer `value`), which are pinned by an explicit
+  path allowlist in the contract's no-content invariant.
+- **Workspace tier** (cloud-side) — the dashboard's ZAVET · KNOWLEDGE SYNC
+  setting: `off` refuses the channel (`knowledge_disabled`), `metadata`
+  refuses content (`content_not_allowed` — the daemon downgrades the window
+  with `strip_content()` and retries once, so sync never wedges), `full`
+  accepts everything. Content is stored only when BOTH ends said `full`.
 
-M1 keeps that door open: `content_hash` exists from day one, trailers join the
-`artifacts` table the cloud already anchors on, and no zavet column shares a
-name with the wire denylist tokens.
+Cursors: decisions and specs advance on a `touched_seq` watermark (bumped on
+every upsert — git author dates are non-monotonic under rebase, so
+`updated_at` can't be a cursor), trailers on rowid, guard events on their
+ULID. All four blank together with the attestation cursors on a `dataEpoch`
+change, `dira nuke`, or `dira device resync` — and because ingestion is
+idempotent by natural keys + a deterministic `batchId`, wipe-and-resync
+reproduces cloud state exactly.

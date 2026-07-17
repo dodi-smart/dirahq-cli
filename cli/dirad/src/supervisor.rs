@@ -173,9 +173,10 @@ mod tests {
     #[tokio::test]
     async fn writer_wedged_flags_a_hang_on_the_very_first_message() {
         let store = dira_core::Store::open_in_memory().await.unwrap();
-        let (state, _rx, _sync_rx) = crate::build_state(store, dira_core::Config::default())
-            .await
-            .unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, dira_core::Config::default())
+                .await
+                .unwrap();
         // A message is backed up (nothing is draining `_rx`)…
         state.tx.try_send(queued_event()).unwrap();
         // …and the daemon started longer ago than the stall threshold with
@@ -195,9 +196,10 @@ mod tests {
     #[tokio::test]
     async fn writer_wedged_stays_quiet_on_fresh_start_or_empty_queue() {
         let store = dira_core::Store::open_in_memory().await.unwrap();
-        let (state, _rx, _sync_rx) = crate::build_state(store, dira_core::Config::default())
-            .await
-            .unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, dira_core::Config::default())
+                .await
+                .unwrap();
         // Old daemon, empty queue: quiet.
         state
             .progress

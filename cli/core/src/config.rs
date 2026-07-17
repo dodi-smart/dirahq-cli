@@ -52,6 +52,44 @@ pub struct Modules {
     pub zavet: ZavetMode,
 }
 
+/// Consent tier for the knowledge sync channel (`[sync] knowledge` in
+/// `config.toml`, or `DIRA_SYNC__KNOWLEDGE=off|metadata|full`).
+///
+/// Default **Off**: zavet stays fully functional locally, but nothing
+/// knowledge-related ever leaves the machine without this explicit opt-in —
+/// deliberately stricter than attestations, and only half the gate (the
+/// workspace must also opt in cloud-side; content additionally requires
+/// `Full` here AND the workspace's content opt-in).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KnowledgeSyncMode {
+    #[default]
+    Off,
+    Metadata,
+    Full,
+}
+
+impl KnowledgeSyncMode {
+    /// The knob value as spelled in `config.toml` (and echoed by status views).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KnowledgeSyncMode::Off => "off",
+            KnowledgeSyncMode::Metadata => "metadata",
+            KnowledgeSyncMode::Full => "full",
+        }
+    }
+}
+
+/// Per-channel sync knobs (`[sync]` in `config.toml`).
+///
+/// Attestation sync has no knob here — it is governed by device linking alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SyncKnobs {
+    /// The knowledge channel's consent tier (see [`KnowledgeSyncMode`]).
+    #[serde(default)]
+    pub knowledge: KnowledgeSyncMode,
+}
+
 /// Daemon + CLI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -131,6 +169,9 @@ pub struct Config {
     /// `.zavet/`). Env override: `DIRA_MODULES__ZAVET=auto|on|off`.
     #[serde(default)]
     pub modules: Modules,
+    /// Per-channel sync consent knobs (`[sync]` table; see [`SyncKnobs`]).
+    #[serde(default)]
+    pub sync: SyncKnobs,
 }
 
 impl Default for Config {
@@ -159,6 +200,7 @@ impl Default for Config {
             deep_idle_after_secs: 900,
             presence_ttl_deep_idle_secs: 600,
             modules: Modules::default(),
+            sync: SyncKnobs::default(),
         }
     }
 }
@@ -383,6 +425,35 @@ mod tests {
                 .extract()
                 .unwrap();
             assert_eq!(c.modules.zavet, ZavetMode::On);
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn knowledge_sync_mode_defaults_off_and_layers() {
+        // Default: knowledge never leaves the machine without an explicit knob.
+        let c = Config::default();
+        assert_eq!(c.sync.knowledge, KnowledgeSyncMode::Off);
+
+        let c: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[sync]\nknowledge = \"metadata\""))
+            .extract()
+            .unwrap();
+        assert_eq!(c.sync.knowledge, KnowledgeSyncMode::Metadata);
+
+        // Env wins over toml (DIRA_SYNC__KNOWLEDGE -> sync.knowledge).
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DIRA_SYNC__KNOWLEDGE", "full");
+            let c: Config = Figment::from(Serialized::defaults(Config::default()))
+                .merge(Toml::string("[sync]\nknowledge = \"metadata\""))
+                .merge(
+                    Env::prefixed("DIRA_")
+                        .map(|k| k.as_str().to_lowercase().replace("__", ".").into()),
+                )
+                .extract()
+                .unwrap();
+            assert_eq!(c.sync.knowledge, KnowledgeSyncMode::Full);
             Ok(())
         });
     }

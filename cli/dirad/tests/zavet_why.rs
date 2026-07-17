@@ -17,7 +17,7 @@ const REPO: &str = "github.com/acme/api";
 async fn test_state() -> AppState {
     let store = Store::open_in_memory().await.expect("in-memory store");
     let config = Config::default();
-    let (state, _rx, _sync_rx) = dirad::build_state(store, config)
+    let (state, _rx, _sync_rx, _knowledge_rx) = dirad::build_state(store, config)
         .await
         .expect("build_state");
     state

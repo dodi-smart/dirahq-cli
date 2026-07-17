@@ -39,5 +39,15 @@ fn main() -> std::io::Result<()> {
     std::fs::write(&billing_out, billing_json + "\n")?;
     eprintln!("wrote {}", billing_out.display());
 
+    // The signed knowledge batch (M2): zavet's consent-tiered channel beside
+    // attestations — its own endpoint, cursors, and consent gate. Content
+    // fields (bodyMd / trailer value) exist in the schema but flow only under
+    // double opt-in; see the contract's no-content-fields invariant.
+    let knowledge = schemars::schema_for!(dira_contract::KnowledgeEnvelope);
+    let knowledge_json = serde_json::to_string_pretty(&knowledge).expect("schema serializes");
+    let knowledge_out = dir.join("knowledge.schema.json");
+    std::fs::write(&knowledge_out, knowledge_json + "\n")?;
+    eprintln!("wrote {}", knowledge_out.display());
+
     Ok(())
 }

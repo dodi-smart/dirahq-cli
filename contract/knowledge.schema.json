@@ -1,0 +1,483 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KnowledgeEnvelope",
+  "description": "A signed knowledge batch as it travels to `POST /api/v1/knowledge`.\n\nMirrors [`Envelope`] exactly (same framing, same signing rule): the signature\nis computed over the canonical-JSON (RFC 8785) encoding of `payload` only.\nKnowledge is a **separate, consent-gated channel** beside attestations — it\nnever rides [`AttestationBatch`] (decision D-0001), has its own sync cursors,\nand flows only when the producer's `[sync] knowledge` knob is enabled AND the\nworkspace has opted in cloud-side.",
+  "type": "object",
+  "properties": {
+    "deviceId": {
+      "description": "ULID of the device that produced and signed this batch.",
+      "type": "string"
+    },
+    "payload": {
+      "description": "The knowledge batch being attested to.",
+      "$ref": "#/$defs/KnowledgeBatch"
+    },
+    "schemaVersion": {
+      "description": "Semver of this contract, e.g. `\"1.2.0\"`.",
+      "type": "string"
+    },
+    "sig": {
+      "description": "`ed25519(JCS(payload))`, base64 (standard, no padding).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "deviceId",
+    "payload",
+    "sig"
+  ],
+  "$defs": {
+    "KnowledgeBatch": {
+      "description": "The unit of knowledge sync: zavet decisions, specs, trailer refs, guard\nevents, and per-repo coverage stats captured locally.\n\nIdempotent by `batchId` (deterministic over the covered items + tier, so a\ncrash-retry re-sends identical bytes) and by per-item natural keys cloud-side\n— wipe-and-resync reproduces cloud state.\n\n**Tiering.** At `tier: \"metadata\"` (the default when the channel is enabled\nat all) every content field — `bodyMd` on decisions and specs, `value` on\ntrailer refs — is `None`/absent: ids, slugs, titles, status, globs, shas,\ntrailer keys + decision refs, and counts are enough for dashboards to show\nstructure, cost, and guard telemetry without any prose. `tier: \"full\"`\npopulates them, and only a workspace that separately opted in stores them.\n[`KnowledgeBatch::strip_content`] is the producer-side downgrade.",
+      "type": "object",
+      "properties": {
+        "batchId": {
+          "description": "Deterministic idempotency key for this batch (content-derived, not a ULID).",
+          "type": "string"
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KnowledgeDecision"
+          }
+        },
+        "deviceId": {
+          "description": "ULID of the producing device (matches the envelope).",
+          "type": "string"
+        },
+        "generatedAt": {
+          "description": "RFC 3339 timestamp the batch was assembled.",
+          "type": "string"
+        },
+        "guardEvents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KnowledgeGuardEvent"
+          }
+        },
+        "repoStats": {
+          "description": "Per-repo coverage/capture snapshot (see [`KnowledgeRepoStats`]).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KnowledgeRepoStats"
+          }
+        },
+        "specs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KnowledgeSpec"
+          }
+        },
+        "tier": {
+          "description": "`\"metadata\"` or `\"full\"` — what the batch was built under. A string, not\nan enum, so new tiers are additive without a schema major bump. The cloud\ngates on the actual content fields too, never on this label alone.",
+          "type": "string"
+        },
+        "trailerRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KnowledgeTrailerRef"
+          }
+        }
+      },
+      "required": [
+        "batchId",
+        "deviceId",
+        "generatedAt",
+        "tier"
+      ]
+    },
+    "KnowledgeDecision": {
+      "description": "One zavet decision record, metadata-first.\n\n`recordSha` is the git blob oid of the record file (a content-identity\npointer like [`BlobRef::blob`], never the file's bytes). `bodyMd` is the\nconsent-gated content field — `None` at the metadata tier.",
+      "type": "object",
+      "properties": {
+        "bodyMd": {
+          "description": "CONTENT (consent-gated): the record body markdown. `None` unless the\nbatch is full-tier. Allowlisted in the no-content-fields invariant.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "description": "Author date of the introducing commit, RFC 3339.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "firstCommit": {
+          "description": "Commit that first introduced the record (first-sight provenance).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "guards": {
+          "description": "Guard globs (active enforcement surface).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "description": "Canonical decision id, e.g. `D-0042`.",
+          "type": "string"
+        },
+        "lastCommit": {
+          "description": "Most recent commit that touched the record.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "description": "How the record came to be: `recorded` | `reverse-engineered` | …",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Repo-relative path of the record file.",
+          "type": "string"
+        },
+        "recordSha": {
+          "description": "Git blob oid of the record file (identity pointer, not content).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repoCanonical": {
+          "description": "Canonical repo ref, e.g. `github.com/acme/api`.",
+          "type": "string"
+        },
+        "slug": {
+          "description": "Filename-derived slug, e.g. `attestation-wire-is-content-free`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceSession": {
+          "description": "The session attributed to the introducing commit, if uniquely known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "`active` | `superseded` (open set — stored verbatim).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supersedes": {
+          "description": "The decision this one supersedes, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "Human title — metadata (it names the record, like a filename).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updatedAt": {
+          "description": "Author date of the latest touching commit, RFC 3339.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verified": {
+          "description": "True only after a human confirmed the record matches reality.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "repoCanonical",
+        "id",
+        "path"
+      ]
+    },
+    "KnowledgeGuardEvent": {
+      "description": "One guard event (shown / blocked / complied / overridden / superseded) —\npure telemetry, always metadata.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "description": "RFC 3339 receive time.",
+          "type": "string"
+        },
+        "decisionId": {
+          "description": "The decision the event concerns.",
+          "type": "string"
+        },
+        "filePath": {
+          "description": "Repo-relative path involved, when reported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "ULID (the idempotency key for this event).",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Event kind — stored verbatim (a plugin newer than the daemon degrades\nto \"recorded, filtered at query time\").",
+          "type": "string"
+        },
+        "repoCanonical": {
+          "description": "Canonical repo ref, when resolved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "description": "The attributed session, if uniquely known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "at",
+        "decisionId",
+        "kind"
+      ]
+    },
+    "KnowledgeRepoStats": {
+      "description": "Per-repo knowledge coverage/capture snapshot, computed producer-side (only\nthe daemon can walk git history and match paths against guard/spec globs).\nCounts only — feeds the dashboard's \"Knowledge coverage\" and \"Capture\nratio\" tiles. Upserted per repo cloud-side (a snapshot, not a stream).",
+      "type": "object",
+      "properties": {
+        "activePaths": {
+          "description": "Distinct paths touched by commits inside the window.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "computedAt": {
+          "description": "RFC 3339 timestamp the snapshot was computed.",
+          "type": "string"
+        },
+        "coveredPaths": {
+          "description": "Of those, paths covered by an active guard glob or a verified spec.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nontrivialCommits": {
+          "description": "Non-merge commits in the window touching non-`.zavet/` paths.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "repoCanonical": {
+          "description": "Canonical repo ref.",
+          "type": "string"
+        },
+        "trailerCommits": {
+          "description": "Of those, commits carrying at least one knowledge trailer.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "windowDays": {
+          "description": "The rolling window the counts cover, in days (currently 90).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "repoCanonical",
+        "windowDays",
+        "activePaths",
+        "coveredPaths",
+        "nontrivialCommits",
+        "trailerCommits",
+        "computedAt"
+      ]
+    },
+    "KnowledgeSpec": {
+      "description": "One living spec, metadata-first. Same tiering rules as [`KnowledgeDecision`].",
+      "type": "object",
+      "properties": {
+        "bodyMd": {
+          "description": "CONTENT (consent-gated): the spec body markdown. `None` unless the\nbatch is full-tier. Allowlisted in the no-content-fields invariant.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "confidence": {
+          "description": "`low` | `med` | `high`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "date": {
+          "description": "The spec's self-reported date (frontmatter `date:`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "decisions": {
+          "description": "Linked decision ids (frontmatter ∪ body refs, canonical, deduplicated).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "firstCommit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastCommit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "description": "`designed` | `session` | `reverse-engineered`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Repo-relative path of the spec file.",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Git pathspecs the spec covers (staleness surface).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "recordSha": {
+          "description": "Git blob oid of the spec file (identity pointer, not content).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repoCanonical": {
+          "description": "Canonical repo ref.",
+          "type": "string"
+        },
+        "slug": {
+          "description": "Filename-stem identity, e.g. `capture-pipeline`.",
+          "type": "string"
+        },
+        "sourceSession": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "Human title — metadata.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updatedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verified": {
+          "description": "True only after a human confirmed spec-matches-code.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "Spec document version (bumped on regeneration).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "repoCanonical",
+        "slug",
+        "version",
+        "path"
+      ]
+    },
+    "KnowledgeTrailerRef": {
+      "description": "One commit trailer occurrence: the key and the decision it references.\n\nThe trailer's free-text `value` is CONTENT (author prose, like a commit\nmessage) — `None` at the metadata tier; keys + refs alone already draw the\ndecision↔commit graph.",
+      "type": "object",
+      "properties": {
+        "decisionId": {
+          "description": "First canonical `D-NNNN` referenced by the value, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "description": "Trailer key, lowercased: `why` | `refs` | `supersedes` | `spec` | …",
+          "type": "string"
+        },
+        "repoCanonical": {
+          "description": "Canonical repo ref, when resolved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seq": {
+          "description": "Position of this trailer within the commit's trailer block.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sha": {
+          "description": "Commit sha carrying the trailer.",
+          "type": "string"
+        },
+        "value": {
+          "description": "CONTENT (consent-gated): the trailer's free text. `None` unless the\nbatch is full-tier (policy-gated: the token denylist cannot see the\nword `value`, so the metadata-tier test pins its absence explicitly).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sha",
+        "seq",
+        "key"
+      ]
+    }
+  }
+}

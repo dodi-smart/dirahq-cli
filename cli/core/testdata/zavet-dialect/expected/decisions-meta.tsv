@@ -1,0 +1,11 @@
+D-0001	active	Auth session tokens are opaque
+D-0002	active	Payments idempotency keys are session-scoped
+D-0003	active	Missing status defaults to active
+D-0004	active	Free text keeps its # characters
+D-0005	active	Comment-only value blanks to the default
+D-0008	active	Quoted values are unquoted
+D-0009	superseded	Superseded records keep meta, lose guards
+D-0010	active	Empty inline guard list
+D-0011	active	A key line terminates the block list
+D-0012	active	Unindented block items still count
+D-0013	active	Block items trim trailing whitespace

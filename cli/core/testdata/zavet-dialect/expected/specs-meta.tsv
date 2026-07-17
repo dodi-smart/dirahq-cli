@@ -1,0 +1,5 @@
+block-paths	designed	med	2026-06-30	Block paths end at the verified key
+comment-only-origin	reverse-engineered	med	2026-01-01	Comment-only origin defaults
+defaults-apply	reverse-engineered	low		Only title and paths
+happy-spec	session	high	2026-07-16	Capture pipeline
+no-title-spec	session	med		

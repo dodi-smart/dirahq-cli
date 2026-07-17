@@ -13,7 +13,8 @@ version = "0.1.0-develop.9"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/dodi-smart/dirahq-cli"
-rust-version = "1.80"
+# 1.85 required by ed25519-dalek 3 (edition 2024).
+rust-version = "1.85"
 
 # Centralized dependency versions. Members opt in via `dep.workspace = true`.
 [workspace.dependencies]
@@ -55,8 +56,10 @@ serde_json = "1"
 schemars = "1"
 
 # Crypto + identity
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+# ed25519-dalek 3 moved to rand_core 0.10, which dropped `OsRng`; the OS CSPRNG
+# now comes straight from getrandom (`SysRng`, behind the `sys_rng` feature).
+getrandom = { version = "0.4", features = ["sys_rng"] }
 # keyring 4 was rewritten: the platform backends now live in separate store crates and
 # the old `*-native` features are gone. The `v1` feature re-exposes the original drop-in
 # `Entry` API (Keychain on macOS, Credential Manager on Windows, Secret Service on *nix).

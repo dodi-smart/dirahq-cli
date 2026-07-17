@@ -984,19 +984,42 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut d = row_to_zavet_decision(row);
-            d.guards = self
-                .zavet_guards_for(&d.repo.clone(), &d.id.clone())
-                .await?;
-            out.push((row.get::<i64, _>("touched_seq"), d));
+        // Guards for exactly this window, one bulk query grouped in memory
+        // (the window spans repos, so the key is (repo, id)).
+        let guard_rows = sqlx::query(
+            "SELECT g.repo, g.decision_id, g.glob
+             FROM zavet_guards g
+             JOIN (SELECT repo, id FROM zavet_decisions
+                   WHERE touched_seq > ?1 ORDER BY touched_seq ASC LIMIT ?2) w
+               ON w.repo = g.repo AND w.id = g.decision_id
+             ORDER BY g.repo, g.decision_id, g.glob",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut guards: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for r in &guard_rows {
+            guards
+                .entry((r.get("repo"), r.get("decision_id")))
+                .or_default()
+                .push(r.get("glob"));
         }
-        Ok(out)
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut d = row_to_zavet_decision(row);
+                if let Some(g) = guards.remove(&(d.repo.clone(), d.id.clone())) {
+                    d.guards = g;
+                }
+                (row.get::<i64, _>("touched_seq"), d)
+            })
+            .collect())
     }
 
     /// Specs touched after `seq`, oldest-touch first, with paths + decision
-    /// links joined.
+    /// links bulk-joined (two child queries for the whole window, grouped in
+    /// memory — the window spans repos, so the key is (repo, slug)).
     pub async fn zavet_specs_since(
         &self,
         seq: i64,
@@ -1014,32 +1037,58 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut s = row_to_zavet_spec(row);
-            let paths = sqlx::query(
-                "SELECT glob FROM zavet_spec_paths WHERE repo = ?1 AND slug = ?2 ORDER BY glob",
-            )
-            .bind(&s.repo)
-            .bind(&s.slug)
-            .fetch_all(&self.pool)
-            .await?;
-            s.paths = paths.iter().map(|r| r.get::<String, _>("glob")).collect();
-            let links = sqlx::query(
-                "SELECT decision_id FROM zavet_spec_decisions
-                 WHERE repo = ?1 AND slug = ?2 ORDER BY decision_id",
-            )
-            .bind(&s.repo)
-            .bind(&s.slug)
-            .fetch_all(&self.pool)
-            .await?;
-            s.decisions = links
-                .iter()
-                .map(|r| r.get::<String, _>("decision_id"))
-                .collect();
-            out.push((row.get::<i64, _>("touched_seq"), s));
+        let path_rows = sqlx::query(
+            "SELECT p.repo, p.slug, p.glob
+             FROM zavet_spec_paths p
+             JOIN (SELECT repo, slug FROM zavet_specs
+                   WHERE touched_seq > ?1 ORDER BY touched_seq ASC LIMIT ?2) w
+               ON w.repo = p.repo AND w.slug = p.slug
+             ORDER BY p.repo, p.slug, p.glob",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut paths: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for r in &path_rows {
+            paths
+                .entry((r.get("repo"), r.get("slug")))
+                .or_default()
+                .push(r.get("glob"));
         }
-        Ok(out)
+        let link_rows = sqlx::query(
+            "SELECT d.repo, d.slug, d.decision_id
+             FROM zavet_spec_decisions d
+             JOIN (SELECT repo, slug FROM zavet_specs
+                   WHERE touched_seq > ?1 ORDER BY touched_seq ASC LIMIT ?2) w
+               ON w.repo = d.repo AND w.slug = d.slug
+             ORDER BY d.repo, d.slug, d.decision_id",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut links: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for r in &link_rows {
+            links
+                .entry((r.get("repo"), r.get("slug")))
+                .or_default()
+                .push(r.get("decision_id"));
+        }
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut s = row_to_zavet_spec(row);
+                let key = (s.repo.clone(), s.slug.clone());
+                if let Some(p) = paths.remove(&key) {
+                    s.paths = p;
+                }
+                if let Some(d) = links.remove(&key) {
+                    s.decisions = d;
+                }
+                (row.get::<i64, _>("touched_seq"), s)
+            })
+            .collect())
     }
 
     /// Trailer rows inserted after `rowid` (the table is insert-only, keyed

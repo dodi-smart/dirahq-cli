@@ -19,7 +19,7 @@ use ulid::Ulid;
 async fn test_state() -> (AppState, tokio::sync::mpsc::Receiver<EventMsg>) {
     let store = Store::open_in_memory().await.expect("in-memory store");
     let config = Config::default();
-    let (state, rx, _sync_rx) = dirad::build_state(store, config)
+    let (state, rx, _sync_rx, _knowledge_rx) = dirad::build_state(store, config)
         .await
         .expect("build_state");
     (state, rx)

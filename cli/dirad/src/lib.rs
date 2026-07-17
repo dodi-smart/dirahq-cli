@@ -25,6 +25,7 @@ pub mod events;
 pub mod heartbeat;
 pub mod http;
 pub mod jitter;
+pub mod knowledge_sync;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
@@ -79,11 +80,17 @@ pub fn local_offset() -> Option<UtcOffset> {
 pub async fn build_state(
     store: Store,
     config: Config,
-) -> anyhow::Result<(AppState, mpsc::Receiver<EventMsg>, mpsc::Receiver<()>)> {
+) -> anyhow::Result<(
+    AppState,
+    mpsc::Receiver<EventMsg>,
+    mpsc::Receiver<()>,
+    mpsc::Receiver<()>,
+)> {
     let bearer = resolve_bearer(&store).await?;
     let (tx, rx) = mpsc::channel::<EventMsg>(QUEUE_CAPACITY);
     let sessions = Arc::new(Mutex::new(SessionRegistry::default()));
     let (sync_handle, sync_rx) = sync::channel();
+    let (knowledge_handle, knowledge_rx) = knowledge_sync::channel();
 
     // One pooled HTTP client for every device→cloud task. Keep-alive so repeat
     // POSTs (heartbeat/sync/billing) to the same cloud host reuse the connection
@@ -106,6 +113,7 @@ pub async fn build_state(
         started_at: std::time::Instant::now(),
         bearer: Arc::new(bearer),
         sync: sync_handle,
+        knowledge_sync: knowledge_handle,
         device_key: Arc::new(tokio::sync::RwLock::new(None)),
         progress: Arc::new(ProgressTracker::default()),
         hydrated: Arc::new(AtomicBool::new(false)),
@@ -115,7 +123,7 @@ pub async fn build_state(
         billing_refresh: Arc::new(tokio::sync::Notify::new()),
         presence_wake: Arc::new(tokio::sync::Notify::new()),
     };
-    Ok((state, rx, sync_rx))
+    Ok((state, rx, sync_rx, knowledge_rx))
 }
 
 /// Bind the UDS control socket and spawn its accept loop on `state`. Bound
@@ -141,7 +149,7 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!(db = %config.db_path.display(), sock = %config.socket_path.display(), port = config.http_port, "starting dirad");
 
     let store = Store::open(&config.db_path).await?;
-    let (state, rx, sync_rx) = build_state(store, config).await?;
+    let (state, rx, sync_rx, knowledge_rx) = build_state(store, config).await?;
 
     // --- Bind the ingress surfaces FIRST (Commit 2) ---------------------------
     // Bind the control socket and HTTP *before* hydration so the daemon answers
@@ -185,6 +193,9 @@ pub async fn run() -> anyhow::Result<()> {
     tokio::spawn(maintenance(state.clone()));
     // Background cloud sync (off the hot path; no-ops until linked + cloud_url set).
     sync::spawn(state.clone(), sync_rx);
+    // Knowledge sync (M2): consent-gated, no-ops until [sync] knowledge is
+    // enabled AND the device is linked.
+    knowledge_sync::spawn(state.clone(), knowledge_rx);
     // Live-presence heartbeat (ephemeral; no-ops until linked + cloud_url set).
     heartbeat::spawn(state.clone());
     // Cloud billing-summary fetch (best-effort; no-ops until linked + cloud_url set).

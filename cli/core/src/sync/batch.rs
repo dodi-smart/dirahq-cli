@@ -746,7 +746,7 @@ fn batch_id_for_chunk(
     }
 }
 
-fn fnv1a(ids: &[&str], seed: u64) -> u64 {
+pub(crate) fn fnv1a(ids: &[&str], seed: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     // A tiny deterministic hasher (std's DefaultHasher is not stable across
     // releases, so we roll FNV-1a for a fixed, reproducible batch id).

@@ -94,7 +94,12 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
         )
         .await
     {
-        Ok(_) => Response::Ok,
+        Ok(_) => {
+            // Fresh telemetry for the knowledge channel — lossy nudge, the
+            // backstop covers a miss.
+            let _ = state.knowledge_sync.trigger.try_send(());
+            Response::Ok
+        }
         Err(e) => Response::Error {
             message: format!("zavet ingest failed: {e}"),
         },

@@ -364,6 +364,10 @@ pub async fn capture_commits(state: &AppState, cwd: &str, canonical: &str) {
     if let Err(e) = state.store.repo_baseline_set(canonical, &walk.head).await {
         tracing::warn!("repo baseline set failed for {canonical}: {e}");
     }
+    if !walk.trailers.is_empty() || !walk.decisions.is_empty() || !walk.specs.is_empty() {
+        // Fresh knowledge landed — nudge its channel (lossy; backstop covers).
+        let _ = state.knowledge_sync.trigger.try_send(());
+    }
     if recorded > 0 {
         tracing::info!(commits = recorded, repo = %canonical, "captured commits");
         let _ = state.sync.trigger.try_send(());

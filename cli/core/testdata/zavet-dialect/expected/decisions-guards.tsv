@@ -1,0 +1,13 @@
+D-0001	src/auth/**
+D-0001	docs/adr/
+D-0002	src/payments/**
+D-0002	src/billing/
+D-0003	src/three/**
+D-0004	src/four/**
+D-0005	src/five/**
+D-0008	a/**
+D-0008	b/c/**
+D-0011	src/core/**
+D-0012	api/**
+D-0012	web/
+D-0013	cli/core/src/lib.rs

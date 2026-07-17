@@ -12,14 +12,20 @@
 //! - Capture is **policy-free**: there is no money, rate, or currency field
 //!   anywhere in this contract. Billing is resolved late, in the cloud.
 //! - **Metadata only**: there is deliberately no field for prompt text, file
-//!   contents, or diffs. The absence is the privacy guarantee.
+//!   contents, or diffs. The absence is the privacy guarantee. The single
+//!   audited exception is the knowledge channel's consent-gated content tier
+//!   ([`KnowledgeBatch`]): `bodyMd` / trailer `value` fields exist on the wire
+//!   but are populated only when BOTH the producer knob and the workspace have
+//!   explicitly opted in — and they are pinned by an explicit allowlist in the
+//!   `wire_contract_carries_no_content_fields` test, so nothing else can ever
+//!   join them silently.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.1.0";
+pub const SCHEMA_VERSION: &str = "1.2.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -495,6 +501,291 @@ pub struct BillingSummaryEnvelope {
     pub sig: String,
 }
 
+/// A signed knowledge batch as it travels to `POST /api/v1/knowledge`.
+///
+/// Mirrors [`Envelope`] exactly (same framing, same signing rule): the signature
+/// is computed over the canonical-JSON (RFC 8785) encoding of `payload` only.
+/// Knowledge is a **separate, consent-gated channel** beside attestations — it
+/// never rides [`AttestationBatch`] (decision D-0001), has its own sync cursors,
+/// and flows only when the producer's `[sync] knowledge` knob is enabled AND the
+/// workspace has opted in cloud-side.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeEnvelope {
+    /// Semver of this contract, e.g. `"1.2.0"`.
+    pub schema_version: String,
+    /// ULID of the device that produced and signed this batch.
+    pub device_id: String,
+    /// The knowledge batch being attested to.
+    pub payload: KnowledgeBatch,
+    /// `ed25519(JCS(payload))`, base64 (standard, no padding).
+    pub sig: String,
+}
+
+/// The unit of knowledge sync: zavet decisions, specs, trailer refs, guard
+/// events, and per-repo coverage stats captured locally.
+///
+/// Idempotent by `batchId` (deterministic over the covered items + tier, so a
+/// crash-retry re-sends identical bytes) and by per-item natural keys cloud-side
+/// — wipe-and-resync reproduces cloud state.
+///
+/// **Tiering.** At `tier: "metadata"` (the default when the channel is enabled
+/// at all) every content field — `bodyMd` on decisions and specs, `value` on
+/// trailer refs — is `None`/absent: ids, slugs, titles, status, globs, shas,
+/// trailer keys + decision refs, and counts are enough for dashboards to show
+/// structure, cost, and guard telemetry without any prose. `tier: "full"`
+/// populates them, and only a workspace that separately opted in stores them.
+/// [`KnowledgeBatch::strip_content`] is the producer-side downgrade.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeBatch {
+    /// Deterministic idempotency key for this batch (content-derived, not a ULID).
+    pub batch_id: String,
+    /// ULID of the producing device (matches the envelope).
+    pub device_id: String,
+    /// RFC 3339 timestamp the batch was assembled.
+    pub generated_at: String,
+    /// `"metadata"` or `"full"` — what the batch was built under. A string, not
+    /// an enum, so new tiers are additive without a schema major bump. The cloud
+    /// gates on the actual content fields too, never on this label alone.
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<KnowledgeDecision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs: Vec<KnowledgeSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trailer_refs: Vec<KnowledgeTrailerRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_events: Vec<KnowledgeGuardEvent>,
+    /// Per-repo coverage/capture snapshot (see [`KnowledgeRepoStats`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_stats: Vec<KnowledgeRepoStats>,
+}
+
+impl KnowledgeBatch {
+    /// Downgrade this batch to the metadata tier in place: every consent-gated
+    /// content field is cleared and the tier label follows. This is what the
+    /// daemon applies when the cloud answers `content_not_allowed` — sync never
+    /// wedges, content never leaves without both consents.
+    pub fn strip_content(&mut self) {
+        for d in &mut self.decisions {
+            d.body_md = None;
+        }
+        for s in &mut self.specs {
+            s.body_md = None;
+        }
+        for t in &mut self.trailer_refs {
+            t.value = None;
+        }
+        self.tier = "metadata".to_string();
+    }
+}
+
+/// One zavet decision record, metadata-first.
+///
+/// `recordSha` is the git blob oid of the record file (a content-identity
+/// pointer like [`BlobRef::blob`], never the file's bytes). `bodyMd` is the
+/// consent-gated content field — `None` at the metadata tier.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeDecision {
+    /// Canonical repo ref, e.g. `github.com/acme/api`.
+    pub repo_canonical: String,
+    /// Canonical decision id, e.g. `D-0042`.
+    pub id: String,
+    /// Filename-derived slug, e.g. `attestation-wire-is-content-free`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// `active` | `superseded` (open set — stored verbatim).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The decision this one supersedes, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Repo-relative path of the record file.
+    pub path: String,
+    /// Human title — metadata (it names the record, like a filename).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Git blob oid of the record file (identity pointer, not content).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_sha: Option<String>,
+    /// Commit that first introduced the record (first-sight provenance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_commit: Option<String>,
+    /// Most recent commit that touched the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit: Option<String>,
+    /// Author date of the introducing commit, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// Author date of the latest touching commit, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// The session attributed to the introducing commit, if uniquely known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session: Option<String>,
+    /// How the record came to be: `recorded` | `reverse-engineered` | …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// True only after a human confirmed the record matches reality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// Guard globs (active enforcement surface).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<String>,
+    /// CONTENT (consent-gated): the record body markdown. `None` unless the
+    /// batch is full-tier. Allowlisted in the no-content-fields invariant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+}
+
+/// One living spec, metadata-first. Same tiering rules as [`KnowledgeDecision`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeSpec {
+    /// Canonical repo ref.
+    pub repo_canonical: String,
+    /// Filename-stem identity, e.g. `capture-pipeline`.
+    pub slug: String,
+    /// Spec document version (bumped on regeneration).
+    pub version: u64,
+    /// `designed` | `session` | `reverse-engineered`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// `low` | `med` | `high`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// The spec's self-reported date (frontmatter `date:`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// True only after a human confirmed spec-matches-code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// Repo-relative path of the spec file.
+    pub path: String,
+    /// Human title — metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Git blob oid of the spec file (identity pointer, not content).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session: Option<String>,
+    /// Git pathspecs the spec covers (staleness surface).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Linked decision ids (frontmatter ∪ body refs, canonical, deduplicated).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<String>,
+    /// CONTENT (consent-gated): the spec body markdown. `None` unless the
+    /// batch is full-tier. Allowlisted in the no-content-fields invariant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+}
+
+/// One commit trailer occurrence: the key and the decision it references.
+///
+/// The trailer's free-text `value` is CONTENT (author prose, like a commit
+/// message) — `None` at the metadata tier; keys + refs alone already draw the
+/// decision↔commit graph.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeTrailerRef {
+    /// Canonical repo ref, when resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_canonical: Option<String>,
+    /// Commit sha carrying the trailer.
+    pub sha: String,
+    /// Position of this trailer within the commit's trailer block.
+    pub seq: u32,
+    /// Trailer key, lowercased: `why` | `refs` | `supersedes` | `spec` | …
+    pub key: String,
+    /// First canonical `D-NNNN` referenced by the value, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    /// CONTENT (consent-gated): the trailer's free text. `None` unless the
+    /// batch is full-tier (policy-gated: the token denylist cannot see the
+    /// word `value`, so the metadata-tier test pins its absence explicitly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+/// One guard event (shown / blocked / complied / overridden / superseded) —
+/// pure telemetry, always metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeGuardEvent {
+    /// ULID (the idempotency key for this event).
+    pub id: String,
+    /// RFC 3339 receive time.
+    pub at: String,
+    /// Canonical repo ref, when resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_canonical: Option<String>,
+    /// The decision the event concerns.
+    pub decision_id: String,
+    /// Event kind — stored verbatim (a plugin newer than the daemon degrades
+    /// to "recorded, filtered at query time").
+    pub kind: String,
+    /// Repo-relative path involved, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// The attributed session, if uniquely known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Per-repo knowledge coverage/capture snapshot, computed producer-side (only
+/// the daemon can walk git history and match paths against guard/spec globs).
+/// Counts only — feeds the dashboard's "Knowledge coverage" and "Capture
+/// ratio" tiles. Upserted per repo cloud-side (a snapshot, not a stream).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeRepoStats {
+    /// Canonical repo ref.
+    pub repo_canonical: String,
+    /// The rolling window the counts cover, in days (currently 90).
+    pub window_days: u32,
+    /// Distinct paths touched by commits inside the window.
+    pub active_paths: u64,
+    /// Of those, paths covered by an active guard glob or a verified spec.
+    pub covered_paths: u64,
+    /// Non-merge commits in the window touching non-`.zavet/` paths.
+    pub nontrivial_commits: u64,
+    /// Of those, commits carrying at least one knowledge trailer.
+    pub trailer_commits: u64,
+    /// RFC 3339 timestamp the snapshot was computed.
+    pub computed_at: String,
+}
+
+/// The cloud's typed response to a successful `POST /api/v1/knowledge`.
+/// Tolerant like [`IngestAck`]: an empty body deserializes with defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeAck {
+    /// RFC 3339 timestamp the cloud processed the batch. Empty when unknown.
+    #[serde(default)]
+    pub server_time: String,
+    /// Count of newly-accepted items in this batch.
+    #[serde(default)]
+    pub accepted: u64,
+    /// Count of items the cloud already had (idempotent duplicates).
+    #[serde(default)]
+    pub duplicates: u64,
+    /// The contract version the cloud processed under. Empty when unknown.
+    #[serde(default)]
+    pub schema_version: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,11 +930,158 @@ mod tests {
         assert_eq!(back.min_schema_version, "1.0.0");
     }
 
+    // Content-bearing terms that must never name a wire field. Matched against
+    // whole snake_case *tokens* of a field name (not raw substrings), so a
+    // legitimate metadata field like `source_session` (token `source` is NOT
+    // on the list) is unaffected while a content field like `prompt_text`,
+    // `diff`, or `source_code` is caught. Keeping it token-level avoids both
+    // false positives (substring of an innocent word) and the `source_session`
+    // collision a bare "source" substring rule would cause.
+    const DENY: &[&str] = &[
+        "prompt", "content", "diff", "body", "text", "patch", "code", "snippet",
+    ];
+
+    /// The ONLY sanctioned content-bearing wire fields, as exact normalized
+    /// JSON paths (arrays flattened to `[]`). These are the knowledge
+    /// channel's consent-gated fields: populated exclusively at `tier: "full"`
+    /// under the producer's explicit `[sync] knowledge = "full"` knob, and
+    /// stored only by a workspace that separately opted in (see D-0001 and
+    /// docs/zavet.md). Anything content-shaped outside this list still fails
+    /// the invariant.
+    const CONTENT_ALLOWLIST: &[&str] = &["payload.decisions[].bodyMd", "payload.specs[].bodyMd"];
+
+    // Split a field name (snake_case on disk, camelCase on the wire) into its
+    // lowercase word tokens.
+    fn tokens(name: &str) -> Vec<String> {
+        // Insert a separator at camelCase humps, then split on `_`.
+        let mut s = String::new();
+        for (i, ch) in name.chars().enumerate() {
+            if ch.is_ascii_uppercase() && i > 0 {
+                s.push('_');
+            }
+            s.push(ch.to_ascii_lowercase());
+        }
+        s.split('_')
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    // Collect every (normalized path, key) pair of a serialized wire value:
+    // objects extend the path with `.key`, arrays with `[]`. Serializing a
+    // fully-populated instance (not Default) guarantees `Option` and `Vec`
+    // fields are present so they're inspected too.
+    fn collect_paths(v: &serde_json::Value, prefix: &str, out: &mut Vec<(String, String)>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    out.push((path.clone(), k.clone()));
+                    collect_paths(val, &path, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                let path = format!("{prefix}[]");
+                for val in arr {
+                    collect_paths(val, &path, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A fully-populated full-tier knowledge batch — every field `Some`/non-empty
+    /// so the denylist walk and the strip test inspect all of them.
+    fn full_knowledge_batch() -> KnowledgeBatch {
+        KnowledgeBatch {
+            batch_id: "kb".into(),
+            device_id: "d".into(),
+            generated_at: "t".into(),
+            tier: "full".into(),
+            decisions: vec![KnowledgeDecision {
+                repo_canonical: "github.com/acme/api".into(),
+                id: "D-0001".into(),
+                slug: Some("wire-is-metadata-only".into()),
+                status: Some("active".into()),
+                supersedes: Some("D-0000".into()),
+                path: ".zavet/decisions/D-0001-wire.md".into(),
+                title: Some("Wire is metadata only".into()),
+                record_sha: Some("blob1".into()),
+                first_commit: Some("c1".into()),
+                last_commit: Some("c2".into()),
+                created_at: Some("t1".into()),
+                updated_at: Some("t2".into()),
+                source_session: Some("s1".into()),
+                origin: Some("recorded".into()),
+                verified: Some(true),
+                guards: vec!["contract/**".into()],
+                body_md: Some("## Decision\nfull-tier prose".into()),
+            }],
+            specs: vec![KnowledgeSpec {
+                repo_canonical: "github.com/acme/api".into(),
+                slug: "capture-pipeline".into(),
+                version: 2,
+                origin: Some("session".into()),
+                confidence: Some("high".into()),
+                date: Some("2026-07-16".into()),
+                verified: Some(false),
+                path: ".zavet/specs/capture-pipeline.md".into(),
+                title: Some("Capture pipeline".into()),
+                record_sha: Some("blob2".into()),
+                first_commit: Some("c1".into()),
+                last_commit: Some("c2".into()),
+                created_at: Some("t1".into()),
+                updated_at: Some("t2".into()),
+                source_session: Some("s1".into()),
+                paths: vec!["cli/dirad/src/capture.rs".into()],
+                decisions: vec!["D-0001".into()],
+                body_md: Some("## Overview\nfull-tier prose".into()),
+            }],
+            trailer_refs: vec![KnowledgeTrailerRef {
+                repo_canonical: Some("github.com/acme/api".into()),
+                sha: "sha1".into(),
+                seq: 0,
+                key: "refs".into(),
+                decision_id: Some("D-0001".into()),
+                value: Some("D-0001 full-tier prose".into()),
+            }],
+            guard_events: vec![KnowledgeGuardEvent {
+                id: "01J0EVENT".into(),
+                at: "t".into(),
+                repo_canonical: Some("github.com/acme/api".into()),
+                decision_id: "D-0001".into(),
+                kind: "guard_blocked".into(),
+                file_path: Some("contract/src/lib.rs".into()),
+                session_id: Some("s1".into()),
+            }],
+            repo_stats: vec![KnowledgeRepoStats {
+                repo_canonical: "github.com/acme/api".into(),
+                window_days: 90,
+                active_paths: 120,
+                covered_paths: 80,
+                nontrivial_commits: 40,
+                trailer_commits: 25,
+                computed_at: "t".into(),
+            }],
+        }
+    }
+
     /// Privacy invariant (Phase 4e): the wire contract must never carry payload
     /// content — no prompt text, file contents, diffs, message bodies, or raw
     /// source. The absence of these is the privacy guarantee (see the module-level
     /// "Metadata only" invariant). This test fails if any contract struct ever
     /// grows such a field, catching a regression at the schema boundary.
+    ///
+    /// The knowledge channel's consent-gated content fields are the single
+    /// audited exception, subtracted as **exact paths** via `CONTENT_ALLOWLIST`
+    /// (never token names) — a new `bodyMd` anywhere else still fails, and the
+    /// full-tier `KnowledgeEnvelope` sits in the instance list so the allowlist
+    /// is exercised, not assumed. The metadata-tier guarantee has its own test:
+    /// `knowledge_metadata_tier_is_content_free`.
     ///
     /// Scope is the *wire contract only*. We deliberately do NOT scan the local
     /// store, whose `artifacts.message` column holds commit messages — that lives
@@ -652,55 +1090,6 @@ mod tests {
     /// snake_case field name, so camelCase wire names (`messageText`) are covered.
     #[test]
     fn wire_contract_carries_no_content_fields() {
-        // Content-bearing terms that must never name a wire field. Matched against
-        // whole snake_case *tokens* of a field name (not raw substrings), so a
-        // legitimate metadata field like `source_session` (token `source` is NOT
-        // on the list) is unaffected while a content field like `prompt_text`,
-        // `diff`, or `source_code` is caught. Keeping it token-level avoids both
-        // false positives (substring of an innocent word) and the `source_session`
-        // collision a bare "source" substring rule would cause.
-        const DENY: &[&str] = &[
-            "prompt", "content", "diff", "body", "text", "patch", "code", "snippet",
-        ];
-
-        // Split a field name (snake_case on disk, camelCase on the wire) into its
-        // lowercase word tokens.
-        fn tokens(name: &str) -> Vec<String> {
-            // Insert a separator at camelCase humps, then split on `_`.
-            let mut s = String::new();
-            for (i, ch) in name.chars().enumerate() {
-                if ch.is_ascii_uppercase() && i > 0 {
-                    s.push('_');
-                }
-                s.push(ch.to_ascii_lowercase());
-            }
-            s.split('_')
-                .filter(|t| !t.is_empty())
-                .map(str::to_string)
-                .collect()
-        }
-
-        // Collect the field names of every struct that crosses the boundary by
-        // serializing a fully-populated instance and reading its JSON keys
-        // recursively. Using real values (not Default) guarantees `Option` and
-        // `Vec` fields are present so they're inspected too.
-        fn collect_keys(v: &serde_json::Value, out: &mut Vec<String>) {
-            match v {
-                serde_json::Value::Object(map) => {
-                    for (k, val) in map {
-                        out.push(k.clone());
-                        collect_keys(val, out);
-                    }
-                }
-                serde_json::Value::Array(arr) => {
-                    for val in arr {
-                        collect_keys(val, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-
         let envelope = Envelope {
             schema_version: SCHEMA_VERSION.into(),
             device_id: "d".into(),
@@ -808,21 +1197,135 @@ mod tests {
             sig: "sig".into(),
         };
 
-        let mut keys = Vec::new();
-        collect_keys(&serde_json::to_value(&envelope).unwrap(), &mut keys);
-        collect_keys(&serde_json::to_value(&presence).unwrap(), &mut keys);
-        collect_keys(&serde_json::to_value(&rotate).unwrap(), &mut keys);
-        collect_keys(&serde_json::to_value(&billing).unwrap(), &mut keys);
+        let knowledge = KnowledgeEnvelope {
+            schema_version: SCHEMA_VERSION.into(),
+            device_id: "d".into(),
+            payload: full_knowledge_batch(),
+            sig: "sig".into(),
+        };
 
-        for key in &keys {
+        let mut fields = Vec::new();
+        collect_paths(&serde_json::to_value(&envelope).unwrap(), "", &mut fields);
+        collect_paths(&serde_json::to_value(&presence).unwrap(), "", &mut fields);
+        collect_paths(&serde_json::to_value(&rotate).unwrap(), "", &mut fields);
+        collect_paths(&serde_json::to_value(&billing).unwrap(), "", &mut fields);
+        // The allowlist must actually be exercised, not vacuously true.
+        let before = fields.len();
+        collect_paths(&serde_json::to_value(&knowledge).unwrap(), "", &mut fields);
+        assert!(
+            fields.len() > before,
+            "knowledge envelope produced no fields"
+        );
+        let allowlisted_seen = fields
+            .iter()
+            .filter(|(p, _)| CONTENT_ALLOWLIST.contains(&p.as_str()))
+            .count();
+        assert_eq!(
+            allowlisted_seen,
+            CONTENT_ALLOWLIST.len(),
+            "every CONTENT_ALLOWLIST path must appear in the full-tier instance \
+             (a stale allowlist entry is a hole in the invariant)"
+        );
+
+        for (path, key) in &fields {
+            if CONTENT_ALLOWLIST.contains(&path.as_str()) {
+                continue;
+            }
             for tok in tokens(key) {
                 assert!(
                     !DENY.contains(&tok.as_str()),
-                    "wire field `{key}` contains denylisted content token `{tok}` — \
-                     the contract must not carry payload content (prompt/diff/body/etc.)"
+                    "wire field `{path}` contains denylisted content token `{tok}` — \
+                     the contract must not carry payload content (prompt/diff/body/etc.) \
+                     outside the consent-gated CONTENT_ALLOWLIST"
                 );
             }
         }
+    }
+
+    /// The metadata tier is content-free BY CONSTRUCTION: after
+    /// [`KnowledgeBatch::strip_content`] a fully-populated batch serializes
+    /// with zero denied tokens, zero allowlisted paths, and no trailer `value`
+    /// key. The trailer `value` matters especially — the word carries no
+    /// denied token, so the path/token walk above cannot see it; this test is
+    /// its real guard (titles, by decision, are metadata and stay).
+    #[test]
+    fn knowledge_metadata_tier_is_content_free() {
+        let mut batch = full_knowledge_batch();
+        batch.strip_content();
+        assert_eq!(batch.tier, "metadata");
+
+        let mut fields = Vec::new();
+        collect_paths(&serde_json::to_value(&batch).unwrap(), "", &mut fields);
+        for (path, key) in &fields {
+            assert!(
+                !CONTENT_ALLOWLIST.contains(&path.as_str()),
+                "metadata tier must not serialize allowlisted content path `{path}`"
+            );
+            assert!(
+                key != "value",
+                "metadata tier must not serialize trailer `value` (path `{path}`)"
+            );
+            for tok in tokens(key) {
+                assert!(
+                    !DENY.contains(&tok.as_str()),
+                    "metadata-tier field `{path}` carries denied token `{tok}`"
+                );
+            }
+        }
+        // Titles are metadata by design decision — they must survive the strip.
+        let json = serde_json::to_string(&batch).unwrap();
+        assert!(json.contains("\"title\""));
+        assert!(!json.contains("\"bodyMd\""));
+    }
+
+    #[test]
+    fn knowledge_envelope_roundtrips_camel_case() {
+        let env = KnowledgeEnvelope {
+            schema_version: SCHEMA_VERSION.into(),
+            device_id: "d".into(),
+            payload: full_knowledge_batch(),
+            sig: "sig".into(),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        // The local content_hash rides the wire under the evasive-but-honest
+        // name `recordSha` (token `content` is denied; precedent: patch_id →
+        // changeId).
+        assert!(json.contains("\"recordSha\""));
+        assert!(!json.contains("content_hash"));
+        assert!(json.contains("\"trailerRefs\""));
+        assert!(json.contains("\"repoStats\""));
+        assert!(json.contains("\"windowDays\":90"));
+        let back: KnowledgeEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.payload.decisions[0].id, "D-0001");
+        assert_eq!(back.payload.specs[0].version, 2);
+        assert_eq!(back.payload.tier, "full");
+    }
+
+    #[test]
+    fn knowledge_empty_collections_are_omitted() {
+        let batch = KnowledgeBatch {
+            batch_id: "kb".into(),
+            device_id: "d".into(),
+            generated_at: "t".into(),
+            tier: "metadata".into(),
+            decisions: vec![],
+            specs: vec![],
+            trailer_refs: vec![],
+            guard_events: vec![],
+            repo_stats: vec![],
+        };
+        let json = serde_json::to_string(&batch).unwrap();
+        assert!(!json.contains("decisions"));
+        assert!(!json.contains("guardEvents"));
+        assert!(!json.contains("repoStats"));
+    }
+
+    #[test]
+    fn knowledge_ack_tolerates_empty_body() {
+        let ack: KnowledgeAck = serde_json::from_str("{}").unwrap();
+        assert_eq!(ack.accepted, 0);
+        assert_eq!(ack.duplicates, 0);
+        assert!(ack.server_time.is_empty());
     }
 
     #[test]

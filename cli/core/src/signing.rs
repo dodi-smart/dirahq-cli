@@ -28,7 +28,10 @@ pub struct DeviceKey {
 impl DeviceKey {
     /// Generate a fresh keypair from the OS CSPRNG.
     pub fn generate() -> Self {
-        let mut rng = rand::rngs::OsRng;
+        // `SigningKey::generate` wants an infallible `CryptoRng`; `UnwrapErr`
+        // panics if the OS entropy source fails, which is the right call for
+        // key generation — there is no safe fallback.
+        let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
         Self {
             signing: SigningKey::generate(&mut rng),
         }

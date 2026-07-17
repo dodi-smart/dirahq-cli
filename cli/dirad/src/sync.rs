@@ -1045,8 +1045,8 @@ fn schema_version_in_range(ours: &str, meta: &ServerMeta) -> bool {
     let Some(ours) = parse_version(ours) else {
         return true; // can't reason about it — don't warn
     };
-    let min_ok = parse_version(&meta.min_schema_version).map_or(true, |min| ours >= min);
-    let max_ok = parse_version(&meta.schema_version).map_or(true, |max| ours <= max);
+    let min_ok = parse_version(&meta.min_schema_version).is_none_or(|min| ours >= min);
+    let max_ok = parse_version(&meta.schema_version).is_none_or(|max| ours <= max);
     min_ok && max_ok
 }
 

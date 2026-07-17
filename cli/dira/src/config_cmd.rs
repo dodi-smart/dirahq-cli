@@ -216,9 +216,8 @@ fn assign(doc: &mut DocumentMut, key: &str, item: toml_edit::Item) {
     let mut cur = doc.as_item_mut();
     for seg in segs {
         // Materialize intermediate segments as real `[table]`s (indexing alone
-        // would create an inline table on assignment). `map_or`, not
-        // `is_none_or`: the latter is stable only since 1.82 and MSRV is 1.80.
-        if cur.get(seg).map_or(true, toml_edit::Item::is_none) {
+        // would create an inline table on assignment).
+        if cur.get(seg).is_none_or(toml_edit::Item::is_none) {
             cur[seg] = toml_edit::Item::Table(toml_edit::Table::new());
         }
         cur = &mut cur[seg];

@@ -48,3 +48,18 @@ Row order = filename sort order (the sh glob and the Rust walker both sort).
 
 Editing anything here means regenerating goldens on BOTH sides, updating
 both MANIFESTs, and keeping the copies byte-identical.
+
+## Cross-repo coupling
+
+zavet's `fixture-sync` CI job diffs `MANIFEST` against the canonical copy on
+dirahq-cli's **`develop`** branch, not `main`. That looks backwards at first glance — zavet
+releases off `main`, so comparing against dira's `main` seems like the obvious choice — but
+it's wrong: zavet has one release channel (see zavet's `CONTRIBUTING.md`), so whatever's on
+`main` there ships to every installed user as soon as it merges. dira's dialect changes land
+on `develop` first and only reach dira's `main` when dira itself cuts a release — by which
+point a zavet release built against dira's stale `main` copy would already be wrong for the
+dira version that's actually shipping next. Comparing against `develop` is what keeps zavet's
+shipped dialect matched to the dialect the *next* dira release ships, instead of the last one.
+
+Because this file is byte-identical in both repos, it is written from neither repo's point of
+view: "here"/"this directory" would be false in one of the two copies. Name the repo instead.

@@ -33,7 +33,7 @@ jobs:
       # mise here only provides the Rust toolchain (cargo set-version), so install
       # bun + node explicitly rather than pinning them in the Rust repo's mise.toml.
       - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install cargo-edit (provides `cargo set-version`)

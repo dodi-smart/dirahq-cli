@@ -27,6 +27,8 @@ effective-dated policy.
   /dirad     resident daemon (tokio): ingress (loopback HTTP + UDS), accounting, store
   /dira      thin CLI client over the daemon's Unix domain socket
   /sources    per-harness hook normalization (claude_code, …)
+/docs         docs/install.md (installer reference), docs/zavet.md (knowledge module)
+install.sh    curl | sh installer for dira + dirad (see docs/install.md)
 mise.toml     toolchain pins (rust, just)
 justfile      task runner
 ```
@@ -43,25 +45,50 @@ product in its own repository. dira ships the optional integration only: repos t
 session time (`dira zavet why D-0042` = the decision *and* what it cost). See
 [docs/zavet.md](docs/zavet.md).
 
-## Quick start
+## Install
+
+```sh
+curl -fsSL https://dirahq.sh/install | sh
+```
+
+Installs `dira` + `dirad` into `~/.local/bin` (override with `DIRA_BIN_DIR`). Targets:
+macOS (universal — Apple Silicon and Intel, one download) and Linux x86_64/arm64 (static
+musl — works on Alpine and old glibc alike); Windows via WSL2.
+
+```sh
+dira init             # wire Claude Code hooks (also: codex, gemini, cursor, opencode)
+dira daemon start     # start the resident tracker daemon
+dira status           # today's summary — engaged, agent, compute, unbilled
+```
+
+Run `dira daemon install` once so `dirad` survives reboots (launchd/systemd-user).
+Stay current with `dira update` — sha256-verified, atomic, restarts the daemon for you.
+See [docs/install.md](docs/install.md) for every flag/env var, air-gapped installs, and
+troubleshooting.
+
+## Build from source
+
+The **contributor path** — build dira yourself instead of downloading a release.
 
 ```sh
 mise install                 # rust + just
 just test                    # unit + property tests for the accounting invariants
+just install                 # build release binaries, symlink onto PATH, restart daemon
+```
 
-# Build the release binaries, symlink `dira` + `dirad` into ~/.local/bin
-# (must be on your PATH), and restart the daemon onto the fresh build:
-just install                 # build + link globally + restart daemon
+`just install` symlinks `target/release/{dira,dirad}` onto `$DIRA_BIN_DIR` (default
+`~/.local/bin`) for a fast dogfood loop — it is **not** a real install. `dira update`
+deliberately refuses to touch a `just install` dev symlink (see
+[docs/install.md](docs/install.md)); re-run `just install` instead to pick up a new build.
 
-dira init                   # wire Claude Code hooks for this repo
-dira status                 # active sessions + today's human vs agent time
-dira start --label meeting  # a manual dira (several may run at once)
+```sh
+dira start --label meeting  # a manual session (several may run at once)
 dira stop --all
 dira log 45 --note "review" # retroactive entry (bare number = minutes)
 dira report --week
 ```
 
-> The symlink target dir defaults to `~/.local/bin`; override with `DIRA_BIN_DIR`.
+## Wiring other harnesses
 
 `dira init` writes Claude Code **command hooks** into `.claude/settings.json`; each event
 runs `dira hook claude`, which forwards the payload to the daemon over the socket. The hot

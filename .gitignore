@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Local release archives from `just package` / `just install-local`: an ~9MB
+# tarball plus extracted binaries. Regenerable, and never something to commit.
+/dist
+
 # Node (release tooling only: semantic-release + commitlint)
 /node_modules
 node_modules

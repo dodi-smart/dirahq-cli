@@ -12,6 +12,76 @@ local storage, and the `dira zavet` query surface.
 no dira installed (capture, recall, enforcement — just no time correlation);
 dira is inert for repos that are not zavet-active.
 
+## Install
+
+`dira zavet install` installs (or updates) the zavet Claude Code plugin by
+shelling out to the `claude` CLI — it never hand-edits Claude Code's own
+config. `dira init` writes `.claude/settings.json` directly, but that
+precedent doesn't transfer here: plugin install is *stateful* (clone a
+marketplace, checkout a version into the plugin cache, and update a
+registry file that already carries its own schema version), and
+hand-writing that state would declare a marketplace that was never actually
+cloned and could race a live Claude Code session rewriting the same files.
+
+```
+dira zavet install                  install at user scope (the default)
+dira zavet install --scope project  or: project, local
+dira zavet install --update         already installed: refresh the
+                                     marketplace + plugin instead of a no-op
+dira zavet install --dry-run        print the exact `claude` invocations
+                                     without running them
+```
+
+State is always detected first, never assumed: `claude plugin list --json`
+(matching `id == "zavet@dirahq"`), falling back to reading Claude Code's own
+`installed_plugins.json` only when that fails, and only trusting that
+fallback file when its top-level `"version"` field is exactly `2` — a
+schema bump is a signal to stop trusting our own parsing, not to guess. A
+repeat `dira zavet install` against an already-installed plugin is a
+read-only no-op unless `--update` is passed. On success the command reports
+the installed version, scope, and install path, plus an **advisory** skew
+line comparing this dira build against the plugin's self-reported
+`min_dira` (never a hard error — see below) and a reminder to restart
+Claude Code to apply the change. `dira zavet status` prints the same
+plugin line, so a stale install is visible from the everyday command, not
+just from `install` itself.
+
+If `claude` isn't on `PATH`, `dira zavet install` prints the manual
+two-command recipe and exits non-zero rather than half-installing anything:
+
+```
+/plugin marketplace add dodi-smart/dirahq-zavet
+/plugin install zavet@dirahq
+```
+
+### The stable integration contract
+
+`dira zavet install` depends on four things staying stable across both
+repos. **Changing any of these is a breaking change that needs a
+coordinated release:**
+
+1. **Identity** — marketplace `dirahq` + plugin `zavet` compose to the id
+   `zavet@dirahq`, the string both `claude plugin list --json` and
+   `installed_plugins.json` key on.
+2. **Source** — repo slug `dodi-smart/dirahq-zavet`, marketplace manifest at
+   `.claude-plugin/marketplace.json`, default branch `main`. A github
+   marketplace source records no `ref`, so `claude plugin marketplace add`
+   always clones whatever the default branch currently is.
+3. **The version probe** — an executable `bin/zavet` at the plugin root
+   supporting `version` and `version --json`, the latter emitting
+   `{"v":1,"plugin":"zavet","version":…,"emit_schema":1,"min_dira":…}`.
+   This is the only machine-readable compatibility signal; dira never gates
+   on it — see "Compatibility posture" below — but it must keep parsing.
+4. **Guard-event schema v1** — the JSON object shape on stdin of
+   `dira zavet emit`, documented above under "The plugin ↔ dira interface".
+
+**Compatibility posture: surface skew, never gate on it.** The skew line is
+advisory only. An installed plugin build that predates the `version`
+subcommand — or any other failure resolving it (binary missing, non-zero
+exit, unparseable output) — degrades to an "unknown" skew line, never an
+error: the whole product promise is that dira and zavet each work fully
+without the other.
+
 ## Activation
 
 | Layer | Mechanism | Precedence |
@@ -91,7 +161,9 @@ evidence still counts and is reported, so costs read as honest lower bounds.
 
 ## Query surface
 
-- `dira zavet status` — activation verdict (and why), capture health.
+- `dira zavet status` — activation verdict (and why), capture health, and a
+  client-side plugin line (installed version, scope, enabled) resolved the
+  same way `dira zavet install` detects state — see "Install" above.
 - `dira zavet why <question, D-0042, or spec slug>` — answer "why?" from
   recorded knowledge. A decision id or an exact spec slug answers directly;
   free text ("why are we polling instead of a filesystem watcher") ranks

@@ -11,3 +11,7 @@ agent context at session start — keep it short and non-negotiable.
   scope, and is DCO signed off (`-s`).
 - Nothing content-bearing (prompts, diffs, bodies, messages) may cross the
   attestation wire — metadata only. See D-0001.
+- Never open an installed binary for writing — stage beside it and `rename`
+  onto it, or you get `ETXTBSY` in production and green tests. See D-0003.
+- Linux artifacts are static musl; macOS is one universal binary. Never add
+  an arch branch on Darwin or a libc probe. See D-0002.

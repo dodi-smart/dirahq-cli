@@ -57,6 +57,22 @@ schemars = "1"
 
 # Crypto + identity
 ed25519-dalek = { version = "3", features = ["rand_core"] }
+# `dira update`'s sha256 artifact verification (WP-A3). Pinned to the 0.10 line
+# specifically: 0.10.9 is already resolved transitively (sqlx-core's row
+# hashing), and 0.11 is also present in the tree via a different consumer —
+# depending on "0.10" here reuses the existing 0.10.9 resolution instead of
+# compiling both major lines for one crate.
+sha2 = "0.10"
+# Hex-encode/decode the sha256 digest `dira update` compares against the
+# published `.sha256` asset. Already resolved transitively (sqlx-macros-core);
+# promoted to a direct dep rather than added fresh.
+hex = "0.4"
+# Parse + order GitHub release tags for `dira update`'s channel/latest
+# resolution (SemVer 2.0.0 prerelease-identifier comparison handles
+# `0.2.0-develop.9 < 0.2.0-develop.10 < 0.2.0` correctly, unlike a naive
+# string sort). Already resolved transitively (rustc_version's build-dep
+# chain); promoted to a direct dep rather than added fresh.
+semver = "1"
 # ed25519-dalek 3 moved to rand_core 0.10, which dropped `OsRng`; the OS CSPRNG
 # now comes straight from getrandom (`SysRng`, behind the `sys_rng` feature).
 getrandom = { version = "0.4", features = ["sys_rng"] }

@@ -90,6 +90,38 @@ pub struct SyncKnobs {
     pub knowledge: KnowledgeSyncMode,
 }
 
+/// `#[serde(default = "default_true")]`'s target — a plain `fn() -> bool`
+/// literal isn't accepted there, so this is the field-level default for
+/// [`UpdateKnobs::check`].
+fn default_true() -> bool {
+    true
+}
+
+/// Passive update-check knobs (`[update]` in `config.toml`).
+///
+/// Governs only the cached, rate-limited "update available" notice printed
+/// after `status`/`version`/`daemon status` (plan §A5) — `dira update` itself
+/// is always an explicit, user-run command and never reads this knob. Env
+/// override: `DIRA_UPDATE__CHECK=true|false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateKnobs {
+    /// Whether the passive notice may run at all: `false` suppresses both
+    /// the printed notice and the background cache refresh that keeps it
+    /// warm (see `update/notice.rs`).
+    #[serde(default = "default_true")]
+    pub check: bool,
+}
+
+impl Default for UpdateKnobs {
+    fn default() -> Self {
+        // Not `#[derive(Default)]`: that would give `check: false` (bool's
+        // zero value), contradicting the field's own serde default — checking
+        // is on out of the box, same as every pre-A5 config that lacks an
+        // `[update]` table entirely.
+        Self { check: true }
+    }
+}
+
 /// Daemon + CLI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -172,6 +204,9 @@ pub struct Config {
     /// Per-channel sync consent knobs (`[sync]` table; see [`SyncKnobs`]).
     #[serde(default)]
     pub sync: SyncKnobs,
+    /// Passive-update-check knobs (`[update]` table; see [`UpdateKnobs`]).
+    #[serde(default)]
+    pub update: UpdateKnobs,
 }
 
 impl Default for Config {
@@ -201,6 +236,7 @@ impl Default for Config {
             presence_ttl_deep_idle_secs: 600,
             modules: Modules::default(),
             sync: SyncKnobs::default(),
+            update: UpdateKnobs::default(),
         }
     }
 }
@@ -544,5 +580,46 @@ mod tests {
     fn presence_ttl_deep_idle_passes_through_in_range() {
         let c = Config::default();
         assert_eq!(c.presence_ttl_deep_idle(), 600);
+    }
+
+    #[test]
+    fn update_check_defaults_to_true() {
+        // Absent [update] table (every pre-A5 config) must resolve to
+        // checking-on, matching UpdateKnobs::default().
+        assert!(Config::default().update.check);
+        let c: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("idle_seconds = 120"))
+            .extract()
+            .unwrap();
+        assert!(c.update.check);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn update_check_layers_from_toml_and_env() {
+        let c: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[update]\ncheck = false"))
+            .extract()
+            .unwrap();
+        assert!(!c.update.check);
+
+        // Env wins over toml, via the same DIRA_ prefix + `__`->`.` mapping
+        // Config::load installs (DIRA_UPDATE__CHECK -> update.check). This is
+        // the T5 acceptance criterion that env overrides work "for free" —
+        // verified here rather than assumed, since `bool` (unlike ZavetMode)
+        // has no custom Deserialize impl to lean on.
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DIRA_UPDATE__CHECK", "false");
+            let c: Config = Figment::from(Serialized::defaults(Config::default()))
+                .merge(Toml::string("[update]\ncheck = true"))
+                .merge(
+                    Env::prefixed("DIRA_")
+                        .map(|k| k.as_str().to_lowercase().replace("__", ".").into()),
+                )
+                .extract()
+                .unwrap();
+            assert!(!c.update.check);
+            Ok(())
+        });
     }
 }

@@ -1,0 +1,121 @@
+[
+  {
+    "id": 500,
+    "tag_name": "v0.1.0-develop.10",
+    "name": "v0.1.0-develop.10",
+    "draft": false,
+    "prerelease": true,
+    "assets": [
+      {
+        "id": 5001,
+        "name": "dira-0.1.0-develop.10-x86_64-unknown-linux-musl.tar.gz",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0-develop.10/dira-0.1.0-develop.10-x86_64-unknown-linux-musl.tar.gz"
+      },
+      {
+        "id": 5002,
+        "name": "dira-0.1.0-develop.10-x86_64-unknown-linux-musl.sha256",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0-develop.10/dira-0.1.0-develop.10-x86_64-unknown-linux-musl.sha256"
+      },
+      {
+        "id": 5003,
+        "name": "dira-0.1.0-develop.10-aarch64-unknown-linux-musl.tar.gz",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0-develop.10/dira-0.1.0-develop.10-aarch64-unknown-linux-musl.tar.gz"
+      },
+      {
+        "id": 5004,
+        "name": "dira-0.1.0-develop.10-aarch64-unknown-linux-musl.sha256",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0-develop.10/dira-0.1.0-develop.10-aarch64-unknown-linux-musl.sha256"
+      },
+      {
+        "id": 5005,
+        "name": "dira-0.1.0-develop.10-universal-apple-darwin.tar.gz",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0-develop.10/dira-0.1.0-develop.10-universal-apple-darwin.tar.gz"
+      },
+      {
+        "id": 5006,
+        "name": "dira-0.1.0-develop.10-universal-apple-darwin.sha256",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0-develop.10/dira-0.1.0-develop.10-universal-apple-darwin.sha256"
+      }
+    ]
+  },
+  {
+    "id": 499,
+    "tag_name": "v0.1.0-develop.9",
+    "name": "v0.1.0-develop.9",
+    "draft": false,
+    "prerelease": true,
+    "assets": [
+      {
+        "id": 4991,
+        "name": "dira-0.1.0-develop.9-x86_64-unknown-linux-musl.tar.gz",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0-develop.9/dira-0.1.0-develop.9-x86_64-unknown-linux-musl.tar.gz"
+      },
+      {
+        "id": 4992,
+        "name": "dira-0.1.0-develop.9-x86_64-unknown-linux-musl.sha256",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0-develop.9/dira-0.1.0-develop.9-x86_64-unknown-linux-musl.sha256"
+      }
+    ]
+  },
+  {
+    "id": 420,
+    "tag_name": "v0.1.0",
+    "name": "v0.1.0",
+    "draft": false,
+    "prerelease": false,
+    "assets": [
+      {
+        "id": 4201,
+        "name": "dira-0.1.0-x86_64-unknown-linux-musl.tar.gz",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0/dira-0.1.0-x86_64-unknown-linux-musl.tar.gz"
+      },
+      {
+        "id": 4202,
+        "name": "dira-0.1.0-x86_64-unknown-linux-musl.sha256",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0/dira-0.1.0-x86_64-unknown-linux-musl.sha256"
+      },
+      {
+        "id": 4203,
+        "name": "dira-0.1.0-aarch64-unknown-linux-musl.tar.gz",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0/dira-0.1.0-aarch64-unknown-linux-musl.tar.gz"
+      },
+      {
+        "id": 4204,
+        "name": "dira-0.1.0-aarch64-unknown-linux-musl.sha256",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0/dira-0.1.0-aarch64-unknown-linux-musl.sha256"
+      },
+      {
+        "id": 4205,
+        "name": "dira-0.1.0-universal-apple-darwin.tar.gz",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0/dira-0.1.0-universal-apple-darwin.tar.gz"
+      },
+      {
+        "id": 4206,
+        "name": "dira-0.1.0-universal-apple-darwin.sha256",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.1.0/dira-0.1.0-universal-apple-darwin.sha256"
+      }
+    ]
+  },
+  {
+    "id": 100,
+    "tag_name": "v0.0.5",
+    "name": "v0.0.5",
+    "draft": false,
+    "prerelease": false,
+    "assets": [
+      {
+        "id": 1001,
+        "name": "dira-0.0.5-x86_64-unknown-linux-musl.tar.gz",
+        "browser_download_url": "https://github.com/dodi-smart/dirahq-cli/releases/download/v0.0.5/dira-0.0.5-x86_64-unknown-linux-musl.tar.gz"
+      }
+    ]
+  },
+  {
+    "id": 900,
+    "tag_name": "v0.2.0-draft",
+    "name": "v0.2.0-draft (unpublished)",
+    "draft": true,
+    "prerelease": false,
+    "assets": []
+  }
+]

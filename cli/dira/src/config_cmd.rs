@@ -95,6 +95,17 @@ const KNOBS: &[Knob] = &[
         kind: Kind::Enum(&["auto", "on", "off"]),
         help: "zavet knowledge module: auto (active when a repo has .zavet/), on, off",
     },
+    // `Config.update.check` is a plain `bool` (see `dira_core::config::UpdateKnobs`),
+    // not an enum type — unlike `modules.zavet`'s `ZavetMode`, there's no
+    // `Deserialize`/`Serialize` impl mapping "on"/"off" to it for free. So this
+    // knob gets its own `parse_and_validate` arm (bool <- "on"/"off") and its own
+    // `get()` rendering (bool -> "on"/"off") below, instead of relying on the
+    // generic `Kind::Enum` path the way `modules.zavet` does.
+    Knob {
+        key: "update.check",
+        kind: Kind::Enum(&["on", "off"]),
+        help: "passive update-available notice after status/version/daemon status: on, off",
+    },
 ];
 
 fn knob(key: &str) -> Option<&'static Knob> {
@@ -146,7 +157,7 @@ pub fn get(config: &Config, key: Option<&str>) -> Result<()> {
         }
         match cur {
             Some(v) => {
-                println!("{}", render_json_scalar(v));
+                println!("{}", render_scalar(k, v));
                 Ok(())
             }
             None => bail!("unknown config key `{k}` (try `dira config get` to list all)"),
@@ -170,6 +181,20 @@ fn render_json_scalar(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// Like [`render_json_scalar`], but lets a dotted-key lookup render in the
+/// vocabulary its `set` counterpart accepts. Only `update.check` needs this:
+/// its backing field is a plain `bool` (see `UpdateKnobs`), but `set` speaks
+/// "on"/"off" like the enum knobs do, so `get` echoes the same words rather
+/// than leaking the wire representation.
+fn render_scalar(key: &str, v: &serde_json::Value) -> String {
+    if key == "update.check" {
+        if let Some(b) = v.as_bool() {
+            return if b { "on" } else { "off" }.to_string();
+        }
+    }
+    render_json_scalar(v)
 }
 
 /// `dira config set <key> <value>` — validate then persist to `config.toml`.
@@ -248,6 +273,15 @@ fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_ed
             }
             Ok(value(v))
         }
+        // Bridges the "on"/"off" vocabulary (matching the other enum-shaped
+        // knobs) onto the real `bool` `Config.update.check` field — a real
+        // TOML boolean, not the string "on"/"off", since that's what
+        // `UpdateKnobs` deserializes.
+        "update.check" => match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Ok(value(true)),
+            "off" => Ok(value(false)),
+            _ => bail!("update.check must be one of: on, off (got `{raw}`)"),
+        },
         key => match knob.kind {
             Kind::U64 => {
                 let n: u64 = raw
@@ -384,6 +418,51 @@ mod tests {
         assert!(parse_and_validate(&cfg(), knob, "ON").is_ok()); // case-folded
         assert!(parse_and_validate(&cfg(), knob, "off").is_ok());
         assert!(parse_and_validate(&cfg(), knob, "maybe").is_err());
+    }
+
+    #[test]
+    fn update_check_accepts_only_on_off() {
+        let knob = knob("update.check").unwrap();
+        assert!(parse_and_validate(&cfg(), knob, "on").is_ok());
+        assert!(parse_and_validate(&cfg(), knob, "OFF").is_ok()); // case-folded
+        assert!(parse_and_validate(&cfg(), knob, "true").is_err());
+        assert!(parse_and_validate(&cfg(), knob, "maybe").is_err());
+    }
+
+    #[test]
+    fn update_check_writes_a_real_toml_bool_not_a_string() {
+        let knob = knob("update.check").unwrap();
+        let item = parse_and_validate(&cfg(), knob, "off").unwrap();
+        assert_eq!(item.as_bool(), Some(false));
+        let item = parse_and_validate(&cfg(), knob, "on").unwrap();
+        assert_eq!(item.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn update_check_round_trips_through_set_and_get() {
+        // The same dotted-table assign `set()` uses, then the same traversal
+        // `get()` uses, then rendered the way `get`'s CLI path renders it
+        // (on/off, not true/false) — end-to-end proof of the T5 acceptance
+        // criterion without touching the real XDG config path.
+        let original = "idle_seconds = 300\n";
+        let mut doc: DocumentMut = original.parse().unwrap();
+        let item = parse_and_validate(&cfg(), knob("update.check").unwrap(), "off").unwrap();
+        assign(&mut doc, "update.check", item);
+        let out = doc.to_string();
+        assert!(out.contains("[update]"));
+        assert!(out.contains("check = false"));
+
+        use figment::providers::Format as _;
+        let resolved: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(figment::providers::Toml::string(&out))
+                .extract()
+                .unwrap();
+        assert!(!resolved.update.check);
+
+        let v = serde_json::to_value(&resolved).unwrap();
+        let got = v.get("update").and_then(|u| u.get("check")).unwrap();
+        assert_eq!(render_scalar("update.check", got), "off");
     }
 
     #[test]

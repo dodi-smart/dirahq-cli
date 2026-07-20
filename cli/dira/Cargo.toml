@@ -27,6 +27,13 @@ ratatui.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 toml_edit.workspace = true
+# `dira update` (WP-A3): sha256 artifact verification, hex digest comparison,
+# and GitHub release tag / channel ordering. All three are already resolved
+# transitively in Cargo.lock (see the workspace Cargo.toml comments) — this
+# adds zero new crates.
+sha2.workspace = true
+hex.workspace = true
+semver.workspace = true
 
 [dev-dependencies]
 # `config_cmd`'s round-trip test re-layers a written config.toml the same way
@@ -42,3 +49,8 @@ axum.workspace = true
 # the real OS keychain either.
 keyring.workspace = true
 keyring-core.workspace = true
+# `dira update`'s unit tests (`discover_install`, `swap_in`) and its
+# `tests/update_e2e.rs` integration test build every fixture — fake installs,
+# staged tarballs, mock-served archives — under an isolated temp dir, never
+# under `~/.local/bin` or the real `target/{release,debug}`.
+tempfile.workspace = true

@@ -26,6 +26,24 @@ jobs:
         with:
           configFile: commitlint.config.mjs
 
+  # Lint install.sh: POSIX-only shellcheck plus canonical shfmt formatting.
+  # Lightweight — stays on GitHub-hosted runners, same as commit-lint.
+  shell-lint:
+    name: Shell Lint (install.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shfmt
+        uses: taiki-e/install-action@v2
+        with:
+          tool: shfmt
+      - name: shellcheck -s sh install.sh
+        run: shellcheck -s sh install.sh
+      - name: shfmt -d -s -ln posix -i 2 install.sh
+        run: shfmt -d -s -ln posix -i 2 install.sh
+
   # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
   # to `ubuntu-latest` when none are available. Downstream jobs read the chosen
   # label set from `outputs.runner` via `fromJson()`.

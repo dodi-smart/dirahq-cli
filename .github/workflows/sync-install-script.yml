@@ -1,0 +1,97 @@
+name: Sync install.sh to landing
+
+# The landing repo (dirahq-landing) cannot read this private repo, so the
+# sync has to originate here: whenever the canonical install.sh changes on
+# `main`, mirror it into the public site's scripts/install.sh via a PR --
+# never a direct push, since the deploy gate on that repo matters.
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-install-script-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync install.sh -> dirahq-landing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout dirahq-cli
+        uses: actions/checkout@v7
+        with:
+          path: dirahq-cli
+
+      # Org-level app credentials, same pattern as ci.yml's check-runners job
+      # and build-release.yml's check-runners job. Scoping by `owner` alone
+      # (no `repositories` list) grants the token access to every repo the
+      # App installation covers in this org, which is what lets a workflow
+      # running in the private dirahq-cli repo open a PR against the public
+      # dirahq-landing repo.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout dirahq-landing
+        uses: actions/checkout@v7
+        with:
+          repository: dodi-smart/dirahq-landing
+          token: ${{ steps.app-token.outputs.token }}
+          path: dirahq-landing
+
+      - name: Vendor install.sh and open a sync PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          sha_short=$(git -C dirahq-cli rev-parse --short HEAD)
+          branch="sync-install-script/${sha_short}"
+
+          mkdir -p dirahq-landing/scripts
+
+          # Rebuild scripts/install.sh as a vendored copy: keep the shebang
+          # first (so it's still a valid, directly-runnable script), then
+          # insert the "do not edit here" header, then the rest verbatim.
+          {
+            head -n1 dirahq-cli/install.sh
+            printf '# Vendored from dodi-smart/dirahq-cli -- do not edit here.\n'
+            printf '# Synced automatically by the sync-install-script workflow.\n'
+            tail -n +2 dirahq-cli/install.sh
+          } >dirahq-landing/scripts/install.sh
+
+          cd dirahq-landing
+
+          # git diff ignores untracked files, which would silently skip the
+          # very first sync (before scripts/install.sh exists at all) -- use
+          # status instead so both "new file" and "changed file" are caught.
+          if [ -z "$(git status --porcelain -- scripts/install.sh)" ]; then
+            echo "install.sh is already in sync with dirahq-landing -- nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${branch}"
+          git add scripts/install.sh
+          git commit -s -m "chore(install): sync installer from dirahq-cli@${sha_short}"
+          git push -u origin "${branch}" --force
+
+          gh pr create \
+            --repo dodi-smart/dirahq-landing \
+            --base main \
+            --head "${branch}" \
+            --title "chore(install): sync installer from dirahq-cli@${sha_short}" \
+            --body "Automated sync of \`scripts/install.sh\` from dodi-smart/dirahq-cli@${sha_short} (https://github.com/dodi-smart/dirahq-cli/commit/${sha_short}). Source of truth is \`install.sh\` at the CLI repo root -- do not edit the landing copy by hand." \
+            || echo "a PR for ${branch} may already be open -- see dodi-smart/dirahq-landing pulls."

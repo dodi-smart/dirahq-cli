@@ -13,12 +13,15 @@ mod render;
 mod test_support;
 mod theme;
 mod tui;
+mod update;
+mod zavet_install;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use dira_core::protocol::{ReportScope, Request, Response, StopSelector};
 use dira_core::Config;
 use std::io::Read;
+use std::path::PathBuf;
 
 /// Help styling — ANSI-16 only, deliberately: clap renders help before we can
 /// probe `COLORTERM`, and theme.rs's own ANSI fallback maps Engaged→cyan and
@@ -370,6 +373,47 @@ Examples:
   dira version               CLI + daemon build, wire schema, uptime — and a
                              warning when the CLI and daemon builds differ")]
     Version,
+    /// Update dira to the latest release (resolve, verify, atomic swap, restart).
+    #[command(
+        long_about = "\
+Resolve the current (or a chosen) release, download the platform artifact,
+verify its sha256 against the published checksum, and atomically swap both
+`dira` and `dirad` in place. Restarts the daemon afterward unless
+--no-restart is given or the daemon wasn't running to begin with.
+
+`--check` only resolves — it never downloads and never touches a binary —
+and exits 0 in every non-error case, including offline, so it's safe to run
+speculatively (it also refreshes the cache behind the passive update
+notice). `--version` allows downgrading to any published release, not only
+upgrading to a newer one.",
+        after_help = "\
+Examples:
+  dira update --check               is a newer release available?
+  dira update                       update to the latest release, restart the daemon
+  dira update --channel prerelease  opt into a prerelease build
+  dira update --version 0.2.0       pin to (or downgrade to) an exact version
+  dira update --no-restart          swap the binaries, leave the running daemon alone"
+    )]
+    Update {
+        /// Resolve only — report what's available, change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Update (or downgrade) to this exact version instead of the latest.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+        /// Release channel to resolve against: stable (default) or prerelease.
+        #[arg(long, value_name = "CHANNEL")]
+        channel: Option<String>,
+        /// Skip the dev-install guard (never bypasses sha256 verification).
+        #[arg(long)]
+        force: bool,
+        /// Swap the binaries but leave a running daemon on the old version.
+        #[arg(long)]
+        no_restart: bool,
+        /// Install directory for the new binaries (default: alongside the running `dira`).
+        #[arg(long, value_name = "DIR", env = "DIRA_BIN_DIR")]
+        bin_dir: Option<PathBuf>,
+    },
     /// Zavet knowledge module: what the tracked time produced, and why.
     #[command(
         long_about = "\
@@ -455,6 +499,36 @@ Examples:
     /// Emit shim: read one guard-event JSON on stdin and forward it to the
     /// daemon (fire-and-forget; always exits 0). Wired by the zavet plugin.
     Emit,
+    /// Install (or update) the zavet Claude Code plugin.
+    #[command(
+        long_about = "\
+Installs the zavet Claude Code plugin by shelling out to the `claude` CLI —
+never by hand-editing its config: `claude plugin marketplace add
+dodi-smart/dirahq-zavet`, then `claude plugin install zavet@dirahq --scope
+<scope>`. Detects the current state first (`claude plugin list --json`,
+falling back to Claude Code's own installed_plugins.json) so a repeat run
+is a clean no-op instead of a duplicate install. Reports the installed
+version, scope, install path, and an advisory skew line comparing this dira
+build against the plugin's declared minimum — advisory only, never a hard
+error, since each product works fully without the other.",
+        after_help = "\
+Examples:
+  dira zavet install                 install at user scope (the default)
+  dira zavet install --scope project
+  dira zavet install --update        already installed: refresh it
+  dira zavet install --dry-run       print the exact `claude` invocations only"
+    )]
+    Install {
+        /// Installation scope passed to `claude plugin install` (default: user).
+        #[arg(long, default_value = "user", value_name = "SCOPE")]
+        scope: String,
+        /// Already installed: refresh the marketplace + plugin instead of a no-op.
+        #[arg(long)]
+        update: bool,
+        /// Print the exact `claude` invocations without running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -523,6 +597,20 @@ enum DaemonAction {
     Status,
     /// Install an OS service (launchd/systemd-user) so it survives reboots.
     Install,
+    /// Restart the daemon, however it's currently supervised.
+    #[command(
+        long_about = "\
+Restart the daemon, working out how it's currently supervised (launchd,
+systemd --user, or a bare pidfile-tracked process) and restarting it the
+way that supervisor expects, then waiting for it to answer again and
+reporting the version that comes back up. A daemon that wasn't running is
+a no-op, not an error; a service-managed restart that fails prints the
+exact manual command to run instead of pretending it succeeded.",
+        after_help = "\
+Examples:
+  dira daemon restart        works for launchd, systemd --user, or a bare process"
+    )]
+    Restart,
 }
 
 #[tokio::main]
@@ -566,8 +654,16 @@ async fn main() -> Result<()> {
             return match action {
                 DaemonAction::Start => daemon::start(&config).await,
                 DaemonAction::Stop => daemon::stop(&config).await,
-                DaemonAction::Status => daemon::status(&config).await,
+                DaemonAction::Status => {
+                    let result = daemon::status(&config).await;
+                    if result.is_ok() {
+                        print_supervision(&config).await;
+                    }
+                    update::notice::maybe_print(&config);
+                    result
+                }
                 DaemonAction::Install => daemon::install(&config),
+                DaemonAction::Restart => daemon::restart(&config).await,
             };
         }
         Command::Config { action } => {
@@ -581,8 +677,47 @@ async fn main() -> Result<()> {
         Command::Zavet {
             action: ZavetAction::Emit,
         } => return forward_zavet_event(&config).await,
+        Command::Zavet {
+            action:
+                ZavetAction::Install {
+                    scope,
+                    update,
+                    dry_run,
+                },
+        } => {
+            return zavet_install::install(zavet_install::InstallArgs {
+                scope: scope.clone(),
+                update: *update,
+                dry_run: *dry_run,
+            });
+        }
         Command::Nuke { yes } => return nuke(&config, *yes).await,
-        Command::Version => return print_version(&config).await,
+        Command::Version => {
+            print_version(&config).await?;
+            update::notice::maybe_print(&config);
+            return Ok(());
+        }
+        Command::Update {
+            check,
+            version,
+            channel,
+            force,
+            no_restart,
+            bin_dir,
+        } => {
+            return update::run(
+                &config,
+                update::UpdateArgs {
+                    check: *check,
+                    version: version.clone(),
+                    channel: channel.clone(),
+                    force: *force,
+                    no_restart: *no_restart,
+                    bin_dir: bin_dir.clone(),
+                },
+            )
+            .await;
+        }
         Command::Device { action } => {
             return match action {
                 DeviceAction::Link { code, label } => {
@@ -609,8 +744,20 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        update::notice::maybe_print(&config);
         return Ok(());
     }
+
+    // `dira zavet status` gets an extra client-side plugin summary line
+    // after the daemon's own capture-health response — same detection path
+    // as `dira zavet install`, read-only. Captured by reference before the
+    // by-value match below moves `cli.command`.
+    let is_zavet_status = matches!(
+        &cli.command,
+        Command::Zavet {
+            action: ZavetAction::Status { .. }
+        }
+    );
 
     // Commands that talk to the daemon.
     let req = match cli.command {
@@ -709,6 +856,7 @@ async fn main() -> Result<()> {
             },
             // handled client-side above
             ZavetAction::Emit => unreachable!(),
+            ZavetAction::Install { .. } => unreachable!(),
         },
         // already handled above
         Command::Status { .. }
@@ -720,11 +868,17 @@ async fn main() -> Result<()> {
         | Command::Hook { .. }
         | Command::Nuke { .. }
         | Command::Completions { .. }
-        | Command::Version => unreachable!(),
+        | Command::Version
+        | Command::Update { .. } => unreachable!(),
     };
 
     let resp = client::send(&config.socket_path, &req).await?;
     let ok = render::print(&resp);
+    if is_zavet_status {
+        if let Some(line) = zavet_install::status_line() {
+            println!("{line}");
+        }
+    }
     if !ok {
         std::process::exit(1);
     }
@@ -802,6 +956,21 @@ async fn print_version(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Extra line for `dira daemon status`: which supervisor (if any) is keeping
+/// the daemon alive — the same probe `dira daemon restart` uses internally to
+/// pick a restart strategy, surfaced here so a user can tell why a bare `kill`
+/// isn't enough before reaching for `restart`.
+async fn print_supervision(config: &Config) {
+    let label = match daemon::detect_supervision(config).await {
+        daemon::Supervision::Launchd => "launchd".to_string(),
+        daemon::Supervision::SystemdUser => "systemd --user".to_string(),
+        daemon::Supervision::Pidfile(pid) => format!("pidfile (pid {pid})"),
+        daemon::Supervision::Socket(pid) => format!("unmanaged (pid {pid}, no pidfile)"),
+        daemon::Supervision::NotRunning => return,
+    };
+    println!("supervised by: {label}");
+}
+
 /// Wipe all local statistics via the daemon (so its live-session registry is
 /// cleared too). Confirms first unless `--yes`. Routing through the daemon — not
 /// deleting the db file directly — is deliberate: an emptied db with a running
@@ -866,6 +1035,7 @@ mod tests {
             "init",
             "device",
             "zavet",
+            "update",
         ] {
             let sub = cmd
                 .find_subcommand_mut(name)
@@ -902,6 +1072,7 @@ mod tests {
             "retention_days",
             "partial_rollup_after_secs",
             "report_local_day",
+            "update.check",
         ] {
             assert!(help.contains(key), "config set --help must list `{key}`");
         }

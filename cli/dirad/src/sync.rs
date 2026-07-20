@@ -266,13 +266,17 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
             }
             Err(SyncError::SchemaSkew(body)) => {
                 // Re-sending won't help — don't hot-loop the rejected batch. Back
-                // off long so the operator has time to upgrade the daemon or cloud.
+                // off long so the operator has time to act. The hosted cloud is
+                // always current, so a rejected major almost always means this
+                // daemon's contract version has fallen behind it — `dira update`
+                // is the remediation (self-hosted clouds should upgrade instead).
                 backoff = MAX_BACKOFF;
                 consecutive_failures += 1;
                 state.progress.mark_flush_failure();
                 tracing::error!(
                     "sync: cloud rejected our contract version (unsupported_schema_version) — \
-                     upgrade the daemon or cloud to matching majors; pausing sync: {body}"
+                     run `dira update` to bring the daemon's contract version back in range \
+                     (self-hosting the cloud instead? upgrade it to match); pausing sync: {body}"
                 );
                 record_health(
                     &state,

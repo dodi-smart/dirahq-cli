@@ -218,7 +218,7 @@ pub async fn run() -> anyhow::Result<()> {
     serve_control(state.clone(), uds);
 
     // Block until shutdown. The accept loop runs detached in `serve_control`.
-    tokio::signal::ctrl_c().await.ok();
+    wait_for_shutdown_signal().await;
     tracing::info!("shutting down");
     // Graceful offline: tell the cloud this device is going offline with one
     // best-effort empty-sessions beat (short timeout, errors ignored) so it
@@ -227,6 +227,35 @@ pub async fn run() -> anyhow::Result<()> {
 
     let _ = std::fs::remove_file(&sock);
     Ok(())
+}
+
+/// Block until either Ctrl-C (SIGINT) or SIGTERM arrives, then return so the
+/// caller runs the SAME orderly shutdown for both.
+///
+/// `kill <pid>` (what `dira daemon stop` sends), `launchctl kickstart -k`, and
+/// `systemctl restart` all deliver **SIGTERM**, not SIGINT — so `ctrl_c()`
+/// alone left every daemon restart (including the ones `dira update` performs)
+/// killing the process via the default signal disposition: no log line, no
+/// offline beat, no chance to flush. Unix-only: this project ships macOS +
+/// Linux binaries only, so there is no Windows signal branch to add here.
+async fn wait_for_shutdown_signal() {
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            // Registration only fails on resource exhaustion; fall back to
+            // Ctrl-C alone rather than panicking a running daemon over it.
+            tracing::warn!(
+                "failed to install SIGTERM handler: {e}; SIGTERM will use the default disposition"
+            );
+            tokio::signal::ctrl_c().await.ok();
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
 }
 
 /// Best-effort restrict the control socket to the owner (0600). No-op on non-unix.

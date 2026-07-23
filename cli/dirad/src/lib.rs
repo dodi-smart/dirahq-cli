@@ -36,6 +36,7 @@ pub mod zavet;
 
 use crate::state::{AppState, EventMsg, ProgressTracker, SessionRegistry};
 use crate::writer::QUEUE_CAPACITY;
+use anyhow::Context;
 use dira_core::{Config, Store};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -122,8 +123,163 @@ pub async fn build_state(
         billing: Arc::new(Mutex::new(None)),
         billing_refresh: Arc::new(tokio::sync::Notify::new()),
         presence_wake: Arc::new(tokio::sync::Notify::new()),
+        http_ingress_error: Arc::new(Mutex::new(None)),
     };
     Ok((state, rx, sync_rx, knowledge_rx))
+}
+
+/// Holds the daemon's single-instance `flock` for as long as the listener
+/// bound beside it is in use. Dropping it releases the lock, and the kernel
+/// releases it if the process dies — so it can never go stale the way a
+/// leftover socket file (or a pidfile) can.
+#[derive(Debug)]
+pub struct SocketLock {
+    _file: std::fs::File,
+}
+
+/// Bind the control socket at `sock`, refusing to take it from a daemon that
+/// is already using it. Hold the returned [`SocketLock`] as long as the
+/// listener is in use.
+///
+/// The probe is a plain `connect`: a live listener accepts, while a socket file
+/// orphaned by a dead daemon gives `ECONNREFUSED`. Only the latter is unlinked.
+/// This matters because binding a UDS *requires* the path to be free, so the
+/// pre-D-0009 code unlinked unconditionally — which meant a second daemon took
+/// the path away from a healthy first one. The first daemon's listener stayed
+/// alive on an unlinked inode, reachable by nobody, and no error was logged on
+/// either side.
+///
+/// The probe→unlink→bind sequence is not atomic on its own: two daemons racing
+/// onto a *stale* socket file can both see "nothing answers" before either
+/// unlinks, and the loser's unlink then steals the path from the winner's
+/// freshly bound listener — the same orphaned-listener failure via a second
+/// door. An exclusive `flock` on `<sock>.lock`, taken before the probe and held
+/// for the daemon's lifetime, makes the sequence mutually exclusive. Unlike the
+/// pidfile lock D-0009 rejected, an `flock` cannot go stale: the kernel drops
+/// it on any exit, SIGKILL included. The probe stays: a pre-lock daemon holds
+/// the socket without holding any lock.
+///
+/// This is also the daemon's only single-instance guard. It used to be provided
+/// by accident: the HTTP port was bound first, so a duplicate died on
+/// `EADDRINUSE` before it could reach the unlink. Now that an unavailable port
+/// is survivable (see [`run`]), the guard has to be explicit.
+pub async fn bind_control_socket(
+    sock: &std::path::Path,
+) -> anyhow::Result<(UnixListener, SocketLock)> {
+    use std::os::fd::AsRawFd;
+
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let lock_path = sock.with_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open the socket lock at {}", lock_path.display()))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::bail!(
+                "another dirad is already running (or starting) on {} — stop it first, or \
+                 use `dira daemon restart` to replace it",
+                sock.display(),
+            );
+        }
+        return Err(err)
+            .with_context(|| format!("failed to lock the socket lock at {}", lock_path.display()));
+    }
+
+    if sock.exists() {
+        if tokio::net::UnixStream::connect(sock).await.is_ok() {
+            anyhow::bail!(
+                "another dirad is already running on {} — stop it first, or use \
+                 `dira daemon restart` to replace it",
+                sock.display(),
+            );
+        }
+        // Nothing is listening: a leftover file from a daemon that died.
+        tracing::warn!(sock = %sock.display(), "reclaiming a stale control socket");
+        let _ = std::fs::remove_file(sock);
+    }
+
+    let listener = UnixListener::bind(sock)
+        .with_context(|| format!("failed to bind the control socket at {}", sock.display()))?;
+    Ok((listener, SocketLock { _file: lock }))
+}
+
+/// Serve the loopback hook ingress on `addr`, treating an unavailable port as
+/// a degradation rather than a fatal error.
+///
+/// A port conflict used to abort startup — and because the port was bound
+/// before the control socket, the daemon died without ever becoming
+/// introspectable, so every client reported "down" while `KeepAlive` respawned
+/// it on a 10s loop. The control socket is now bound first and survives this,
+/// so the daemon stays answerable and *reports* why capture is not flowing.
+///
+/// On failure a background task retries with exponential backoff from
+/// `retry_base` (capped at [`HTTP_RETRY_MAX`]) until the port frees, then
+/// clears the degradation. That self-healing is what removes the respawn loop:
+/// there is no longer anything for the supervisor to restart. Returns once the
+/// outcome is known; serving and retrying continue detached.
+pub async fn serve_http_ingress(state: AppState, addr: String, retry_base: std::time::Duration) {
+    match TcpListener::bind(&addr).await {
+        Ok(listener) => {
+            *state.http_ingress_error.lock().unwrap() = None;
+            tracing::info!("hook ingress on http://{addr}/hooks/claude");
+            spawn_http_server(state, listener);
+        }
+        Err(e) => {
+            let reason = format!(
+                "could not bind the hook ingress on {addr}: {e} — another dirad may already \
+                 be running (check `dira daemon status`), or set a different `http_port`"
+            );
+            tracing::error!(
+                "{reason}; the daemon is running DEGRADED: control socket is up, but harness \
+                 hooks cannot reach it, so no capture will flow until the port frees"
+            );
+            *state.http_ingress_error.lock().unwrap() = Some(reason);
+            spawn_http_retry(state, addr, retry_base);
+        }
+    }
+}
+
+/// First delay before retrying an unavailable hook-ingress port.
+pub const HTTP_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ceiling for the hook-ingress rebind backoff.
+pub const HTTP_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn spawn_http_server(state: AppState, listener: TcpListener) {
+    let app = http::router(state);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("http server error: {e}");
+        }
+    });
+}
+
+/// Retry the ingress bind until it succeeds, then clear the degradation.
+fn spawn_http_retry(state: AppState, addr: String, retry_base: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut delay = retry_base;
+        loop {
+            tokio::time::sleep(delay).await;
+            match TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    *state.http_ingress_error.lock().unwrap() = None;
+                    tracing::info!("hook ingress recovered on http://{addr}/hooks/claude");
+                    spawn_http_server(state, listener);
+                    return;
+                }
+                // Still held. Back off so a permanently-occupied port costs
+                // one bind attempt a minute, not a spin.
+                Err(_) => delay = (delay * 2).min(HTTP_RETRY_MAX),
+            }
+        }
+    });
 }
 
 /// Bind the UDS control socket and spawn its accept loop on `state`. Bound
@@ -156,27 +312,25 @@ pub async fn run() -> anyhow::Result<()> {
     // `Ping`/`Status` the instant it's up. Hydration then runs on a background
     // task; a status during warm-up reports `hydrating: true` rather than hanging
     // on a multi-second log replay or returning a connection error.
+    //
+    // The control socket goes first (D-0009). It is the surface every client and
+    // every supervision probe depends on, so it must survive an unavailable HTTP
+    // port — the reverse order meant a port conflict killed the daemon before it
+    // was ever introspectable. Ordering the UDS first is only safe because
+    // `bind_control_socket` refuses to take the path from a live daemon; it used
+    // to unlink unconditionally, and the HTTP bind was the accidental guard.
 
-    // HTTP ingress (loopback only).
-    let http_addr = format!("127.0.0.1:{}", state.config.http_port);
-    let http_listener = TcpListener::bind(&http_addr).await?;
-    let http_app = http::router(state.clone());
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(http_listener, http_app).await {
-            tracing::error!("http server error: {e}");
-        }
-    });
-    tracing::info!("hook ingress on http://{http_addr}/hooks/claude");
-
-    // UDS control channel.
+    // UDS control channel. The lock lives until `run` returns — i.e. for the
+    // daemon's whole life — so no duplicate can race the socket path meanwhile.
     let sock = state.config.socket_path.clone();
-    let _ = std::fs::remove_file(&sock); // clear stale socket
-    if let Some(parent) = sock.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let uds = UnixListener::bind(&sock)?;
+    let (uds, _socket_lock) = bind_control_socket(&sock).await?;
     set_socket_perms(&sock);
     tracing::info!(sock = %sock.display(), "control socket ready");
+
+    // HTTP ingress (loopback only). Survivable: a conflict leaves the daemon up
+    // and degraded, retrying in the background.
+    let http_addr = format!("127.0.0.1:{}", state.config.http_port);
+    serve_http_ingress(state.clone(), http_addr, HTTP_RETRY_BASE).await;
 
     // --- Background work (after the sockets are live) -------------------------
     // Rebuild live-session state from the log so a daemon bounce loses nothing.

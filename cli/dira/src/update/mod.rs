@@ -171,11 +171,7 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
 
     if args.no_restart {
         replace::cleanup_backups(&bin_dir);
-        println!(
-            "dira + dirad updated to {} in {} — daemon left untouched (--no-restart)",
-            resolved.version,
-            bin_dir.display()
-        );
+        println!("{}", no_restart_notice(&resolved.version, &bin_dir));
         return Ok(());
     }
 
@@ -241,6 +237,21 @@ fn guard_to_bin_dir(guard: replace::Guard, force: bool) -> Result<PathBuf> {
             );
         }
     }
+}
+
+/// `--no-restart`'s success line. Pure so the cost disclosure is testable
+/// without exercising the whole `run` pipeline. In a post-fix→post-fix
+/// upgrade the socket path is stable and capture merely runs version-skewed
+/// until the next restart; only a transitional upgrade (still-running
+/// pre-D-0008 daemon) actually goes dark — hence "not guaranteed" rather
+/// than "stopped".
+fn no_restart_notice(version: &str, bin_dir: &Path) -> String {
+    format!(
+        "dira + dirad updated to {version} in {} — daemon left untouched (--no-restart)\n  \
+         warning: the running dirad is still the previous version — hook capture is not \
+         guaranteed until you run `dira daemon restart`",
+        bin_dir.display(),
+    )
 }
 
 fn now_unix() -> i64 {
@@ -395,6 +406,14 @@ mod tests {
             guard_to_bin_dir(guard, true).is_err(),
             "--force must never override a DevBuild refusal"
         );
+    }
+
+    #[test]
+    fn no_restart_notice_warns_that_capture_waits_on_a_restart() {
+        let msg = no_restart_notice("1.2.3", Path::new("/opt/dira/bin"));
+        assert!(msg.contains("--no-restart"), "message was: {msg}");
+        assert!(msg.contains("dira daemon restart"), "message was: {msg}");
+        assert!(msg.contains("capture"), "message was: {msg}");
     }
 
     #[test]

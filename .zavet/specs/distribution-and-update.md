@@ -1,16 +1,16 @@
 ---
 title: Distribution and self-update
-version: 1
+version: 2
 origin: session
 verified: false
 confidence: high
-date: 2026-07-20
+date: 2026-07-22
 paths:
   - install.sh
   - cli/dira/src/update/**
   - cli/dira/src/daemon.rs
   - .github/workflows/build-release.yml
-decisions: [D-0002, D-0003, D-0004, D-0005, D-0006, D-0007]
+decisions: [D-0002, D-0003, D-0004, D-0005, D-0006, D-0007, D-0008]
 ---
 
 ## Overview
@@ -41,6 +41,19 @@ and restarts whatever is supervising the daemon.
 - Daemon restart covers launchd, systemd-user, and pidfile supervision. The
   running daemon reports its own pid over the socket, so a missing pidfile is
   not a dead end.
+- Every one of those probes dials the control socket, so they all depend on
+  client and daemon resolving the same path with no coordination — hence the
+  fixed per-user socket location (D-0008). `dira daemon restart` (and the
+  restart inside `dira update`) detects a bare pre-D-0008 daemon still bound
+  to the old `$TMPDIR` socket, kills it, removes its socket and pidfile, and
+  starts a fresh daemon on the fixed path, rather than treating it as
+  `NotRunning` and no-op'ing. If its pid can't be determined, restart errors
+  with manual instructions instead of starting a second daemon beside it.
+- `dira daemon status` exits 0 when any daemon is running — healthy,
+  degraded, or still on the legacy socket — and 1 when none is; `install.sh`
+  keys its post-upgrade restart decision off that exit code, so a legacy
+  daemon must count as "running" (a restart will migrate it) rather than
+  "down" (which would make install.sh skip the restart and strand it).
 
 ## Interfaces & data
 
@@ -73,6 +86,9 @@ and restarts whatever is supervising the daemon.
   (D-0004).
 - The update check never performs network I/O on the foreground path
   (D-0006), and its notice goes to stderr so piped output is unchanged.
+- The control socket is never resolved through `$TMPDIR` (D-0008): it differs
+  per process, so a client and a healthy daemon would silently miss each
+  other and the daemon would present as "down".
 
 ## Open Questions
 

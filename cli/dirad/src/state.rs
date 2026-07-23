@@ -97,6 +97,14 @@ pub struct AppState {
     /// off doing a beat is the acceptable, rare miss (the sleep still bounds the
     /// wait to at most one cadence, and jitter already keeps that bounded).
     pub presence_wake: Arc<Notify>,
+    /// Why the loopback hook ingress is not serving, or `None` when it is
+    /// healthy. Set when its port cannot be bound — a conflict is survivable
+    /// (the control socket is bound first and stays live), so the daemon runs
+    /// **degraded** rather than exiting, and a background task retries until
+    /// the port frees and clears this. Surfaced over `DaemonInfo` so
+    /// `dira daemon status` can say so instead of the daemon silently
+    /// capturing nothing. Never hold this lock across an await. See D-0009.
+    pub http_ingress_error: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {

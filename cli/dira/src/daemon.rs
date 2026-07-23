@@ -9,15 +9,20 @@ use crate::client;
 use anyhow::{Context, Result};
 use dira_core::protocol::{Request, Response};
 use dira_core::Config;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn pidfile(config: &Config) -> PathBuf {
-    config
-        .socket_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("/tmp"))
+/// The pidfile that sits beside a given socket. Generalized from the
+/// configured-socket-only version so the legacy-migration path (W1) can ask
+/// the same question about the pre-D-0008 socket.
+fn pidfile_beside(sock: &Path) -> PathBuf {
+    sock.parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
         .join("dirad.pid")
+}
+
+fn pidfile(config: &Config) -> PathBuf {
+    pidfile_beside(&config.socket_path)
 }
 
 /// Locate the `dirad` binary: `DIRAD_BIN`, else a sibling of this exe, else PATH.
@@ -36,12 +41,14 @@ fn locate_dirad() -> PathBuf {
     PathBuf::from("dirad")
 }
 
+/// Is a daemon answering `Ping` on this exact socket?
+pub async fn answers(sock: &Path) -> bool {
+    matches!(client::send(sock, &Request::Ping).await, Ok(Response::Pong))
+}
+
 /// Is the daemon answering on the socket?
 pub async fn is_up(config: &Config) -> bool {
-    matches!(
-        client::send(&config.socket_path, &Request::Ping).await,
-        Ok(Response::Pong)
-    )
+    answers(&config.socket_path).await
 }
 
 pub async fn start(config: &Config) -> Result<()> {
@@ -102,13 +109,111 @@ pub async fn stop(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub async fn status(config: &Config) -> Result<()> {
-    if is_up(config).await {
-        println!("dirad: up  (socket {})", config.socket_path.display());
-    } else {
-        println!("dirad: down");
+/// The `dirad: down` line, plus — when a daemon is still answering on the
+/// pre-D-0008 `$TMPDIR` socket — the reason and the one command that fixes it.
+/// Pure so both branches are testable without a live daemon.
+fn down_message(legacy: Option<&std::path::Path>) -> String {
+    match legacy {
+        None => "dirad: down".to_string(),
+        Some(sock) => format!(
+            "dirad: down\n  \
+             note: a daemon IS answering on the legacy socket {}\n  \
+             it predates the move to a fixed per-user socket path, so this \
+             client can no longer reach it.\n  \
+             restart it to move it over: dira daemon restart",
+            sock.display(),
+        ),
     }
-    Ok(())
+}
+
+/// `dira version`'s `Err(_)` line, plus — same legacy-daemon nudge as
+/// [`down_message`] — the reason the CLI/daemon skew check below it couldn't
+/// even run: it depends on reaching the daemon over the socket, and a
+/// legacy daemon defeats that silently otherwise. Pure for the same reason
+/// as `down_message`.
+pub(crate) fn version_not_running_message(legacy: Option<&Path>) -> String {
+    match legacy {
+        None => "dirad   not running".to_string(),
+        Some(sock) => format!(
+            "dirad   not running\n\
+             note: a pre-upgrade daemon is still answering on {} — run `dira daemon restart`",
+            sock.display(),
+        ),
+    }
+}
+
+/// Is a pre-D-0008 daemon still listening on `legacy`? Only ever called once
+/// the configured socket has already failed, and only to build the "restart
+/// it" hint or (via [`status`]) decide whether a daemon is running at all —
+/// never to actually talk to it. `legacy` is injected, mirroring
+/// `detect_supervision_with`'s `legacy_sock` param, so tests never probe the
+/// real `$TMPDIR/dira.sock` on this dogfooding machine.
+async fn legacy_daemon_socket(config: &Config, legacy: &Path) -> Option<PathBuf> {
+    // On an exotic platform (or with the socket pinned via config/env) the
+    // legacy path can BE the configured one — we already know it is down.
+    if legacy == config.socket_path {
+        return None;
+    }
+    answers(legacy).await.then(|| legacy.to_path_buf())
+}
+
+/// `legacy_daemon_socket` against the real legacy path — for callers (like
+/// `dira version`'s skew note) that have no reason to inject one.
+pub(crate) async fn legacy_daemon_socket_default(config: &Config) -> Option<PathBuf> {
+    legacy_daemon_socket(config, &dira_core::config::legacy_socket_path()).await
+}
+
+/// The `dirad: up` line. A daemon whose hook ingress failed to bind answers
+/// every control request but captures nothing, so it is reported as **degraded**
+/// with the reason rather than as a healthy "up" (D-0009).
+fn up_message(sock: &std::path::Path, ingress_error: Option<&str>) -> String {
+    match ingress_error {
+        None => format!("dirad: up  (socket {})", sock.display()),
+        Some(reason) => format!(
+            "dirad: up, DEGRADED  (socket {})\n  {reason}\n  \
+             capture will not flow until this resolves; the daemon retries in the background",
+            sock.display(),
+        ),
+    }
+}
+
+/// `true` iff a daemon is running somewhere — healthy, degraded, or still
+/// answering on the legacy socket. install.sh (and any other scripted
+/// caller) keys a restart-after-upgrade decision off this exit code, so
+/// "legacy" must count as running: once `restart` migrates it (W1),
+/// answering "no" here would make install.sh skip the restart and strand
+/// the old daemon — the exact failure W1 fixes.
+pub async fn status(config: &Config) -> Result<bool> {
+    status_with(config, &dira_core::config::legacy_socket_path()).await
+}
+
+async fn status_with(config: &Config, legacy_sock: &Path) -> Result<bool> {
+    // `DaemonInfo` rather than `Ping`, because only it carries the degradation.
+    // A daemon too old to answer it still answers `Ping`, so fall back rather
+    // than calling a live daemon down during a partial update.
+    let ingress_error = match client::send(&config.socket_path, &Request::DaemonInfo).await {
+        Ok(Response::DaemonInfo {
+            http_ingress_error, ..
+        }) => Some(http_ingress_error),
+        _ => None,
+    };
+
+    match ingress_error {
+        Some(err) => {
+            println!("{}", up_message(&config.socket_path, err.as_deref()));
+            Ok(true)
+        }
+        None if is_up(config).await => {
+            println!("{}", up_message(&config.socket_path, None));
+            Ok(true)
+        }
+        None => {
+            let legacy = legacy_daemon_socket(config, legacy_sock).await;
+            let running = legacy.is_some();
+            println!("{}", down_message(legacy.as_deref()));
+            Ok(running)
+        }
+    }
 }
 
 /// Write and load an OS service so the daemon survives reboots.
@@ -197,6 +302,12 @@ pub enum Supervision {
     /// self-reports its pid via `Response::DaemonInfo` — e.g. it was started
     /// by something other than `dira daemon start`, or the pidfile was lost.
     Socket(u32),
+    /// Nothing answers on the configured socket, but a bare pre-D-0008 daemon
+    /// is still answering on the legacy `$TMPDIR` one — invisible to every
+    /// check above because its pidfile and socket both live under the old
+    /// anchor. `pid` is `None` for a pre-public dev build old enough to
+    /// answer `Ping` but not `DaemonInfo`, with no pidfile to fall back to.
+    LegacySocket { pid: Option<u32>, sock: PathBuf },
     /// Nothing answers and no service manager claims it.
     NotRunning,
 }
@@ -242,22 +353,39 @@ impl Runner for SystemRunner {
     }
 }
 
-/// Is the pidfile's pid alive? `None` if there is no pidfile, it doesn't
-/// parse, or the pid is dead.
-fn alive_pidfile_pid(config: &Config, runner: &dyn Runner) -> Option<u32> {
-    let contents = std::fs::read_to_string(pidfile(config)).ok()?;
+/// Is the pid named by `pidfile` alive? `None` if there is no pidfile, it
+/// doesn't parse, or the pid is dead. Generalized from the configured-socket
+/// case so the legacy-migration path (W1) can ask the same question about the
+/// pidfile beside the pre-D-0008 socket.
+fn alive_pid_at(pidfile: &Path, runner: &dyn Runner) -> Option<u32> {
+    let contents = std::fs::read_to_string(pidfile).ok()?;
     let pid: u32 = contents.trim().parse().ok()?;
     let out = runner.run("kill", &["-0", &pid.to_string()])?;
     out.status.success().then_some(pid)
 }
 
-/// Work out how the daemon is currently supervised. See [`Supervision`] for
-/// the five possible outcomes and the order they're checked in.
-pub async fn detect_supervision(config: &Config) -> Supervision {
-    detect_supervision_with(config, &SystemRunner, current_os()).await
+fn alive_pidfile_pid(config: &Config, runner: &dyn Runner) -> Option<u32> {
+    alive_pid_at(&pidfile(config), runner)
 }
 
-async fn detect_supervision_with(config: &Config, runner: &dyn Runner, os: Os) -> Supervision {
+/// Work out how the daemon is currently supervised. See [`Supervision`] for
+/// the six possible outcomes and the order they're checked in.
+pub async fn detect_supervision(config: &Config) -> Supervision {
+    detect_supervision_with(
+        config,
+        &SystemRunner,
+        current_os(),
+        &dira_core::config::legacy_socket_path(),
+    )
+    .await
+}
+
+async fn detect_supervision_with(
+    config: &Config,
+    runner: &dyn Runner,
+    os: Os,
+    legacy_sock: &Path,
+) -> Supervision {
     if os == Os::Macos {
         if let Some(out) = runner.run("launchctl", &["list", "sh.dirahq.dirad"]) {
             if out.status.success() {
@@ -282,6 +410,33 @@ async fn detect_supervision_with(config: &Config, runner: &dyn Runner, os: Os) -
         client::send(&config.socket_path, &Request::DaemonInfo).await
     {
         return Supervision::Socket(pid);
+    }
+
+    // A bare pre-D-0008 daemon predates the fixed socket path (D-0008) and is
+    // otherwise invisible above — its pidfile and socket both live under the
+    // old $TMPDIR anchor. Probed only to find and kill it on restart, never
+    // as a working rendezvous point (see D-0008's amendment).
+    if legacy_sock != config.socket_path {
+        if let Ok(Response::DaemonInfo { pid, .. }) =
+            client::send(legacy_sock, &Request::DaemonInfo).await
+        {
+            return Supervision::LegacySocket {
+                pid: Some(pid),
+                sock: legacy_sock.to_path_buf(),
+            };
+        }
+
+        if answers(legacy_sock).await {
+            // Too old to answer `DaemonInfo` — a pre-public dev build. Fall
+            // back to the pidfile beside the legacy socket; if that's also
+            // gone, the pid is unrecoverable and `restart` must say so
+            // rather than guess.
+            let pid = alive_pid_at(&pidfile_beside(legacy_sock), runner);
+            return Supervision::LegacySocket {
+                pid,
+                sock: legacy_sock.to_path_buf(),
+            };
+        }
     }
 
     Supervision::NotRunning
@@ -341,16 +496,18 @@ fn restart_systemd(runner: &dyn Runner) -> Result<()> {
     )
 }
 
-/// Kill a bare (non-service-managed) `dirad` we found by pidfile or by asking
-/// the socket, then reuse [`start`] to bring it back — the plain dev/dogfood
-/// path `install()` doesn't touch.
-async fn restart_bare(config: &Config, pid: u32, runner: &dyn Runner) -> Result<()> {
+/// Kill the `dirad` at `pid` answering on `sock` (escalating to `-9` if it
+/// doesn't let go within 5s), then remove its pidfile and socket file so
+/// nothing stumbles over a stale rendezvous point afterward. Split out from
+/// [`restart_bare`] so the cleanup half is unit-testable without spawning a
+/// real daemon — starting one is still the part no test here attempts.
+async fn reap(pid: u32, sock: &Path, runner: &dyn Runner) {
     let _ = runner.run("kill", &[&pid.to_string()]);
 
     let mut still_up = true;
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if !is_up(config).await {
+        if !answers(sock).await {
             still_up = false;
             break;
         }
@@ -359,9 +516,17 @@ async fn restart_bare(config: &Config, pid: u32, runner: &dyn Runner) -> Result<
         let _ = runner.run("kill", &["-9", &pid.to_string()]);
     }
 
-    std::fs::remove_file(pidfile(config)).ok();
-    std::fs::remove_file(&config.socket_path).ok();
+    std::fs::remove_file(pidfile_beside(sock)).ok();
+    std::fs::remove_file(sock).ok();
+}
 
+/// Kill a bare (non-service-managed) `dirad` we found by pidfile or by asking
+/// the socket, then reuse [`start`] to bring it back — the plain dev/dogfood
+/// path `install()` doesn't touch. `sock` is the socket the dying daemon
+/// answers on — the configured one for [`Supervision::Pidfile`]/[`Supervision::Socket`],
+/// or the legacy one when migrating a pre-D-0008 daemon off it.
+async fn restart_bare(config: &Config, pid: u32, sock: &Path, runner: &dyn Runner) -> Result<()> {
+    reap(pid, sock, runner).await;
     start(config).await
 }
 
@@ -389,18 +554,42 @@ async fn wait_up_and_report(config: &Config) -> Result<()> {
 /// hand rather than pretending it succeeded; a daemon that wasn't running is
 /// a no-op, not an error.
 pub async fn restart(config: &Config) -> Result<()> {
-    restart_with(config, &SystemRunner, current_os()).await
+    restart_with(
+        config,
+        &SystemRunner,
+        current_os(),
+        &dira_core::config::legacy_socket_path(),
+    )
+    .await
 }
 
-async fn restart_with(config: &Config, runner: &dyn Runner, os: Os) -> Result<()> {
-    let supervision = detect_supervision_with(config, runner, os).await;
+async fn restart_with(
+    config: &Config,
+    runner: &dyn Runner,
+    os: Os,
+    legacy_sock: &Path,
+) -> Result<()> {
+    let supervision = detect_supervision_with(config, runner, os, legacy_sock).await;
     println!("supervision: {supervision:?}");
 
     match &supervision {
         Supervision::Launchd => restart_launchd(runner)?,
         Supervision::SystemdUser => restart_systemd(runner)?,
         Supervision::Pidfile(pid) | Supervision::Socket(pid) => {
-            restart_bare(config, *pid, runner).await?;
+            restart_bare(config, *pid, &config.socket_path, runner).await?;
+        }
+        Supervision::LegacySocket {
+            pid: Some(pid),
+            sock,
+        } => {
+            restart_bare(config, *pid, sock, runner).await?;
+        }
+        Supervision::LegacySocket { pid: None, sock } => {
+            anyhow::bail!(
+                "a pre-upgrade dirad is still running on {} but its pid could not be \
+                 determined — stop it yourself (pkill -x dirad), then run `dira daemon start`",
+                sock.display()
+            );
         }
         Supervision::NotRunning => {
             println!("daemon was not running");
@@ -456,25 +645,64 @@ mod tests {
     }
 
     /// A unique temp dir per test, mirroring `project.rs`'s `temp_repo_dir` —
-    /// pid + a nanosecond suffix so parallel tests never collide.
+    /// pid + a clock suffix so parallel tests never collide.
+    ///
+    /// Deliberately terse. Everything here ends up inside a `sun_path`, which
+    /// caps at 104 bytes on macOS, and `$TMPDIR` alone eats ~49 of those on a
+    /// stock mac. A descriptive directory name is what pushed five of these
+    /// tests over the limit — they passed under a short `$TMPDIR` locally and
+    /// failed in CI with a bare `InvalidInput`. `sock_in` re-checks the budget
+    /// so a future long tag fails with an explanation instead of that.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        // Hex-truncated: the low 32 bits of the nanosecond clock still separate
+        // parallel tests, in 8 characters instead of 19.
         let base = std::env::temp_dir().join(format!(
-            "dira-sup-{tag}-{}-{}",
+            "ds-{tag}-{}-{:x}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            uniq & 0xffff_ffff
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
     }
 
+    /// The longest path `UnixListener::bind` accepts: `sun_path` is 104 bytes
+    /// on macOS, 108 on Linux. Assert against the smaller so a path that would
+    /// only fail on macOS fails everywhere.
+    const SUN_MAX: usize = 104;
+
+    /// A socket path inside a fresh temp dir, checked against [`SUN_MAX`] so an
+    /// over-long path names itself instead of surfacing as `InvalidInput` from
+    /// deep inside a bind.
+    fn sock_in(tag: &str, name: &str) -> PathBuf {
+        let path = temp_dir(tag).join(name);
+        assert!(
+            path.as_os_str().len() < SUN_MAX,
+            "test socket path is {} bytes, over the {SUN_MAX}-byte sun_path limit: {} \
+             — shorten the tag",
+            path.as_os_str().len(),
+            path.display(),
+        );
+        path
+    }
+
     fn test_config(tag: &str) -> Config {
         Config {
-            socket_path: temp_dir(tag).join("d.sock"),
+            socket_path: sock_in(tag, "d.sock"),
             ..Config::default()
         }
+    }
+
+    /// A legacy-socket path guaranteed to be dead — nothing ever binds it.
+    /// Every `detect_supervision_with`/`restart_with` call in this module must
+    /// pass one of these rather than the real `legacy_socket_path()`, or the
+    /// test probes the live `$TMPDIR/dira.sock` on this dogfooding machine
+    /// and flakes.
+    fn dead_legacy(tag: &str) -> PathBuf {
+        sock_in(tag, "l.sock")
     }
 
     /// Answer one `DaemonInfo` request on an accepted connection with a
@@ -498,20 +726,149 @@ mod tests {
             schema_version: "1".to_string(),
             pid,
             uptime_seconds: 1,
+            http_ingress_error: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
         let _ = stream.write_all(&bytes).await;
     }
 
-    // -- the five `Supervision` branches -----------------------------------
+    /// Answer one `Ping` with `Pong` — stands in for a pre-public dev build
+    /// that predates `DaemonInfo` but still answers the oldest request.
+    async fn respond_pong(mut stream: tokio::net::UnixStream) {
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            return;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        if stream.read_exact(&mut buf).await.is_err() {
+            return;
+        }
+
+        let bytes = serde_json::to_vec(&Response::Pong).unwrap();
+        let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
+        let _ = stream.write_all(&bytes).await;
+    }
+
+    // -- the "up" line, incl. the degraded-ingress flag ----------------------
+
+    #[test]
+    fn up_message_is_plain_when_the_daemon_is_healthy() {
+        let msg = up_message(std::path::Path::new("/x/dira.sock"), None);
+        assert_eq!(msg, "dirad: up  (socket /x/dira.sock)");
+    }
+
+    #[test]
+    fn up_message_flags_a_degraded_hook_ingress() {
+        // A daemon whose ingress port is taken answers every control request
+        // but captures nothing — it must not read as plain "up".
+        let msg = up_message(
+            std::path::Path::new("/x/dira.sock"),
+            Some("could not bind the hook ingress on 127.0.0.1:8722: Address already in use"),
+        );
+        assert!(
+            msg.to_lowercase().contains("degraded"),
+            "must be flagged as degraded, got: {msg}"
+        );
+        assert!(
+            msg.contains("8722"),
+            "must carry the underlying reason, got: {msg}"
+        );
+    }
+
+    // -- the "down" line, incl. the legacy-socket nudge ----------------------
+
+    #[test]
+    fn down_message_is_bare_when_no_legacy_daemon_answers() {
+        assert_eq!(down_message(None), "dirad: down");
+    }
+
+    #[test]
+    fn down_message_points_at_a_daemon_still_on_the_legacy_socket() {
+        let msg = down_message(Some(std::path::Path::new("/var/folders/x/T/dira.sock")));
+        assert!(
+            msg.contains("/var/folders/x/T/dira.sock"),
+            "must name the legacy socket that answered, got: {msg}"
+        );
+        assert!(
+            msg.contains("dira daemon restart"),
+            "must tell the user how to move it onto the new socket, got: {msg}"
+        );
+    }
+
+    // -- `dira version`'s legacy-skew note ------------------------------------
+
+    #[test]
+    fn version_not_running_message_is_bare_without_a_legacy_daemon() {
+        assert_eq!(version_not_running_message(None), "dirad   not running");
+    }
+
+    #[test]
+    fn version_not_running_message_points_at_the_legacy_daemon() {
+        let msg =
+            version_not_running_message(Some(std::path::Path::new("/var/folders/x/T/dira.sock")));
+        assert!(
+            msg.contains("/var/folders/x/T/dira.sock"),
+            "must name the legacy socket, got: {msg}"
+        );
+        assert!(
+            msg.contains("dira daemon restart"),
+            "must tell the user how to migrate it, got: {msg}"
+        );
+    }
+
+    // -- `status`'s exit-code contract ---------------------------------------
+
+    #[tokio::test]
+    async fn status_reports_running_when_the_daemon_answers() {
+        let config = test_config("status-up");
+        let listener = UnixListener::bind(&config.socket_path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                respond_daemon_info(stream, 111).await;
+            }
+        });
+
+        let got = status_with(&config, &dead_legacy("status-up")).await;
+        assert!(got.unwrap());
+    }
+
+    #[tokio::test]
+    async fn status_reports_not_running_when_nothing_answers() {
+        let config = test_config("status-down");
+        let got = status_with(&config, &dead_legacy("status-down")).await;
+        assert!(!got.unwrap());
+    }
+
+    #[tokio::test]
+    async fn status_reports_running_when_only_the_legacy_socket_answers() {
+        // The configured socket is dead, but a pre-upgrade daemon still
+        // answers on the legacy one — install.sh's restart-after-upgrade
+        // decision must see this as "running", or it skips the restart that
+        // W1 relies on to migrate it and strands the old daemon.
+        let config = test_config("status-legacy");
+        let legacy = sock_in("st-leg", "l.sock");
+        let listener = UnixListener::bind(&legacy).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                respond_pong(stream).await;
+            }
+        });
+
+        let got = status_with(&config, &legacy).await;
+        assert!(got.unwrap());
+    }
+
+    // -- the six `Supervision` branches --------------------------------------
 
     #[tokio::test]
     async fn detect_supervision_launchd_when_launchctl_list_succeeds() {
         let config = test_config("launchd");
         let runner =
             FakeRunner::default().returning("launchctl", &["list", "sh.dirahq.dirad"], 0, "");
-        let got = detect_supervision_with(&config, &runner, Os::Macos).await;
+        let got =
+            detect_supervision_with(&config, &runner, Os::Macos, &dead_legacy("launchd")).await;
         assert_eq!(got, Supervision::Launchd);
     }
 
@@ -522,7 +879,13 @@ mod tests {
         let config = test_config("launchd-off-platform");
         let runner =
             FakeRunner::default().returning("launchctl", &["list", "sh.dirahq.dirad"], 0, "");
-        let got = detect_supervision_with(&config, &runner, Os::Linux).await;
+        let got = detect_supervision_with(
+            &config,
+            &runner,
+            Os::Linux,
+            &dead_legacy("launchd-off-platform"),
+        )
+        .await;
         assert_eq!(got, Supervision::NotRunning);
     }
 
@@ -535,7 +898,8 @@ mod tests {
             0,
             "active\n",
         );
-        let got = detect_supervision_with(&config, &runner, Os::Linux).await;
+        let got =
+            detect_supervision_with(&config, &runner, Os::Linux, &dead_legacy("systemd")).await;
         assert_eq!(got, Supervision::SystemdUser);
     }
 
@@ -548,7 +912,13 @@ mod tests {
             3,
             "inactive\n",
         );
-        let got = detect_supervision_with(&config, &runner, Os::Linux).await;
+        let got = detect_supervision_with(
+            &config,
+            &runner,
+            Os::Linux,
+            &dead_legacy("systemd-inactive"),
+        )
+        .await;
         assert_eq!(got, Supervision::NotRunning);
     }
 
@@ -558,7 +928,8 @@ mod tests {
         let pid = std::process::id();
         std::fs::write(pidfile(&config), pid.to_string()).unwrap();
         let runner = FakeRunner::default().returning("kill", &["-0", &pid.to_string()], 0, "");
-        let got = detect_supervision_with(&config, &runner, Os::Other).await;
+        let got =
+            detect_supervision_with(&config, &runner, Os::Other, &dead_legacy("pidfile")).await;
         assert_eq!(got, Supervision::Pidfile(pid));
     }
 
@@ -567,7 +938,9 @@ mod tests {
         let config = test_config("pidfile-dead");
         std::fs::write(pidfile(&config), "999999").unwrap();
         let runner = FakeRunner::default().returning("kill", &["-0", "999999"], 1, "");
-        let got = detect_supervision_with(&config, &runner, Os::Other).await;
+        let got =
+            detect_supervision_with(&config, &runner, Os::Other, &dead_legacy("pidfile-dead"))
+                .await;
         assert_eq!(got, Supervision::NotRunning);
     }
 
@@ -583,7 +956,8 @@ mod tests {
         });
 
         let runner = FakeRunner::default();
-        let got = detect_supervision_with(&config, &runner, Os::Other).await;
+        let got =
+            detect_supervision_with(&config, &runner, Os::Other, &dead_legacy("socket")).await;
         assert_eq!(got, Supervision::Socket(fake_pid));
     }
 
@@ -591,8 +965,121 @@ mod tests {
     async fn detect_supervision_not_running_when_nothing_answers() {
         let config = test_config("notrunning");
         let runner = FakeRunner::default();
-        let got = detect_supervision_with(&config, &runner, Os::Other).await;
+        let got =
+            detect_supervision_with(&config, &runner, Os::Other, &dead_legacy("notrunning")).await;
         assert_eq!(got, Supervision::NotRunning);
+    }
+
+    #[tokio::test]
+    async fn detect_supervision_finds_bare_daemon_on_legacy_socket() {
+        // The configured socket is dead, but a pre-D-0008 daemon still
+        // answers on the legacy $TMPDIR path — it must not read as NotRunning,
+        // or `dira daemon restart` is a silent no-op against it.
+        let config = test_config("legacy-daemon-info");
+        let legacy = sock_in("leg-info", "l.sock");
+        let listener = UnixListener::bind(&legacy).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                respond_daemon_info(stream, 777).await;
+            }
+        });
+
+        let runner = FakeRunner::default();
+        let got = detect_supervision_with(&config, &runner, Os::Other, &legacy).await;
+        assert_eq!(
+            got,
+            Supervision::LegacySocket {
+                pid: Some(777),
+                sock: legacy,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_supervision_prefers_the_configured_socket_over_legacy() {
+        // Both sockets answer, with different pids — the legacy probe must
+        // never fire while the configured one is live, so the legacy path
+        // stays non-load-bearing per D-0008.
+        let config = test_config("both-sockets");
+        let configured_pid = 111u32;
+        let configured_listener = UnixListener::bind(&config.socket_path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = configured_listener.accept().await {
+                respond_daemon_info(stream, configured_pid).await;
+            }
+        });
+
+        let legacy = sock_in("both", "l.sock");
+        let legacy_listener = UnixListener::bind(&legacy).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = legacy_listener.accept().await {
+                respond_daemon_info(stream, 222).await;
+            }
+        });
+
+        let runner = FakeRunner::default();
+        let got = detect_supervision_with(&config, &runner, Os::Other, &legacy).await;
+        assert_eq!(got, Supervision::Socket(configured_pid));
+    }
+
+    #[tokio::test]
+    async fn detect_supervision_skips_legacy_when_it_is_the_configured_path() {
+        // Nothing listens anywhere, and the "legacy" path passed in is the
+        // configured one — the guard must skip the (redundant) probe rather
+        // than dialing the same dead path twice and returning something
+        // other than NotRunning.
+        let config = test_config("legacy-is-configured");
+        let legacy = config.socket_path.clone();
+        let runner = FakeRunner::default();
+        let got = detect_supervision_with(&config, &runner, Os::Other, &legacy).await;
+        assert_eq!(got, Supervision::NotRunning);
+    }
+
+    #[tokio::test]
+    async fn detect_supervision_legacy_pid_from_pidfile_when_daemon_predates_daemon_info() {
+        // A pre-public dev build answers `Ping` but not `DaemonInfo` — pid
+        // recovery falls back to the pidfile beside the legacy socket.
+        let config = test_config("legacy-pong-only");
+        let legacy = sock_in("leg-pong", "l.sock");
+        let listener = UnixListener::bind(&legacy).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                respond_pong(stream).await;
+            }
+        });
+
+        let pid = std::process::id();
+        std::fs::write(pidfile_beside(&legacy), pid.to_string()).unwrap();
+        let runner = FakeRunner::default().returning("kill", &["-0", &pid.to_string()], 0, "");
+
+        let got = detect_supervision_with(&config, &runner, Os::Other, &legacy).await;
+        assert_eq!(
+            got,
+            Supervision::LegacySocket {
+                pid: Some(pid),
+                sock: legacy,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_removes_the_legacy_socket_and_pidfile() {
+        // Nothing listens — the pid is already dead — but the socket file and
+        // pidfile are still on disk, as they would be after a hard crash.
+        // `reap` must clean both up so nothing trips on the stale rendezvous
+        // point later.
+        let legacy = sock_in("reap", "l.sock");
+        std::fs::write(&legacy, b"").unwrap();
+        std::fs::write(pidfile_beside(&legacy), "999999").unwrap();
+
+        let runner = FakeRunner::default();
+        reap(999_999, &legacy, &runner).await;
+
+        assert!(!legacy.exists(), "legacy socket file must be removed");
+        assert!(
+            !pidfile_beside(&legacy).exists(),
+            "legacy pidfile must be removed"
+        );
     }
 
     // -- restart's per-mode command selection --------------------------------
@@ -644,5 +1131,32 @@ mod tests {
         assert!(err
             .to_string()
             .contains("systemctl --user restart dirad.service"));
+    }
+
+    #[tokio::test]
+    async fn restart_errors_with_manual_command_for_a_legacy_daemon_without_pid() {
+        // A legacy daemon answers (so it's not NotRunning) but its pid can't
+        // be determined (no pidfile, pre-public dev build) — restart must
+        // refuse rather than start a second daemon beside an unkillable
+        // zombie (the D-0009 two-daemon hazard).
+        let config = test_config("legacy-no-pid-restart");
+        let legacy = sock_in("leg-nopid", "l.sock");
+        let listener = UnixListener::bind(&legacy).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                respond_pong(stream).await;
+            }
+        });
+
+        let runner = FakeRunner::default();
+        let err = restart_with(&config, &runner, Os::Other, &legacy)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pkill -x dirad"), "message was: {msg}");
+        assert!(
+            msg.contains(&legacy.display().to_string()),
+            "message was: {msg}"
+        );
     }
 }

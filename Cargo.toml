@@ -28,12 +28,12 @@ tower = "0.5"
 
 # HTTP client (daemon → cloud ingest, CLI → device claim). rustls so we never
 # depend on a system OpenSSL; json for (de)serializing envelope/claim bodies.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 
 # Terminal UI (the `dira watch` live dashboard). crossterm's `event-stream`
 # feature gives an async `EventStream` we can poll alongside the refresh timer;
@@ -51,7 +51,7 @@ futures = "0.3"
 # Storage
 # `macros` provides `migrate!` + `query!`; we use runtime queries only, so builds
 # and CI never need a live DB (no `query!` calls = no compile-time DB check).
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 
 # Serialization + schema
 serde = { version = "1", features = ["derive"] }
@@ -65,7 +65,7 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 # hashing), and 0.11 is also present in the tree via a different consumer —
 # depending on "0.10" here reuses the existing 0.10.9 resolution instead of
 # compiling both major lines for one crate.
-sha2 = "0.10"
+sha2 = "0.11"
 # Hex-encode/decode the sha256 digest `dira update` compares against the
 # published `.sha256` asset. Already resolved transitively (sqlx-macros-core);
 # promoted to a direct dep rather than added fresh.
@@ -86,14 +86,14 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 # real OS keychain — it must track the version keyring depends on.
 keyring = { version = "4", features = ["v1"] }
 keyring-core = "1"
-serde_jcs = "0.1"
-base64 = "0.22"
+serde_jcs = "0.2"
+base64 = "0.23"
 
 # Config + ids + logging
 figment = { version = "0.10", features = ["toml", "env"] }
 # Surgical, comment-preserving edits to the XDG `config.toml` (`dira config set`).
 # Already in the tree transitively via figment; pinned to the same 0.22 line.
-toml_edit = "0.22"
+toml_edit = "0.25"
 ulid = { version = "1", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -113,7 +113,7 @@ dira-core = { path = "cli/core" }
 dira-sources = { path = "cli/sources" }
 
 # Dev-only
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1"
 tempfile = "3"
 

@@ -159,6 +159,7 @@ fn daemon_info(state: &AppState) -> Response {
         schema_version: dira_contract::SCHEMA_VERSION.to_string(),
         pid: std::process::id(),
         uptime_seconds: state.started_at.elapsed().as_secs(),
+        http_ingress_error: state.http_ingress_error.lock().unwrap().clone(),
     }
 }
 

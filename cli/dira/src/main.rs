@@ -593,7 +593,8 @@ enum DaemonAction {
     Start,
     /// Stop the daemon.
     Stop,
-    /// Show whether the daemon is up.
+    /// Show whether the daemon is up (exit 0 if any daemon is running — even
+    /// a pre-upgrade one; 1 if none).
     Status,
     /// Install an OS service (launchd/systemd-user) so it survives reboots.
     Install,
@@ -655,12 +656,13 @@ async fn main() -> Result<()> {
                 DaemonAction::Start => daemon::start(&config).await,
                 DaemonAction::Stop => daemon::stop(&config).await,
                 DaemonAction::Status => {
-                    let result = daemon::status(&config).await;
-                    if result.is_ok() {
-                        print_supervision(&config).await;
-                    }
+                    let running = daemon::status(&config).await?;
+                    print_supervision(&config).await;
                     update::notice::maybe_print(&config);
-                    result
+                    if !running {
+                        std::process::exit(1);
+                    }
+                    Ok(())
                 }
                 DaemonAction::Install => daemon::install(&config),
                 DaemonAction::Restart => daemon::restart(&config).await,
@@ -938,11 +940,15 @@ async fn print_version(config: &Config) -> Result<()> {
             schema_version,
             pid,
             uptime_seconds,
+            http_ingress_error,
         }) => {
             println!(
                 "dirad   {version}  (schema {schema_version}, pid {pid}, up {})",
                 format::hms(uptime_seconds as i64)
             );
+            if let Some(reason) = http_ingress_error {
+                println!("warning: daemon is DEGRADED — {reason}");
+            }
             if version != cli {
                 println!(
                     "warning: CLI ({cli}) and daemon ({version}) differ — restart the daemon \
@@ -951,7 +957,14 @@ async fn print_version(config: &Config) -> Result<()> {
             }
         }
         Ok(_) => println!("dirad   (unexpected daemon response)"),
-        Err(_) => println!("dirad   not running"),
+        Err(_) => println!(
+            "{}",
+            daemon::version_not_running_message(
+                daemon::legacy_daemon_socket_default(config)
+                    .await
+                    .as_deref()
+            )
+        ),
     }
     Ok(())
 }
@@ -966,6 +979,11 @@ async fn print_supervision(config: &Config) {
         daemon::Supervision::SystemdUser => "systemd --user".to_string(),
         daemon::Supervision::Pidfile(pid) => format!("pidfile (pid {pid})"),
         daemon::Supervision::Socket(pid) => format!("unmanaged (pid {pid}, no pidfile)"),
+        daemon::Supervision::LegacySocket { pid, sock } => format!(
+            "pre-upgrade daemon on legacy socket {} (pid {})",
+            sock.display(),
+            pid.map_or("unknown".into(), |p| p.to_string())
+        ),
         daemon::Supervision::NotRunning => return,
     };
     println!("supervised by: {label}");

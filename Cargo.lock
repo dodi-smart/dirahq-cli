@@ -1046,6 +1046,7 @@ dependencies = [
  "futures",
  "keyring",
  "keyring-core",
+ "libc",
  "proptest",
  "reqwest",
  "serde",

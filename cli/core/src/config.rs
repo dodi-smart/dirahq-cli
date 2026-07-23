@@ -209,15 +209,54 @@ pub struct Config {
     pub update: UpdateKnobs,
 }
 
+/// Where the control socket lives by default.
+///
+/// The daemon and every client must resolve this to the *same* path with no
+/// coordination, so it may only be anchored to per-user locations — never to
+/// `$TMPDIR`, which differs per process (a launchd agent, an agent sandbox and
+/// a login shell each see a different one) and would leave clients probing a
+/// path nothing is listening on. See D-0008.
+///
+/// Inputs are injected rather than read from the environment inline so every
+/// platform branch is unit-testable from a single dev machine — the same
+/// pattern [`start_of_day`] uses for the UTC offset.
+fn default_socket_path(xdg_runtime: Option<PathBuf>, data_dir: Option<PathBuf>) -> PathBuf {
+    // `$XDG_RUNTIME_DIR` first: on Linux it is the standard home for per-user
+    // sockets, and it is already per-user and session-stable.
+    if let Some(runtime) = xdg_runtime {
+        return runtime.join("dira.sock");
+    }
+    // Otherwise sit beside the database — unset on macOS, and on Linux boxes
+    // without a session runtime dir. Well inside the ~104-byte `sun_path`
+    // limit for any realistic username.
+    if let Some(data_dir) = data_dir {
+        return data_dir.join("dira.sock");
+    }
+    // Exotic platform with no resolvable project dirs: nothing stable to
+    // anchor to, so the historical temp-dir behavior is all that is left.
+    std::env::temp_dir().join("dira.sock")
+}
+
+/// Where the control socket lived *before* [`default_socket_path`] anchored it
+/// to a per-user location — `$TMPDIR/dira.sock`.
+///
+/// Transitional: a daemon started by an older build is still listening here,
+/// and a freshly-upgraded client would otherwise report it "down" — the exact
+/// confusion D-0008 exists to remove. Used only to render an actionable
+/// "restart it" hint, never as a working fallback, so the old path never
+/// becomes load-bearing again. Delete once no pre-D-0008 daemon can be alive.
+pub fn legacy_socket_path() -> PathBuf {
+    std::env::temp_dir().join("dira.sock")
+}
+
 impl Default for Config {
     fn default() -> Self {
         let dirs = project_dirs();
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .or_else(|| std::env::temp_dir().into())
-            .unwrap_or_else(std::env::temp_dir);
         Self {
-            socket_path: runtime.join("dira.sock"),
+            socket_path: default_socket_path(
+                std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+                dirs.as_ref().map(|d| d.data_dir().to_path_buf()),
+            ),
             http_port: 8722,
             db_path: dirs
                 .map(|d| d.data_dir().join("dira.db"))
@@ -345,6 +384,81 @@ pub fn project_dirs() -> Option<ProjectDirs> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- control socket path ------------------------------------------------
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn socket_path_does_not_follow_tmpdir() {
+        // Regression: the control socket used to be resolved through
+        // `std::env::temp_dir()`, i.e. `$TMPDIR`. Any client whose TMPDIR
+        // differed from the daemon's — an agent sandbox, a launchd agent, a
+        // cron job — then looked for the socket somewhere nothing was
+        // listening and reported the daemon "down" while it was healthy.
+        let home = std::env::var("HOME").expect("HOME must be set to resolve project dirs");
+        figment::Jail::expect_with(|jail| {
+            // `clear_env` also drops XDG_RUNTIME_DIR, pinning this on the
+            // per-user fallback branch on both macOS and Linux. HOME goes back
+            // because `project_dirs()` needs it.
+            jail.clear_env();
+            jail.set_env("HOME", &home);
+
+            jail.set_env("TMPDIR", "/tmp/dira-tmpdir-a");
+            let a = Config::default().socket_path;
+            jail.set_env("TMPDIR", "/tmp/dira-tmpdir-b");
+            let b = Config::default().socket_path;
+
+            assert_eq!(a, b, "the control socket path must not depend on $TMPDIR");
+            Ok(())
+        });
+    }
+
+    // The three `default_socket_path` branches. The regression test above can
+    // only ever exercise whichever branch the host machine lands on, so pin
+    // each one explicitly.
+
+    #[test]
+    fn socket_path_prefers_xdg_runtime_dir() {
+        let got = default_socket_path(
+            Some(PathBuf::from("/run/user/1000")),
+            Some(PathBuf::from("/home/u/.local/share/dira")),
+        );
+        assert_eq!(got, PathBuf::from("/run/user/1000/dira.sock"));
+    }
+
+    #[test]
+    fn socket_path_falls_back_to_the_data_dir() {
+        // No XDG_RUNTIME_DIR (always the macOS case, and Linux without a
+        // session runtime dir): the socket sits beside the database, which is
+        // already a stable per-user location.
+        let got = default_socket_path(None, Some(PathBuf::from("/home/u/.local/share/dira")));
+        assert_eq!(got, PathBuf::from("/home/u/.local/share/dira/dira.sock"));
+    }
+
+    #[test]
+    fn socket_path_last_resort_is_the_temp_dir() {
+        let got = default_socket_path(None, None);
+        assert_eq!(got, std::env::temp_dir().join("dira.sock"));
+    }
+
+    #[test]
+    fn socket_path_stays_within_the_sun_path_limit() {
+        // A unix socket path is capped at ~104 bytes on macOS / 108 on Linux;
+        // exceeding it fails the bind at runtime, which the type system will
+        // not catch. Leave generous headroom for a long username.
+        let got = default_socket_path(
+            None,
+            Some(PathBuf::from(
+                "/Users/a-rather-long-user-name/Library/Application Support/sh.dirahq.dira",
+            )),
+        );
+        assert!(
+            got.as_os_str().len() < 104,
+            "socket path {} is {} bytes — too long to bind",
+            got.display(),
+            got.as_os_str().len(),
+        );
+    }
 
     #[test]
     fn default_cloud_url_is_the_hosted_cloud() {

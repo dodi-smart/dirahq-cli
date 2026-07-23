@@ -169,6 +169,13 @@ pub enum Response {
         pid: u32,
         /// Seconds since the daemon started.
         uptime_seconds: u64,
+        /// Why the loopback hook ingress is not serving, or `None` when it is
+        /// healthy. A daemon whose ingress port is taken keeps answering here
+        /// but captures nothing, so it must not be indistinguishable from a
+        /// healthy one (D-0009). `default` so a newer `dira` can still read an
+        /// older daemon's reply during a partial update.
+        #[serde(default)]
+        http_ingress_error: Option<String>,
     },
     /// `ZavetStatus`. Boxed like `Status` to keep small arms small.
     ZavetStatus(Box<ZavetStatusView>),

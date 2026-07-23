@@ -30,6 +30,7 @@ time.workspace = true
 anyhow.workspace = true
 fastrand.workspace = true
 futures.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 # Throwaway dirs for `zavet`'s activation-probe and capture tests.

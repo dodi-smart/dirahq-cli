@@ -20,6 +20,9 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Async runtime + ingress
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+# `flock(2)` for the daemon's single-instance lock (D-0009); already in the
+# tree transitively, MSRV-safe where `std`'s file locks (1.89) are not.
+libc = "0.2"
 axum = "0.8"
 tower = "0.5"
 

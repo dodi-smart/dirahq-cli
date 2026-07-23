@@ -307,6 +307,7 @@ async fn daemon_info_reports_version_schema_and_pid() {
             schema_version,
             pid,
             uptime_seconds: _,
+            http_ingress_error: _,
         } => {
             assert_eq!(version, env!("CARGO_PKG_VERSION"));
             assert_eq!(schema_version, dira_contract::SCHEMA_VERSION);

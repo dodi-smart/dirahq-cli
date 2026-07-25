@@ -150,6 +150,9 @@ pub fn build_batch_with_partials(
     assemble_batch(
         events,
         &[], // single-window build: no pre-cursor seed
+        &[], // no history — build_batch* has no store to fetch it from; the
+        // daemon's chunked path (build_chunked_batches) is what feeds history
+        // in production (issue #40).
         token_rows,
         artifact_rows,
         partials,
@@ -170,6 +173,12 @@ fn assemble_batch(
     // Gap anchors from before the window's cursor (see `build_intervals_seeded`).
     // Empty for a single-window build and for every chunk after the first.
     seed: &[RawEvent],
+    // Full retained history for sessions ending in THIS `events` slice, so their
+    // terminal rollup aggregates over the whole session, not just the tail window
+    // (issue #40). Feeds ONLY `build_sessions` below — intervals and the batch id
+    // derive from `events` (+ `seed`) alone, so they stay byte-identical whether or
+    // not a session's rollup ends up history-aggregated.
+    history: &[RawEvent],
     token_rows: &[TokenRow],
     artifact_rows: &[ArtifactRow],
     partials: &[PartialSession],
@@ -183,7 +192,7 @@ fn assemble_batch(
     // interval's (start,end) split of the same minutes yields a DIFFERENT batch id so
     // the cloud re-unpacks it, while a byte-identical rebuild stays stable (issue #21).
     let batch_id = batch_id_for_chunk(events, artifact_rows, &intervals);
-    let mut sessions = build_sessions(events, idle);
+    let mut sessions = build_sessions(events, history, idle);
     // Drop degenerate sessions before shipping: no engaged time AND no agent
     // activity is empty noise (a bare SessionStart with nothing after it), so it
     // never reaches the cloud. Manual/agent sessions with real time are kept.
@@ -298,12 +307,19 @@ pub fn build_chunked_batches(
     // boundary. Used only to recover the boundary-straddling gap in the FIRST chunk;
     // later chunks open on `> idle` breaks by construction, so nothing straddles them.
     seed: &[RawEvent],
+    // Full retained history for sessions ENDING somewhere in this flush's window
+    // (issue #40). Passed to EVERY chunk's `assemble_batch` call: each chunk derives
+    // its own `ended_ids` from its own event slice, so history only actually merges
+    // into whichever chunk holds that session's SessionEnd/ManualStop — passing it to
+    // the others is a no-op for them, not a duplication risk.
+    history: &[RawEvent],
 ) -> Vec<ChunkBatch> {
     if events.is_empty() {
         // Artifact/partial-only flush — one batch, no event cursor to advance.
         let batch = assemble_batch(
             &[],
             &[], // no window events → no boundary gap to seed
+            history,
             token_rows,
             artifact_rows,
             partials,
@@ -333,7 +349,9 @@ pub fn build_chunked_batches(
             } else {
                 (&[], &[], &[])
             };
-            let batch = assemble_batch(chunk, chunk_seed, toks, arts, parts, device_id, idle, now);
+            let batch = assemble_batch(
+                chunk, chunk_seed, history, toks, arts, parts, device_id, idle, now,
+            );
             ChunkBatch {
                 batch,
                 cursor_event_id: chunk.last().map(|ev| ev.id.clone()),
@@ -527,7 +545,34 @@ fn interval_id(
 /// session's event timestamps ([`crate::accounting::active_seconds`]), so a
 /// session left open for hours but only sporadically active reports its active
 /// spans, not the dead span between them.
-fn build_sessions(events: &[RawEvent], idle: Duration) -> Vec<SessionRollup> {
+///
+/// ## History aggregation (issue #40)
+/// A session that spans multiple sync flush windows previously rolled up only its
+/// TAIL window: the daemon emits a session's `SessionRollup` once, on the flush
+/// where it observes the end, built solely from that flush's `events` slice — so
+/// `prompts`, `branch`, `started_at`, and `agent_wall_seconds` only ever reflected
+/// the last window, silently dropping everything from earlier windows. `history`
+/// fixes that: for each session that ends IN `events` (`ended_ids`, computed from
+/// `events` alone), we merge in the session's full retained history — deduped by
+/// event id against `events` — before running the accumulator, so the rollup
+/// aggregates over the WHOLE session.
+///
+/// CRITICAL: history must NEVER mark a session ended. Claude Code emits
+/// `SessionEnd` on compaction, so a still-*live* session's history can contain a
+/// stale end event; if history could set `ended`, we'd emit a false terminal
+/// rollup for a live session. This is enforced structurally, not by a runtime
+/// check: history is only ever merged in for a session already in `ended_ids`
+/// (i.e. one whose *window* slice carries a real end), so a live session's
+/// history never enters `merged` at all.
+///
+/// Best-effort semantics: `history` comes from retained (not-yet-compacted)
+/// storage, so a session that outlives retention yields a partial — but always a
+/// superset of the old tail-only — rollup. Idempotency note: a retried chunk
+/// after compaction narrows the available history, so it may produce a rollup
+/// with slightly different content under the same `batch_id`; the cloud's
+/// batch-id dedup makes the FIRST accepted version stick, which is acceptable —
+/// it is still always a superset of the pre-#40 tail-only rollup.
+fn build_sessions(events: &[RawEvent], history: &[RawEvent], idle: Duration) -> Vec<SessionRollup> {
     // session_id -> accumulator. BTreeMap for deterministic output ordering.
     struct Acc {
         harness: Harness,
@@ -552,8 +597,36 @@ fn build_sessions(events: &[RawEvent], idle: Duration) -> Vec<SessionRollup> {
         label: Option<String>,
     }
 
+    // Sessions that END in THIS window's slice ONLY — never from `history` (see the
+    // CRITICAL note above).
+    let ended_ids: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::SessionEnd | EventKind::ManualStop))
+        .map(|e| e.session_id.as_str())
+        .collect();
+
+    // Merge `events` with the subset of `history` that (a) belongs to a session
+    // ending in this window and (b) isn't already in `events` (ids are ULIDs, the
+    // events-table PK, so a plain set-membership check dedups exactly). Note that
+    // the history query returns window events too — including this SAME session's
+    // events sitting in OTHER chunks of this flush — so those get pulled in here
+    // too, which is exactly the point: a session's rollup should aggregate over the
+    // whole flush's worth of its events, not just the chunk that happened to carry
+    // the end.
+    let slice_ids: std::collections::HashSet<&str> = events.iter().map(|e| e.id.as_str()).collect();
+    let mut merged: Vec<&RawEvent> = events.iter().collect();
+    merged.extend(history.iter().filter(|e| {
+        ended_ids.contains(e.session_id.as_str()) && !slice_ids.contains(e.id.as_str())
+    }));
+    // Sort by (at, id): the accumulator below is order-dependent (first-non-null
+    // project/email/note/label, `start_branch` via `e.at < entry.first`), and a
+    // history-carried stale end (e.g. a compaction `SessionEnd`) must lose to a
+    // later real end on `ended_at` — sorting by `at` (ties broken by id) makes the
+    // last-processed end win, which is always the temporally-latest one.
+    merged.sort_by(|a, b| (a.at, a.id.as_str()).cmp(&(b.at, b.id.as_str())));
+
     let mut sessions: BTreeMap<&str, Acc> = BTreeMap::new();
-    for e in events {
+    for e in merged.into_iter() {
         let entry = sessions
             .entry(e.session_id.as_str())
             .or_insert_with(|| Acc {
@@ -810,6 +883,16 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+        }
+    }
+
+    /// Like [`ev`] but with a branch set — the plain helper hardcodes `branch:
+    /// None`, so history-aggregation tests that need to track a branch across
+    /// events use this instead.
+    fn ev_b(session: &str, secs: i64, kind: EventKind, project: &str, branch: &str) -> RawEvent {
+        RawEvent {
+            branch: Some(branch.to_string()),
+            ..ev(session, secs, kind, project)
         }
     }
 
@@ -1474,5 +1557,200 @@ mod tests {
         if let Some(asess) = abatch.sessions.iter().find(|s| s.session_id == "a") {
             assert!(asess.note.is_none() && asess.label.is_none());
         }
+    }
+
+    // --- issue #40: history-aware build_sessions ---------------------------------
+
+    #[test]
+    fn history_merges_prompts_branch_started_at_into_ended_rollup() {
+        // The window carries ONLY the bare SessionEnd; everything that makes the
+        // rollup meaningful — its start, branch, and prompts — lives in history
+        // from earlier flush windows only.
+        let history = vec![
+            ev_b("s1", 0, EventKind::SessionStart, "p", "main"),
+            ev_b("s1", 10, EventKind::UserPrompt, "p", "main"),
+            ev("s1", 20, EventKind::PreTool, "p"),
+            ev("s1", 30, EventKind::PostTool, "p"),
+            ev_b("s1", 40, EventKind::UserPrompt, "p", "main"),
+        ];
+        let window = vec![ev("s1", 600, EventKind::SessionEnd, "p")];
+
+        // Go through the full chunked-build path (not `build_sessions` directly) so
+        // this also exercises `assemble_batch`'s degenerate-session retain filter:
+        // pre-fix, a window slice that's just a bare SessionEnd has no agent
+        // activity and no interval-engaged time of its own, so the old (window-
+        // only) rollup would have been silently dropped by that filter.
+        let chunks = build_chunked_batches(&window, &[], &[], &[], "d", IDLE, NOW, &[], &history);
+        assert_eq!(chunks.len(), 1);
+        let sessions = &chunks[0].batch.sessions;
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the rollup must exist at all — regression for the degenerate-session \
+             retain filter, which previously dropped a rollup whose window slice \
+             (just the bare SessionEnd) had no activity of its own"
+        );
+        let s = &sessions[0];
+        assert_eq!(
+            s.prompts,
+            Some(2),
+            "two UserPrompt events across history → prompts = 2"
+        );
+        assert_eq!(s.branch.as_deref(), Some("main"));
+        assert_eq!(s.started_at, fmt(OffsetDateTime::UNIX_EPOCH));
+        assert!(
+            s.agent_wall_seconds > 0,
+            "agent wall-clock computed over the full history-merged span, not just \
+             the bare SessionEnd"
+        );
+    }
+
+    #[test]
+    fn history_never_marks_live_session_ended() {
+        // A stale SessionEnd (e.g. a Claude Code compaction end) sits ONLY in
+        // history; the session is still live — its WINDOW slice carries no end at
+        // all. History must never be able to terminate it.
+        let window = vec![
+            ev("s1", 100, EventKind::UserPrompt, "p"),
+            ev("s1", 110, EventKind::PreTool, "p"),
+        ];
+        let history = vec![ev("s1", 50, EventKind::SessionEnd, "p")];
+        let sessions = build_sessions(&window, &history, IDLE);
+        assert!(
+            sessions.iter().all(|s| s.session_id != "s1"),
+            "a SessionEnd sitting only in history must never terminate a live session"
+        );
+    }
+
+    #[test]
+    fn history_dedup_by_event_id_no_double_count() {
+        // The history query is session-scoped, not id-range-scoped, so it
+        // naturally returns the window's own rows again (same ids) plus a
+        // genuinely older event. The window copies must dedup by id, not
+        // double-count.
+        let window = vec![
+            ev("s1", 100, EventKind::UserPrompt, "p"),
+            ev("s1", 200, EventKind::SessionEnd, "p"),
+        ];
+        let history = vec![
+            ev("s1", 0, EventKind::UserPrompt, "p"), // genuinely older — not a dup
+            window[0].clone(),
+            window[1].clone(),
+        ];
+        let sessions = build_sessions(&window, &history, IDLE);
+        let s = sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .expect("session rolled up");
+        assert_eq!(
+            s.prompts,
+            Some(2),
+            "one window prompt + one distinct older history prompt — the id-\
+             duplicated window copies in history must not be double-counted"
+        );
+    }
+
+    #[test]
+    fn chunked_end_chunk_gets_full_history_and_batch_ids_unchanged() {
+        // A window that splits into two chunks: a packed CHUNK_EVENTS-sized burst
+        // (carrying the session's start/branch/prompt), then a > idle gap, then a
+        // short tail chunk that carries the SessionEnd.
+        let mut window: Vec<RawEvent> = Vec::new();
+        window.push(ev_b("s1", 0, EventKind::SessionStart, "p", "main"));
+        window.push(ev_b("s1", 1, EventKind::UserPrompt, "p", "main"));
+        for secs in 2..CHUNK_EVENTS as i64 {
+            window.push(ev("s1", secs, EventKind::PreTool, "p"));
+        }
+        // > idle (5 min = 300s) gap from the burst's last event (@999).
+        window.push(ev("s1", 1300, EventKind::PreTool, "p"));
+        window.push(ev("s1", 1305, EventKind::SessionEnd, "p"));
+
+        let with_history =
+            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, NOW, &[], &window);
+        let without_history =
+            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, NOW, &[], &[]);
+
+        assert_eq!(
+            with_history.len(),
+            2,
+            "expected the burst+tail split into exactly two chunks"
+        );
+        assert_eq!(without_history.len(), 2);
+
+        // Chunk 1 (the burst) carries no SessionEnd in its own slice, so it never
+        // emits a rollup for s1 — history or not.
+        assert!(with_history[0]
+            .batch
+            .sessions
+            .iter()
+            .all(|s| s.session_id != "s1"));
+        assert!(without_history[0]
+            .batch
+            .sessions
+            .iter()
+            .all(|s| s.session_id != "s1"));
+
+        // Chunk 2 (the tail) carries the SessionEnd. WITH history, the rollup
+        // aggregates the FULL session: the burst's prompt and start branch.
+        let s_with = with_history[1]
+            .batch
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .expect("chunk 2 rolls up s1 with history");
+        assert_eq!(
+            s_with.prompts,
+            Some(1),
+            "the single UserPrompt lives in the burst chunk's slice"
+        );
+        assert_eq!(s_with.branch.as_deref(), Some("main"));
+        assert_eq!(s_with.started_at, fmt(OffsetDateTime::UNIX_EPOCH));
+
+        // WITHOUT history, the same chunk only sees its own 2-event tail slice —
+        // the pre-#40 tail-only behavior this fix supersedes.
+        let s_without = without_history[1]
+            .batch
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .expect("chunk 2 still rolls up s1 without history (it has its own activity)");
+        assert_eq!(s_without.prompts, Some(0));
+        assert_eq!(s_without.branch, None);
+        assert_ne!(
+            s_without.started_at, s_with.started_at,
+            "without history, started_at falls back to the tail chunk's own first event"
+        );
+
+        // Batch ids (and, transitively, intervals) must be BYTE-IDENTICAL whether
+        // or not history is supplied — history feeds ONLY build_sessions, never
+        // build_intervals_seeded or batch_id_for_chunk.
+        for i in 0..2 {
+            assert_eq!(
+                with_history[i].batch.batch_id, without_history[i].batch.batch_id,
+                "chunk {i}'s batch_id must be unaffected by history"
+            );
+        }
+    }
+
+    #[test]
+    fn history_ended_at_is_latest_end() {
+        // A compaction-triggered SessionEnd sits in history at t=100; the real
+        // end arrives in the window at t=500. `ended_at` must be the LATEST end
+        // (t=500), not the stale compaction one.
+        let history = vec![
+            ev("s1", 0, EventKind::SessionStart, "p"),
+            ev("s1", 100, EventKind::SessionEnd, "p"), // stale compaction end
+        ];
+        let window = vec![ev("s1", 500, EventKind::SessionEnd, "p")]; // the real end
+        let sessions = build_sessions(&window, &history, IDLE);
+        let s = sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .expect("session rolled up");
+        assert_eq!(
+            s.ended_at,
+            Some(fmt(OffsetDateTime::UNIX_EPOCH + Duration::seconds(500))),
+            "ended_at must be the temporally-latest end, not the stale history one"
+        );
     }
 }

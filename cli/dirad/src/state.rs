@@ -384,6 +384,14 @@ pub struct LiveSession {
     /// or `None` if none yet. Used to decide "new activity since the last partial"
     /// (6c) without re-scanning.
     pub last_partial_active_seconds: Option<u64>,
+    /// Human prompts (`UserPrompt` events) observed so far.
+    pub prompts: u64,
+    /// Last resolved (non-null) branch across the session's events. Deliberately
+    /// last-wins — a *live* session's current branch is the honest answer for a
+    /// partial rollup — unlike `build_sessions`' start-branch-with-frequency-
+    /// fallback policy for ended rollups, whose terminal write overwrites this
+    /// anyway (issue #40).
+    pub branch: Option<String>,
 }
 
 impl LiveSession {
@@ -453,6 +461,8 @@ impl SessionRegistry {
                 last_human_signal_at: None,
                 last_active_at: None,
                 last_partial_active_seconds: None,
+                prompts: 0,
+                branch: ev.branch.clone(),
             });
 
         // Active gap (all events): add the gap from the previous event of any kind
@@ -477,6 +487,12 @@ impl SessionRegistry {
         }
         if entry.note.is_none() && ev.note.is_some() {
             entry.note = ev.note.clone();
+        }
+        if ev.branch.is_some() {
+            entry.branch = ev.branch.clone();
+        }
+        if matches!(ev.kind, EventKind::UserPrompt) {
+            entry.prompts += 1;
         }
         if ev.kind.is_human_signal() {
             entry.last_human_signal_at = Some(ev.at);
@@ -719,6 +735,21 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+        }
+    }
+
+    /// Like `ev_at`, but carries a `branch` — for the last-wins branch tracking
+    /// tests, which need events that actually set it.
+    fn ev_at_branch(
+        session: &str,
+        kind: EventKind,
+        project: Option<&str>,
+        secs: i64,
+        branch: Option<&str>,
+    ) -> RawEvent {
+        RawEvent {
+            branch: branch.map(str::to_string),
+            ..ev_at(session, kind, project, secs)
         }
     }
 
@@ -966,5 +997,60 @@ mod tests {
             accounting::total_human_seconds(&signals, IDLE) as u64,
             "per-session engaged must sum to the deduped grand total",
         );
+    }
+
+    /// Issue #40: a partial rollup for a still-live session needs `prompts` and
+    /// `branch` filled in instead of `None`/0. `prompts` counts `UserPrompt`
+    /// events; `branch` is last-wins over any event that carries one, and a
+    /// branchless event must never clear a previously-resolved branch.
+    #[test]
+    fn observe_counts_prompts_and_tracks_last_branch() {
+        let p = Some("github.com/acme/api");
+        let mut reg = SessionRegistry::default();
+
+        reg.observe(
+            &ev_at_branch("s1", EventKind::SessionStart, p, 0, Some("main")),
+            IDLE,
+        );
+        reg.observe(
+            &ev_at_branch("s1", EventKind::UserPrompt, p, 10, Some("main")),
+            IDLE,
+        );
+        reg.observe(&ev_at("s1", EventKind::PreTool, p, 20), IDLE);
+        reg.observe(&ev_at("s1", EventKind::PostTool, p, 30), IDLE);
+        // Branch flips mid-session.
+        reg.observe(
+            &ev_at_branch("s1", EventKind::UserPrompt, p, 40, Some("feat/x")),
+            IDLE,
+        );
+        // A branchless event must NOT clear the resolved branch.
+        reg.observe(&ev_at("s1", EventKind::PostTool, p, 50), IDLE);
+
+        let s1 = reg.sessions.get("s1").expect("session present");
+        assert_eq!(s1.prompts, 2, "two UserPrompt events observed");
+        assert_eq!(
+            s1.branch.as_deref(),
+            Some("feat/x"),
+            "last non-null branch wins, and a later branchless event doesn't clear it"
+        );
+
+        // Replay-equivalence: a fresh registry fed the identical sequence
+        // reproduces the same (prompts, branch) — the guarantee `hydrate` relies
+        // on to reconstruct live state after a daemon restart.
+        let seq = [
+            ev_at_branch("s1", EventKind::SessionStart, p, 0, Some("main")),
+            ev_at_branch("s1", EventKind::UserPrompt, p, 10, Some("main")),
+            ev_at("s1", EventKind::PreTool, p, 20),
+            ev_at("s1", EventKind::PostTool, p, 30),
+            ev_at_branch("s1", EventKind::UserPrompt, p, 40, Some("feat/x")),
+            ev_at("s1", EventKind::PostTool, p, 50),
+        ];
+        let mut replay = SessionRegistry::default();
+        for ev in &seq {
+            replay.observe(ev, IDLE);
+        }
+        let replayed = replay.sessions.get("s1").expect("session present");
+        assert_eq!(replayed.prompts, s1.prompts);
+        assert_eq!(replayed.branch, s1.branch);
     }
 }

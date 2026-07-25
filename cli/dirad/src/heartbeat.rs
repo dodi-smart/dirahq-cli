@@ -1108,6 +1108,8 @@ mod tests {
             last_human_signal_at: None,
             last_active_at: None,
             last_partial_active_seconds: None,
+            prompts: 0,
+            branch: None,
         }
     }
 

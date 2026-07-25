@@ -142,10 +142,13 @@ async fn process_message(
     events_ingested: &mut u64,
     events_coalesced: &mut u64,
 ) {
-    // For Claude hooks at a turn boundary, remember the transcript so we can
-    // capture token usage after the event is logged (off the response path).
+    // For hooks at a turn boundary, remember the transcript (and which harness
+    // wrote it) so we can capture token usage after the event is logged (off
+    // the response path).
     let transcript = match &msg {
-        EventMsg::Hook { norm, .. } if captures_tokens(norm.kind) => norm.transcript_path.clone(),
+        EventMsg::Hook { norm, harness, .. } if captures_tokens(norm.kind) => {
+            norm.transcript_path.clone().map(|p| (p, *harness))
+        }
         _ => None,
     };
     let ev = match msg {
@@ -230,8 +233,8 @@ async fn process_message(
             capture_fn(state, cwd, proj);
         }
     }
-    if let Some(path) = transcript {
-        capture_tokens(state, &path, &ev.session_id, ev.project.as_deref()).await;
+    if let Some((path, harness)) = transcript {
+        capture_tokens(state, &path, harness, &ev.session_id, ev.project.as_deref()).await;
     }
 }
 
@@ -370,7 +373,9 @@ fn enrich(
     }
 }
 
-/// Parse the session transcript and upsert each assistant turn's token usage.
+/// Tail-read whichever per-session file the harness's hook reported —
+/// Claude's JSONL transcript, grok's `updates.jsonl` — and upsert each turn's
+/// token usage.
 ///
 /// Reads only the *appended tail* since the last capture: a per-session byte
 /// offset is kept in `meta` (`token_offset:<session_id>`) so a long-running
@@ -380,15 +385,22 @@ fn enrich(
 /// (the byte after the final `\n`). Stopping at a line boundary means the next
 /// read never begins mid-record, so a turn written across two captures is never
 /// dropped. If the file shrank below the stored offset (truncation/rotation, e.g.
-/// a compaction), we reset to 0 and re-read.
+/// a compaction), we reset to 0 and re-read. This offset/dedup machinery is
+/// shared across harnesses; only the per-line parser below is harness-specific.
 ///
-/// uuid dedup (`upsert ON CONFLICT DO NOTHING`) is the correctness backstop, so a
+/// `harness` selects the parser: grok turns come from
+/// `dira_core::tokens::parse_grok_updates_usage` and are keyed by the update's
+/// `eventId`, everything else uses `dira_core::tokens::parse_transcript_usage`
+/// (Claude's transcript uuid).
+///
+/// id dedup (`upsert ON CONFLICT DO NOTHING`) is the correctness backstop, so a
 /// small overlap at the offset boundary is harmless. Best-effort throughout: any
 /// IO error logs at debug and leaves the offset untouched (the next capture
 /// retries from the same point).
 async fn capture_tokens(
     state: &AppState,
     transcript_path: &str,
+    harness: Harness,
     session_id: &str,
     project: Option<&str>,
 ) {
@@ -441,7 +453,10 @@ async fn capture_tokens(
         return;
     }
 
-    let turns = dira_core::tokens::parse_transcript_usage(&tail);
+    let turns = match harness {
+        Harness::Grok => dira_core::tokens::parse_grok_updates_usage(&tail),
+        _ => dira_core::tokens::parse_transcript_usage(&tail),
+    };
     let mut captured = 0usize;
     for t in &turns {
         match state.store.upsert_token_usage(t, session_id, project).await {

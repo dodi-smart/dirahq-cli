@@ -36,10 +36,17 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
   project scope would prompt for folder trust). Grok's envelope is camelCase
   (`hookEventName`, `sessionId`, `workspaceRoot`) with snake_case event
   values (`user_prompt_submit`); `cwd` falls back to `workspaceRoot`.
-- Grok's `transcriptPath` (an ACP `updates.jsonl`) is deliberately withheld
-  from `Normalized` — the daemon's token backfill parser is Claude-shaped
-  and would waste IO on it. Grok-aware token capture (diffing the session's
-  `signals.json` counters) is a planned follow-up.
+- Grok's `transcriptPath` (an ACP `updates.jsonl`) is forwarded through
+  `Normalized` like any other harness's transcript path. The daemon's
+  `capture_tokens` (`cli/dirad/src/writer.rs`) selects a harness-specific
+  parser: `Harness::Grok` uses `dira_core::tokens::parse_grok_updates_usage`,
+  which reads `_x.ai/session/update` envelopes and extracts `usage` only from
+  `turn_completed` records, keyed by the update's `_meta.eventId` (falling
+  back to `prompt_id` + envelope timestamp). The offset/dedup machinery is
+  shared with Claude's transcript capture — only the per-line parser differs.
+  `signals.json` was investigated as an alternative (diffing its counters)
+  and dropped: it carries no token counters at all, so `updates.jsonl` is the
+  only source of per-turn usage.
 
 ## Interfaces & data
 
@@ -62,7 +69,5 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 
 ## Open Questions
 
-- Grok token capture via `signals.json` diffing (needs field verification
-  against a real grok-build install).
 - Should `dira init` warn when grok-build's Claude/Cursor compat replay is
   enabled (double-fire is harmless but noisy in daemon logs)?

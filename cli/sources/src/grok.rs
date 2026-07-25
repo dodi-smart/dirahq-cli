@@ -35,8 +35,8 @@ pub struct GrokHook {
     pub workspace_root: Option<String>,
     #[serde(default)]
     pub tool_name: Option<String>,
-    /// Absolute path to the session's ACP `updates.jsonl`, when present. We
-    /// deliberately never forward this — see [`normalize`].
+    /// Absolute path to the session's ACP `updates.jsonl`, when present.
+    /// Forwarded as-is — see [`normalize`].
     #[serde(default)]
     pub transcript_path: Option<String>,
 }
@@ -66,11 +66,11 @@ pub fn normalize(hook: &GrokHook) -> Option<Normalized> {
         kind,
         cwd: hook.cwd.clone().or_else(|| hook.workspace_root.clone()),
         tool: hook.tool_name.clone(),
-        // grok's transcriptPath points at an ACP `updates.jsonl`, not a
-        // Claude-shaped transcript. Withholding it here keeps the daemon's
-        // Claude-specific token parser from wasting IO trying to read it.
-        // A grok-aware transcript capture is a planned follow-up.
-        transcript_path: None,
+        // grok's transcriptPath points at its ACP `updates.jsonl`, whose
+        // `turn_completed` records are parsed by
+        // `dira_core::tokens::parse_grok_updates_usage` in the daemon's
+        // token capture — see `cli/dirad/src/writer.rs::capture_tokens`.
+        transcript_path: hook.transcript_path.clone(),
     })
 }
 
@@ -166,13 +166,13 @@ mod tests {
     }
 
     #[test]
-    fn transcript_path_is_never_forwarded() {
+    fn transcript_path_is_forwarded() {
         let hook: GrokHook = serde_json::from_str(
             r#"{"hookEventName":"session_start","sessionId":"c","transcriptPath":"/tmp/updates.jsonl"}"#,
         )
         .unwrap();
         let n = normalize(&hook).unwrap();
-        assert!(n.transcript_path.is_none());
+        assert_eq!(n.transcript_path.as_deref(), Some("/tmp/updates.jsonl"));
     }
 
     #[test]

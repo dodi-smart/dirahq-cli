@@ -9,6 +9,8 @@
 //! label, never a billing base (the contract keeps compute out of money).
 
 use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 /// One assistant turn's token usage. `id` is the transcript message uuid, used as
 /// the idempotency key when persisting.
@@ -61,6 +63,14 @@ pub fn pricing_for(model: &str) -> ModelPricing {
             output: 4.0,
             cache_read: 0.08,
             cache_write: 1.0,
+        }
+    } else if m.contains("grok") {
+        // xAI grok-4 list pricing; fast/mini variants cost less — still only an estimate.
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.75,
+            cache_write: 0.0,
         }
     } else {
         // sonnet + unknown fallback
@@ -125,6 +135,113 @@ pub fn parse_transcript_usage(jsonl: &str) -> Vec<TokenTurn> {
             cache_read: u("cache_read_input_tokens"),
             cache_create: u("cache_creation_input_tokens"),
         });
+    }
+    out
+}
+
+/// Parse a grok-build session transcript (`~/.grok/sessions/<encoded-cwd>/<id>/updates.jsonl`,
+/// JSONL) into per-turn token usage.
+///
+/// Each line is an envelope `{"timestamp": <unix_secs>, "method": "...", "params": {...}}`.
+/// Only lines where `method == "_x.ai/session/update"` and
+/// `params.update.sessionUpdate == "turn_completed"` carry usage; per-turn usage is
+/// otherwise absent from the file entirely. `params.update.usage` is itself optional
+/// (omitted on some error/cancel paths) — such lines are skipped rather than treated
+/// as zero usage. Lines that don't parse, aren't turn-completion records, or lack
+/// usage are skipped.
+///
+/// Idempotency key: `params._meta.eventId` when present, else
+/// `grok:{prompt_id}:{envelope timestamp}` built from `update.prompt_id` and the
+/// envelope's `timestamp`. A line with neither is skipped — there's no stable key to
+/// dedup or upsert by. De-duplicated by that id within a single parse call.
+pub fn parse_grok_updates_usage(jsonl: &str) -> Vec<TokenTurn> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("method").and_then(|m| m.as_str()) != Some("_x.ai/session/update") {
+            continue;
+        }
+        let Some(params) = v.get("params") else {
+            continue;
+        };
+        let Some(update) = params.get("update") else {
+            continue;
+        };
+        if update.get("sessionUpdate").and_then(|s| s.as_str()) != Some("turn_completed") {
+            continue;
+        }
+        let Some(usage) = update.get("usage").filter(|u| u.is_object()) else {
+            continue; // usage is optional (error/cancel paths) — skip, never zero
+        };
+
+        let envelope_ts = v.get("timestamp").and_then(|t| t.as_i64());
+        // `_meta` rides inside `params` (the ACP notification), not the envelope.
+        let meta = params.get("_meta");
+        let event_id = meta
+            .and_then(|m| m.get("eventId"))
+            .and_then(|e| e.as_str())
+            .map(|s| s.to_string());
+        let prompt_id = update.get("prompt_id").and_then(|p| p.as_str());
+        let id = match (&event_id, prompt_id, envelope_ts) {
+            (Some(id), _, _) => id.clone(),
+            (None, Some(pid), Some(ts)) => format!("grok:{pid}:{ts}"),
+            _ => continue, // no stable key to dedup or upsert by
+        };
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+
+        let at = meta
+            .and_then(|m| m.get("agentTimestampMs"))
+            .and_then(|ms| ms.as_i64())
+            .and_then(|ms| OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).ok())
+            .or_else(|| envelope_ts.and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok()))
+            .and_then(|t| t.format(&Rfc3339).ok())
+            .unwrap_or_default();
+
+        let u64_of =
+            |obj: &serde_json::Value, k: &str| obj.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        // TokenTurn.input follows Claude semantics of non-cached input tokens; grok's
+        // inputTokens includes cache reads, so we subtract them out here.
+        // reasoningTokens are informational only and not separately priced.
+        let model_usage = usage
+            .get("modelUsage")
+            .and_then(|m| m.as_object())
+            .filter(|m| !m.is_empty());
+        if let Some(model_usage) = model_usage {
+            for (model, m) in model_usage {
+                let input_tokens = u64_of(m, "inputTokens");
+                let cache_read = u64_of(m, "cachedReadTokens");
+                out.push(TokenTurn {
+                    id: format!("{id}:{model}"),
+                    at: at.clone(),
+                    model: model.clone(),
+                    input: input_tokens.saturating_sub(cache_read),
+                    output: u64_of(m, "outputTokens"),
+                    cache_read,
+                    cache_create: 0,
+                });
+            }
+        } else {
+            let input_tokens = u64_of(usage, "inputTokens");
+            let cache_read = u64_of(usage, "cachedReadTokens");
+            out.push(TokenTurn {
+                id,
+                at,
+                model: "grok".to_string(),
+                input: input_tokens.saturating_sub(cache_read),
+                output: u64_of(usage, "outputTokens"),
+                cache_read,
+                cache_create: 0,
+            });
+        }
     }
     out
 }
@@ -214,5 +331,85 @@ not-json
         };
         // 1M cache_read @ $1.5 + 1M cache_write @ $18.75 = $20.25.
         assert!((t.est_cost_usd() - 20.25).abs() < 1e-9);
+    }
+
+    const GROK_SAMPLE: &str = r#"
+{"timestamp":1753420000,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}}
+not-json
+{"timestamp":1753420100,"method":"_x.ai/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"turn_completed","prompt_id":"p-1"}}}
+{"timestamp":1753420412,"method":"_x.ai/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"turn_completed","prompt_id":"p-17","agent_result":"Done.","usage":{"inputTokens":15234,"outputTokens":842,"cachedReadTokens":12000,"modelUsage":{"grok-4-fast":{"inputTokens":15234,"outputTokens":842,"cachedReadTokens":12000}}}},"_meta":{"eventId":"ev_9f2a","agentTimestampMs":1753420412873}}}
+{"timestamp":1753420500,"method":"_x.ai/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"turn_completed","prompt_id":"p-18","usage":{"inputTokens":5000,"outputTokens":300,"cachedReadTokens":1000}},"_meta":{"eventId":"ev_abcd"}}}
+"#;
+
+    #[test]
+    fn parses_grok_turn_completed_usage() {
+        let turns = parse_grok_updates_usage(GROK_SAMPLE);
+        assert_eq!(
+            turns.len(),
+            2,
+            "plain session/update, malformed line, and no-usage turn are all skipped"
+        );
+
+        assert_eq!(turns[0].id, "ev_9f2a:grok-4-fast");
+        assert_eq!(turns[0].model, "grok-4-fast");
+        assert_eq!(turns[0].input, 15234 - 12000);
+        assert_eq!(turns[0].output, 842);
+        assert_eq!(turns[0].cache_read, 12000);
+        assert_eq!(turns[0].cache_create, 0);
+
+        assert_eq!(turns[1].id, "ev_abcd");
+        assert_eq!(
+            turns[1].model, "grok",
+            "no modelUsage falls back to \"grok\""
+        );
+        assert_eq!(turns[1].input, 5000 - 1000);
+        assert_eq!(turns[1].output, 300);
+        assert_eq!(turns[1].cache_read, 1000);
+    }
+
+    #[test]
+    fn grok_duplicate_event_id_is_deduped() {
+        let sample = r#"
+{"timestamp":1753420412,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p-1","usage":{"inputTokens":10,"outputTokens":5}},"_meta":{"eventId":"ev_dup"}}}
+{"timestamp":1753420500,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p-1","usage":{"inputTokens":99,"outputTokens":99}},"_meta":{"eventId":"ev_dup"}}}
+"#;
+        let turns = parse_grok_updates_usage(sample);
+        assert_eq!(turns.len(), 1, "same eventId is deduped within the parse");
+        assert_eq!(turns[0].input, 10);
+    }
+
+    #[test]
+    fn grok_missing_meta_falls_back_to_prompt_id_and_timestamp() {
+        let sample = r#"
+{"timestamp":1700000000,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p-99","usage":{"inputTokens":100,"outputTokens":50}}}}
+"#;
+        let turns = parse_grok_updates_usage(sample);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, "grok:p-99:1700000000");
+        let want_at = OffsetDateTime::from_unix_timestamp(1_700_000_000)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        assert_eq!(turns[0].at, want_at);
+    }
+
+    #[test]
+    fn grok_pricing_family_prices_cache_read_at_075() {
+        let p = pricing_for("grok-4-fast");
+        assert_eq!(p.input, 3.0);
+        assert_eq!(p.output, 15.0);
+        assert_eq!(p.cache_read, 0.75);
+
+        let t = TokenTurn {
+            id: "x".into(),
+            at: "t".into(),
+            model: "grok-4-fast".into(),
+            input: 0,
+            output: 0,
+            cache_read: 1_000_000,
+            cache_create: 0,
+        };
+        // 1M cache_read @ $0.75 = $0.75.
+        assert!((t.est_cost_usd() - 0.75).abs() < 1e-9);
     }
 }

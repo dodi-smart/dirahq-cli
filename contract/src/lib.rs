@@ -94,6 +94,7 @@ pub enum Harness {
     Gemini,
     Cursor,
     OpenCode,
+    Grok,
     Generic,
     Manual,
 }

@@ -156,6 +156,39 @@ impl Store {
         rows.iter().map(row_to_event).collect()
     }
 
+    /// All retained events for `session_ids` with `id <= until`, per session ordered
+    /// by `at`. Used by the daemon to rebuild an *ended* session's rollup from its
+    /// full retained history rather than the current sync window (issue #40): the
+    /// sync cursor consumes early events window-by-window, but the rows stay on disk
+    /// until compaction, so a just-ended multi-window session can be re-aggregated
+    /// completely. Best-effort by design — events already compacted (synced AND
+    /// older than retention) are gone, so a session outliving retention yields a
+    /// partial (but still superset-of-tail) history.
+    ///
+    /// Queried per session id (not a single `IN (...)`) so each lookup rides the
+    /// `idx_events_session_at (session_id, at)` index; results are concatenated with
+    /// no ordering guarantee across different sessions.
+    pub async fn events_for_sessions(
+        &self,
+        session_ids: &[String],
+        until: &str,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let mut out = Vec::new();
+        for session_id in session_ids {
+            let rows = sqlx::query(
+                "SELECT * FROM events WHERE session_id = ?1 AND id <= ?2 ORDER BY at ASC",
+            )
+            .bind(session_id)
+            .bind(until)
+            .fetch_all(&self.pool)
+            .await?;
+            for row in &rows {
+                out.push(row_to_event(row)?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Human-signal "seed" for a sync flush: the already-synced human signals (id ≤
     /// `cursor`) whose `at` falls in `[at_lo, at_hi]`, ordered by `at` ascending.
     ///
@@ -2128,6 +2161,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_for_sessions_filters_ids_and_bounds_by_until() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mk = |id: &str, session: &str, secs: i64| RawEvent {
+            id: id.to_string(),
+            at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs),
+            session_id: session.to_string(),
+            harness: Harness::ClaudeCode,
+            kind: EventKind::UserPrompt,
+            cwd: None,
+            project: Some("p".to_string()),
+            identity_email: Some("d@e.com".to_string()),
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+        };
+        // Session s1 spans multiple ids; s2 is a different session entirely.
+        store.append(&mk("01A", "s1", 0)).await.unwrap();
+        store.append(&mk("01C", "s1", 200)).await.unwrap(); // out of at-order vs 01B
+        store.append(&mk("01B", "s1", 100)).await.unwrap();
+        store.append(&mk("01D", "s1", 300)).await.unwrap(); // above `until` — excluded
+        store.append(&mk("01X", "s2", 50)).await.unwrap(); // other session — excluded
+
+        let got = store
+            .events_for_sessions(&["s1".to_string()], "01C")
+            .await
+            .unwrap();
+
+        // Only s1's events with id <= "01C" come back, ordered by `at` ascending.
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["01A", "01B", "01C"]);
+        assert!(got.iter().all(|e| e.session_id == "s1"));
+    }
+
+    #[tokio::test]
     async fn meta_roundtrips() {
         let store = Store::open_in_memory().await.unwrap();
         assert_eq!(store.meta_get("device_id").await.unwrap(), None);
@@ -2453,6 +2522,48 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(store.events_since(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_for_sessions_after_compact_returns_remainder() {
+        let store = Store::open_in_memory().await.unwrap();
+        let idle = time::Duration::minutes(5);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(30);
+        // A single long-lived session with an old, synced+aged window (eligible for
+        // compaction) and a recent window (too new to prune).
+        let old_base = now - time::Duration::days(20);
+        let mut old_events = Vec::new();
+        for i in 0..4 {
+            let at = old_base + time::Duration::seconds(60 * i);
+            old_events.push(ev_at(&format!("01OLD{i}"), "s1", at, EventKind::UserPrompt));
+        }
+        for e in &old_events {
+            store.append(e).await.unwrap();
+        }
+        let recent_a = ev_at("01REC0", "s1", now, EventKind::UserPrompt);
+        let recent_b = ev_at(
+            "01REC1",
+            "s1",
+            now + time::Duration::seconds(30),
+            EventKind::UserPrompt,
+        );
+        store.append(&recent_a).await.unwrap();
+        store.append(&recent_b).await.unwrap();
+
+        // Cursor covers the old rows only; cutoff prunes the old window.
+        let cutoff = now - time::Duration::days(14);
+        let deleted = store.compact(Some("01OLD3"), cutoff, idle).await.unwrap();
+        assert_eq!(deleted, 4, "the 4 old+synced rows are pruned");
+
+        // Best-effort semantics: the compacted rows are gone, so a rebuild over the
+        // full retained history only sees the surviving (recent) tail — a partial
+        // but still superset-of-tail history, not an error.
+        let got = store
+            .events_for_sessions(&["s1".to_string()], "01REC1")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["01REC0", "01REC1"]);
     }
 
     #[tokio::test]

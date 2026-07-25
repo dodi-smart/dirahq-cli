@@ -699,6 +699,31 @@ async fn flush(
             .map_err(|e| SyncError::Fatal(format!("read human-signal seed: {e}")))?,
         _ => Vec::new(), // no human signals in the window → no gaps to anchor
     };
+    // Issue #40: a multi-window session's early events were consumed by earlier
+    // flushes. For sessions that END in this window, re-fetch their full retained
+    // history so the terminal rollup aggregates the whole session.
+    let ended_ids: Vec<String> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                dira_core::model::EventKind::SessionEnd | dira_core::model::EventKind::ManualStop
+            )
+        })
+        .map(|e| e.session_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    // Bounded by the same `until` snapshot as `events_between` above, so the
+    // history read is consistent with the window we're building this flush.
+    let history = match &until {
+        Some(u) if !ended_ids.is_empty() => state
+            .store
+            .events_for_sessions(&ended_ids, u)
+            .await
+            .map_err(|e| SyncError::Fatal(format!("load session history: {e}")))?,
+        _ => Vec::new(),
+    };
     let chunks = dira_core::sync::build_chunked_batches(
         &events,
         &token_rows,
@@ -708,6 +733,7 @@ async fn flush(
         idle,
         now,
         &seed,
+        &history,
     );
 
     // 4. POST each chunk in order; advance the event cursor to that chunk's high-water
@@ -1021,11 +1047,12 @@ fn partial_rollups(
             identity_email: s.identity_email,
             started_at: s.started_at,
             active_seconds: s.active_seconds,
-            // The live registry does not count prompts or track a branch per
-            // session, so a partial omits both (the eventual ended rollup, built
-            // from the event window, carries them). Omitted-when-None on the wire.
-            prompts: None,
-            branch: None,
+            // The live registry now tracks both prompts and the last-resolved
+            // branch per session (issue #40), so a partial carries them straight
+            // through. `Some(0)` for a session with no prompts yet is deliberate —
+            // consistent with the ended path's `Some(a.prompts)` in `build_sessions`.
+            prompts: Some(s.prompts),
+            branch: s.branch,
             note: s.note,
             label: s.label,
         })
@@ -1818,6 +1845,7 @@ mod tests {
             idle,
             time::OffsetDateTime::now_utc(),
             &[], // no seed
+            &[], // no history
         );
         let unseeded_batch_id = unseeded[0].batch.batch_id.clone();
 
@@ -1826,6 +1854,215 @@ mod tests {
             "the seeded (boundary-recovering) decomposition must carry a DIFFERENT batchId \
              than an unseeded rebuild of the same window — forcing the cloud to re-unpack the \
              corrected intervals instead of dedup-dropping them"
+        );
+    }
+
+    /// Headline regression for issue #40, at the daemon LOOP level: a session
+    /// that spans two flushes must not lose its early prompts/branch/start.
+    /// Flush #1 ships the session's start + a prompt (with a branch) + tool
+    /// activity, but the session hasn't ended yet — no rollup ships. Flush #2's
+    /// window is just the trailing `SessionEnd`, but `flush` must fetch the
+    /// session's full retained history from the store (issue #40) so the
+    /// terminal rollup aggregates the WHOLE session, not just the bare end.
+    #[tokio::test]
+    async fn multi_window_session_final_rollup_carries_prompts_and_branch() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        dira_core::identity::set_device_id(&store, "01TESTDEVICE")
+            .await
+            .unwrap();
+
+        let base = time::OffsetDateTime::now_utc() - time::Duration::minutes(30);
+        let mut start = human_event(
+            "0000000001",
+            "s1",
+            base,
+            dira_core::model::EventKind::SessionStart,
+        );
+        start.branch = Some("feat/x".into());
+        let mut prompt = human_event(
+            "0000000002",
+            "s1",
+            base + time::Duration::seconds(10),
+            dira_core::model::EventKind::UserPrompt,
+        );
+        prompt.branch = Some("feat/x".into());
+        let pre = human_event(
+            "0000000003",
+            "s1",
+            base + time::Duration::seconds(20),
+            dira_core::model::EventKind::PreTool,
+        );
+        let post = human_event(
+            "0000000004",
+            "s1",
+            base + time::Duration::seconds(30),
+            dira_core::model::EventKind::PostTool,
+        );
+        store.append(&start).await.unwrap();
+        store.append(&prompt).await.unwrap();
+        store.append(&pre).await.unwrap();
+        store.append(&post).await.unwrap();
+
+        let config = dira_core::Config {
+            cloud_url: Some(cloud.base_url().to_string()),
+            ..Default::default()
+        };
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
+        let key = DeviceKey::generate();
+
+        // Flush #1: start + prompt + tool activity, no end yet — no rollup ships.
+        cloud.push(
+            "/api/v1/ingest",
+            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
+        );
+        let outcome = flush(&state, &key, &state.http).await.expect("flush 1 ok");
+        assert!(matches!(outcome, FlushOutcome::Synced));
+        let cursor = state.store.meta_get(META_SYNC_CURSOR).await.unwrap();
+        assert_eq!(cursor.as_deref(), Some("0000000004"));
+
+        let requests = cloud.requests("/api/v1/ingest");
+        let body1: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        // `sessions` is omitted entirely (`skip_serializing_if = "Vec::is_empty"`)
+        // when there's nothing to roll up yet, so a missing key is the expected
+        // "no sessions" shape here — not an array to unwrap.
+        let sessions1 = body1["payload"]["sessions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            sessions1.iter().all(|s| s["sessionId"] != "s1"),
+            "the session hasn't ended yet — no rollup in window 1"
+        );
+
+        // The session ends; flush #2's window is JUST the SessionEnd.
+        let end = human_event(
+            "0000000005",
+            "s1",
+            base + time::Duration::seconds(40),
+            dira_core::model::EventKind::SessionEnd,
+        );
+        state.store.append(&end).await.unwrap();
+
+        cloud.push(
+            "/api/v1/ingest",
+            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
+        );
+        let outcome = flush(&state, &key, &state.http).await.expect("flush 2 ok");
+        assert!(matches!(outcome, FlushOutcome::Synced));
+
+        let requests = cloud.requests("/api/v1/ingest");
+        assert_eq!(requests.len(), 2);
+        let body2: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        let sessions2 = body2["payload"]["sessions"].as_array().unwrap();
+        let s = sessions2
+            .iter()
+            .find(|s| s["sessionId"] == "s1")
+            .expect("the terminal rollup ships in window 2");
+        assert_eq!(
+            s["prompts"],
+            serde_json::json!(1),
+            "the prompt from flush #1's window must still be counted"
+        );
+        assert_eq!(
+            s["branch"],
+            serde_json::json!("feat/x"),
+            "the branch from flush #1's window must still be carried"
+        );
+        assert_eq!(
+            s["startedAt"],
+            serde_json::json!(fmt_at(&start)),
+            "started_at must be the session's TRUE start, from flush #1's window, not \
+             flush #2's bare SessionEnd"
+        );
+        assert!(s["endedAt"].is_string(), "the terminal rollup is ended");
+    }
+
+    /// A long-running session with prompts/branch tracked in the live registry
+    /// (issue #40 also fixed the partial-rollup path, which used to hardcode
+    /// `prompts: None, branch: None`) must ship both on its partial rollup.
+    #[tokio::test]
+    async fn partial_rollup_ships_prompts_and_branch() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        dira_core::identity::set_device_id(&store, "01TESTDEVICE")
+            .await
+            .unwrap();
+
+        // A window event unrelated to the long session, just so `flush` has
+        // something pending this cycle (a purely partial-only flush still needs
+        // *some* new events or artifacts, per the early `Nothing` gate).
+        store
+            .append(&test_event("s-other", time::OffsetDateTime::now_utc()))
+            .await
+            .unwrap();
+
+        let config = dira_core::Config {
+            cloud_url: Some(cloud.base_url().to_string()),
+            partial_rollup_after_secs: 60, // eligible once older than 1 minute
+            ..Default::default()
+        };
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
+        let idle = state.config.idle();
+
+        // Drive the live registry directly (mirrors what the writer does on
+        // every observed event) so a long-running, un-ended session with
+        // prompts and a branch is a partial-rollup candidate.
+        let started_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let mut start = human_event(
+            "l1",
+            "long",
+            started_at,
+            dira_core::model::EventKind::SessionStart,
+        );
+        start.branch = Some("feat/long".into());
+        let mut prompt = human_event(
+            "l2",
+            "long",
+            started_at + time::Duration::seconds(10),
+            dira_core::model::EventKind::UserPrompt,
+        );
+        prompt.branch = Some("feat/long".into());
+        let pre = human_event(
+            "l3",
+            "long",
+            started_at + time::Duration::seconds(20),
+            dira_core::model::EventKind::PreTool,
+        );
+        {
+            let mut reg = state.sessions.lock().unwrap();
+            reg.observe(&start, idle);
+            reg.observe(&prompt, idle);
+            reg.observe(&pre, idle);
+        }
+
+        let key = DeviceKey::generate();
+        cloud.push(
+            "/api/v1/ingest",
+            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
+        );
+        let outcome = flush(&state, &key, &state.http).await.expect("flush ok");
+        assert!(matches!(outcome, FlushOutcome::Synced));
+
+        let requests = cloud.requests("/api/v1/ingest");
+        let body: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let sessions = body["payload"]["sessions"].as_array().unwrap();
+        let s = sessions
+            .iter()
+            .find(|s| s["sessionId"] == "long")
+            .expect("the partial rollup for the long-running session shipped");
+        assert!(s["endedAt"].is_null(), "a partial rollup is open-ended");
+        assert_eq!(
+            s["prompts"],
+            serde_json::json!(1),
+            "the registry's prompt count must carry through onto the partial"
+        );
+        assert_eq!(
+            s["branch"],
+            serde_json::json!("feat/long"),
+            "the registry's last-resolved branch must carry through onto the partial"
         );
     }
 

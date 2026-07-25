@@ -15,6 +15,7 @@ pub mod codex;
 pub mod cursor;
 pub mod gemini;
 pub mod generic;
+pub mod grok;
 pub mod opencode;
 
 use dira_contract::Harness;
@@ -55,6 +56,7 @@ pub fn registry() -> Vec<Box<dyn HarnessSource>> {
         Box::new(codex::CodexSource),
         Box::new(gemini::GeminiSource),
         Box::new(cursor::CursorSource),
+        Box::new(grok::GrokSource),
         Box::new(opencode::OpenCodeSource),
         Box::new(generic::GenericSource),
     ]
@@ -70,6 +72,7 @@ pub fn canonical_harness_id(id: &str) -> Option<&'static str> {
         "codex" | "codex-notify" | "codexnotify" => "codex",
         "gemini" | "gemini_cli" | "geminicli" | "gemini-cli" => "gemini",
         "cursor" => "cursor",
+        "grok" | "grok-build" | "grok_build" | "grokbuild" => "grok",
         "opencode" | "open_code" | "open-code" => "opencode",
         "generic" => "generic",
         _ => return None,
@@ -151,5 +154,30 @@ mod tests {
         assert!(normalize_for("nope", serde_json::json!({})).is_none());
         assert!(!is_known_harness("nope"));
         assert!(is_known_harness("codex"));
+    }
+
+    #[test]
+    fn dispatch_routes_grok_aliases() {
+        let payload = serde_json::json!({
+            "hookEventName": "user_prompt_submit",
+            "sessionId": "g1",
+            "cwd": "/repo"
+        });
+        for alias in ["grok", "grok-build", "grok_build", "grokbuild"] {
+            let (n, h) = normalize_for(alias, payload.clone()).expect("known alias");
+            assert_eq!(n.kind, EventKind::UserPrompt);
+            assert_eq!(h, Harness::Grok);
+        }
+    }
+
+    #[test]
+    fn grok_payload_ignored_by_claude_and_cursor_sources() {
+        let payload = serde_json::json!({
+            "hookEventName": "user_prompt_submit",
+            "sessionId": "g1",
+            "cwd": "/repo"
+        });
+        assert!(normalize_for("claude", payload.clone()).is_none());
+        assert!(normalize_for("cursor", payload).is_none());
     }
 }

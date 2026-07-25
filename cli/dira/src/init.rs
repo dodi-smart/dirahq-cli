@@ -16,6 +16,10 @@
 //! - **OpenCode** (`dira init opencode`): OpenCode has no command hooks, so we
 //!   write a tiny forwarder **plugin** to `~/.config/opencode/plugin/dira.js`
 //!   that HTTP-POSTs to the daemon's `/hooks/opencode` route.
+//! - **Grok Build** (`dira init grok`): grok-build merges every `*.json` in
+//!   `~/.grok/hooks/`, so we write a dedicated hooks file
+//!   `~/.grok/hooks/dira.json` (user scope is always trusted); each event runs
+//!   `dira hook grok` over the stdin→socket shim.
 
 use anyhow::{Context, Result};
 use dira_core::{Config, Store};
@@ -58,6 +62,23 @@ const CURSOR_EVENTS: &[&str] = &[
     "stop",
 ];
 
+/// Grok Build events we hook and whether they need a tool matcher. grok-build's
+/// event vocabulary is a superset of Claude Code's (values are mapped in
+/// `dira_sources::grok`); no matcher — grok hooks fire for all tools without one.
+const GROK_EVENTS: &[(&str, bool)] = &[
+    ("SessionStart", false),
+    ("SessionEnd", false),
+    ("UserPromptSubmit", false),
+    ("Stop", false),
+    ("StopFailure", false),
+    ("SubagentStop", false),
+    ("PreToolUse", false),
+    ("PostToolUse", false),
+    ("PostToolUseFailure", false),
+    ("PermissionDenied", false),
+    ("Notification", false),
+];
+
 /// `dira init` (default) — wire Claude Code command hooks.
 pub fn run(global: bool, print_only: bool) -> Result<()> {
     let command = format!("{} hook claude", dira_exe());
@@ -97,6 +118,25 @@ pub fn run_cursor(global: bool, print_only: bool) -> Result<()> {
     };
     apply_json_settings(path, print_only, "Cursor", &command, |s| {
         inject_cursor_hooks(s, &command);
+    })
+}
+
+/// `dira init grok` — wire Grok Build hooks into `~/.grok/hooks/dira.json`.
+/// grok-build has no equivalent project-local scope we can write without a
+/// folder-trust prompt, so hooks are always written user-level regardless of
+/// `--global`.
+pub fn run_grok(global: bool, print_only: bool) -> Result<()> {
+    let command = format!("{} hook grok", dira_exe());
+    let path =
+        PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".grok/hooks/dira.json");
+    if !global && !print_only {
+        println!(
+            "note: grok hooks are user-level only (no trusted project scope); writing {}",
+            path.display()
+        );
+    }
+    apply_json_settings(path, print_only, "Grok Build", &command, |s| {
+        inject_nested_hooks(s, &command, GROK_EVENTS, "*");
     })
 }
 
@@ -361,5 +401,22 @@ mod tests {
         inject_cursor_hooks(&mut s, "dira hook cursor");
         // pre-existing + ours, ours added once.
         assert_eq!(s["hooks"]["stop"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn grok_injects_events_without_matcher() {
+        let mut s = json!({});
+        inject_nested_hooks(&mut s, "dira hook grok", GROK_EVENTS, "*");
+        assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert!(s["hooks"]["PreToolUse"][0].get("matcher").is_none());
+    }
+
+    #[test]
+    fn grok_inject_is_idempotent() {
+        let mut s = json!({});
+        inject_nested_hooks(&mut s, "dira hook grok", GROK_EVENTS, "*");
+        inject_nested_hooks(&mut s, "dira hook grok", GROK_EVENTS, "*");
+        assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }
 }

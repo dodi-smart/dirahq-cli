@@ -56,7 +56,7 @@ macOS (universal — Apple Silicon and Intel, one download) and Linux x86_64/arm
 musl — works on Alpine and old glibc alike); Windows via WSL2.
 
 ```sh
-dira init             # wire Claude Code hooks (also: codex, gemini, cursor, opencode)
+dira init             # wire Claude Code hooks (also: codex, gemini, cursor, opencode, grok)
 dira daemon start     # start the resident tracker daemon
 dira status           # today's summary — engaged, agent, compute, unbilled
 ```
@@ -103,8 +103,9 @@ Other harnesses are wired the same way — `dira init <harness>`:
 | Gemini CLI | `dira init gemini` | command hooks → `~/.gemini/settings.json` |
 | Cursor | `dira init cursor` | command hooks → `~/.cursor/hooks.json` |
 | OpenCode | `dira init opencode` | forwarder plugin → `~/.config/opencode/plugin/dira.js` (HTTP) |
+| Grok Build | `dira init grok` | command hooks → `~/.grok/hooks/dira.json` |
 
-The command-hook harnesses (Claude, Codex, Gemini, Cursor) all forward over the same
+The command-hook harnesses (Claude, Codex, Gemini, Cursor, Grok Build) all forward over the same
 stdin→socket shim (`dira hook <harness>`); OpenCode has no command hooks, so it POSTs to the
 daemon's loopback `/hooks/opencode` route instead. Each harness's own hook vocabulary is
 normalized into Dira's shared event set in `cli/sources`.

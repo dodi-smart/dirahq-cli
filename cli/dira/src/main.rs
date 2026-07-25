@@ -66,7 +66,7 @@ fn long_version() -> &'static str {
     styles = HELP_STYLES,
     after_help = "\
 Getting started:
-  dira init             wire Claude Code hooks (also: codex, gemini, cursor, opencode)
+  dira init             wire Claude Code hooks (also: codex, gemini, cursor, opencode, grok)
   dira daemon start     start the resident tracker daemon
   dira status           today's summary — engaged, agent, compute, unbilled
   dira device link      link this device to the cloud for sync + billables
@@ -259,10 +259,10 @@ Examples:
   dira init                  Claude Code, current project
   dira init --global         Claude Code, all projects
   dira init codex --print    show what would be written, write nothing
-  dira init opencode         also: gemini, cursor"
+  dira init opencode         also: gemini, cursor, grok"
     )]
     Init {
-        /// Harness to wire: `claude` (default), `codex`, `gemini`, `cursor`, or `opencode`.
+        /// Harness to wire: `claude` (default), `codex`, `gemini`, `cursor`, `opencode`, or `grok`.
         #[arg(value_name = "HARNESS")]
         harness: Option<String>,
         /// Write to the user-level settings instead of the project's.
@@ -638,8 +638,9 @@ async fn main() -> Result<()> {
                 Some("gemini") => init::run_gemini(*global, *print),
                 Some("cursor") => init::run_cursor(*global, *print),
                 Some("opencode") => init::run_opencode(&config, *print).await,
+                Some("grok") => init::run_grok(*global, *print),
                 _ => Err(anyhow::anyhow!(
-                    "unknown harness '{id}' (expected: claude, codex, gemini, cursor, opencode)"
+                    "unknown harness '{id}' (expected: claude, codex, gemini, cursor, opencode, grok)"
                 )),
             };
         }

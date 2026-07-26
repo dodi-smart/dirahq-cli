@@ -99,6 +99,15 @@ pub enum Request {
         repo: Option<String>,
         mode: String,
     },
+    /// Ask the daemon to shut down gracefully over the control channel — the
+    /// platform-neutral SIGTERM equivalent. Unix already has SIGTERM (and
+    /// keeps it; see `dirad::wait_for_shutdown_signal`), but windows has no
+    /// signal of that shape at all, so `dira daemon stop` and self-restarts
+    /// (`dira update`) need an in-band way to ask the resident daemon to wind
+    /// down instead of being hard-killed. This is the internal CLI↔daemon
+    /// control protocol — distinct from the cloud wire contract under
+    /// `/contract`, which this does not touch.
+    Shutdown,
 }
 
 /// Which manual session(s) to stop.

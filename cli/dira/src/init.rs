@@ -81,54 +81,63 @@ const GROK_EVENTS: &[(&str, bool)] = &[
 
 /// `dira init` (default) — wire Claude Code command hooks.
 pub fn run(global: bool, print_only: bool) -> Result<()> {
-    let command = format!("{} hook claude", dira_exe());
+    let (command, legacy_command) = hook_commands("claude");
     let path = if global {
-        PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".claude/settings.json")
+        dira_core::config::home_dir()
+            .context("resolve home directory")?
+            .join(".claude/settings.json")
     } else {
         PathBuf::from(".claude/settings.json")
     };
     apply_json_settings(path, print_only, "Claude Code", &command, |s| {
-        inject_nested_hooks(s, &command, CLAUDE_EVENTS, "*");
+        inject_nested_hooks(s, &command, &legacy_command, CLAUDE_EVENTS, "*");
     })
 }
 
 /// `dira init gemini` — wire Gemini CLI command hooks into `~/.gemini/settings.json`
 /// (or `.gemini/settings.json` without `--global`).
 pub fn run_gemini(global: bool, print_only: bool) -> Result<()> {
-    let command = format!("{} hook gemini", dira_exe());
+    let (command, legacy_command) = hook_commands("gemini");
     let path = if global {
-        PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".gemini/settings.json")
+        dira_core::config::home_dir()
+            .context("resolve home directory")?
+            .join(".gemini/settings.json")
     } else {
         PathBuf::from(".gemini/settings.json")
     };
     // Gemini matches tool events by regex, so the catch-all is `.*` (not Claude's `*`).
     apply_json_settings(path, print_only, "Gemini CLI", &command, |s| {
-        inject_nested_hooks(s, &command, GEMINI_EVENTS, ".*");
+        inject_nested_hooks(s, &command, &legacy_command, GEMINI_EVENTS, ".*");
     })
 }
 
 /// `dira init cursor` — wire Cursor agent hooks into `~/.cursor/hooks.json`
 /// (or `.cursor/hooks.json` without `--global`).
 pub fn run_cursor(global: bool, print_only: bool) -> Result<()> {
-    let command = format!("{} hook cursor", dira_exe());
+    let (command, legacy_command) = hook_commands("cursor");
     let path = if global {
-        PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".cursor/hooks.json")
+        dira_core::config::home_dir()
+            .context("resolve home directory")?
+            .join(".cursor/hooks.json")
     } else {
         PathBuf::from(".cursor/hooks.json")
     };
     apply_json_settings(path, print_only, "Cursor", &command, |s| {
-        inject_cursor_hooks(s, &command);
+        inject_cursor_hooks(s, &command, &legacy_command);
     })
 }
 
 /// `dira init grok` — wire Grok Build hooks into `~/.grok/hooks/dira.json`.
 /// grok-build has no equivalent project-local scope we can write without a
 /// folder-trust prompt, so hooks are always written user-level regardless of
-/// `--global`.
+/// `--global`. Home resolves via `home_dir()` (USERPROFILE-aware) and the
+/// command goes through `hook_commands` like every other harness — grok-build
+/// runs natively on windows too, with the same `%USERPROFILE%\.grok` layout.
 pub fn run_grok(global: bool, print_only: bool) -> Result<()> {
-    let command = format!("{} hook grok", dira_exe());
-    let path =
-        PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".grok/hooks/dira.json");
+    let (command, legacy_command) = hook_commands("grok");
+    let path = dira_core::config::home_dir()
+        .context("resolve home directory")?
+        .join(".grok/hooks/dira.json");
     if !global && !print_only {
         println!(
             "note: grok hooks are user-level only (no trusted project scope); writing {}",
@@ -136,17 +145,65 @@ pub fn run_grok(global: bool, print_only: bool) -> Result<()> {
         );
     }
     apply_json_settings(path, print_only, "Grok Build", &command, |s| {
-        inject_nested_hooks(s, &command, GROK_EVENTS, "*");
+        inject_nested_hooks(s, &command, &legacy_command, GROK_EVENTS, "*");
     })
 }
 
-/// Resolve the path to this `dira` executable (canonicalized when possible).
-fn dira_exe() -> String {
-    std::env::current_exe()
+/// Resolve the path to this `dira` executable, canonicalized and normalized
+/// for embedding into generated hook command strings.
+///
+/// Uses `dunce::canonicalize` instead of `std::fs::canonicalize`: on Windows,
+/// std's canonicalize returns a `\\?\C:\...` verbatim-prefixed path, which —
+/// once embedded into a hook config — breaks both Git Bash and PowerShell
+/// (neither treats `\\?\` as an ordinary path). `dunce` strips the prefix
+/// when it's safe to and is a no-op on unix.
+fn dira_exe_path() -> String {
+    let raw = std::env::current_exe()
         .ok()
-        .and_then(|p| std::fs::canonicalize(&p).ok())
+        .and_then(|p| dunce::canonicalize(&p).ok())
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "dira".to_string())
+        .unwrap_or_else(|| "dira".to_string());
+    normalize_exe_path(raw)
+}
+
+/// On Windows, rewrite backslashes to forward slashes: `C:/Users/.../dira.exe`
+/// is valid input to Win32, cmd.exe, PowerShell, and Git Bash alike, and it
+/// keeps the printed Codex TOML snippet free of `\`-escape issues (TOML basic
+/// strings treat `\` as an escape character, so a raw Windows path would need
+/// every backslash doubled).
+#[cfg(windows)]
+fn normalize_exe_path(path: String) -> String {
+    path.replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn normalize_exe_path(path: String) -> String {
+    path
+}
+
+/// Quote `path` for embedding into a generated command string when it
+/// contains whitespace (e.g. `/Users/John Doe/.local/bin/dira`). This was
+/// broken on every platform before (not just Windows) — fixed once here for
+/// every call site that builds a hook command string.
+fn quote_if_needed(path: &str) -> String {
+    if path.chars().any(char::is_whitespace) {
+        format!("\"{path}\"")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Build the `dira hook <harness>` command string in both forms an
+/// idempotency check must recognize:
+/// - `command` — the current, quoted-if-needed form actually written today.
+/// - `legacy_command` — the always-unquoted form earlier `dira init` builds
+///   wrote, so re-running `init` after an upgrade recognizes its own
+///   previously-installed (unquoted) entry instead of adding a duplicate.
+fn hook_commands(harness: &str) -> (String, String) {
+    let exe = dira_exe_path();
+    let command = format!("{} hook {harness}", quote_if_needed(&exe));
+    let legacy_command = format!("{exe} hook {harness}");
+    (command, legacy_command)
 }
 
 /// Load a JSON settings file (or start empty), let `inject` merge our hooks in,
@@ -193,7 +250,12 @@ fn apply_json_settings(
 /// Codex hooks use nested array-of-tables: `[[hooks.<Event>]]` (with an optional
 /// regex `matcher`) then `[[hooks.<Event>.hooks]]` carrying `type`/`command`.
 pub fn run_codex(_print_only: bool) -> Result<()> {
-    let command = format!("{} hook codex", dira_exe());
+    let (command, _legacy_command) = hook_commands("codex");
+    // The snippet is only ever printed (never merged into an existing file),
+    // so there's no idempotency check here and no need for the legacy form.
+    // TOML basic strings use `"` as the delimiter, so a quoted exe path (see
+    // `quote_if_needed`) needs its inner `"` escaped to stay valid TOML.
+    let toml_command = command.replace('"', "\\\"");
     // Codex's hook events mirror Claude Code's; each runs the same forwarder.
     let events: &[(&str, bool)] = &[
         ("SessionStart", false),
@@ -212,7 +274,7 @@ pub fn run_codex(_print_only: bool) -> Result<()> {
         }
         println!("[[hooks.{ev}.hooks]]");
         println!("type = \"command\"");
-        println!("command = \"{command}\"");
+        println!("command = \"{toml_command}\"");
         println!();
     }
     println!("# Then start the daemon with `dira daemon start` and work as usual.");
@@ -233,8 +295,9 @@ pub async fn run_opencode(config: &Config, print_only: bool) -> Result<()> {
         return Ok(());
     }
 
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let dir = PathBuf::from(home).join(".config/opencode/plugin");
+    let home = dira_core::config::home_dir().context("resolve home directory")?;
+    // verify on native Windows — OpenCode's Windows plugin directory is unconfirmed.
+    let dir = home.join(".config/opencode/plugin");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("dira.js");
     std::fs::write(&path, plugin)?;
@@ -271,9 +334,15 @@ async fn resolve_bearer(config: &Config) -> Result<String> {
 /// Ensure each event has our command hook under a Claude/Gemini-shaped `hooks`
 /// object, without clobbering existing hooks. `matcher` is the catch-all value for
 /// tool events (`*` for Claude, `.*` for Gemini's regex matcher).
+///
+/// `legacy_command` is the always-unquoted form of `command` a pre-upgrade
+/// `dira init` may have already written (see [`hook_commands`]) — the
+/// "already installed" check matches either form so re-running `init` after
+/// an upgrade doesn't duplicate the entry.
 fn inject_nested_hooks(
     settings: &mut Value,
     command: &str,
+    legacy_command: &str,
     events: &[(&str, bool)],
     matcher: &str,
 ) {
@@ -298,8 +367,12 @@ fn inject_nested_hooks(
                 .get("hooks")
                 .and_then(|h| h.as_array())
                 .map(|hs| {
-                    hs.iter()
-                        .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(command))
+                    hs.iter().any(|h| {
+                        matches!(
+                            h.get("command").and_then(|c| c.as_str()),
+                            Some(c) if c == command || c == legacy_command
+                        )
+                    })
                 })
                 .unwrap_or(false)
         });
@@ -317,7 +390,12 @@ fn inject_nested_hooks(
 
 /// Ensure each Cursor event has our `{ command }` entry under `hooks`, without
 /// clobbering existing ones. Cursor's `hooks.json` is a flat `{ version, hooks }`.
-fn inject_cursor_hooks(settings: &mut Value, command: &str) {
+///
+/// `legacy_command` is the always-unquoted form of `command` a pre-upgrade
+/// `dira init` may have already written (see [`hook_commands`]) — matched
+/// alongside `command` so re-running `init` after an upgrade doesn't
+/// duplicate the entry.
+fn inject_cursor_hooks(settings: &mut Value, command: &str, legacy_command: &str) {
     let obj = settings.as_object_mut().expect("settings is an object");
     obj.entry("version".to_string()).or_insert_with(|| json!(1));
     let hooks = obj.entry("hooks".to_string()).or_insert_with(|| json!({}));
@@ -331,9 +409,12 @@ fn inject_cursor_hooks(settings: &mut Value, command: &str) {
             Some(a) => a,
             None => continue,
         };
-        let already = arr
-            .iter()
-            .any(|e| e.get("command").and_then(|c| c.as_str()) == Some(command));
+        let already = arr.iter().any(|e| {
+            matches!(
+                e.get("command").and_then(|c| c.as_str()),
+                Some(c) if c == command || c == legacy_command
+            )
+        });
         if already {
             continue;
         }
@@ -348,7 +429,13 @@ mod tests {
     #[test]
     fn injects_into_empty_settings() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, "dira hook claude", CLAUDE_EVENTS, "*");
+        inject_nested_hooks(
+            &mut s,
+            "dira hook claude",
+            "dira hook claude",
+            CLAUDE_EVENTS,
+            "*",
+        );
         assert!(s["hooks"]["UserPromptSubmit"].is_array());
         assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"].as_str(), Some("*"));
     }
@@ -356,8 +443,45 @@ mod tests {
     #[test]
     fn is_idempotent() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, "dira hook claude", CLAUDE_EVENTS, "*");
-        inject_nested_hooks(&mut s, "dira hook claude", CLAUDE_EVENTS, "*");
+        inject_nested_hooks(
+            &mut s,
+            "dira hook claude",
+            "dira hook claude",
+            CLAUDE_EVENTS,
+            "*",
+        );
+        inject_nested_hooks(
+            &mut s,
+            "dira hook claude",
+            "dira hook claude",
+            CLAUDE_EVENTS,
+            "*",
+        );
+        assert_eq!(s["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+    }
+
+    /// A pre-existing entry in the *legacy* (always-unquoted) form — as an
+    /// earlier `dira init` would have written before quoting was added —
+    /// must also be recognized as "already installed", so upgrading and
+    /// re-running `init` doesn't duplicate the hook entry.
+    #[test]
+    fn is_idempotent_against_a_legacy_unquoted_entry() {
+        let mut s = json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    { "hooks": [ { "type": "command", "command": "/Users/John Doe/bin/dira hook claude" } ] }
+                ]
+            }
+        });
+        // The new quoted form differs from what's on disk...
+        inject_nested_hooks(
+            &mut s,
+            "\"/Users/John Doe/bin/dira\" hook claude",
+            "/Users/John Doe/bin/dira hook claude",
+            CLAUDE_EVENTS,
+            "*",
+        );
+        // ...but matching the legacy form must still suppress the duplicate.
         assert_eq!(s["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
     }
 
@@ -367,7 +491,13 @@ mod tests {
             "model": "claude-opus-4-8",
             "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "other" } ] } ] }
         });
-        inject_nested_hooks(&mut s, "dira hook claude", CLAUDE_EVENTS, "*");
+        inject_nested_hooks(
+            &mut s,
+            "dira hook claude",
+            "dira hook claude",
+            CLAUDE_EVENTS,
+            "*",
+        );
         assert_eq!(s["model"].as_str(), Some("claude-opus-4-8"));
         // both the pre-existing and our hook are present.
         assert_eq!(s["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 2);
@@ -376,7 +506,13 @@ mod tests {
     #[test]
     fn gemini_injects_lifecycle_and_regex_matcher() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, "dira hook gemini", GEMINI_EVENTS, ".*");
+        inject_nested_hooks(
+            &mut s,
+            "dira hook gemini",
+            "dira hook gemini",
+            GEMINI_EVENTS,
+            ".*",
+        );
         assert!(s["hooks"]["BeforeAgent"].is_array());
         assert!(s["hooks"]["AfterAgent"].is_array());
         assert_eq!(s["hooks"]["BeforeTool"][0]["matcher"].as_str(), Some(".*"));
@@ -385,7 +521,7 @@ mod tests {
     #[test]
     fn cursor_injects_flat_command_entries() {
         let mut s = json!({});
-        inject_cursor_hooks(&mut s, "dira hook cursor");
+        inject_cursor_hooks(&mut s, "dira hook cursor", "dira hook cursor");
         assert_eq!(s["version"].as_i64(), Some(1));
         assert_eq!(
             s["hooks"]["beforeSubmitPrompt"][0]["command"].as_str(),
@@ -397,16 +533,44 @@ mod tests {
     #[test]
     fn cursor_is_idempotent_and_preserves_keys() {
         let mut s = json!({ "version": 1, "hooks": { "stop": [ { "command": "other" } ] } });
-        inject_cursor_hooks(&mut s, "dira hook cursor");
-        inject_cursor_hooks(&mut s, "dira hook cursor");
+        inject_cursor_hooks(&mut s, "dira hook cursor", "dira hook cursor");
+        inject_cursor_hooks(&mut s, "dira hook cursor", "dira hook cursor");
         // pre-existing + ours, ours added once.
         assert_eq!(s["hooks"]["stop"].as_array().unwrap().len(), 2);
+    }
+
+    /// Cursor's flat entry form must also recognize a pre-existing legacy
+    /// (unquoted) command string as already installed.
+    #[test]
+    fn cursor_is_idempotent_against_a_legacy_unquoted_entry() {
+        let mut s = json!({
+            "version": 1,
+            "hooks": { "stop": [ { "command": "/Users/John Doe/bin/dira hook cursor" } ] }
+        });
+        inject_cursor_hooks(
+            &mut s,
+            "\"/Users/John Doe/bin/dira\" hook cursor",
+            "/Users/John Doe/bin/dira hook cursor",
+        );
+        assert_eq!(s["hooks"]["stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn quote_if_needed_quotes_paths_with_whitespace() {
+        assert_eq!(
+            quote_if_needed("/Users/John Doe/.local/bin/dira"),
+            "\"/Users/John Doe/.local/bin/dira\""
+        );
+        assert_eq!(
+            quote_if_needed("/Users/jane/.local/bin/dira"),
+            "/Users/jane/.local/bin/dira"
+        );
     }
 
     #[test]
     fn grok_injects_events_without_matcher() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, "dira hook grok", GROK_EVENTS, "*");
+        inject_nested_hooks(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
         assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert!(s["hooks"]["PreToolUse"][0].get("matcher").is_none());
     }
@@ -414,8 +578,8 @@ mod tests {
     #[test]
     fn grok_inject_is_idempotent() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, "dira hook grok", GROK_EVENTS, "*");
-        inject_nested_hooks(&mut s, "dira hook grok", GROK_EVENTS, "*");
+        inject_nested_hooks(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
+        inject_nested_hooks(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
         assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }

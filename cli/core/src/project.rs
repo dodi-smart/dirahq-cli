@@ -351,7 +351,7 @@ fn cumulative_change_id(root: &Path, range: &str) -> Option<String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let diff = Command::new("git")
+    let diff = git_command()
         .arg("-C")
         .arg(root)
         .args(["diff", "--no-color", range])
@@ -361,7 +361,7 @@ fn cumulative_change_id(root: &Path, range: &str) -> Option<String> {
         return None;
     }
 
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .arg("-C")
         .arg(root)
         .args(["patch-id", "--stable"])
@@ -388,7 +388,7 @@ fn cumulative_change_id(root: &Path, range: &str) -> Option<String> {
 /// Repo-relative paths changed across `<base>..<head>` (`git diff --name-only`).
 /// `None` on git failure; an empty (but successful) result is `Some(vec![])`.
 fn touched_paths(root: &Path, base: &str, head: &str) -> Option<Vec<String>> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(root)
         .args(["diff", "--name-only", "--no-color", base, head])
@@ -472,7 +472,7 @@ fn patch_id(root: &Path, sha: &str) -> Option<String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let diff = Command::new("git")
+    let diff = git_command()
         .arg("-C")
         .arg(root)
         .args(["diff-tree", "-p", "--no-color", "--root", sha])
@@ -482,7 +482,7 @@ fn patch_id(root: &Path, sha: &str) -> Option<String> {
         return None;
     }
 
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .arg("-C")
         .arg(root)
         .args(["patch-id", "--stable"])
@@ -565,14 +565,28 @@ fn extract_count(line: &str, noun: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Build a `git` [`Command`], platform-adjusted. Every git spawn in this module
+/// must go through here: `dirad` runs console-less on windows (spawned with
+/// `CREATE_NO_WINDOW`), and a console subprocess launched from a console-less
+/// parent without that same flag makes Windows allocate — and briefly flash — a
+/// brand-new console window. These spawns fire from the capture path on every
+/// idle-ticker sweep, so an unflagged spawn is a visible window strobe in the
+/// user's session.
+fn git_command() -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Run a git command in `dir`, returning trimmed stdout on success.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = git_command().arg("-C").arg(dir).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -729,13 +743,12 @@ mod tests {
 
     // --- Squash-resilient session signals -----------------------------------
 
-    use super::{session_signals, SessionSignals};
+    use super::{git_command, session_signals, SessionSignals};
     use std::path::Path;
-    use std::process::Command;
 
     /// Run a git command in `dir`, panicking on failure (test setup helper).
     fn run_git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -754,7 +767,7 @@ mod tests {
 
     /// Capture trimmed stdout of a git command (test helper).
     fn out_git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -857,13 +870,13 @@ mod tests {
         run_git(&root, &["merge", "--squash", "-q", "feat"]);
         run_git(&root, &["commit", "-q", "-m", "squashed"]);
         let squash_pid = {
-            let diff = Command::new("git")
+            let diff = git_command()
                 .arg("-C")
                 .arg(&root)
                 .args(["diff-tree", "-p", "--no-color", "--root", "HEAD"])
                 .output()
                 .unwrap();
-            let mut child = Command::new("git")
+            let mut child = git_command()
                 .arg("-C")
                 .arg(&root)
                 .args(["patch-id", "--stable"])
@@ -936,7 +949,7 @@ mod tests {
         let tip = out_git(&root, &["rev-parse", "HEAD"]);
         let parent = out_git(&root, &["rev-parse", "HEAD~1"]);
         run_git(&root, &["reset", "--hard", "-q", "origin/main"]);
-        let status = Command::new("git")
+        let status = git_command()
             .arg("-C")
             .arg(&root)
             .args(["cherry-pick", &parent, &tip])

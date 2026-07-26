@@ -90,8 +90,9 @@ jobs:
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Idempotency: skip if this release already has tarball assets.
-          count=$(gh release view "$tag" --json assets -q '[.assets[] | select(.name | endswith(".tar.gz"))] | length' 2>/dev/null || echo 0)
+          # Idempotency: skip if this release already has archive assets -- .tar.gz for
+          # the unix legs, .zip for the Windows legs (D-0010).
+          count=$(gh release view "$tag" --json assets -q '[.assets[] | select((.name | endswith(".tar.gz")) or (.name | endswith(".zip")))] | length' 2>/dev/null || echo 0)
           if [ "${count:-0}" -gt 0 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "Release $tag already has $count artifact(s) — skipping."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -129,14 +130,17 @@ jobs:
           github-token: ${{ steps.app-token.outputs.token }}
           fallback-on-error: true
 
-  # Three legs, half the original six, with *wider* coverage: musl is
-  # statically linked, so the build host's glibc floor is irrelevant — one
-  # binary per Linux arch covers Alpine, containers, and old-glibc distros
-  # alike. The x86_64 leg matters most here since it runs on a self-hosted
-  # runner whose glibc version is unknown and can drift without notice.
-  # `universal-apple-darwin` is a lipo fat binary the upload action builds
-  # itself (both rustup targets + `lipo -create`), so Apple Silicon and
-  # Intel ship from one leg — no separate x86_64-apple-darwin leg needed.
+  # musl is statically linked, so the build host's glibc floor is irrelevant — one binary
+  # per Linux arch covers Alpine, containers, and old-glibc distros alike. The x86_64 leg
+  # matters most here since it runs on a self-hosted runner whose glibc version is unknown
+  # and can drift without notice. `universal-apple-darwin` is a lipo fat binary the upload
+  # action builds itself (both rustup targets + `lipo -create`), so Apple Silicon and Intel
+  # ship from one leg — no separate x86_64-apple-darwin leg needed. The two Windows legs
+  # (D-0010) both build on `windows-latest`: x86_64-pc-windows-msvc natively, and
+  # aarch64-pc-windows-msvc cross-compiled -- MSVC's linker can target a foreign
+  # architecture from an x86_64 host with nothing beyond `rustup target add` (no separate
+  # cross-linker/sysroot the way the musl legs need), and the native `windows-11-arm`
+  # runner label fails outright on private repos, which this one still is.
   build:
     name: Build ${{ matrix.target }}
     needs: [resolve, check-runners]
@@ -158,6 +162,15 @@ jobs:
             cross: true
           - target: universal-apple-darwin
             runner: macos-latest
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
+          # TODO(public): once this repo is public, move this leg to a native
+          # windows-11-arm runner (that label only works on public repos today) and give
+          # it its own native smoke leg instead of relying on the x86_64 Windows leg below.
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
             cross: false
     steps:
       - uses: actions/checkout@v7
@@ -192,6 +205,15 @@ jobs:
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: ${{ matrix.target }}
+      # Windows legs only: `rustup target add` is the entire cross-compile setup here
+      # (unlike the musl legs above, MSVC needs no separate cross-linker or sysroot to
+      # target a foreign architecture from an x86_64 host). x86_64-pc-windows-msvc is the
+      # runner's own host triple and typically already installed, so this is a harmless
+      # no-op for that leg; aarch64-pc-windows-msvc is the genuine cross-compile.
+      - name: Add Windows rustup target
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
       - name: Build & upload binaries
         uses: taiki-e/upload-rust-binary-action@v1
         with:
@@ -200,14 +222,15 @@ jobs:
           archive: dira-${{ needs.resolve.outputs.version }}-$target
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           tar: unix
+          zip: windows
           checksum: sha256
           dry-run: ${{ inputs.dry_run == true }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Attach the contract artifacts (schema + signing fixture) and install.sh to
-  # the release so the cloud repo's `just contract-pull` and
-  # https://github.com/dodi-smart/dirahq-cli/releases/latest/download/install.sh
-  # (a permanent fallback URL) both work with no sibling checkout.
+  # Attach the contract artifacts (schema + signing fixture) and both installers to the
+  # release so the cloud repo's `just contract-pull` and
+  # https://github.com/dodi-smart/dirahq-cli/releases/latest/download/{install.sh,install.ps1}
+  # (permanent fallback URLs) all work with no sibling checkout.
   release-assets:
     name: Publish release assets
     needs: [resolve]
@@ -227,6 +250,7 @@ jobs:
             contract/attestation.schema.json \
             contract/testdata/signing-vector.json \
             install.sh \
+            install.ps1 \
             --clobber
 
   # Human-facing convenience only — install.sh verifies each download against
@@ -285,6 +309,13 @@ jobs:
           # current GitHub-hosted Intel macOS image is macos-15-intel.
           - leg: macos-intel
             runner: macos-15-intel
+          # install.ps1, for real, against the just-built release. NOTE: this leg only
+          # goes green once the Rust-side Windows target support (landing in a parallel
+          # package) is in the released tag being smoked here -- acceptable because
+          # releases are manual-dispatch-only while the repo is private (D-0005), so
+          # nothing forces this leg to pass before that sibling work lands.
+          - leg: windows-x64
+            runner: windows-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -298,6 +329,9 @@ jobs:
         # identically everywhere. (`shell:` doesn't support the `matrix`
         # context anyway — only a fixed value or `github`/`env`/`vars`/`inputs`
         # contexts are allowed there.)
+        # Skipped on Windows: install.sh is the POSIX installer, exercised by every
+        # other leg here; the Windows leg below exercises install.ps1 instead.
+        if: runner.os != 'Windows'
         shell: sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -326,12 +360,48 @@ jobs:
           echo "$info"
           echo "$info" | grep -q x86_64
           echo "$info" | grep -q arm64
+      # install.ps1's Windows counterpart to the "Install dira via install.sh" step
+      # above. `shell: powershell` pins Windows PowerShell 5.1, install.ps1's actual
+      # compatibility floor and the default host behind `irm | iex` -- not pwsh/Core,
+      # which is a separate, newer binary that wouldn't catch a 5.1-only regression.
+      - name: Install dira via install.ps1 and exercise it (windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIRA_REPO: ${{ github.repository }}
+          DIRA_VERSION: ${{ needs.resolve.outputs.version }}
+          DIRA_BIN_DIR: ${{ runner.temp }}\dira-bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\install.ps1
+          $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
+          $reported = ((dira --version | Select-Object -First 1) -split '\s+')[1]
+          if ($LASTEXITCODE -ne 0) { throw "dira --version failed" }
+          if ($reported -ne $env:DIRA_VERSION) { throw "dira --version reported '$reported', expected '$env:DIRA_VERSION'" }
+          dirad --version
+          if ($LASTEXITCODE -ne 0) { throw "dirad --version failed" }
+          dira daemon start
+          if ($LASTEXITCODE -ne 0) { throw "dira daemon start failed" }
+          dira daemon status
+          if ($LASTEXITCODE -ne 0) { throw "dira daemon status failed" }
+          # Resolves against the release we just published and must report "up to
+          # date". Exits 0 even offline, so a network blip here is a real failure
+          # signal, not flake -- same rationale as the unix legs above.
+          dira update --check
+          if ($LASTEXITCODE -ne 0) { throw "dira update --check failed" }
+          dira daemon restart
+          if ($LASTEXITCODE -ne 0) { throw "dira daemon restart failed" }
+          dira daemon stop
+          if ($LASTEXITCODE -ne 0) { throw "dira daemon stop failed" }
       - name: Idempotent re-run, then uninstall
         # Static `sh`, not `bash`: alpine has no bash, and the script bodies
         # below are already POSIX-`sh`-safe (no bashisms), so one shell works
         # identically everywhere. (`shell:` doesn't support the `matrix`
         # context anyway — only a fixed value or `github`/`env`/`vars`/`inputs`
         # contexts are allowed there.)
+        # Skipped on Windows: see "Idempotent re-run + uninstall (windows)" below.
+        if: runner.os != 'Windows'
         shell: sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -344,3 +414,19 @@ jobs:
           sh ./install.sh
           sh ./install.sh --uninstall
           ! command -v dira
+      - name: Idempotent re-run + uninstall (windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIRA_REPO: ${{ github.repository }}
+          DIRA_VERSION: ${{ needs.resolve.outputs.version }}
+          DIRA_BIN_DIR: ${{ runner.temp }}\dira-bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
+          # Re-running over an identical install is a no-op.
+          .\install.ps1
+          .\install.ps1 -Uninstall -Force
+          if (Test-Path "$env:DIRA_BIN_DIR\dira.exe") { throw "dira.exe still present after -Uninstall" }
+          if (Test-Path "$env:DIRA_BIN_DIR\dirad.exe") { throw "dirad.exe still present after -Uninstall" }

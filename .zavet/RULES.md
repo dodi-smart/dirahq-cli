@@ -12,6 +12,9 @@ agent context at session start — keep it short and non-negotiable.
 - Nothing content-bearing (prompts, diffs, bodies, messages) may cross the
   attestation wire — metadata only. See D-0001.
 - Never open an installed binary for writing — stage beside it and `rename`
-  onto it, or you get `ETXTBSY` in production and green tests. See D-0003.
-- Linux artifacts are static musl; macOS is one universal binary. Never add
-  an arch branch on Darwin or a libc probe. See D-0002.
+  onto it (on Windows: rename the running exe aside first), or you get
+  `ETXTBSY` in production and green tests. See D-0003.
+- Linux artifacts are static musl; macOS is one universal binary; Windows is
+  two MSVC zip legs. Never add an arch branch on Darwin, a libc probe, or a
+  Windows case to install.sh — Windows installs go through install.ps1.
+  See D-0002/D-0010.

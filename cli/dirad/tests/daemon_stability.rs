@@ -1,7 +1,10 @@
 //! Integration tests for Commit 1 (stability) + Commit 2 (status reactivity).
 //!
 //! These stand up real daemon state (an in-memory store, the live registry, the
-//! writer loop, a bound UDS) so they exercise the same code the binary runs.
+//! writer loop, a bound control listener) so they exercise the same code the
+//! binary runs. The transport tests go through `dira_ipc`, so on unix they
+//! exercise the UDS path and on windows CI the named-pipe path — same tests,
+//! both platforms.
 
 use dira_contract::Harness;
 use dira_core::model::{EventKind, RawEvent};
@@ -317,28 +320,43 @@ async fn daemon_info_reports_version_schema_and_pid() {
     }
 }
 
-/// Frame a request, write it, read the framed response.
-async fn rpc(stream: &mut tokio::net::UnixStream, req: &Request) -> Response {
+/// Frame a request, write it, read the framed response — over whichever
+/// transport `dira_ipc` picked for this platform.
+async fn rpc(stream: &mut dira_ipc::Stream, req: &Request) -> Response {
     let bytes = serde_json::to_vec(req).unwrap();
-    dirad::control::write_frame(stream, &bytes).await.unwrap();
-    let resp = dirad::control::read_frame(stream).await.unwrap();
+    dira_ipc::write_frame(stream, &bytes).await.unwrap();
+    let resp = dira_ipc::read_frame(stream).await.unwrap();
     serde_json::from_slice(&resp).unwrap()
 }
 
-/// (c) Status reactivity: the control socket must answer `Ping` and `Status`
+/// A per-test control endpoint: a short UDS path under `$TMPDIR` on unix
+/// (kept under the ~104-char socket-path limit, sandbox-writable), a
+/// uniquely-named pipe on windows (the pipe namespace is flat and global, so
+/// uniqueness comes from the name, and nothing is created on disk).
+fn test_endpoint(tag: &str) -> std::path::PathBuf {
+    let unique = &Ulid::new().to_string()[..10];
+    #[cfg(unix)]
+    {
+        let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+        std::path::Path::new(&tmp).join(format!("{tag}{unique}.sock"))
+    }
+    #[cfg(windows)]
+    {
+        std::path::PathBuf::from(format!(r"\\.\pipe\dirad-test-{tag}-{unique}"))
+    }
+}
+
+/// (c) Status reactivity: the control channel must answer `Ping` and `Status`
 /// before a (deliberately slowed) hydrate completes.
 #[tokio::test]
 async fn socket_answers_ping_and_status_before_hydrate_completes() {
     let (state, _rx) = test_state().await;
 
-    // Bind the control socket FIRST (as `run()` does), then start a slow hydrate
-    // that hasn't flipped `hydrated` yet. Use `$TMPDIR` (sandbox-writable) and a
-    // short name to stay under the ~104-char UDS path limit.
-    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    let dir = std::path::Path::new(&tmp).join(format!("d{}.sock", &Ulid::new().to_string()[..10]));
-    let _ = std::fs::remove_file(&dir);
-    let uds = tokio::net::UnixListener::bind(&dir).expect("bind uds");
-    dirad::serve_control(state.clone(), uds);
+    // Bind the control listener FIRST (as `run()` does), then start a slow
+    // hydrate that hasn't flipped `hydrated` yet.
+    let dir = test_endpoint("d");
+    let listener = dira_ipc::Listener::bind(&dir).await.expect("bind control");
+    dirad::serve_control(state.clone(), listener);
 
     // A hydrate that takes a while: `hydrated` stays false meanwhile.
     let hydrate_state = state.clone();
@@ -349,18 +367,14 @@ async fn socket_answers_ping_and_status_before_hydrate_completes() {
 
     // Immediately connect and issue Ping + Status — both must succeed while
     // hydration is still in flight.
-    let mut stream = tokio::net::UnixStream::connect(&dir)
-        .await
-        .expect("connect");
+    let mut stream = dira_ipc::connect(&dir).await.expect("connect");
     assert!(
         matches!(rpc(&mut stream, &Request::Ping).await, Response::Pong),
         "Ping must answer immediately"
     );
 
     // Fresh connection per request (one request/response per connection).
-    let mut stream = tokio::net::UnixStream::connect(&dir)
-        .await
-        .expect("connect");
+    let mut stream = dira_ipc::connect(&dir).await.expect("connect");
     match rpc(&mut stream, &Request::Status).await {
         Response::Status(view) => assert!(
             view.hydrating,
@@ -375,5 +389,39 @@ async fn socket_answers_ping_and_status_before_hydrate_completes() {
         "hydrate should still be in flight at this point"
     );
 
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&dir);
+}
+
+/// The in-band orderly-shutdown path: `Request::Shutdown` over the control
+/// channel must (1) answer `Ok` — written BEFORE the daemon starts tearing
+/// down, so the CLI never loses the acknowledgment — and (2) wake whatever is
+/// parked on `state.shutdown` (in the real binary, `wait_for_shutdown_signal`
+/// inside `run()`). On windows this is the ONLY orderly-shutdown trigger
+/// (there is no SIGTERM), which is why this test is deliberately
+/// cross-platform where `sigterm_shutdown.rs` is `#![cfg(unix)]`.
+///
+/// Also proves the no-parked-waiter race is closed: the `notified()` future is
+/// created only AFTER the response arrives — `notify_one`'s stored permit is
+/// what makes that ordering safe (see the `AppState::shutdown` field doc).
+#[tokio::test]
+async fn shutdown_request_triggers_orderly_shutdown() {
+    let (state, _rx) = test_state().await;
+
+    let dir = test_endpoint("dstop");
+    let listener = dira_ipc::Listener::bind(&dir).await.expect("bind control");
+    dirad::serve_control(state.clone(), listener);
+
+    let mut stream = dira_ipc::connect(&dir).await.expect("connect");
+    match rpc(&mut stream, &Request::Shutdown).await {
+        Response::Ok => {}
+        other => panic!("expected Ok for Shutdown, got {other:?}"),
+    }
+
+    tokio::time::timeout(StdDuration::from_secs(2), state.shutdown.notified())
+        .await
+        .expect("Shutdown request must wake the daemon's shutdown waiter");
+
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&dir);
 }

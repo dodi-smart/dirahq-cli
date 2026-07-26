@@ -11,7 +11,9 @@ use dira_core::{Config, Store};
 use dirad::state::AppState;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use ulid::Ulid;
 
 async fn test_state() -> AppState {
@@ -34,22 +36,35 @@ async fn wait_for_degraded(state: &AppState, want_some: bool) -> Option<String> 
     state.http_ingress_error.lock().unwrap().clone()
 }
 
-/// A short, unique socket path under `$TMPDIR` — short because the whole path
-/// has to stay under the ~104-byte `sun_path` limit.
+/// A short, unique control endpoint.
+///
+/// unix: a socket path under `$TMPDIR` — short because the whole path has to
+/// stay under the ~104-byte `sun_path` limit. windows: a uniquely-named pipe
+/// (nothing on disk; the filesystem failure modes the unix tests below cover
+/// don't exist there).
 ///
 /// Slices the ULID's *random* half (chars 16..26). The leading 10 characters
 /// are its millisecond timestamp, so two of these built in the same tick would
 /// collide — which is exactly what happened when these tests first ran in
 /// parallel.
 fn tmp_sock() -> PathBuf {
-    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(tmp).join(format!("d{}.sock", &Ulid::new().to_string()[16..26]))
+    let uniq = &Ulid::new().to_string()[16..26];
+    #[cfg(unix)]
+    {
+        let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(tmp).join(format!("d{uniq}.sock"))
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\.\pipe\dirad-sb-{uniq}"))
+    }
 }
 
 /// The single-instance guard. Before this existed, `run()` unconditionally
 /// unlinked the socket path and rebound it — so a second daemon would take the
 /// path away from a healthy first one, leaving that first daemon alive but
 /// unreachable by any client.
+#[cfg(unix)]
 #[tokio::test]
 async fn refuses_to_steal_a_live_daemons_socket() {
     let sock = tmp_sock();
@@ -78,6 +93,7 @@ async fn refuses_to_steal_a_live_daemons_socket() {
 /// The flip side: a socket file left behind by a daemon that died (dropping a
 /// `UnixListener` does not unlink its path) must be reclaimed, not treated as
 /// a live peer — otherwise a crashed daemon would wedge every later start.
+#[cfg(unix)]
 #[tokio::test]
 async fn reclaims_a_stale_socket_file() {
     let sock = tmp_sock();
@@ -108,6 +124,7 @@ async fn reclaims_a_stale_socket_file() {
 /// winner's freshly bound listener. That is the same orphaned-listener failure
 /// D-0009 exists to prevent, just triggered by a stale-file reclaim instead of
 /// a port conflict.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_binders_never_both_win_a_stale_socket() {
     for round in 0..1000 {
@@ -156,6 +173,7 @@ async fn concurrent_binders_never_both_win_a_stale_socket() {
 
 /// First run on a fresh machine: the data directory holding the socket may not
 /// exist yet.
+#[cfg(unix)]
 #[tokio::test]
 async fn creates_the_socket_parent_directory() {
     let dir = tmp_sock().with_extension("d");
@@ -232,13 +250,11 @@ async fn a_free_port_is_not_degraded() {
 
 // -- the degradation has to be visible to clients ---------------------------
 
-async fn rpc(sock: &PathBuf, req: &Request) -> Response {
-    let mut stream = UnixStream::connect(sock).await.expect("connect");
+async fn rpc(sock: &std::path::Path, req: &Request) -> Response {
+    let mut stream = dira_ipc::connect(sock).await.expect("connect");
     let bytes = serde_json::to_vec(req).unwrap();
-    dirad::control::write_frame(&mut stream, &bytes)
-        .await
-        .unwrap();
-    let resp = dirad::control::read_frame(&mut stream).await.unwrap();
+    dira_ipc::write_frame(&mut stream, &bytes).await.unwrap();
+    let resp = dira_ipc::read_frame(&mut stream).await.unwrap();
     serde_json::from_slice(&resp).unwrap()
 }
 

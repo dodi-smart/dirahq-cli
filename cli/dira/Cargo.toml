@@ -14,6 +14,7 @@ path = "src/main.rs"
 dira-core.workspace = true
 dira-sources.workspace = true
 dira-contract.workspace = true
+dira-ipc.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 tokio.workspace = true
@@ -34,6 +35,16 @@ toml_edit.workspace = true
 sha2.workspace = true
 hex.workspace = true
 semver.workspace = true
+# Verbatim-prefix-free canonicalize for paths embedded into harness hook configs
+# and schtasks arguments (no-op on unix).
+dunce.workspace = true
+
+# Windows release artifacts are .zip (unix ships .tar.gz and keeps shelling out
+# to tar): no guaranteed tar/gzip on Windows, and Expand-Archive is PowerShell,
+# not something `dira update` can assume. Deflate-only keeps the compile cost
+# bounded; the updater only reads archives our own release workflow produced.
+[target.'cfg(windows)'.dependencies]
+zip = { version = "5", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # `config_cmd`'s round-trip test re-layers a written config.toml the same way

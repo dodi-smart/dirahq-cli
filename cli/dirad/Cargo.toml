@@ -18,6 +18,7 @@ path = "src/main.rs"
 dira-core.workspace = true
 dira-sources.workspace = true
 dira-contract.workspace = true
+dira-ipc.workspace = true
 tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true

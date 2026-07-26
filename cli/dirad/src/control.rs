@@ -1,4 +1,6 @@
-//! The Unix domain socket control server: handles `dira` CLI commands.
+//! The control server: handles `dira` CLI commands over the platform IPC
+//! channel (a Unix domain socket on unix, a named pipe on windows — see
+//! `dira_ipc`).
 //!
 //! Unlike the HTTP hot path, these are human-initiated and may resolve git
 //! synchronously — millisecond latency is fine. Each connection carries exactly
@@ -17,8 +19,6 @@ use dira_core::report;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use time::{Duration, OffsetDateTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use ulid::Ulid;
 
 /// Lock a mutex, recovering the guard even if it was poisoned.
@@ -39,40 +39,37 @@ pub fn lock_recover_map<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     lock_recover(m)
 }
 
-/// Read one framed JSON value (4-byte BE length prefix + payload).
-pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(buf)
-}
-
-/// Write one framed JSON value.
-pub async fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> std::io::Result<()> {
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await?;
-    stream.write_all(bytes).await?;
-    stream.flush().await
-}
-
 /// Serve a single CLI connection.
-pub async fn handle_conn(state: AppState, mut stream: UnixStream) {
-    let resp = match read_frame(&mut stream).await {
-        Ok(buf) => match serde_json::from_slice::<Request>(&buf) {
-            Ok(req) => dispatch(&state, req).await,
-            Err(e) => Response::Error {
-                message: format!("bad request: {e}"),
-            },
-        },
-        Err(e) => Response::Error {
-            message: format!("read error: {e}"),
-        },
+///
+/// `Request::Shutdown` gets one piece of special handling here (everything
+/// else is a plain dispatch-then-reply): the daemon's shutdown notify is
+/// fired *after* the response is written, not inside `dispatch` itself, so
+/// the CLI's `Ok` is durably queued on the wire before `run()`'s shutdown
+/// select can wake up and start tearing the process down. `dispatch` staying
+/// pure (compute a `Response`, no side channel to the transport) also keeps
+/// it trivially callable by tests without a real connection — see
+/// `tests/daemon_stability.rs`'s direct `dispatch(&state, Request::Status)`
+/// calls.
+pub async fn handle_conn(state: AppState, mut stream: dira_ipc::Stream) {
+    let parsed = match dira_ipc::read_frame(&mut stream).await {
+        Ok(buf) => serde_json::from_slice::<Request>(&buf).map_err(|e| format!("bad request: {e}")),
+        Err(e) => Err(format!("read error: {e}")),
+    };
+    let (resp, is_shutdown) = match parsed {
+        Ok(req) => {
+            let is_shutdown = matches!(req, Request::Shutdown);
+            (dispatch(&state, req).await, is_shutdown)
+        }
+        Err(message) => (Response::Error { message }, false),
     };
     let bytes = serde_json::to_vec(&resp).unwrap_or_default();
-    let _ = write_frame(&mut stream, &bytes).await;
+    let _ = dira_ipc::write_frame(&mut stream, &bytes).await;
+    if is_shutdown {
+        // See the field doc on `AppState::shutdown`: `notify_one` stores a
+        // permit even if `run()`'s select! hasn't started waiting yet, so
+        // this can never race a startup window and drop the request.
+        state.shutdown.notify_one();
+    }
 }
 
 /// Dispatch a single control request to its handler. Public so integration tests
@@ -113,6 +110,11 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
         Request::ZavetSetMode { cwd, repo, mode } => {
             crate::zavet::set_mode(state, cwd, repo, mode).await
         }
+        // The actual `state.shutdown.notify_one()` happens in `handle_conn`,
+        // AFTER this `Ok` is written to the client — see its doc comment for
+        // why the ordering matters and `dispatch` doesn't touch `shutdown`
+        // itself.
+        Request::Shutdown => Response::Ok,
     }
 }
 

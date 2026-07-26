@@ -1,9 +1,10 @@
 ---
 id: D-0007
-title: The landing site vendors install.sh byte-for-byte; it does not proxy it
+title: The landing site vendors the installers byte-for-byte; it does not proxy them
 status: active
 guards:
   - install.sh
+  - install.ps1
   - .github/workflows/sync-install-script.yml
 origin: recorded
 verified: true
@@ -11,10 +12,18 @@ verified: true
 
 ## Decision
 
-`install.sh` at this repo's root is the source of truth. The landing site
-carries a byte-identical copy at `scripts/install.sh` and serves it from
-`/install`. A workflow here opens a PR against the landing repo whenever the
-script changes, and a scheduled job diffs the served URL against this copy.
+`install.sh` and `install.ps1` at this repo's root are the source of truth.
+The landing site carries byte-identical copies at `scripts/install.sh` and
+`scripts/install.ps1` and serves them from `/install` (+ `/install.sh`) and
+`/install.ps1`. A workflow here opens a PR against the landing repo whenever
+either script changes, and a scheduled job diffs the served URLs against
+these copies.
+
+History note: the sync workflow originally prepended a two-line provenance
+header to the vendored copy, contradicting this record and the landing
+repo's own README (both said byte-identical, and the actual landing bytes
+had no header). The workflow was the bug; it now does a plain `cp`. Do not
+reintroduce a header.
 
 ## Why
 

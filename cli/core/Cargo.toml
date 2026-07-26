@@ -8,6 +8,12 @@ description = "Dira capture engine: event model, accounting FSM, project resolve
 
 [dependencies]
 dira-contract.workspace = true
+# `config::home_dir()`'s error type. `dira-core`'s own `Error` enum stays reserved for
+# the store/config/crypto errors its callers pattern-match on; `home_dir()` is a
+# leaf helper with a single failure mode, so a plain `anyhow::Result` (the pattern
+# `dira`/`dirad` already use for exactly this shape of error) is a better fit than
+# growing `Error` a variant nothing else needs.
+anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

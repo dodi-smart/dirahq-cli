@@ -1,7 +1,8 @@
 ---
 id: D-0002
 title: Linux ships static musl only; macOS ships one universal binary
-status: active
+status: superseded
+superseded-by: D-0010
 guards:
   - .github/workflows/build-release.yml
   - install.sh

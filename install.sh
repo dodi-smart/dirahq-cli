@@ -180,10 +180,16 @@ detect_target() {
     arm64 | aarch64) arch=aarch64 ;;
     *) err "unsupported Linux architecture: $arch (supported: x86_64, aarch64)" ;;
     esac
+    # WSL is just Linux to uname -- target selection is unchanged -- but a
+    # native Windows install exists and is often what the user actually
+    # wants, so point at it once instead of leaving them to discover it later.
+    if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+      info "WSL detected -- installing the Linux build. Native Windows users can instead run: irm https://dirahq.sh/install.ps1 | iex"
+    fi
     printf '%s-unknown-linux-musl\n' "$arch"
     ;;
   MINGW* | MSYS* | CYGWIN* | Windows_NT)
-    err "native Windows is not supported. Install inside WSL2 (Windows Subsystem for Linux) and run this script from there: https://learn.microsoft.com/windows/wsl/install"
+    err "native Windows: use the PowerShell installer -- irm https://dirahq.sh/install.ps1 | iex. Alternatively, install inside WSL2 (Windows Subsystem for Linux) and run this script from there: https://learn.microsoft.com/windows/wsl/install"
     ;;
   *)
     err "unsupported OS: $os (supported targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, universal-apple-darwin)"

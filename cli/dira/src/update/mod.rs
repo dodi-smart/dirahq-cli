@@ -139,25 +139,31 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
         channel.label()
     );
 
+    // Best-effort sweep of `.{name}.old.*` leftovers from a prior update that
+    // couldn't clean up because the old process still held its file locked
+    // (windows swap-away path — see replace.rs) — before this run adds its
+    // own. Harmless (and simply finds nothing) on unix.
+    replace::cleanup_stale_old_files(&bin_dir);
+
     let workdir = Workdir::new()?;
-    let tarball_path = workdir.path().join(&resolved.tarball_name);
+    let archive_path = workdir.path().join(&resolved.archive_name);
     let sha_path = workdir.path().join(&resolved.sha_name);
 
-    artifact::download(&http, &resolved.tarball, &tarball_path)
+    artifact::download(&http, &resolved.archive, &archive_path)
         .await
-        .with_context(|| format!("download {}", resolved.tarball_name))?;
+        .with_context(|| format!("download {}", resolved.archive_name))?;
     artifact::download(&http, &resolved.sha, &sha_path)
         .await
         .with_context(|| format!("download {}", resolved.sha_name))?;
 
     let sha_contents =
         std::fs::read_to_string(&sha_path).context("read the downloaded checksum file")?;
-    let expected = artifact::parse_sha256_file(&sha_contents, &resolved.tarball_name)?;
-    artifact::verify_sha256(&tarball_path, &expected)?;
-    println!("checksum OK for {}", resolved.tarball_name);
+    let expected = artifact::parse_sha256_file(&sha_contents, &resolved.archive_name)?;
+    artifact::verify_sha256(&archive_path, &expected)?;
+    println!("checksum OK for {}", resolved.archive_name);
 
     let extract_dir = workdir.path().join("extract");
-    artifact::extract(&tarball_path, &extract_dir)?;
+    artifact::extract(&archive_path, &extract_dir)?;
 
     replace::swap_binaries(&bin_dir, &extract_dir)?;
 
@@ -218,13 +224,13 @@ fn guard_to_bin_dir(guard: replace::Guard, force: bool) -> Result<PathBuf> {
                     "{} is a symlink into a `just install` dev build ({}) — refusing to \
                      overwrite it. Re-run with --force, or use `just install` to update a dev \
                      setup.",
-                    bin_dir.join("dira").display(),
+                    bin_dir.join(dira_ipc::DIRA_BIN).display(),
                     link_target.display()
                 );
             }
             eprintln!(
                 "warning: overwriting dev symlink at {} (--force)",
-                bin_dir.join("dira").display()
+                bin_dir.join(dira_ipc::DIRA_BIN).display()
             );
             Ok(bin_dir)
         }

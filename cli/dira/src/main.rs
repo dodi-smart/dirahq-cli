@@ -596,8 +596,10 @@ enum DaemonAction {
     /// Show whether the daemon is up (exit 0 if any daemon is running — even
     /// a pre-upgrade one; 1 if none).
     Status,
-    /// Install an OS service (launchd/systemd-user) so it survives reboots.
+    /// Install an OS service (launchd/systemd-user/scheduled task) so it survives reboots.
     Install,
+    /// Remove the OS service `install` set up (binaries and data are untouched).
+    Uninstall,
     /// Restart the daemon, however it's currently supervised.
     #[command(
         long_about = "\
@@ -666,6 +668,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 DaemonAction::Install => daemon::install(&config),
+                DaemonAction::Uninstall => daemon::uninstall(&config),
                 DaemonAction::Restart => daemon::restart(&config).await,
             };
         }
@@ -978,6 +981,7 @@ async fn print_supervision(config: &Config) {
     let label = match daemon::detect_supervision(config).await {
         daemon::Supervision::Launchd => "launchd".to_string(),
         daemon::Supervision::SystemdUser => "systemd --user".to_string(),
+        daemon::Supervision::ScheduledTask => "scheduled task".to_string(),
         daemon::Supervision::Pidfile(pid) => format!("pidfile (pid {pid})"),
         daemon::Supervision::Socket(pid) => format!("unmanaged (pid {pid}, no pidfile)"),
         daemon::Supervision::LegacySocket { pid, sock } => format!(

@@ -650,9 +650,16 @@ fn needs_confirmation(pending: u64, yes: bool) -> bool {
 const SYNC_CURSOR_KEY: &str = "sync_cursor_event_id";
 
 /// A reasonable default device label: the machine hostname.
+///
+/// `COMPUTERNAME` is checked first — it's the Windows convention (set by the
+/// OS for every process, no subprocess needed) and reading it before falling
+/// through to the `HOSTNAME` env / `hostname` command chain is purely an
+/// optimization: `hostname.exe` exists on Windows too, so that chain would
+/// still resolve correctly there, this just avoids spawning it.
 fn default_label() -> Option<String> {
-    std::env::var("HOSTNAME")
+    std::env::var("COMPUTERNAME")
         .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(hostname_via_uname)
         .filter(|s| !s.is_empty())
 }

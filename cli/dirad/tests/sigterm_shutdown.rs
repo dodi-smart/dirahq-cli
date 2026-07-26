@@ -13,6 +13,11 @@
 //! doc), waits for its control socket to come up, sends a **real** SIGTERM via
 //! `kill -TERM <pid>`, and asserts a clean, bounded-time exit whose captured
 //! stdout carries the same "shutting down" log line the Ctrl-C path emits.
+//!
+//! Unix-only by nature: SIGTERM and `kill(1)` don't exist on windows. The
+//! windows orderly-shutdown path is `Request::Shutdown` over the control
+//! channel, covered cross-platform in `daemon_stability.rs`.
+#![cfg(unix)]
 
 use std::io::Read;
 use std::process::{Command, Stdio};

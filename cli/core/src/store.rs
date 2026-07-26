@@ -1711,6 +1711,14 @@ impl Store {
 /// Tighten `path` (and its SQLite `-wal`/`-shm` sidecars) to owner-only `0600`
 /// on unix. Best-effort: a missing file or a chmod failure is ignored — this is a
 /// hardening step, not a correctness gate. No-op on non-unix targets.
+///
+/// Windows posture (deliberate, v1): no ACL tightening. The db lives under the
+/// per-user data dir (`%APPDATA%\...`), whose default DACL already denies other
+/// non-admin users — the same protection profile the peer AI CLIs give their
+/// credential files. The db can hold the keychain-fallback device secret, so if
+/// the threat model ever tightens, the follow-up is an explicit owner-only
+/// security descriptor here (icacls or a Win32 SetSecurityInfo call), not a
+/// umask analogue — Windows has none.
 #[cfg(unix)]
 fn restrict_to_owner_0600(path: &Path) {
     use std::os::unix::fs::PermissionsExt;

@@ -5,8 +5,10 @@
 //! enough that the two stay easy to cross-check by eye: same env vars, same
 //! two-path split (public asset URLs vs. bearer-authenticated asset ids for
 //! the private-repo window), same asset naming (`dira-<version>-<target>.tar.gz`
-//! / `.sha256`, NOT `.tar.gz.sha256` — see `taiki-e/upload-rust-binary-action`'s
-//! `checksum: sha256` behavior).
+//! / `.sha256` for the unix targets, `dira-<version>-<target>.zip` / `.sha256`
+//! for the `windows`-containing ones (D-0010) — never `.tar.gz.sha256` /
+//! `.zip.sha256`, see `taiki-e/upload-rust-binary-action`'s `checksum: sha256`
+//! behavior).
 //!
 //! No CLI flag carries the repo/API base URL/download URL/token — those are
 //! maintainer/CI/air-gapped knobs, not something an end user tunes per
@@ -169,15 +171,30 @@ impl AssetRef {
 pub struct Resolved {
     pub version: String,
     pub tag: String,
-    pub tarball_name: String,
+    pub archive_name: String,
     pub sha_name: String,
-    pub tarball: AssetRef,
+    pub archive: AssetRef,
     pub sha: AssetRef,
+}
+
+/// The release archive extension for `target` — `.zip` for the `windows`
+/// targets (D-0010: windows release assets are packaged as `.zip`, not
+/// `.tar.gz`, since neither `tar`/`gzip` nor `Expand-Archive` can be assumed
+/// present/scriptable the way `tar` is on every macOS/Linux target), `.tar.gz`
+/// for everything else. String-driven off `target` (not `cfg!`) so a
+/// `DIRA_TARGET` override still resolves the matching archive kind rather
+/// than the host's own platform.
+fn archive_extension(target: &str) -> &'static str {
+    if target.contains("windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    }
 }
 
 fn asset_names(version: &str, target: &str) -> (String, String) {
     (
-        format!("dira-{version}-{target}.tar.gz"),
+        format!("dira-{version}-{target}.{}", archive_extension(target)),
         format!("dira-{version}-{target}.sha256"),
     )
 }
@@ -273,7 +290,7 @@ async fn resolve_unauthenticated(
         }
     };
 
-    let (tarball_name, sha_name) = asset_names(&version, target);
+    let (archive_name, sha_name) = asset_names(&version, target);
     let base = ctx
         .download_base
         .clone()
@@ -283,9 +300,9 @@ async fn resolve_unauthenticated(
     Ok(Resolved {
         version,
         tag,
-        tarball: AssetRef::Url(format!("{base}/{tarball_name}")),
+        archive: AssetRef::Url(format!("{base}/{archive_name}")),
         sha: AssetRef::Url(format!("{base}/{sha_name}")),
-        tarball_name,
+        archive_name,
         sha_name,
     })
 }
@@ -351,8 +368,8 @@ async fn resolve_authenticated(
         .strip_prefix('v')
         .unwrap_or(&release.tag_name)
         .to_string();
-    let (tarball_name, sha_name) = asset_names(&version, target);
-    let tarball_id = find_asset_id(&release, &tarball_name)?;
+    let (archive_name, sha_name) = asset_names(&version, target);
+    let archive_id = find_asset_id(&release, &archive_name)?;
     let sha_id = find_asset_id(&release, &sha_name)?;
 
     let asset_url = |id: u64| {
@@ -366,13 +383,13 @@ async fn resolve_authenticated(
     Ok(Resolved {
         version,
         tag: release.tag_name.clone(),
-        tarball: AssetRef::ApiAsset {
-            url: asset_url(tarball_id),
+        archive: AssetRef::ApiAsset {
+            url: asset_url(archive_id),
         },
         sha: AssetRef::ApiAsset {
             url: asset_url(sha_id),
         },
-        tarball_name,
+        archive_name,
         sha_name,
     })
 }
@@ -487,6 +504,30 @@ mod tests {
         ];
         let picked = pick_latest(&releases, Channel::Stable).unwrap();
         assert_eq!(picked.tag_name, "v0.1.0");
+    }
+
+    // --- asset_names / archive_extension (D-0010) --------------------------
+
+    #[test]
+    fn asset_names_uses_zip_for_windows_targets() {
+        let (archive, sha) = asset_names("0.3.0", "x86_64-pc-windows-msvc");
+        assert_eq!(archive, "dira-0.3.0-x86_64-pc-windows-msvc.zip");
+        assert_eq!(sha, "dira-0.3.0-x86_64-pc-windows-msvc.sha256");
+
+        let (archive, sha) = asset_names("0.3.0", "aarch64-pc-windows-msvc");
+        assert_eq!(archive, "dira-0.3.0-aarch64-pc-windows-msvc.zip");
+        assert_eq!(sha, "dira-0.3.0-aarch64-pc-windows-msvc.sha256");
+    }
+
+    #[test]
+    fn asset_names_uses_tar_gz_for_unix_targets() {
+        let (archive, sha) = asset_names("0.3.0", "x86_64-unknown-linux-musl");
+        assert_eq!(archive, "dira-0.3.0-x86_64-unknown-linux-musl.tar.gz");
+        assert_eq!(sha, "dira-0.3.0-x86_64-unknown-linux-musl.sha256");
+
+        let (archive, sha) = asset_names("0.3.0", "universal-apple-darwin");
+        assert_eq!(archive, "dira-0.3.0-universal-apple-darwin.tar.gz");
+        assert_eq!(sha, "dira-0.3.0-universal-apple-darwin.sha256");
     }
 
     // --- default_channel --------------------------------------------------

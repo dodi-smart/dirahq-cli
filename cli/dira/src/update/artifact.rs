@@ -43,9 +43,20 @@ fn detect_target_for(os: &str, arch: &str) -> Result<String> {
             };
             Ok(format!("{a}-unknown-linux-musl"))
         }
+        "windows" => {
+            let a = match arch {
+                "x86_64" => "x86_64",
+                "aarch64" => "aarch64",
+                other => anyhow::bail!(
+                    "unsupported Windows architecture: {other} (supported: x86_64, aarch64)"
+                ),
+            };
+            Ok(format!("{a}-pc-windows-msvc"))
+        }
         other => anyhow::bail!(
             "unsupported OS: {other} (supported targets: x86_64-unknown-linux-musl, \
-             aarch64-unknown-linux-musl, universal-apple-darwin)"
+             aarch64-unknown-linux-musl, universal-apple-darwin, x86_64-pc-windows-msvc, \
+             aarch64-pc-windows-msvc)"
         ),
     }
 }
@@ -129,36 +140,21 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extract `tarball` (flat root — `dira`, `dirad` with no leading directory,
-/// per `taiki-e/upload-rust-binary-action`'s `leading-dir: false` default)
-/// into `dest_dir`, then assert both binaries exist and are non-empty —
-/// catches a packaging-action layout change with a clear message instead of
-/// a confusing later failure.
-///
-/// Shells out to `tar -xzf` rather than depending on the `tar`/`flate2`
-/// crates: neither is in `Cargo.lock` today (unlike `sha2`/`hex`/`semver`),
-/// so pulling them in would be genuinely new dependency weight for one
-/// extraction step, and `tar` is already a hard requirement of `install.sh`
-/// — present on every macOS (bsdtar) and Linux (GNU/busybox) target we ship.
-pub fn extract(tarball: &Path, dest_dir: &Path) -> Result<()> {
+/// Extract `archive` (flat root — `dira`/`dirad` (or `dira.exe`/`dirad.exe`
+/// on windows) with no leading directory, per
+/// `taiki-e/upload-rust-binary-action`'s `leading-dir: false` default) into
+/// `dest_dir`, then assert both binaries exist and are non-empty — catches a
+/// packaging-action layout change with a clear message instead of a
+/// confusing later failure. The actual unpacking is platform-specific (see
+/// [`extract_impl`]); this wrapper owns the dest-dir setup and the
+/// post-extract assertion shared by both.
+pub fn extract(archive: &Path, dest_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dest_dir)
         .with_context(|| format!("create extraction dir {}", dest_dir.display()))?;
 
-    let status = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(tarball)
-        .arg("-C")
-        .arg(dest_dir)
-        .status()
-        .context(
-            "failed to spawn `tar` — it is required to extract release archives and should be \
-             on PATH on every macOS or Linux system",
-        )?;
-    if !status.success() {
-        anyhow::bail!("tar -xzf {} failed ({status})", tarball.display());
-    }
+    extract_impl(archive, dest_dir)?;
 
-    for name in ["dira", "dirad"] {
+    for name in [dira_ipc::DIRA_BIN, dira_ipc::DIRAD_BIN] {
         let p = dest_dir.join(name);
         let meta = std::fs::metadata(&p).with_context(|| {
             format!(
@@ -169,6 +165,75 @@ pub fn extract(tarball: &Path, dest_dir: &Path) -> Result<()> {
         if meta.len() == 0 {
             anyhow::bail!("downloaded '{name}' binary is empty");
         }
+    }
+    Ok(())
+}
+
+/// Unix: shells out to `tar -xzf` rather than depending on the `tar`/`flate2`
+/// crates: neither is in `Cargo.lock` today (unlike `sha2`/`hex`/`semver`),
+/// so pulling them in would be genuinely new dependency weight for one
+/// extraction step, and `tar` is already a hard requirement of `install.sh`
+/// — present on every macOS (bsdtar) and Linux (GNU/busybox) target we ship.
+#[cfg(unix)]
+fn extract_impl(archive: &Path, dest_dir: &Path) -> Result<()> {
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest_dir)
+        .status()
+        .context(
+            "failed to spawn `tar` — it is required to extract release archives and should be \
+             on PATH on every macOS or Linux system",
+        )?;
+    if !status.success() {
+        anyhow::bail!("tar -xzf {} failed ({status})", archive.display());
+    }
+    Ok(())
+}
+
+/// Windows: release assets are `.zip` (D-0010 — no guaranteed `tar`/`gzip` on
+/// Windows, and `Expand-Archive` is PowerShell, not something `dira update`
+/// can shell out to the way `install.sh` shells out to `tar`). Extracted via
+/// the `zip` crate (already a `cfg(windows)` dependency staged for this —
+/// deflate-only, no encryption/zstd support needed since the updater only
+/// ever reads archives our own release workflow produced).
+///
+/// Deliberately restrictive about what it writes: only entries whose name is
+/// *exactly* [`dira_ipc::DIRA_BIN`] or [`dira_ipc::DIRAD_BIN`] are extracted,
+/// and any entry name containing a path separator is skipped outright — a
+/// zip-slip guard. `/` is the zip spec's own separator and `\` is what
+/// Windows itself treats as one, so both are checked regardless of which
+/// tool built the archive; this guarantees extraction can never escape
+/// `dest_dir` even against a maliciously crafted archive, even though in
+/// practice we only ever expect two flat-root entries here.
+#[cfg(windows)]
+fn extract_impl(archive: &Path, dest_dir: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive)
+        .with_context(|| format!("open {} for extraction", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .with_context(|| format!("read {} as a zip archive", archive.display()))?;
+
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .with_context(|| format!("read entry {i} of {}", archive.display()))?;
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        // zip-slip guard: skip anything that isn't a bare file name.
+        if name.contains('/') || name.contains('\\') {
+            continue;
+        }
+        if name != dira_ipc::DIRA_BIN && name != dira_ipc::DIRAD_BIN {
+            continue;
+        }
+        let dest = dest_dir.join(&name);
+        let mut out =
+            std::fs::File::create(&dest).with_context(|| format!("create {}", dest.display()))?;
+        std::io::copy(&mut entry, &mut out)
+            .with_context(|| format!("extract {name} to {}", dest.display()))?;
     }
     Ok(())
 }
@@ -209,8 +274,25 @@ mod tests {
     }
 
     #[test]
+    fn detect_target_windows_maps_known_arches() {
+        assert_eq!(
+            detect_target_for("windows", "x86_64").unwrap(),
+            "x86_64-pc-windows-msvc"
+        );
+        assert_eq!(
+            detect_target_for("windows", "aarch64").unwrap(),
+            "aarch64-pc-windows-msvc"
+        );
+    }
+
+    #[test]
+    fn detect_target_rejects_unsupported_windows_arch() {
+        assert!(detect_target_for("windows", "riscv64").is_err());
+    }
+
+    #[test]
     fn detect_target_rejects_unsupported_os() {
-        assert!(detect_target_for("windows", "x86_64").is_err());
+        assert!(detect_target_for("plan9", "x86_64").is_err());
     }
 
     #[test]
@@ -300,8 +382,9 @@ cccc222222222222222222222222222222222222222222222222222222222  dira-0.2.0-univer
         assert!(verify_sha256(&path, wrong).is_err());
     }
 
-    // --- extract ---------------------------------------------------------------
+    // --- extract (unix: real .tar.gz fixtures via `tar`) ------------------
 
+    #[cfg(unix)]
     fn build_tarball(dir: &Path, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -324,34 +407,113 @@ cccc222222222222222222222222222222222222222222222222222222222  dira-0.2.0-univer
         tarball
     }
 
+    #[cfg(unix)]
     #[test]
     fn extract_flat_archive_with_both_binaries_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let tarball = build_tarball(
             dir.path(),
-            &[("dira", b"fake-dira"), ("dirad", b"fake-dirad")],
+            &[
+                (dira_ipc::DIRA_BIN, b"fake-dira"),
+                (dira_ipc::DIRAD_BIN, b"fake-dirad"),
+            ],
         );
         let dest = dir.path().join("out");
         extract(&tarball, &dest).unwrap();
-        assert_eq!(std::fs::read(dest.join("dira")).unwrap(), b"fake-dira");
-        assert_eq!(std::fs::read(dest.join("dirad")).unwrap(), b"fake-dirad");
+        assert_eq!(
+            std::fs::read(dest.join(dira_ipc::DIRA_BIN)).unwrap(),
+            b"fake-dira"
+        );
+        assert_eq!(
+            std::fs::read(dest.join(dira_ipc::DIRAD_BIN)).unwrap(),
+            b"fake-dirad"
+        );
     }
 
+    #[cfg(unix)]
     #[test]
     fn extract_missing_dirad_gives_a_clear_error() {
         let dir = tempfile::tempdir().unwrap();
-        let tarball = build_tarball(dir.path(), &[("dira", b"fake-dira")]);
+        let tarball = build_tarball(dir.path(), &[(dira_ipc::DIRA_BIN, b"fake-dira")]);
         let dest = dir.path().join("out");
         let err = extract(&tarball, &dest).unwrap_err();
         assert!(err.to_string().contains("dirad"), "error was: {err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn extract_empty_binary_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let tarball = build_tarball(dir.path(), &[("dira", b""), ("dirad", b"fake-dirad")]);
+        let tarball = build_tarball(
+            dir.path(),
+            &[
+                (dira_ipc::DIRA_BIN, b""),
+                (dira_ipc::DIRAD_BIN, b"fake-dirad"),
+            ],
+        );
         let dest = dir.path().join("out");
         let err = extract(&tarball, &dest).unwrap_err();
         assert!(err.to_string().contains("empty"), "error was: {err}");
+    }
+
+    // --- extract (windows: real .zip fixtures via the `zip` crate) --------
+
+    /// Builds a real zip in memory with the `zip` crate — the same
+    /// `cfg(windows)` dependency `extract_impl` uses, so this exercises the
+    /// real read path rather than a hand-rolled byte layout. Confirms both
+    /// expected binaries land, and that a zip-slip-shaped nested entry is
+    /// silently skipped rather than escaping `dest_dir`.
+    #[cfg(windows)]
+    #[test]
+    fn extract_windows_zip_extracts_only_the_named_binaries_and_skips_nested_paths() {
+        use std::io::{Cursor, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(dira_ipc::DIRA_BIN, options).unwrap();
+        zip.write_all(b"fake-dira").unwrap();
+        zip.start_file(dira_ipc::DIRAD_BIN, options).unwrap();
+        zip.write_all(b"fake-dirad").unwrap();
+        // A zip-slip attempt: must be skipped, never extracted anywhere.
+        zip.start_file("nested/evil.txt", options).unwrap();
+        zip.write_all(b"should never be written").unwrap();
+        let cursor = zip.finish().unwrap();
+
+        let archive_path = dir.path().join("archive.zip");
+        std::fs::write(&archive_path, cursor.into_inner()).unwrap();
+
+        let dest = dir.path().join("out");
+        extract(&archive_path, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join(dira_ipc::DIRA_BIN)).unwrap(),
+            b"fake-dira"
+        );
+        assert_eq!(
+            std::fs::read(dest.join(dira_ipc::DIRAD_BIN)).unwrap(),
+            b"fake-dirad"
+        );
+        assert!(!dest.join("nested").exists());
+        assert!(!dest.join("evil.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extract_windows_zip_missing_dirad_gives_a_clear_error() {
+        use std::io::{Cursor, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(dira_ipc::DIRA_BIN, options).unwrap();
+        zip.write_all(b"fake-dira").unwrap();
+        let cursor = zip.finish().unwrap();
+
+        let archive_path = dir.path().join("archive.zip");
+        std::fs::write(&archive_path, cursor.into_inner()).unwrap();
+
+        let dest = dir.path().join("out");
+        let err = extract(&archive_path, &dest).unwrap_err();
+        assert!(err.to_string().contains("dirad"), "error was: {err}");
     }
 }

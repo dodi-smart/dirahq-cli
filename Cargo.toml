@@ -4,6 +4,7 @@ members = [
     "contract",
     "cli/core",
     "cli/sources",
+    "cli/ipc",
     "cli/dirad",
     "cli/dira",
 ]
@@ -103,6 +104,10 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"
 thiserror = "2"
 anyhow = "1"
 directories = "6"
+# Canonicalize without the `\\?\` verbatim prefix on windows (no-op elsewhere):
+# std::fs::canonicalize's verbatim paths break when embedded into harness hook
+# configs (Git Bash / PowerShell can't run them) and schtasks arguments.
+dunce = "1"
 # Timer jitter (dirad only): small, fast, non-cryptographic RNG for spreading
 # background POST timers so many daemons don't beat the cloud in lockstep.
 fastrand = "2"
@@ -111,6 +116,15 @@ fastrand = "2"
 dira-contract = { path = "contract" }
 dira-core = { path = "cli/core" }
 dira-sources = { path = "cli/sources" }
+# UDS (unix) / named-pipe (windows) transport + shared length-prefixed-JSON framing;
+# the only framing implementation in the workspace — both dira and dirad go through it.
+dira-ipc = { path = "cli/ipc" }
+
+# windows-sys: only `ClientOptions::open`'s `ERROR_PIPE_BUSY` retry-loop (cli/ipc) needs
+# it directly. Pinned to "0.61" to match the version already dominant in the tree
+# (tokio/mio's own windows backend, `keyring`'s windows-native-keyring-store, etc.) so
+# cargo resolves one copy instead of two.
+windows-sys = "0.61"
 
 # Dev-only
 criterion = "0.5"

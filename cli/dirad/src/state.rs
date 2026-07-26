@@ -97,6 +97,16 @@ pub struct AppState {
     /// off doing a beat is the acceptable, rare miss (the sleep still bounds the
     /// wait to at most one cadence, and jitter already keeps that bounded).
     pub presence_wake: Arc<Notify>,
+    /// Fired (at most once, ever) by `control::handle_conn` after it has
+    /// written the response to a `Request::Shutdown` — the in-band,
+    /// platform-neutral SIGTERM equivalent `dirad::wait_for_shutdown_signal`
+    /// also selects on, required on windows where no SIGTERM exists to send.
+    /// Deliberately `notify_one`, not `notify_waiters`, at the call site: a
+    /// `Notify` only stores a permit for `notify_one`, so a `Shutdown` request
+    /// that lands before `run()` reaches its `select!` (e.g. mid-startup)
+    /// still wakes it the instant it starts waiting, instead of the
+    /// notification being silently dropped for lack of a parked waiter.
+    pub shutdown: Arc<Notify>,
     /// Why the loopback hook ingress is not serving, or `None` when it is
     /// healthy. Set when its port cannot be bound — a conflict is survivable
     /// (the control socket is bound first and stays live), so the daemon runs

@@ -44,6 +44,24 @@ jobs:
       - name: shfmt -d -s -ln posix -i 2 install.sh
         run: shfmt -d -s -ln posix -i 2 install.sh
 
+  # Lint install.ps1: PSScriptAnalyzer at Warning severity, install.sh's Windows sibling.
+  # Lightweight — stays on GitHub-hosted runners, same as shell-lint above. `shell: pwsh`
+  # runs PowerShell 7+ (only what ubuntu-latest ships); install.ps1's own compatibility
+  # floor is Windows PowerShell 5.1, but PSScriptAnalyzer's rules are version-agnostic
+  # static analysis, so linting under pwsh here still catches what matters.
+  powershell-lint:
+    name: PowerShell Lint (install.ps1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Invoke-ScriptAnalyzer install.ps1
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          Invoke-ScriptAnalyzer -Path install.ps1 -Severity Warning -EnableExit
+
   # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
   # to `ubuntu-latest` when none are available. Downstream jobs read the chosen
   # label set from `outputs.runner` via `fromJson()`.
@@ -116,3 +134,30 @@ jobs:
           cargo run -q -p dira-core --bin sign_vector > contract/testdata/signing-vector.json
           git diff --exit-code contract/testdata/signing-vector.json \
             || (echo "signing-vector fixture is stale — run 'just vector'"; exit 1)
+
+  # Windows build/test lane (native, not WSL): validates the named-pipe IPC transport
+  # (`cli/ipc`) and everything else in the workspace on the actual target platform.
+  # Independent of `rust` above (GitHub-hosted `windows-latest`, not the self-hosted
+  # `build` pool) — fmt/contract-schema stay Linux-only intentionally (see module doc),
+  # so this job only runs clippy + tests.
+  rust-windows:
+    name: Rust (windows)
+    runs-on: windows-latest
+    if: github.event.pull_request.draft == false
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace

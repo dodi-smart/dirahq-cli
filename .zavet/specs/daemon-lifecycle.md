@@ -9,7 +9,8 @@ paths:
   - cli/dirad/src/lib.rs
   - cli/dirad/src/control.rs
   - cli/dira/src/daemon.rs
-decisions: [D-0008, D-0009]
+  - cli/ipc/**
+decisions: [D-0008, D-0009, D-0010]
 ---
 
 ## Overview
@@ -18,10 +19,16 @@ How `dirad` comes up: which surfaces it binds, in what order, what happens when
 one of them cannot bind, and how it refuses to run twice. The ordering is not
 incidental — it decides whether a failing daemon can still be diagnosed.
 
+The control channel is platform-split behind `dira-ipc`: a Unix domain socket
+on unix, a named pipe on windows (D-0010). Everything below about socket
+files, `flock`, and stale-path reclaim is the unix arm; on windows the pipe's
+`first_pipe_instance` bind is atomically the single-instance guard, and no
+filesystem state exists to go stale.
+
 ## Behavior
 
 - `run()` loads config, opens the store, builds state, then binds — in order —
-  the UDS control socket, then the loopback HTTP hook ingress. Both bind before
+  the control channel, then the loopback HTTP hook ingress. Both bind before
   hydration, so `Ping`/`Status` answer immediately and a status during warm-up
   reports `hydrating: true`.
 - `bind_control_socket` creates the parent directory, takes an exclusive

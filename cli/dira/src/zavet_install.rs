@@ -47,7 +47,7 @@
 //! every zavet build before the T15 landing) degrades to an "unknown" skew
 //! line rather than an error.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -118,6 +118,11 @@ struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, prog: &str, args: &[&str]) -> Option<Output> {
+        // On Windows `prog` ("claude") commonly resolves to an npm-installed
+        // `claude.cmd` shim; `args` here are always simple flags (never
+        // attacker-controlled shell metacharacters), and std's Command has
+        // spawned `.bat`/`.cmd` targets via `cmd.exe` with correctly escaped
+        // arguments since the "BatBadBut" fix, so this is safe as-is.
         Command::new(prog).args(args).output().ok()
     }
 }
@@ -290,10 +295,35 @@ fn resolve_claude_on_path() -> Option<PathBuf> {
 }
 
 fn resolve_on_path_in(prog: &str, path_var: &OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path_var).find_map(|dir| {
-        let candidate = dir.join(prog);
-        is_executable_file(&candidate).then_some(candidate)
-    })
+    std::env::split_paths(path_var).find_map(|dir| resolve_candidate_in_dir(&dir, prog))
+}
+
+/// unix: `dir/prog` is directly runnable or it isn't — no extension games.
+#[cfg(not(windows))]
+fn resolve_candidate_in_dir(dir: &Path, prog: &str) -> Option<PathBuf> {
+    let candidate = dir.join(prog);
+    is_executable_file(&candidate).then_some(candidate)
+}
+
+/// Windows has no executable bit and (unlike unix) usually doesn't ship
+/// `prog` as a bare extensionless file — npm installs `claude` as a
+/// `claude.cmd` shim, for example. Try the bare name first (covers a real
+/// `.exe`), then each extension `PATHEXT` lists, falling back to the
+/// documented Windows default order when the var is unset or empty.
+#[cfg(windows)]
+fn resolve_candidate_in_dir(dir: &Path, prog: &str) -> Option<PathBuf> {
+    let bare = dir.join(prog);
+    if is_executable_file(&bare) {
+        return Some(bare);
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    pathext
+        .split(';')
+        .filter(|ext| !ext.is_empty())
+        .find_map(|ext| {
+            let candidate = dir.join(format!("{prog}{ext}"));
+            is_executable_file(&candidate).then_some(candidate)
+        })
 }
 
 #[cfg(unix)]
@@ -310,9 +340,7 @@ fn is_executable_file(p: &Path) -> bool {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .context("HOME not set")
+    dira_core::config::home_dir()
 }
 
 /// The two-line manual recipe printed (and the reason `install` bails
@@ -530,8 +558,24 @@ fn skew_line(runner: &dyn Runner, install_path: &str, dira_version: &str) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
+
+    /// Build a synthetic exit status from a plain exit code. `ExitStatusExt`
+    /// is platform-specific (`from_raw` takes `i32` on unix, encoding the
+    /// code shifted into the high byte the way `wait(2)` does, vs `u32` on
+    /// windows, which is the raw process exit code) — this hides that so the
+    /// tests compile and run identically on both.
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
+    }
 
     /// A scripted [`Runner`]: `key(prog, args) -> (exit_code, stdout, stderr)`.
     /// A missing key means the command wasn't stubbed and behaves like
@@ -560,7 +604,7 @@ mod tests {
         fn run(&self, prog: &str, args: &[&str]) -> Option<Output> {
             let (code, stdout, stderr) = self.responses.get(&key(prog, args))?;
             Some(Output {
-                status: ExitStatus::from_raw(*code << 8),
+                status: exit_status(*code),
                 stdout: stdout.as_bytes().to_vec(),
                 stderr: stderr.as_bytes().to_vec(),
             })
@@ -611,14 +655,20 @@ mod tests {
         let real = home.path().join("workspace").join("dirahq-zavet");
         std::fs::create_dir_all(&real).unwrap();
 
+        // Built with serde_json, not format!: a windows path's backslashes are
+        // invalid JSON escapes when spliced in raw, and the parser would then
+        // (rightly) reject the whole file — which is exactly how this test
+        // silently lost its fallback on windows CI before this was fixed.
+        let real_str = real.display().to_string();
         write_known_marketplaces_json(
             home.path(),
-            &format!(
-                r#"{{"dirahq":{{"source":{{"source":"directory","path":"{}"}},
-                     "installLocation":"{}"}}}}"#,
-                real.display(),
-                real.display()
-            ),
+            &serde_json::json!({
+                "dirahq": {
+                    "source": {"source": "directory", "path": real_str},
+                    "installLocation": real_str,
+                }
+            })
+            .to_string(),
         );
 
         let reported = home
@@ -686,6 +736,16 @@ mod tests {
         std::fs::set_permissions(path, perms).unwrap();
     }
 
+    // Windows has no executable bit, and `is_executable_file`'s non-unix
+    // stub is just `is_file()` — so unconditionally writing the file already
+    // makes it "executable" by that stub. Needed only so this test module
+    // compiles and runs on windows CI (used unconditionally below, not
+    // behind a unix-only test).
+    #[cfg(windows)]
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
     // -- resolve_on_path_in ---------------------------------------------------
 
     #[test]
@@ -697,6 +757,10 @@ mod tests {
         assert_eq!(got, Some(dir.join("claude")));
     }
 
+    /// Unix-only by design: the exec-bit is the discriminator here, and windows
+    /// has no such bit — `is_executable_file`'s non-unix arm is deliberately
+    /// just `is_file()`, so a bare non-executable file DOES resolve there.
+    #[cfg(unix)]
     #[test]
     fn resolve_on_path_none_when_not_executable() {
         let dir = fake_bin_dir("not-exec");

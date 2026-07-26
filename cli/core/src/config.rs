@@ -220,6 +220,12 @@ pub struct Config {
 /// Inputs are injected rather than read from the environment inline so every
 /// platform branch is unit-testable from a single dev machine — the same
 /// pattern [`start_of_day`] uses for the UTC offset.
+///
+/// Unix only: the windows control channel is a named pipe, whose endpoint is a
+/// kernel-namespace name rather than a filesystem path — see the `cfg(windows)`
+/// sibling below. D-0008's per-user anchoring holds there by construction (the
+/// pipe name embeds the username; no `$TMPDIR`-shaped ambient state exists).
+#[cfg(unix)]
 fn default_socket_path(xdg_runtime: Option<PathBuf>, data_dir: Option<PathBuf>) -> PathBuf {
     // `$XDG_RUNTIME_DIR` first: on Linux it is the standard home for per-user
     // sockets, and it is already per-user and session-stable.
@@ -252,11 +258,15 @@ pub fn legacy_socket_path() -> PathBuf {
 impl Default for Config {
     fn default() -> Self {
         let dirs = project_dirs();
+        #[cfg(unix)]
+        let socket_path = default_socket_path(
+            std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+            dirs.as_ref().map(|d| d.data_dir().to_path_buf()),
+        );
+        #[cfg(windows)]
+        let socket_path = default_socket_path();
         Self {
-            socket_path: default_socket_path(
-                std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-                dirs.as_ref().map(|d| d.data_dir().to_path_buf()),
-            ),
+            socket_path,
             http_port: 8722,
             db_path: dirs
                 .map(|d| d.data_dir().join("dira.db"))
@@ -278,6 +288,51 @@ impl Default for Config {
             update: UpdateKnobs::default(),
         }
     }
+}
+
+/// The default CLI↔daemon control-channel endpoint.
+///
+/// windows: `\\.\pipe\dira-<user>`. The per-user anchoring D-0008 requires is
+/// inherent here — the pipe name embeds the username, and no `$TMPDIR`-shaped
+/// ambient state is involved. The Win32 named-pipe namespace is a single flat
+/// namespace shared by every user on the machine — unlike a filesystem path, there is
+/// no per-user runtime directory to scope a pipe *into*, so the per-user scoping has
+/// to live in the name itself: append the sanitized `USERNAME` so two local users'
+/// daemons never collide on (or fight over) the same pipe. `<user>` is restricted to
+/// `[A-Za-z0-9_-]` (anything else, including an unset/empty `USERNAME`, becomes
+/// `default`) since the pipe name has no escaping of its own. Nothing is created on
+/// disk here — `\\.\pipe\...` is a device namespace path, not a filesystem path; see
+/// [`Config::runtime_dir`] for the pidfile trap this implies.
+#[cfg(windows)]
+fn default_socket_path() -> PathBuf {
+    let sanitized = sanitize_ident(&std::env::var("USERNAME").unwrap_or_default());
+    let user = if sanitized.is_empty() {
+        "default".to_string()
+    } else {
+        sanitized
+    };
+    PathBuf::from(format!(r"\\.\pipe\dira-{user}"))
+}
+
+/// Reduce `raw` to `[A-Za-z0-9_-]`, mapping every other character to `_`.
+///
+/// The windows endpoint names built from ambient values — the pipe name's
+/// `USERNAME` in [`default_socket_path`], and the pidfile stem `dira` derives from
+/// that pipe name — have no escaping of their own, so the ambient part is
+/// restricted to a character set that is safe both in the pipe namespace and in a
+/// file name. Compiled (and unit-tested) on every platform even though only the
+/// windows paths call it, so the sanitizer both call sites share cannot drift or
+/// rot unnoticed on a unix-only build.
+pub fn sanitize_ident(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Compute the start-of-day instant for `now` given a UTC `offset`: the most
@@ -374,11 +429,55 @@ impl Config {
         let floor = self.presence_ttl_secs.clamp(1, 600);
         self.presence_ttl_deep_idle_secs.clamp(floor, 600)
     }
+
+    /// The directory for daemon runtime files that are NOT the control channel
+    /// itself (e.g. a pidfile).
+    ///
+    /// unix: `socket_path`'s own parent directory — the runtime dir the socket
+    /// already lives under, so there's nothing new to create.
+    ///
+    /// windows: **must not** be derived from `socket_path.parent()` — that is the
+    /// pidfile trap this method exists to avoid. `socket_path` is a named-pipe path
+    /// (`\\.\pipe\dira-<user>`); its "parent" is `\\.\pipe`, the Win32 device
+    /// namespace for pipes, not a filesystem directory — creating or writing a file
+    /// under it fails outright. Windows has no XDG-runtime-dir equivalent scoped this
+    /// tightly, so this falls back to the project's data dir (the same directory
+    /// `db_path` already lives under), or the system temp dir if that's unavailable.
+    pub fn runtime_dir(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            self.socket_path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+        }
+        #[cfg(windows)]
+        {
+            project_dirs()
+                .map(|d| d.data_dir().to_path_buf())
+                .unwrap_or_else(std::env::temp_dir)
+        }
+    }
 }
 
 /// XDG project dirs for `sh.dirahq.dira`. `None` only on exotic platforms.
 pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("sh", "dirahq", "dira")
+}
+
+/// The current user's home directory, via `directories::BaseDirs` (already a
+/// dependency here).
+///
+/// Prefer this over `env::var("HOME")` in any new code: `BaseDirs` resolves the home
+/// directory the platform-correct way on every target, including Windows, where
+/// `HOME` is frequently unset (the platform convention is `USERPROFILE`, which
+/// `BaseDirs` already knows to check). Existing `env::var("HOME")` call sites
+/// elsewhere in the workspace are unix-only historical code and are deliberately NOT
+/// migrated by this change — later Windows work packages own those.
+pub fn home_dir() -> anyhow::Result<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|d| d.home_dir().to_path_buf())
+        .ok_or_else(|| anyhow::anyhow!("could not determine the home directory"))
 }
 
 #[cfg(test)]
@@ -387,6 +486,9 @@ mod tests {
 
     // -- control socket path ------------------------------------------------
 
+    // Unix-only: the windows endpoint is a pipe name that never touches the
+    // filesystem or `$TMPDIR`/`HOME`, so the whole failure class can't exist.
+    #[cfg(unix)]
     #[test]
     #[allow(clippy::result_large_err)]
     fn socket_path_does_not_follow_tmpdir() {
@@ -417,6 +519,7 @@ mod tests {
     // only ever exercise whichever branch the host machine lands on, so pin
     // each one explicitly.
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_prefers_xdg_runtime_dir() {
         let got = default_socket_path(
@@ -426,6 +529,7 @@ mod tests {
         assert_eq!(got, PathBuf::from("/run/user/1000/dira.sock"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_falls_back_to_the_data_dir() {
         // No XDG_RUNTIME_DIR (always the macOS case, and Linux without a
@@ -435,12 +539,14 @@ mod tests {
         assert_eq!(got, PathBuf::from("/home/u/.local/share/dira/dira.sock"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_last_resort_is_the_temp_dir() {
         let got = default_socket_path(None, None);
         assert_eq!(got, std::env::temp_dir().join("dira.sock"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_stays_within_the_sun_path_limit() {
         // A unix socket path is capped at ~104 bytes on macOS / 108 on Linux;
@@ -735,5 +841,39 @@ mod tests {
             assert!(!c.update.check);
             Ok(())
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_socket_path_is_unchanged_on_unix() {
+        // WP1 cfg-splits `default_socket_path`, but unix behavior must stay exactly
+        // what it was: XDG_RUNTIME_DIR (or the temp dir) joined with `dira.sock`.
+        let c = Config::default();
+        assert_eq!(c.socket_path.file_name().unwrap(), "dira.sock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_is_the_sockets_parent_on_unix() {
+        let c = Config::default();
+        assert_eq!(c.runtime_dir(), c.socket_path.parent().unwrap());
+    }
+
+    #[test]
+    fn sanitize_ident_keeps_only_the_safe_character_set() {
+        // Runs on every platform even though only the windows endpoint names call
+        // it — that is the point of not cfg-gating the helper.
+        assert_eq!(sanitize_ident("Asen-Lekov_1"), "Asen-Lekov_1");
+        assert_eq!(sanitize_ident(r"DOMAIN\user"), "DOMAIN_user");
+        assert_eq!(sanitize_ident("a b.c/d"), "a_b_c_d");
+        assert_eq!(sanitize_ident(""), "");
+    }
+
+    #[test]
+    fn home_dir_resolves_to_a_real_directory() {
+        // No mocking `directories::BaseDirs` (it reads real platform state); just
+        // assert it resolves to something that exists on any dev/CI machine.
+        let home = home_dir().expect("home dir must resolve on a normal machine");
+        assert!(home.is_absolute());
     }
 }

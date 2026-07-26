@@ -5,6 +5,7 @@ status: active
 guards:
   - cli/dira/src/update/replace.rs
   - install.sh
+  - install.ps1
 origin: recorded
 verified: true
 ---
@@ -14,6 +15,16 @@ verified: true
 An update stages the new binary inside the destination directory as a
 temporary file, then `rename(2)`s it over the target. The target path is
 never opened for writing. `dirad` is renamed before `dira`.
+
+Windows variant (same invariant, different rename shape): NTFS refuses to
+rename a new file *over* a running `.exe`, but happily renames the running
+`.exe` itself *away*. So on Windows the swap is: stage same-directory, try
+the direct rename, and when the destination is a live binary rename it
+aside to `.{name}.old.<unique>` first, then rename the staged file into
+place. The destination path is still never opened for writing. `.old`
+leftovers are swept best-effort on later runs (a still-running old process
+keeps its file locked until it exits). Both `dira update` (replace.rs) and
+`install.ps1` implement this identically.
 
 ## Why
 

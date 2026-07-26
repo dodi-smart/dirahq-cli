@@ -1,6 +1,14 @@
 //! End-to-end integration test for `dira update` (production-distribution
 //! plan §A3 / task T4).
 //!
+//! unix-only: this test shells real `#!/bin/sh` fixture scripts (both the
+//! "installed" `dira`/`dirad` and the ones packed into the fixture archive)
+//! and asserts on `0o755` mode bits — neither the shebang trick nor
+//! `PermissionsExt` has a windows equivalent. The windows swap path is
+//! covered by `replace.rs`'s unit tests instead (`swap_in`'s
+//! `#[cfg(windows)]` rename-around-a-locked-dest logic and
+//! `artifact.rs`'s `#[cfg(windows)]` zip-extraction tests).
+//!
 //! `dira` is a bin-only crate (no `[lib]` target), so this can't call
 //! `update::run` directly — it drives the real compiled binary as a
 //! subprocess, exactly the way a user would, against a local mock GitHub
@@ -28,6 +36,8 @@
 //! install's `bin_dir` first and runs *that* copy — its `current_exe()`
 //! then resolves inside the tempdir, matching a real installed `dira`, and
 //! the swap logic gets to run for real.
+
+#![cfg(unix)]
 
 use axum::extract::Path as AxPath;
 use axum::http::StatusCode;

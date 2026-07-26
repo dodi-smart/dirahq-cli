@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use time::{Duration, OffsetDateTime, UtcOffset};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
@@ -123,91 +123,125 @@ pub async fn build_state(
         billing: Arc::new(Mutex::new(None)),
         billing_refresh: Arc::new(tokio::sync::Notify::new()),
         presence_wake: Arc::new(tokio::sync::Notify::new()),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
         http_ingress_error: Arc::new(Mutex::new(None)),
     };
     Ok((state, rx, sync_rx, knowledge_rx))
 }
 
-/// Holds the daemon's single-instance `flock` for as long as the listener
-/// bound beside it is in use. Dropping it releases the lock, and the kernel
-/// releases it if the process dies — so it can never go stale the way a
-/// leftover socket file (or a pidfile) can.
+/// Holds the daemon's single-instance guard for as long as the listener bound
+/// beside it is in use.
+///
+/// unix: an exclusive `flock` on `<sock>.lock`. Dropping it releases the lock,
+/// and the kernel releases it if the process dies — so it can never go stale
+/// the way a leftover socket file (or a pidfile) can.
+///
+/// windows: nothing to hold — the named pipe's `first_pipe_instance` bind is
+/// itself the kernel-held guard (a second `create` on a live pipe name fails,
+/// and a pipe name cannot exist stale: the namespace entry dies with its last
+/// handle). The type still exists so [`bind_control_socket`]'s contract —
+/// "keep this alive as long as the listener serves" — reads the same on both
+/// platforms.
 #[derive(Debug)]
 pub struct SocketLock {
+    #[cfg(unix)]
     _file: std::fs::File,
 }
 
-/// Bind the control socket at `sock`, refusing to take it from a daemon that
+/// Bind the control channel at `sock`, refusing to take it from a daemon that
 /// is already using it. Hold the returned [`SocketLock`] as long as the
 /// listener is in use.
 ///
-/// The probe is a plain `connect`: a live listener accepts, while a socket file
-/// orphaned by a dead daemon gives `ECONNREFUSED`. Only the latter is unlinked.
-/// This matters because binding a UDS *requires* the path to be free, so the
-/// pre-D-0009 code unlinked unconditionally — which meant a second daemon took
-/// the path away from a healthy first one. The first daemon's listener stayed
-/// alive on an unlinked inode, reachable by nobody, and no error was logged on
-/// either side.
+/// unix: the probe is a plain `connect`: a live listener accepts, while a
+/// socket file orphaned by a dead daemon gives `ECONNREFUSED`. Only the latter
+/// is unlinked. This matters because binding a UDS *requires* the path to be
+/// free, so the pre-D-0009 code unlinked unconditionally — which meant a
+/// second daemon took the path away from a healthy first one. The first
+/// daemon's listener stayed alive on an unlinked inode, reachable by nobody,
+/// and no error was logged on either side.
 ///
 /// The probe→unlink→bind sequence is not atomic on its own: two daemons racing
 /// onto a *stale* socket file can both see "nothing answers" before either
 /// unlinks, and the loser's unlink then steals the path from the winner's
 /// freshly bound listener — the same orphaned-listener failure via a second
 /// door. An exclusive `flock` on `<sock>.lock`, taken before the probe and held
-/// for the daemon's lifetime, makes the sequence mutually exclusive. Unlike the
-/// pidfile lock D-0009 rejected, an `flock` cannot go stale: the kernel drops
-/// it on any exit, SIGKILL included. The probe stays: a pre-lock daemon holds
-/// the socket without holding any lock.
+/// for the daemon's lifetime, makes the sequence mutually exclusive (the
+/// stale-path unlink inside `dira_ipc::Listener::bind` runs under it). Unlike
+/// the pidfile lock D-0009 rejected, an `flock` cannot go stale: the kernel
+/// drops it on any exit, SIGKILL included. The probe stays: a pre-lock daemon
+/// holds the socket without holding any lock.
 ///
 /// This is also the daemon's only single-instance guard. It used to be provided
 /// by accident: the HTTP port was bound first, so a duplicate died on
 /// `EADDRINUSE` before it could reach the unlink. Now that an unavailable port
 /// is survivable (see [`run`]), the guard has to be explicit.
+///
+/// windows: none of the filesystem failure modes exist — a pipe name is a
+/// kernel-namespace entry, never a stale file — and
+/// `first_pipe_instance(true)` inside `dira_ipc::Listener::bind` makes the
+/// bind itself refuse a name another daemon holds live, atomically. So the
+/// whole guard is the bind, and the returned [`SocketLock`] holds nothing.
 pub async fn bind_control_socket(
     sock: &std::path::Path,
-) -> anyhow::Result<(UnixListener, SocketLock)> {
-    use std::os::fd::AsRawFd;
+) -> anyhow::Result<(dira_ipc::Listener, SocketLock)> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
 
-    if let Some(parent) = sock.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-
-    let lock_path = sock.with_extension("lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open the socket lock at {}", lock_path.display()))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            anyhow::bail!(
-                "another dirad is already running (or starting) on {} — stop it first, or \
-                 use `dira daemon restart` to replace it",
-                sock.display(),
-            );
+        if let Some(parent) = sock.parent() {
+            std::fs::create_dir_all(parent).ok();
         }
-        return Err(err)
-            .with_context(|| format!("failed to lock the socket lock at {}", lock_path.display()));
-    }
 
-    if sock.exists() {
-        if tokio::net::UnixStream::connect(sock).await.is_ok() {
+        let lock_path = sock.with_extension("lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("failed to open the socket lock at {}", lock_path.display())
+            })?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!(
+                    "another dirad is already running (or starting) on {} — stop it first, or \
+                     use `dira daemon restart` to replace it",
+                    sock.display(),
+                );
+            }
+            return Err(err).with_context(|| {
+                format!("failed to lock the socket lock at {}", lock_path.display())
+            });
+        }
+
+        if sock.exists() && dira_ipc::connect(sock).await.is_ok() {
             anyhow::bail!(
                 "another dirad is already running on {} — stop it first, or use \
                  `dira daemon restart` to replace it",
                 sock.display(),
             );
         }
-        // Nothing is listening: a leftover file from a daemon that died.
-        tracing::warn!(sock = %sock.display(), "reclaiming a stale control socket");
-        let _ = std::fs::remove_file(sock);
+        // Either nothing at the path, or a leftover file nothing answers on;
+        // `dira_ipc::Listener::bind` clears the stale file (safe: we hold the
+        // flock and just proved nothing live is behind it), creates the parent
+        // dir, binds, and restricts the socket to the owner (0600).
+        let listener = dira_ipc::Listener::bind(sock)
+            .await
+            .with_context(|| format!("failed to bind the control socket at {}", sock.display()))?;
+        Ok((listener, SocketLock { _file: lock }))
     }
-
-    let listener = UnixListener::bind(sock)
-        .with_context(|| format!("failed to bind the control socket at {}", sock.display()))?;
-    Ok((listener, SocketLock { _file: lock }))
+    #[cfg(windows)]
+    {
+        let listener = dira_ipc::Listener::bind(sock).await.with_context(|| {
+            format!(
+                "failed to bind the control pipe at {} — another dirad may already be \
+                 running (stop it first, or use `dira daemon restart` to replace it)",
+                sock.display()
+            )
+        })?;
+        Ok((listener, SocketLock {}))
+    }
 }
 
 /// Serve the loopback hook ingress on `addr`, treating an unavailable port as
@@ -282,18 +316,20 @@ fn spawn_http_retry(state: AppState, addr: String, retry_base: std::time::Durati
     });
 }
 
-/// Bind the UDS control socket and spawn its accept loop on `state`. Bound
-/// *before* hydration so the daemon answers `Ping`/`Status` immediately
-/// (Commit 2). Used by both [`run`] and the integration tests.
-pub fn serve_control(state: AppState, uds: UnixListener) {
+/// Spawn the accept loop for a bound control listener (UDS on unix, a named
+/// pipe on windows — see `dira_ipc`) on `state`. Bound *before* hydration so
+/// the daemon answers `Ping`/`Status` immediately (Commit 2). Used by both
+/// [`run`] and the integration tests; production binds via
+/// [`bind_control_socket`] so the single-instance guard applies.
+pub fn serve_control(state: AppState, mut listener: dira_ipc::Listener) {
     tokio::spawn(async move {
         loop {
-            match uds.accept().await {
-                Ok((stream, _)) => {
+            match listener.accept().await {
+                Ok(stream) => {
                     let st = state.clone();
                     tokio::spawn(control::handle_conn(st, stream));
                 }
-                Err(e) => tracing::warn!("uds accept error: {e}"),
+                Err(e) => tracing::warn!("control accept error: {e}"),
             }
         }
     });
@@ -320,11 +356,13 @@ pub async fn run() -> anyhow::Result<()> {
     // `bind_control_socket` refuses to take the path from a live daemon; it used
     // to unlink unconditionally, and the HTTP bind was the accidental guard.
 
-    // UDS control channel. The lock lives until `run` returns — i.e. for the
-    // daemon's whole life — so no duplicate can race the socket path meanwhile.
+    // Control channel (UDS on unix, a named pipe on windows — see `dira_ipc`).
+    // The lock lives until `run` returns — i.e. for the daemon's whole life —
+    // so no duplicate can race the endpoint meanwhile. `bind_control_socket`
+    // owns the guard + bind on both platforms (flock+probe on unix, the pipe's
+    // first-instance bind on windows), including the owner-only socket perms.
     let sock = state.config.socket_path.clone();
-    let (uds, _socket_lock) = bind_control_socket(&sock).await?;
-    set_socket_perms(&sock);
+    let (listener, _socket_lock) = bind_control_socket(&sock).await?;
     tracing::info!(sock = %sock.display(), "control socket ready");
 
     // HTTP ingress (loopback only). Survivable: a conflict leaves the daemon up
@@ -369,58 +407,114 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    serve_control(state.clone(), uds);
+    serve_control(state.clone(), listener);
 
     // Block until shutdown. The accept loop runs detached in `serve_control`.
-    wait_for_shutdown_signal().await;
+    wait_for_shutdown_signal(&state).await;
     tracing::info!("shutting down");
     // Graceful offline: tell the cloud this device is going offline with one
     // best-effort empty-sessions beat (short timeout, errors ignored) so it
     // doesn't wait out the presence TTL.
     heartbeat::send_offline_beat(&state).await;
 
+    // Nothing to clean up on windows — a named pipe isn't a filesystem object,
+    // so there's no stale file for the next `run()` to trip over the way a
+    // leftover UDS path would.
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
     Ok(())
 }
 
-/// Block until either Ctrl-C (SIGINT) or SIGTERM arrives, then return so the
-/// caller runs the SAME orderly shutdown for both.
+/// Block until an orderly-shutdown trigger arrives, then return so the caller
+/// (`run`) performs the SAME shutdown sequence regardless of which trigger
+/// fired: Ctrl-C, a platform termination signal/event, or an in-band
+/// `Request::Shutdown` over the control channel (`control::handle_conn`'s
+/// post-write `state.shutdown.notify_one()` — the windows-required,
+/// platform-neutral SIGTERM equivalent; see `Request::Shutdown`'s doc for why
+/// windows needs this at all).
 ///
-/// `kill <pid>` (what `dira daemon stop` sends), `launchctl kickstart -k`, and
-/// `systemctl restart` all deliver **SIGTERM**, not SIGINT — so `ctrl_c()`
-/// alone left every daemon restart (including the ones `dira update` performs)
-/// killing the process via the default signal disposition: no log line, no
-/// offline beat, no chance to flush. Unix-only: this project ships macOS +
-/// Linux binaries only, so there is no Windows signal branch to add here.
-async fn wait_for_shutdown_signal() {
+/// unix: `kill <pid>` (what `dira daemon stop` sends), `launchctl kickstart
+/// -k`, and `systemctl restart` all deliver **SIGTERM**, not SIGINT — so
+/// `ctrl_c()` alone left every daemon restart (including the ones `dira
+/// update` performs) killing the process via the default signal disposition:
+/// no log line, no offline beat, no chance to flush.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal(state: &AppState) {
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
         Ok(s) => s,
         Err(e) => {
             // Registration only fails on resource exhaustion; fall back to
-            // Ctrl-C alone rather than panicking a running daemon over it.
+            // Ctrl-C + the in-band notify rather than panicking a running
+            // daemon over it.
             tracing::warn!(
                 "failed to install SIGTERM handler: {e}; SIGTERM will use the default disposition"
             );
-            tokio::signal::ctrl_c().await.ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = state.shutdown.notified() => {}
+            }
             return;
         }
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
+        _ = state.shutdown.notified() => {}
     }
 }
 
-/// Best-effort restrict the control socket to the owner (0600). No-op on non-unix.
-pub fn set_socket_perms(sock: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600));
+/// windows has no SIGTERM at all, so `dira daemon stop` and daemon
+/// self-restarts (`dira update`) rely entirely on `Request::Shutdown` over the
+/// control pipe to ask this loop to wind down — `state.shutdown.notified()` is
+/// therefore not just a nicety here the way it is on unix (which also has real
+/// signals), it's windows' only orderly-shutdown path.
+///
+/// The three Win32 console-control events tokio exposes are watched too, so a
+/// console close/logoff/shutdown still gets the orderly path when nothing
+/// sent an explicit `Shutdown` request first: Ctrl-C (interactive), Ctrl-Close
+/// (console window closed), and Ctrl-Shutdown (system shutdown/logoff).
+/// Ctrl-Close in particular gives the process only ~5s before Windows hard-
+/// kills it — the shutdown sequence in `run()` (the offline beat) is already a
+/// single short-timeout best-effort HTTP call with no new blocking work added
+/// here, so it comfortably fits inside that budget.
+#[cfg(windows)]
+async fn wait_for_shutdown_signal(state: &AppState) {
+    // Each registration only fails on resource exhaustion; on failure that
+    // branch below simply never fires (`std::future::pending`) instead of
+    // panicking a running daemon over it — the remaining triggers still cover
+    // shutdown.
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()
+        .inspect_err(|e| tracing::warn!("failed to install Ctrl-C handler: {e}"))
+        .ok();
+    let mut ctrl_close = tokio::signal::windows::ctrl_close()
+        .inspect_err(|e| tracing::warn!("failed to install Ctrl-Close handler: {e}"))
+        .ok();
+    let mut ctrl_shutdown = tokio::signal::windows::ctrl_shutdown()
+        .inspect_err(|e| tracing::warn!("failed to install Ctrl-Shutdown handler: {e}"))
+        .ok();
+
+    tokio::select! {
+        _ = async {
+            match ctrl_c.as_mut() {
+                Some(s) => { s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+        _ = async {
+            match ctrl_close.as_mut() {
+                Some(s) => { s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+        _ = async {
+            match ctrl_shutdown.as_mut() {
+                Some(s) => { s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+        _ = state.shutdown.notified() => {}
     }
-    #[cfg(not(unix))]
-    let _ = sock;
 }
 
 /// Spawn the background hydrate, flipping `hydrated` true when it completes.

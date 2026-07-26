@@ -1,14 +1,15 @@
-name: Sync install.sh to landing
+name: Sync installers to landing
 
 # The landing repo (dirahq-landing) cannot read this private repo, so the
-# sync has to originate here: whenever the canonical install.sh changes on
-# `main`, mirror it into the public site's scripts/install.sh via a PR --
-# never a direct push, since the deploy gate on that repo matters.
+# sync has to originate here: whenever a canonical installer changes on
+# `main`, mirror it into the public site's scripts/ via a PR -- never a
+# direct push, since the deploy gate on that repo matters.
 on:
   push:
     branches: [main]
     paths:
       - install.sh
+      - install.ps1
   workflow_dispatch:
 
 permissions:
@@ -20,7 +21,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync install.sh -> dirahq-landing
+    name: Sync installers -> dirahq-landing
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -50,7 +51,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           path: dirahq-landing
 
-      - name: Vendor install.sh and open a sync PR
+      - name: Vendor installers and open a sync PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -61,37 +62,36 @@ jobs:
 
           mkdir -p dirahq-landing/scripts
 
-          # Rebuild scripts/install.sh as a vendored copy: keep the shebang
-          # first (so it's still a valid, directly-runnable script), then
-          # insert the "do not edit here" header, then the rest verbatim.
-          {
-            head -n1 dirahq-cli/install.sh
-            printf '# Vendored from dodi-smart/dirahq-cli -- do not edit here.\n'
-            printf '# Synced automatically by the sync-install-script workflow.\n'
-            tail -n +2 dirahq-cli/install.sh
-          } >dirahq-landing/scripts/install.sh
+          # Plain `cp`, byte-identical -- D-0007. The landing copy carries no added
+          # header: the "vendored, do not edit here" notice lives in
+          # dirahq-landing/scripts/README.md instead, specifically so the drift check
+          # (a scheduled job on the landing side) is a plain `diff` with nothing to
+          # normalize. A previous version of this step prepended a two-line header,
+          # which broke that byte-for-byte guarantee -- do not reintroduce one.
+          cp dirahq-cli/install.sh dirahq-landing/scripts/install.sh
+          cp dirahq-cli/install.ps1 dirahq-landing/scripts/install.ps1
 
           cd dirahq-landing
 
-          # git diff ignores untracked files, which would silently skip the
-          # very first sync (before scripts/install.sh exists at all) -- use
-          # status instead so both "new file" and "changed file" are caught.
-          if [ -z "$(git status --porcelain -- scripts/install.sh)" ]; then
-            echo "install.sh is already in sync with dirahq-landing -- nothing to do."
+          # git diff ignores untracked files, which would silently skip the very
+          # first sync (before scripts/install.{sh,ps1} exist at all) -- use status
+          # instead so both "new file" and "changed file" are caught.
+          if [ -z "$(git status --porcelain -- scripts/install.sh scripts/install.ps1)" ]; then
+            echo "install.sh and install.ps1 are already in sync with dirahq-landing -- nothing to do."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${branch}"
-          git add scripts/install.sh
-          git commit -s -m "chore(install): sync installer from dirahq-cli@${sha_short}"
+          git add scripts/install.sh scripts/install.ps1
+          git commit -s -m "chore(install): sync installers from dirahq-cli@${sha_short}"
           git push -u origin "${branch}" --force
 
           gh pr create \
             --repo dodi-smart/dirahq-landing \
             --base main \
             --head "${branch}" \
-            --title "chore(install): sync installer from dirahq-cli@${sha_short}" \
-            --body "Automated sync of \`scripts/install.sh\` from dodi-smart/dirahq-cli@${sha_short} (https://github.com/dodi-smart/dirahq-cli/commit/${sha_short}). Source of truth is \`install.sh\` at the CLI repo root -- do not edit the landing copy by hand." \
+            --title "chore(install): sync installers from dirahq-cli@${sha_short}" \
+            --body "Automated sync of \`scripts/install.sh\` and \`scripts/install.ps1\` from dodi-smart/dirahq-cli@${sha_short} (https://github.com/dodi-smart/dirahq-cli/commit/${sha_short}). Source of truth is \`install.sh\` / \`install.ps1\` at the CLI repo root -- do not edit the landing copies by hand." \
             || echo "a PR for ${branch} may already be open -- see dodi-smart/dirahq-landing pulls."

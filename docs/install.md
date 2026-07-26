@@ -4,10 +4,18 @@
 curl -fsSL https://dirahq.sh/install | sh
 ```
 
-This downloads `install.sh` from the landing site (a vendored copy of the script at the
-root of this repo — see its header comment) and runs it. The script is POSIX `sh`, does
-nothing until its very last line (`main "$@"`), and every download is **sha256-verified
-before anything is installed — there is no `--no-verify` escape hatch.**
+```powershell
+irm https://dirahq.sh/install.ps1 | iex
+```
+
+Use `install.sh` on Linux and macOS (including WSL2), and `install.ps1` on native Windows
+-- see [Windows](#windows) below. Both download from the landing site (vendored,
+byte-identical copies of the scripts at the root of this repo), do nothing until their
+very last line, and every download is **sha256-verified before anything is installed —
+there is no `--no-verify` escape hatch.** `install.ps1` is a section-for-section port of
+`install.sh`: same step order, same environment variables, same guarantees, translated to
+PowerShell flag syntax (`-Version` instead of `--version`, etc.) — see
+[Windows](#windows) for its flag table.
 
 Flags always beat their matching environment variable. Everything below is read straight
 out of `install.sh`'s own `--help` and `dira update --help` — if the two ever disagree with
@@ -21,7 +29,9 @@ this file, trust the `--help` output and file a bug.
 | macOS, Intel | `universal-apple-darwin` | Same download as Apple Silicon |
 | Linux x86_64 | `x86_64-unknown-linux-musl` | Static musl — works on Alpine and old-glibc distros alike |
 | Linux arm64 | `aarch64-unknown-linux-musl` | Static musl |
-| Windows | — | Not supported natively. Install inside WSL2 and run the script from there; the Linux target then applies. |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | Native build. Install with `install.ps1`, not `install.sh` — see [Windows](#windows) |
+| Windows arm64 | `aarch64-pc-windows-msvc` | Cross-compiled (MSVC links a foreign architecture natively from an x86_64 host) |
+| WSL2 (any arch) | `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` | WSL is Linux to `uname` — use `install.sh` from inside the WSL shell, same as bare-metal Linux |
 
 There is no `x86_64-apple-darwin` artifact and no glibc (`gnu`) Linux artifact — the
 universal macOS binary and the statically-linked musl binaries make both unnecessary.
@@ -61,6 +71,72 @@ universal macOS binary and the statically-linked musl binaries make both unneces
 
 Two more `DIRA_*` variables are read only by the `dira update` self-updater, not by
 `install.sh` — see [`dira update` semantics](#dira-update-semantics) below.
+
+## Windows
+
+```powershell
+irm https://dirahq.sh/install.ps1 | iex
+```
+
+`install.ps1` is a section-for-section PowerShell port of `install.sh` — same step order,
+same mandatory sha256 verification, same "does nothing until the very last line"
+truncation-safety discipline, just PowerShell flag syntax and a `.exe` extension.
+PowerShell 5.1 (the default host behind `irm | iex`) is the compatibility floor; it never
+calls `Set-ExecutionPolicy`.
+
+`irm | iex` has no way to forward flags to the piped script — it just executes the
+downloaded text. To pass flags, wrap it in a scriptblock and invoke that directly:
+
+```powershell
+& ([scriptblock]::Create((irm https://dirahq.sh/install.ps1))) -Channel prerelease
+```
+
+Or download the script and run it directly — also the only way to use a restricted
+`ExecutionPolicy` without a persistent, machine-wide change (`irm | iex` already bypasses
+policy for itself; a saved `.ps1` file does not):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 [FLAGS]
+```
+
+### Flags
+
+| Flag | Same as | Default |
+|---|---|---|
+| `-Version <VERSION>` | `DIRA_VERSION` | `latest` |
+| `-Channel <CHANNEL>` | `DIRA_CHANNEL` | `stable` (`stable` \| `prerelease`) |
+| `-Prerelease` | shorthand for `-Channel prerelease` | — |
+| `-BinDir <DIR>` | `DIRA_BIN_DIR` | `$env:USERPROFILE\.local\bin` |
+| `-Target <TRIPLE>` | `DIRA_TARGET` | auto-detected (`x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc`) |
+| `-Daemon` | `DIRA_START_DAEMON=1` | off — start `dirad` after installing |
+| `-Service` | `DIRA_INSTALL_SERVICE=1` | off — register a `DiraDaemon` scheduled task (`dira daemon install`) |
+| `-NoDaemon` | — | off — never start, restart, or install the daemon, even if one is already running |
+| `-Force` | — | off — overwrite a dev-build symlink; skip the `-Uninstall` confirmation |
+| `-Uninstall` | — | off — remove `dira.exe` + `dirad.exe` (never config or data) |
+| `-Help` | — | show usage and exit |
+
+The rest of the [environment variables](#environment-variables) above apply identically —
+`DIRA_REPO`, `DIRA_API_URL`, `DIRA_DOWNLOAD_URL` (a `file://` URL still works, for
+air-gapped installs), `GH_TOKEN`/`GITHUB_TOKEN`, and `DIRA_DEBUG`. There is no Windows
+equivalent of `DIRA_ALLOW_ROOT` — it's a Unix-only concept.
+
+PATH is updated in the **user** scope via the registry
+(`[Environment]::SetEnvironmentVariable(..., 'User')`) — never machine-wide, and never
+`setx`, which silently truncates PATH at 1024 characters. It's also prepended to the
+current session's `$env:PATH`, so the printed "Next steps" work immediately; open a new
+terminal for the change to show up elsewhere.
+
+Uninstalling mirrors [Uninstalling](#uninstalling) below: `-Uninstall` (add `-Force` to
+skip the confirmation prompt) asks for confirmation, stops the daemon, best-effort tears
+down the `DiraDaemon` scheduled task, then removes `dira.exe` + `dirad.exe`. Config and
+data are never touched.
+
+### WSL2
+
+WSL2 is Linux as far as dira is concerned — use `install.sh` from inside the WSL shell,
+not `install.ps1`. `install.sh` detects WSL and prints a pointer to `install.ps1` in case
+you actually wanted the native build instead; `install.ps1` itself refuses outright when
+run under `pwsh` on Linux or macOS (including WSL) and points back at `install.sh`.
 
 ## Verifying checksums by hand
 

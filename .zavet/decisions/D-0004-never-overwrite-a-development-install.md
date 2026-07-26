@@ -5,6 +5,7 @@ status: active
 guards:
   - cli/dira/src/update/replace.rs
   - install.sh
+  - install.ps1
   - justfile
 origin: recorded
 verified: true

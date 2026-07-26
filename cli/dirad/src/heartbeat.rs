@@ -684,13 +684,21 @@ pub(crate) fn fmt_rfc3339(t: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{MockCloud, MockResp};
+    use crate::test_support::{keychain_lock, use_mock_keychain, MockCloud, MockResp};
     use dira_contract::{Harness, SessionKind};
 
     /// A linked, cloud-configured `AppState` with no live sessions — enough for
     /// `beat` to attempt a presence POST (an empty `sessions` list is itself a
-    /// valid, sendable snapshot).
-    async fn linked_state(cloud: &MockCloud) -> AppState {
+    /// valid, sendable snapshot) — plus the keychain lock guard that must
+    /// outlive it.
+    ///
+    /// Signing a beat resolves the device key through `dira_core::identity`,
+    /// which is keychain-first; without the mock store that blocks on a real
+    /// OS keychain prompt. Returning the guard makes the isolation impossible
+    /// to forget — bind it (`let (state, _keychain) = ...`), never `_`.
+    async fn linked_state(cloud: &MockCloud) -> (AppState, tokio::sync::MutexGuard<'static, ()>) {
+        let keychain = keychain_lock().await;
+        use_mock_keychain();
         let store = dira_core::Store::open_in_memory().await.unwrap();
         dira_core::identity::set_device_id(&store, "01TESTDEVICE")
             .await
@@ -701,7 +709,7 @@ mod tests {
         };
         let (state, _rx, _sync_rx, _knowledge_rx) =
             crate::build_state(store, config).await.unwrap();
-        state
+        (state, keychain)
     }
 
     /// Issue #23: deep-idle pacing must honor a cloud that clamps the presence
@@ -711,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn deep_idle_effective_ttl_respects_a_smaller_cloud_ack() {
         let cloud = MockCloud::start(&["/api/v1/presence"]).await;
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
         let deep = state.config.presence_ttl_deep_idle();
 
         // No ack yet: pace off the configured deep-idle TTL (fast start).
@@ -745,7 +753,7 @@ mod tests {
             MockResp::status(429, r#"{"error":"rate_limited","retryAfterSecs":99}"#)
                 .with_header("Retry-After", "13"),
         );
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
 
         let mut last_sent_sessions = None;
         let mut last_sent_at = None;
@@ -805,7 +813,7 @@ mod tests {
             "/api/v1/presence",
             MockResp::status(429, r#"{"error":"rate_limited","retryAfterSecs":21}"#),
         );
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
 
         let mut last_sent_sessions = None;
         let mut last_sent_at = None;

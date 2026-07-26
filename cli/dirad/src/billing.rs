@@ -287,9 +287,20 @@ async fn fetch_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{MockCloud, MockResp};
+    use crate::test_support::{keychain_lock, use_mock_keychain, MockCloud, MockResp};
 
-    async fn linked_state(cloud: &MockCloud) -> AppState {
+    /// A linked `AppState` **and** the keychain lock guard that must outlive it.
+    ///
+    /// Every `fetch_once` against this state signs its request, which resolves
+    /// the device key through `dira_core::identity` — keychain-first. Without
+    /// the mock store installed that reaches the real OS keychain and blocks on
+    /// an authorization prompt no CI runner can answer. Returning the guard
+    /// rather than dropping it here makes the isolation impossible to forget:
+    /// you cannot get a linked state without also holding the lock for as long
+    /// as you use it. Bind it (`let (state, _keychain) = ...`), never `_`.
+    async fn linked_state(cloud: &MockCloud) -> (AppState, tokio::sync::MutexGuard<'static, ()>) {
+        let keychain = keychain_lock().await;
+        use_mock_keychain();
         let store = dira_core::Store::open_in_memory().await.unwrap();
         dira_core::identity::set_device_id(&store, "01TESTDEVICE")
             .await
@@ -300,7 +311,7 @@ mod tests {
         };
         let (state, _rx, _sync_rx, _knowledge_rx) =
             crate::build_state(store, config).await.unwrap();
-        state
+        (state, keychain)
     }
 
     /// Task 22 (integration): a freshly built state has an empty session
@@ -311,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_once_skips_the_post_when_deep_idle_and_cache_already_current() {
         let cloud = MockCloud::start(&["/api/v1/billing/summary"]).await;
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
 
         let mut last_attempt: Option<Instant> = None;
         let mut last_success = Some(OffsetDateTime::now_utc());
@@ -341,7 +352,7 @@ mod tests {
     async fn run_always_fetches_on_tick_one_after_a_restart_with_a_cached_summary() {
         let cloud = MockCloud::start(&["/api/v1/billing/summary"]).await;
         cloud.push("/api/v1/billing/summary", MockResp::ok("{}"));
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
 
         // Persist a cache as if this were a prior daemon lifetime's last
         // successful fetch, timestamped now — as fresh as a cache can look,
@@ -393,7 +404,7 @@ mod tests {
     async fn fetch_once_does_not_skip_when_not_deep_idle() {
         let cloud = MockCloud::start(&["/api/v1/billing/summary"]).await;
         cloud.push("/api/v1/billing/summary", MockResp::ok("{}"));
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
 
         let ev = dira_core::model::RawEvent {
             id: "s1-start".to_string(),
@@ -439,7 +450,7 @@ mod tests {
             MockResp::status(429, r#"{"error":"rate_limited","retryAfterSecs":120}"#)
                 .with_header("Retry-After", "120"),
         );
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
 
         let before = Instant::now();
         let mut last_attempt: Option<Instant> = None;
@@ -475,7 +486,7 @@ mod tests {
             "/api/v1/billing/summary",
             MockResp::status(429, "").with_header("Retry-After", &u64::MAX.to_string()),
         );
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
 
         let before = Instant::now();
         let mut last_attempt: Option<Instant> = None;
@@ -498,7 +509,7 @@ mod tests {
     async fn fetch_429_without_hint_leaves_the_ordinary_gap() {
         let cloud = MockCloud::start(&["/api/v1/billing/summary"]).await;
         cloud.push("/api/v1/billing/summary", MockResp::status(429, ""));
-        let state = linked_state(&cloud).await;
+        let (state, _keychain) = linked_state(&cloud).await;
 
         let mut last_attempt: Option<Instant> = None;
         let mut last_success: Option<OffsetDateTime> = None;

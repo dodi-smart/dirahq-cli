@@ -12,7 +12,7 @@ paths:
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0002, D-0003, D-0004, D-0005, D-0006, D-0007, D-0008, D-0009, D-0010]
+decisions: [D-0002, D-0003, D-0004, D-0005, D-0006, D-0007, D-0008, D-0009, D-0010, D-0011]
 ---
 
 ## Overview
@@ -82,6 +82,12 @@ both executables and restarts whatever is supervising the daemon.
   `artifact` (target detection, download, checksum, extract), `replace`
   (install discovery, atomic swap, rollback), and `notice` (the passive
   update-available line).
+- The archive is hashed by streaming it through a 64 KiB buffer into the
+  sha2 hasher: sha2 0.11 (digest 0.11) dropped the hasher's `io::Write` impl,
+  so `io::copy` is no longer available. Constant-memory either way.
+- TLS for the download (and every other cloud call) validates against roots
+  compiled into the binary, not the host trust store — D-0011. That is what
+  keeps the static musl artifact self-sufficient on an unknown host.
 - Extraction shells out to `tar -xzf` on unix rather than vendoring
   `tar`+`flate2`; `tar` is already a hard requirement of the installer. On
   windows the updater uses the `zip` crate (target-gated dep) — no

@@ -49,6 +49,15 @@
       matchUpdateTypes: ["minor", "patch"],
       groupName: "production dependencies (non-major)",
     },
+    // reqwest 0.13 is a TLS-posture change disguised as a 0.x minor: aws-lc-rs replaces
+    // ring, and cert validation moves from bundled Mozilla roots to the host trust store
+    // (see the reqwest comment in the root Cargo.toml). It needs its own PR with a
+    // release-matrix build behind it, so keep it out of the weekly batch until then.
+    {
+      matchPackageNames: ["reqwest"],
+      allowedVersions: "<0.13",
+      description: "held: 0.13 changes the TLS provider + trust anchors; migrate deliberately",
+    },
     // Label majors for visibility (they're not auto-merged — automerge defaults to false).
     { matchUpdateTypes: ["major"], addLabels: ["major"] },
   ],

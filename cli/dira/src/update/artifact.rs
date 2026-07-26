@@ -9,6 +9,7 @@
 use super::resolve::AssetRef;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 
 /// Detect this host's release target triple.
@@ -128,7 +129,19 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("open {} for hashing", path.display()))?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hash {}", path.display()))?;
+    // sha2 0.11 (digest 0.11) dropped the `io::Write` impl on hashers, so the
+    // release archive is streamed through a fixed buffer rather than
+    // `io::copy`-ed into the hasher — still constant-memory over the file.
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .with_context(|| format!("hash {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
     let actual = hex::encode(hasher.finalize());
     if !actual.eq_ignore_ascii_case(expected_hex) {
         anyhow::bail!(
@@ -373,6 +386,26 @@ cccc222222222222222222222222222222222222222222222222222222222  dira-0.2.0-univer
         verify_sha256(&path, &expected.to_ascii_uppercase()).unwrap();
     }
 
+    /// Release archives are megabytes, so hashing spans many reads of the
+    /// 64 KiB buffer — the loop that replaced `io::copy` when sha2 0.11 dropped
+    /// the hasher's `io::Write` impl. A payload that is neither buffer-aligned
+    /// nor single-read catches an off-by-one in the `&buf[..read]` slicing that
+    /// the 11-byte cases above cannot. Digest computed out-of-band (`shasum`).
+    #[test]
+    fn verify_sha256_hashes_a_payload_spanning_many_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let data: Vec<u8> = (0..200_000u32)
+            .map(|i| ((i * 7 + 11) % 251) as u8)
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+        verify_sha256(
+            &path,
+            "d3d6f9698b1b5f12224df555b0704c17f0c4feb6485b49105d4dd99df343660c",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn verify_sha256_rejects_a_mismatched_digest() {
         let dir = tempfile::tempdir().unwrap();
@@ -410,6 +443,8 @@ cccc222222222222222222222222222222222222222222222222222222222  dira-0.2.0-univer
     #[cfg(unix)]
     #[test]
     fn extract_flat_archive_with_both_binaries_succeeds() {
+        // Spawns `tar`, resolved via PATH — see `test_env_lock`.
+        let _guard = super::super::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let tarball = build_tarball(
             dir.path(),
@@ -433,6 +468,8 @@ cccc222222222222222222222222222222222222222222222222222222222  dira-0.2.0-univer
     #[cfg(unix)]
     #[test]
     fn extract_missing_dirad_gives_a_clear_error() {
+        // Spawns `tar`, resolved via PATH — see `test_env_lock`.
+        let _guard = super::super::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let tarball = build_tarball(dir.path(), &[(dira_ipc::DIRA_BIN, b"fake-dira")]);
         let dest = dir.path().join("out");
@@ -443,6 +480,8 @@ cccc222222222222222222222222222222222222222222222222222222222  dira-0.2.0-univer
     #[cfg(unix)]
     #[test]
     fn extract_empty_binary_is_rejected() {
+        // Spawns `tar`, resolved via PATH — see `test_env_lock`.
+        let _guard = super::super::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let tarball = build_tarball(
             dir.path(),

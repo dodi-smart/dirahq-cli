@@ -342,6 +342,12 @@ fn write_check_cache(checked_at: i64, latest: Option<&str>, channel: Channel, er
 /// this *before* touching any such var and hold the guard for the test's
 /// duration — mirrors `test_support::keychain_lock`'s reasoning for the
 /// shared mock keychain.
+///
+/// **Readers count too.** `path_scan_finds_the_directory_containing_dira`
+/// points `PATH` at a temp dir for the length of its call, so any test that
+/// resolves a bare program name through `PATH` — every `extract`/`build_tarball`
+/// test spawning `tar` — races it and fails with a spurious "failed to spawn
+/// `tar`" unless it holds this lock as well.
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

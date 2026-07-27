@@ -44,7 +44,7 @@ dunce.workspace = true
 # not something `dira update` can assume. Deflate-only keeps the compile cost
 # bounded; the updater only reads archives our own release workflow produced.
 [target.'cfg(windows)'.dependencies]
-zip = { version = "5", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # `config_cmd`'s round-trip test re-layers a written config.toml the same way

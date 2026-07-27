@@ -106,7 +106,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # the tree carries both lines; the cost is build time only, and pinning back to
 # 0.22 to dedupe would hold this crate behind figment's release cadence.
 toml_edit = "0.25"
-ulid = { version = "1", features = ["serde"] }
+ulid = { version = "3", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

@@ -14,8 +14,9 @@ version = "0.1.0-develop.15"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/dodi-smart/dirahq-cli"
-# 1.85 required by ed25519-dalek 3 (edition 2024).
-rust-version = "1.85"
+# 1.88 required by zip 8 (Windows-only dep, but the workspace floor is one
+# number); 1.85 was the previous floor, set by ed25519-dalek 3 (edition 2024).
+rust-version = "1.88"
 
 # Centralized dependency versions. Members opt in via `dep.workspace = true`.
 [workspace.dependencies]

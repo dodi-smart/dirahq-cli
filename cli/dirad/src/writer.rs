@@ -201,7 +201,7 @@ async fn process_message(
     // Periodic ingest heartbeat (6d): one info line per 256 stored events keeps
     // the steady-state log quiet while still surfacing volume + the live
     // coalescing ratio and an approximate queue depth.
-    if *events_ingested % 256 == 0 {
+    if events_ingested.is_multiple_of(256) {
         let queue_depth = QUEUE_CAPACITY.saturating_sub(state.tx.capacity());
         tracing::info!(
             events_ingested = *events_ingested,

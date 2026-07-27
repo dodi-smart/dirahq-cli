@@ -129,7 +129,7 @@ pub fn money(currency: &str, amount: f64) -> String {
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     let lead = digits.len() % 3;
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (i + 3 - lead) % 3 == 0 {
+        if i > 0 && (i + 3 - lead).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(ch);

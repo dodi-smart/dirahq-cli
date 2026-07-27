@@ -659,7 +659,7 @@ pub async fn maintenance(state: AppState) {
         if let Err(e) = state.store.wal_checkpoint_truncate().await {
             tracing::debug!("wal checkpoint failed: {e}");
         }
-        if sweeps % VACUUM_EVERY_N_SWEEPS == 0 {
+        if sweeps.is_multiple_of(VACUUM_EVERY_N_SWEEPS) {
             if let Err(e) = state.store.vacuum().await {
                 tracing::debug!("vacuum failed: {e}");
             }

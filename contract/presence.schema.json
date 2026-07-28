@@ -34,7 +34,10 @@
       "enum": [
         "claude_code",
         "codex",
+        "gemini",
+        "cursor",
         "open_code",
+        "grok",
         "generic",
         "manual"
       ]

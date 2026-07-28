@@ -200,7 +200,10 @@
       "enum": [
         "claude_code",
         "codex",
+        "gemini",
+        "cursor",
         "open_code",
+        "grok",
         "generic",
         "manual"
       ]
@@ -303,6 +306,20 @@
         },
         "kind": {
           "$ref": "#/$defs/SessionKind"
+        },
+        "label": {
+          "description": "Operational tag for a manual session (`--label`), used locally to select/stop\nsessions; surfaced read-only in the cloud.\nOptional + omitted-when-absent so older payloads (and the signing vector)\nstay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "description": "Free-text human description for a manual session (`dira log`/`invoice`/`start`\n`--note`, or the trailing comment). Purely descriptive — the invoice line.\nOptional + omitted-when-absent so older payloads (and the signing vector)\nstay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "prompts": {
           "description": "Count of human prompts (user_prompt events) observed in this session.\nOptional + omitted-when-absent so older payloads (and the signing vector)\nstay byte-identical.",

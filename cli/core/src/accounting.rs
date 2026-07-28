@@ -104,9 +104,43 @@ pub fn active_seconds(times: &[OffsetDateTime], idle: Duration) -> i64 {
 /// Per-project breakdown of de-duplicated human seconds. The values sum exactly
 /// to [`total_human_seconds`].
 pub fn per_project_seconds(signals: &[Signal], idle: Duration) -> BTreeMap<Option<String>, i64> {
-    let mut out: BTreeMap<Option<String>, i64> = BTreeMap::new();
-    for gap in counted_gaps(signals, idle) {
-        *out.entry(gap.project.clone()).or_insert(0) += gap.seconds();
+    // Delegate to the generic keyed attribution so project and session breakdowns
+    // can never drift from one another (or from the grand total).
+    let keyed: Vec<(OffsetDateTime, Option<String>)> =
+        signals.iter().map(|s| (s.at, s.project.clone())).collect();
+    per_key_seconds(&keyed, idle)
+}
+
+/// Per-*key* breakdown of de-duplicated, idle-trimmed human seconds, attributing
+/// each counted gap to the key of the signal that **opens** it — the same v1
+/// policy as [`per_project_seconds`], generalised to any grouping key (a project,
+/// a session id, an identity, …).
+///
+/// `keyed` is `(timestamp, key)` for every human signal, in any order. Because the
+/// counted gaps are exactly those of [`counted_gaps`] over the same timestamps —
+/// consecutive, half-open, idle-trimmed — the returned values sum **exactly** to
+/// [`total_human_seconds`]. So a per-session breakdown reconciles to the very same
+/// grand total a per-project breakdown does; no wall-minute is counted twice, and
+/// none is dropped.
+pub fn per_key_seconds<K: Ord + Clone>(
+    keyed: &[(OffsetDateTime, K)],
+    idle: Duration,
+) -> BTreeMap<K, i64> {
+    if keyed.len() < 2 {
+        return BTreeMap::new();
+    }
+    // Sort by time; ties keep input order (stable), matching `counted_gaps`.
+    let mut ordered: Vec<&(OffsetDateTime, K)> = keyed.iter().collect();
+    ordered.sort_by_key(|(at, _)| *at);
+
+    let mut out: BTreeMap<K, i64> = BTreeMap::new();
+    for pair in ordered.windows(2) {
+        let (a_at, a_key) = pair[0];
+        let (b_at, _) = pair[1];
+        let delta = *b_at - *a_at;
+        if delta > Duration::ZERO && delta <= idle {
+            *out.entry(a_key.clone()).or_insert(0) += delta.whole_seconds();
+        }
     }
     out
 }
@@ -183,6 +217,42 @@ mod tests {
         // gap may be dropped); never inflated.
         assert!(coalesced_total <= dense_total);
         assert!(dense_total - coalesced_total <= 45);
+    }
+
+    #[test]
+    fn per_key_attributes_each_gap_to_its_opening_session() {
+        // The parallel-supervision case: two sessions, ONE prompt each, interleaved
+        // with a third. Per session in isolation every session has < 2 signals, so
+        // the old per-session human read 0 — but the global opening-signal
+        // attribution credits each opener its gap.
+        let keyed = [
+            (at(0), "s_a"),  // opens 0..30 (a) — within idle
+            (at(30), "s_b"), // opens 30..60 (b) — within idle
+            (at(60), "s_a"), // opens 60..? — the last signal, no successor
+        ];
+        let by = per_key_seconds(&keyed, IDLE);
+        assert_eq!(by[&"s_a"], 30); // just the 0..30 gap it opened
+        assert_eq!(by[&"s_b"], 30); // the 30..60 gap it opened
+                                    // Sums to the deduped grand total over the same timestamps.
+        let total: i64 = by.values().sum();
+        assert_eq!(total, active_seconds(&[at(0), at(30), at(60)], IDLE));
+        assert_eq!(total, 60);
+    }
+
+    #[test]
+    fn per_key_matches_per_project_for_the_project_key() {
+        // per_project_seconds now delegates to per_key_seconds; prove they agree on
+        // the project grouping so the refactor can't silently drift.
+        let signals = [
+            sig(0, Some("a")),
+            sig(30, Some("b")),
+            sig(60, Some("a")),
+            sig(90, Some("a")),
+        ];
+        let by_project = per_project_seconds(&signals, IDLE);
+        let keyed: Vec<_> = signals.iter().map(|s| (s.at, s.project.clone())).collect();
+        let by_key = per_key_seconds(&keyed, IDLE);
+        assert_eq!(by_project, by_key);
     }
 
     #[test]

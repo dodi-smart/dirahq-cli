@@ -1,0 +1,9 @@
+# Deterministic LF checkouts on every platform (overrides core.autocrlf).
+#
+# Three things here compare bytes on disk and break under CRLF conversion:
+# the zavet dialect golden tests (cli/core/tests/zavet_dialect.rs), the
+# drift-gated contract artifacts (plain `git diff` in CI), and the vendored
+# installer sync to the landing repo (byte-identity per D-0007). install.sh
+# additionally must stay LF to run under sh/WSL from a Windows clone.
+# PowerShell (install.ps1) reads LF-only scripts fine, 5.1 included.
+* text=auto eol=lf

@@ -14,6 +14,7 @@ use crate::Error;
 use dira_contract::Harness;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -82,8 +83,8 @@ impl Store {
     pub async fn append(&self, ev: &RawEvent) -> Result<(), Error> {
         sqlx::query(
             "INSERT INTO events
-                (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(&ev.id)
         .bind(ev.at.format(&Rfc3339).map_err(Error::time)?)
@@ -97,6 +98,7 @@ impl Store {
         .bind(&ev.tool)
         .bind(&ev.label)
         .bind(&ev.activity)
+        .bind(&ev.note)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -151,6 +153,75 @@ impl Store {
                     .await?
             }
         };
+        rows.iter().map(row_to_event).collect()
+    }
+
+    /// All retained events for `session_ids` with `id <= until`, per session ordered
+    /// by `at`. Used by the daemon to rebuild an *ended* session's rollup from its
+    /// full retained history rather than the current sync window (issue #40): the
+    /// sync cursor consumes early events window-by-window, but the rows stay on disk
+    /// until compaction, so a just-ended multi-window session can be re-aggregated
+    /// completely. Best-effort by design — events already compacted (synced AND
+    /// older than retention) are gone, so a session outliving retention yields a
+    /// partial (but still superset-of-tail) history.
+    ///
+    /// Queried per session id (not a single `IN (...)`) so each lookup rides the
+    /// `idx_events_session_at (session_id, at)` index; results are concatenated with
+    /// no ordering guarantee across different sessions.
+    pub async fn events_for_sessions(
+        &self,
+        session_ids: &[String],
+        until: &str,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let mut out = Vec::new();
+        for session_id in session_ids {
+            let rows = sqlx::query(
+                "SELECT * FROM events WHERE session_id = ?1 AND id <= ?2 ORDER BY at ASC",
+            )
+            .bind(session_id)
+            .bind(until)
+            .fetch_all(&self.pool)
+            .await?;
+            for row in &rows {
+                out.push(row_to_event(row)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Human-signal "seed" for a sync flush: the already-synced human signals (id ≤
+    /// `cursor`) whose `at` falls in `[at_lo, at_hi]`, ordered by `at` ascending.
+    ///
+    /// These are gap ANCHORS for the next flush window — they let the interval build
+    /// count a counted gap that straddles the flush boundary, which the per-window
+    /// build otherwise drops (issue #21). They are read-only context, never re-emitted
+    /// as events and never advance the cursor. `cursor = None` ⇒ empty.
+    ///
+    /// The caller passes the window's human-signal `at`-span padded by one `idle` on
+    /// each side (`[min_window_at - idle, max_window_at + idle]`): a pre-cursor signal
+    /// can only bound a counted (≤ idle) gap with a window signal if it lies within
+    /// that band. Bounding by `at` (NOT id) is essential — the window is an id-range
+    /// but a gap is an `at`-relation, and `dira log` backdates `at` below the cursor,
+    /// so a relevant anchor can be a higher-id row an id-window would miss.
+    pub async fn human_signal_seed(
+        &self,
+        cursor: Option<&str>,
+        at_lo: OffsetDateTime,
+        at_hi: OffsetDateTime,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let Some(cursor) = cursor else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE id <= ?1 AND kind IN \
+             ('user_prompt','permission_decision','manual_start','manual_tick','manual_stop') \
+             AND at >= ?2 AND at <= ?3 ORDER BY at ASC",
+        )
+        .bind(cursor)
+        .bind(at_lo.format(&Rfc3339).map_err(Error::time)?)
+        .bind(at_hi.format(&Rfc3339).map_err(Error::time)?)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(row_to_event).collect()
     }
 
@@ -245,6 +316,31 @@ impl Store {
         Ok(())
     }
 
+    /// Read the per-repo zavet override: `Some(true)` = forced on, `Some(false)`
+    /// = forced off, `None` = follow the global `modules.zavet` knob. Keyed in
+    /// `meta` as `zavet_override:<canonical repo>`.
+    pub async fn zavet_override_get(&self, repo: &str) -> Result<Option<bool>, Error> {
+        Ok(self
+            .meta_get(&format!("zavet_override:{repo}"))
+            .await?
+            .map(|v| v == "on"))
+    }
+
+    /// Set (`Some`) or clear (`None`) the per-repo zavet override.
+    pub async fn zavet_override_set(&self, repo: &str, on: Option<bool>) -> Result<(), Error> {
+        let key = format!("zavet_override:{repo}");
+        match on {
+            Some(v) => self.meta_set(&key, if v { "on" } else { "off" }).await,
+            None => {
+                sqlx::query("DELETE FROM meta WHERE key = ?1")
+                    .bind(&key)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
     /// Wipe all captured statistics — the whole event log and token usage — for a
     /// clean slate, returning `(events_deleted, tokens_deleted)`. Runs in a single
     /// transaction so the two tables are never left half-cleared.
@@ -290,6 +386,12 @@ impl Store {
         for key in [
             crate::sync::META_SYNC_CURSOR,
             crate::sync::META_ARTIFACTS_CURSOR,
+            crate::sync::META_LAST_EPOCH,
+            crate::sync::META_CLOUD_WATERMARK,
+            crate::sync::knowledge::META_KNOWLEDGE_DECISION_CURSOR,
+            crate::sync::knowledge::META_KNOWLEDGE_SPEC_CURSOR,
+            crate::sync::knowledge::META_KNOWLEDGE_TRAILER_CURSOR,
+            crate::sync::knowledge::META_KNOWLEDGE_GUARD_CURSOR,
         ] {
             sqlx::query(
                 "INSERT INTO meta (key, value) VALUES (?1, '')
@@ -707,11 +809,916 @@ impl Store {
         };
         Ok(row.get::<i64, _>("n") as usize)
     }
+
+    // ---- zavet knowledge module (all LOCAL-ONLY in M1) ----------------------
+
+    /// Upsert a decision record captured from `commit_sha`. First-sight fields
+    /// (`first_commit`, `created_at`, `source_session`) are preserved on
+    /// conflict — provenance stays with the commit that INTRODUCED the record.
+    /// Guards are replaced wholesale in the same transaction so a narrowed
+    /// guard set actually narrows.
+    pub async fn zavet_upsert_decision(
+        &self,
+        repo: &str,
+        cap: &ZavetDecisionCapture,
+        commit_sha: &str,
+        authored_at: Option<&str>,
+        source_session: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO zavet_decisions
+                (repo, id, slug, title, status, path, supersedes, body_md,
+                 first_commit, last_commit, created_at, updated_at,
+                 source_session, content_hash, origin, verified, touched_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?10, ?11, ?12, ?13, ?14,
+                     (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_decisions))
+             ON CONFLICT(repo, id) DO UPDATE SET
+                slug = excluded.slug,
+                title = excluded.title,
+                status = excluded.status,
+                path = excluded.path,
+                supersedes = excluded.supersedes,
+                body_md = excluded.body_md,
+                last_commit = excluded.last_commit,
+                updated_at = excluded.updated_at,
+                content_hash = excluded.content_hash,
+                origin = excluded.origin,
+                verified = excluded.verified,
+                touched_seq = (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_decisions)",
+        )
+        .bind(repo)
+        .bind(&cap.id)
+        .bind(&cap.slug)
+        .bind(&cap.title)
+        .bind(&cap.status)
+        .bind(&cap.path)
+        .bind(&cap.supersedes)
+        .bind(&cap.body_md)
+        .bind(commit_sha)
+        .bind(authored_at)
+        .bind(source_session)
+        .bind(&cap.content_hash)
+        .bind(&cap.origin)
+        .bind(cap.verified)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM zavet_guards WHERE repo = ?1 AND decision_id = ?2")
+            .bind(repo)
+            .bind(&cap.id)
+            .execute(&mut *tx)
+            .await?;
+        for glob in &cap.guards {
+            sqlx::query(
+                "INSERT OR IGNORE INTO zavet_guards (repo, decision_id, glob) VALUES (?1, ?2, ?3)",
+            )
+            .bind(repo)
+            .bind(&cap.id)
+            .bind(glob)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a commit's parsed trailers, keyed `(sha, seq)` so re-walking a
+    /// range (overlaps, restarts) never duplicates.
+    pub async fn zavet_record_trailers(
+        &self,
+        repo: Option<&str>,
+        sha: &str,
+        trailers: &[ZavetTrailer],
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        for (seq, t) in trailers.iter().enumerate() {
+            sqlx::query(
+                "INSERT OR IGNORE INTO zavet_trailers (sha, repo, key, value, decision_id, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(sha)
+            .bind(repo)
+            .bind(&t.key)
+            .bind(&t.value)
+            .bind(&t.decision_id)
+            .bind(seq as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Store one guard event (already attributed by the caller), returning its id.
+    pub async fn zavet_record_guard_event(
+        &self,
+        at: &str,
+        repo: Option<&str>,
+        decision_id: &str,
+        kind: &str,
+        file_path: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<String, Error> {
+        let id = ulid::Ulid::new().to_string();
+        sqlx::query(
+            "INSERT INTO zavet_guard_events (id, at, repo, decision_id, kind, file_path, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&id)
+        .bind(at)
+        .bind(repo)
+        .bind(decision_id)
+        .bind(kind)
+        .bind(file_path)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// One decision with its guards, or `None`.
+    pub async fn zavet_decision_get(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Option<ZavetDecisionRow>, Error> {
+        let row = sqlx::query(
+            "SELECT repo, id, slug, title, status, path, supersedes, body_md,
+                    first_commit, last_commit, created_at, updated_at,
+                    source_session, content_hash, origin, verified
+             FROM zavet_decisions WHERE repo = ?1 AND id = ?2",
+        )
+        .bind(repo)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let mut decision = row_to_zavet_decision(&row);
+        decision.guards = self.zavet_guards_for(repo, id).await?;
+        Ok(Some(decision))
+    }
+
+    /// All decisions for a repo (with guards), ordered by id. Guards come from
+    /// one bulk query grouped in memory, not a per-decision lookup.
+    pub async fn zavet_decisions_list(&self, repo: &str) -> Result<Vec<ZavetDecisionRow>, Error> {
+        let rows = sqlx::query(
+            "SELECT repo, id, slug, title, status, path, supersedes, body_md,
+                    first_commit, last_commit, created_at, updated_at,
+                    source_session, content_hash, origin, verified
+             FROM zavet_decisions WHERE repo = ?1 ORDER BY id ASC",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let guard_rows = sqlx::query(
+            "SELECT decision_id, glob FROM zavet_guards WHERE repo = ?1
+             ORDER BY decision_id, glob",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut guards: HashMap<String, Vec<String>> = HashMap::new();
+        for r in &guard_rows {
+            guards
+                .entry(r.get("decision_id"))
+                .or_default()
+                .push(r.get("glob"));
+        }
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut d = row_to_zavet_decision(row);
+                if let Some(g) = guards.remove(&d.id) {
+                    d.guards = g;
+                }
+                d
+            })
+            .collect())
+    }
+
+    // ---- knowledge sync selection (M2) — "changed since cursor" windows ----
+
+    /// Decisions touched after `seq`, oldest-touch first, with guards bulk-
+    /// joined; each row carries its own `touched_seq` so the caller can
+    /// advance the cursor to the window's high-water only after a 2xx.
+    pub async fn zavet_decisions_since(
+        &self,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, ZavetDecisionRow)>, Error> {
+        let rows = sqlx::query(
+            "SELECT repo, id, slug, title, status, path, supersedes, body_md,
+                    first_commit, last_commit, created_at, updated_at,
+                    source_session, content_hash, origin, verified, touched_seq
+             FROM zavet_decisions WHERE touched_seq > ?1
+             ORDER BY touched_seq ASC LIMIT ?2",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        // Guards for exactly this window, one bulk query grouped in memory
+        // (the window spans repos, so the key is (repo, id)).
+        let guard_rows = sqlx::query(
+            "SELECT g.repo, g.decision_id, g.glob
+             FROM zavet_guards g
+             JOIN (SELECT repo, id FROM zavet_decisions
+                   WHERE touched_seq > ?1 ORDER BY touched_seq ASC LIMIT ?2) w
+               ON w.repo = g.repo AND w.id = g.decision_id
+             ORDER BY g.repo, g.decision_id, g.glob",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut guards: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for r in &guard_rows {
+            guards
+                .entry((r.get("repo"), r.get("decision_id")))
+                .or_default()
+                .push(r.get("glob"));
+        }
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut d = row_to_zavet_decision(row);
+                if let Some(g) = guards.remove(&(d.repo.clone(), d.id.clone())) {
+                    d.guards = g;
+                }
+                (row.get::<i64, _>("touched_seq"), d)
+            })
+            .collect())
+    }
+
+    /// Specs touched after `seq`, oldest-touch first, with paths + decision
+    /// links bulk-joined (two child queries for the whole window, grouped in
+    /// memory — the window spans repos, so the key is (repo, slug)).
+    pub async fn zavet_specs_since(
+        &self,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, ZavetSpecRow)>, Error> {
+        let rows = sqlx::query(
+            "SELECT repo, slug, title, version, origin, verified, confidence, date,
+                    path, body_md, content_hash,
+                    first_commit, last_commit, created_at, updated_at,
+                    source_session, touched_seq
+             FROM zavet_specs WHERE touched_seq > ?1
+             ORDER BY touched_seq ASC LIMIT ?2",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let path_rows = sqlx::query(
+            "SELECT p.repo, p.slug, p.glob
+             FROM zavet_spec_paths p
+             JOIN (SELECT repo, slug FROM zavet_specs
+                   WHERE touched_seq > ?1 ORDER BY touched_seq ASC LIMIT ?2) w
+               ON w.repo = p.repo AND w.slug = p.slug
+             ORDER BY p.repo, p.slug, p.glob",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut paths: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for r in &path_rows {
+            paths
+                .entry((r.get("repo"), r.get("slug")))
+                .or_default()
+                .push(r.get("glob"));
+        }
+        let link_rows = sqlx::query(
+            "SELECT d.repo, d.slug, d.decision_id
+             FROM zavet_spec_decisions d
+             JOIN (SELECT repo, slug FROM zavet_specs
+                   WHERE touched_seq > ?1 ORDER BY touched_seq ASC LIMIT ?2) w
+               ON w.repo = d.repo AND w.slug = d.slug
+             ORDER BY d.repo, d.slug, d.decision_id",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut links: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for r in &link_rows {
+            links
+                .entry((r.get("repo"), r.get("slug")))
+                .or_default()
+                .push(r.get("decision_id"));
+        }
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut s = row_to_zavet_spec(row);
+                let key = (s.repo.clone(), s.slug.clone());
+                if let Some(p) = paths.remove(&key) {
+                    s.paths = p;
+                }
+                if let Some(d) = links.remove(&key) {
+                    s.decisions = d;
+                }
+                (row.get::<i64, _>("touched_seq"), s)
+            })
+            .collect())
+    }
+
+    /// Trailer rows inserted after `rowid` (the table is insert-only, keyed
+    /// `(sha, seq)` — rowid is a valid monotonic cursor), oldest first.
+    pub async fn zavet_trailers_since(
+        &self,
+        rowid: i64,
+        limit: i64,
+    ) -> Result<Vec<ZavetTrailerSyncRow>, Error> {
+        let rows = sqlx::query(
+            "SELECT rowid, sha, repo, key, value, decision_id, seq
+             FROM zavet_trailers WHERE rowid > ?1
+             ORDER BY rowid ASC LIMIT ?2",
+        )
+        .bind(rowid)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ZavetTrailerSyncRow {
+                rowid: r.get("rowid"),
+                sha: r.get("sha"),
+                repo: r.get("repo"),
+                key: r.get("key"),
+                value: r.get("value"),
+                decision_id: r.get("decision_id"),
+                seq: r.get("seq"),
+            })
+            .collect())
+    }
+
+    /// Guard events after `id` (ULIDs sort lexicographically by time), oldest
+    /// first.
+    pub async fn zavet_guard_events_since(
+        &self,
+        id: &str,
+        limit: i64,
+    ) -> Result<Vec<ZavetGuardEventSyncRow>, Error> {
+        let rows = sqlx::query(
+            "SELECT id, at, repo, decision_id, kind, file_path, session_id
+             FROM zavet_guard_events WHERE id > ?1
+             ORDER BY id ASC LIMIT ?2",
+        )
+        .bind(id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ZavetGuardEventSyncRow {
+                id: r.get("id"),
+                at: r.get("at"),
+                repo: r.get("repo"),
+                decision_id: r.get("decision_id"),
+                kind: r.get("kind"),
+                file_path: r.get("file_path"),
+                session_id: r.get("session_id"),
+            })
+            .collect())
+    }
+
+    /// Distinct commit shas carrying at least one captured trailer for `repo`
+    /// — the numerator input of the knowledge capture-ratio stat.
+    pub async fn zavet_trailer_shas(&self, repo: &str) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query("SELECT DISTINCT sha FROM zavet_trailers WHERE repo = ?1")
+            .bind(repo)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| r.get("sha")).collect())
+    }
+
+    /// The decision that superseded `id` (the reverse of a record's own
+    /// `supersedes` link), if captured.
+    pub async fn zavet_superseded_by(&self, repo: &str, id: &str) -> Result<Option<String>, Error> {
+        let row = sqlx::query(
+            "SELECT id FROM zavet_decisions WHERE repo = ?1 AND supersedes = ?2 LIMIT 1",
+        )
+        .bind(repo)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("id")))
+    }
+
+    async fn zavet_guards_for(&self, repo: &str, decision_id: &str) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT glob FROM zavet_guards WHERE repo = ?1 AND decision_id = ?2 ORDER BY glob",
+        )
+        .bind(repo)
+        .bind(decision_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("glob")).collect())
+    }
+
+    /// The distinct session ids evidencing a decision: attributed guard events,
+    /// plus the source sessions of commits that reference it via trailers or
+    /// that introduced/last-touched the record itself. This is the session set
+    /// `zavet why` prices.
+    pub async fn zavet_sessions_for_decision(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT s FROM (
+                SELECT session_id AS s FROM zavet_guard_events
+                    WHERE repo = ?1 AND decision_id = ?2 AND session_id IS NOT NULL
+                UNION
+                SELECT a.source_session AS s FROM artifacts a
+                    JOIN zavet_trailers t ON t.sha = a.sha
+                    WHERE t.repo = ?1 AND t.decision_id = ?2
+                      AND a.source_session IS NOT NULL
+                UNION
+                SELECT a.source_session AS s FROM artifacts a
+                    WHERE a.source_session IS NOT NULL AND a.sha IN (
+                        SELECT first_commit FROM zavet_decisions
+                            WHERE repo = ?1 AND id = ?2 AND first_commit IS NOT NULL
+                        UNION
+                        SELECT last_commit FROM zavet_decisions
+                            WHERE repo = ?1 AND id = ?2 AND last_commit IS NOT NULL
+                    )
+             ) ORDER BY s",
+        )
+        .bind(repo)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("s")).collect())
+    }
+
+    /// Commits linked to a decision (trailer refs plus the record's own
+    /// first/last commits), newest first. Commits never captured into
+    /// `artifacts` still appear, with only their sha.
+    pub async fn zavet_commits_for_decision(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<ZavetCommitRef>, Error> {
+        let rows = sqlx::query(
+            "SELECT shas.sha AS sha, a.message AS message, a.authored_at AS authored_at,
+                    a.source_session AS source_session
+             FROM (
+                SELECT DISTINCT sha FROM zavet_trailers
+                    WHERE repo = ?1 AND decision_id = ?2
+                UNION
+                SELECT first_commit AS sha FROM zavet_decisions
+                    WHERE repo = ?1 AND id = ?2 AND first_commit IS NOT NULL
+                UNION
+                SELECT last_commit AS sha FROM zavet_decisions
+                    WHERE repo = ?1 AND id = ?2 AND last_commit IS NOT NULL
+             ) shas
+             LEFT JOIN artifacts a ON a.sha = shas.sha
+             ORDER BY a.authored_at DESC, shas.sha",
+        )
+        .bind(repo)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_zavet_commit_ref).collect())
+    }
+
+    /// Every trailer of a repo — `(sha, key, value, decision_id)` — for search:
+    /// trailers referencing a decision boost that record, and orphan trailers
+    /// (the pure micro-decisions) are searchable hits of their own.
+    #[allow(clippy::type_complexity)]
+    pub async fn zavet_all_trailers(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<(String, String, String, Option<String>)>, Error> {
+        let rows =
+            sqlx::query("SELECT sha, key, value, decision_id FROM zavet_trailers WHERE repo = ?1")
+                .bind(repo)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get("sha"),
+                    r.get("key"),
+                    r.get("value"),
+                    r.get("decision_id"),
+                )
+            })
+            .collect())
+    }
+
+    /// The most recent trailers for a repo (rowid-descending), for the wiki's
+    /// "recent knowledge" chronicle.
+    pub async fn zavet_recent_trailers(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String, String)>, Error> {
+        let rows = sqlx::query(
+            "SELECT sha, key, value FROM zavet_trailers WHERE repo = ?1
+             ORDER BY rowid DESC LIMIT ?2",
+        )
+        .bind(repo)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("sha"), r.get("key"), r.get("value")))
+            .collect())
+    }
+
+    /// Guard-event tallies for a repo (optionally one decision): per kind,
+    /// `(total, unattributed)`.
+    pub async fn zavet_guard_event_stats(
+        &self,
+        repo: &str,
+        decision_id: Option<&str>,
+    ) -> Result<Vec<ZavetGuardStat>, Error> {
+        let rows = match decision_id {
+            Some(d) => {
+                sqlx::query(
+                    "SELECT kind, COUNT(*) AS total,
+                            SUM(CASE WHEN session_id IS NULL THEN 1 ELSE 0 END) AS unattributed
+                     FROM zavet_guard_events WHERE repo = ?1 AND decision_id = ?2
+                     GROUP BY kind ORDER BY kind",
+                )
+                .bind(repo)
+                .bind(d)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT kind, COUNT(*) AS total,
+                            SUM(CASE WHEN session_id IS NULL THEN 1 ELSE 0 END) AS unattributed
+                     FROM zavet_guard_events WHERE repo = ?1
+                     GROUP BY kind ORDER BY kind",
+                )
+                .bind(repo)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows
+            .iter()
+            .map(|r| ZavetGuardStat {
+                kind: r.get("kind"),
+                total: r.get::<i64, _>("total") as u64,
+                unattributed: r.get::<i64, _>("unattributed") as u64,
+            })
+            .collect())
+    }
+
+    /// One session's compacted-history and token contributions: the daily-rollup
+    /// sums (data whose raw events may already be pruned) plus the live
+    /// `token_usage` sums. Raw-event time for the recent window is computed by
+    /// the caller over the event log (global human attribution can't be done
+    /// per-session in SQL) and added on top — compaction deletes the raw rows
+    /// it rolls up, so the two parts never double-count.
+    pub async fn zavet_session_totals(
+        &self,
+        session_id: &str,
+    ) -> Result<ZavetSessionTotals, Error> {
+        let r = sqlx::query(
+            "SELECT COALESCE(SUM(human_seconds), 0) AS h,
+                    COALESCE(SUM(active_seconds), 0) AS a,
+                    COALESCE(SUM(input_tokens), 0) AS i,
+                    COALESCE(SUM(output_tokens), 0) AS o
+             FROM session_rollup_daily WHERE session_id = ?1",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let t = sqlx::query(
+            "SELECT COALESCE(SUM(input), 0) AS i, COALESCE(SUM(output), 0) AS o
+             FROM token_usage WHERE session_id = ?1",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(ZavetSessionTotals {
+            rollup_human_seconds: r.get::<i64, _>("h"),
+            rollup_agent_seconds: r.get::<i64, _>("a"),
+            input_tokens: (r.get::<i64, _>("i") + t.get::<i64, _>("i")) as u64,
+            output_tokens: (r.get::<i64, _>("o") + t.get::<i64, _>("o")) as u64,
+        })
+    }
+
+    /// Upsert a living spec captured from `commit_sha`. First-sight fields
+    /// (`first_commit`, `created_at`, `source_session`) are preserved on
+    /// conflict — provenance stays with the commit that INTRODUCED the spec.
+    /// Path globs and decision links are replaced wholesale in the same
+    /// transaction (both are derived from the living document).
+    pub async fn zavet_upsert_spec(
+        &self,
+        repo: &str,
+        cap: &ZavetSpecCapture,
+        commit_sha: &str,
+        authored_at: Option<&str>,
+        source_session: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO zavet_specs
+                (repo, slug, title, version, origin, verified, confidence, date,
+                 path, body_md, content_hash,
+                 first_commit, last_commit, created_at, updated_at, source_session,
+                 touched_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?13, ?14,
+                     (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_specs))
+             ON CONFLICT(repo, slug) DO UPDATE SET
+                title = excluded.title,
+                version = excluded.version,
+                origin = excluded.origin,
+                verified = excluded.verified,
+                confidence = excluded.confidence,
+                date = excluded.date,
+                path = excluded.path,
+                body_md = excluded.body_md,
+                content_hash = excluded.content_hash,
+                last_commit = excluded.last_commit,
+                updated_at = excluded.updated_at,
+                touched_seq = (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_specs)",
+        )
+        .bind(repo)
+        .bind(&cap.slug)
+        .bind(&cap.title)
+        .bind(cap.version)
+        .bind(&cap.origin)
+        .bind(cap.verified)
+        .bind(&cap.confidence)
+        .bind(&cap.date)
+        .bind(&cap.path)
+        .bind(&cap.body_md)
+        .bind(&cap.content_hash)
+        .bind(commit_sha)
+        .bind(authored_at)
+        .bind(source_session)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM zavet_spec_paths WHERE repo = ?1 AND slug = ?2")
+            .bind(repo)
+            .bind(&cap.slug)
+            .execute(&mut *tx)
+            .await?;
+        for glob in &cap.paths {
+            sqlx::query(
+                "INSERT OR IGNORE INTO zavet_spec_paths (repo, slug, glob) VALUES (?1, ?2, ?3)",
+            )
+            .bind(repo)
+            .bind(&cap.slug)
+            .bind(glob)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DELETE FROM zavet_spec_decisions WHERE repo = ?1 AND slug = ?2")
+            .bind(repo)
+            .bind(&cap.slug)
+            .execute(&mut *tx)
+            .await?;
+        for id in &cap.decisions {
+            sqlx::query(
+                "INSERT OR IGNORE INTO zavet_spec_decisions (repo, slug, decision_id)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(repo)
+            .bind(&cap.slug)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// One spec with its paths and decision links, or `None`.
+    pub async fn zavet_spec_get(
+        &self,
+        repo: &str,
+        slug: &str,
+    ) -> Result<Option<ZavetSpecRow>, Error> {
+        let row = sqlx::query(
+            "SELECT repo, slug, title, version, origin, verified, confidence, date,
+                    path, body_md, content_hash,
+                    first_commit, last_commit, created_at, updated_at, source_session
+             FROM zavet_specs WHERE repo = ?1 AND slug = ?2",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let mut spec = row_to_zavet_spec(&row);
+        let paths = sqlx::query(
+            "SELECT glob FROM zavet_spec_paths WHERE repo = ?1 AND slug = ?2 ORDER BY glob",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await?;
+        spec.paths = paths.iter().map(|r| r.get::<String, _>("glob")).collect();
+        let links = sqlx::query(
+            "SELECT decision_id FROM zavet_spec_decisions
+             WHERE repo = ?1 AND slug = ?2 ORDER BY decision_id",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await?;
+        spec.decisions = links
+            .iter()
+            .map(|r| r.get::<String, _>("decision_id"))
+            .collect();
+        Ok(Some(spec))
+    }
+
+    /// All specs for a repo (with paths and decision links), ordered by slug.
+    /// Children come from two bulk queries grouped in memory, not per-spec
+    /// lookups.
+    pub async fn zavet_specs_list(&self, repo: &str) -> Result<Vec<ZavetSpecRow>, Error> {
+        let rows = sqlx::query(
+            "SELECT repo, slug, title, version, origin, verified, confidence, date,
+                    path, body_md, content_hash,
+                    first_commit, last_commit, created_at, updated_at, source_session
+             FROM zavet_specs WHERE repo = ?1 ORDER BY slug ASC",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let path_rows = sqlx::query(
+            "SELECT slug, glob FROM zavet_spec_paths WHERE repo = ?1 ORDER BY slug, glob",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut paths: HashMap<String, Vec<String>> = HashMap::new();
+        for r in &path_rows {
+            paths.entry(r.get("slug")).or_default().push(r.get("glob"));
+        }
+        let link_rows = sqlx::query(
+            "SELECT slug, decision_id FROM zavet_spec_decisions WHERE repo = ?1
+             ORDER BY slug, decision_id",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut links: HashMap<String, Vec<String>> = HashMap::new();
+        for r in &link_rows {
+            links
+                .entry(r.get("slug"))
+                .or_default()
+                .push(r.get("decision_id"));
+        }
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut s = row_to_zavet_spec(row);
+                if let Some(p) = paths.remove(&s.slug) {
+                    s.paths = p;
+                }
+                if let Some(d) = links.remove(&s.slug) {
+                    s.decisions = d;
+                }
+                s
+            })
+            .collect())
+    }
+
+    /// The specs that link a decision — the reverse direction, for
+    /// `zavet why D-NNNN`. `(slug, title)` pairs, ordered by slug.
+    pub async fn zavet_specs_for_decision(
+        &self,
+        repo: &str,
+        decision_id: &str,
+    ) -> Result<Vec<(String, Option<String>)>, Error> {
+        let rows = sqlx::query(
+            "SELECT s.slug AS slug, s.title AS title
+             FROM zavet_spec_decisions d
+             JOIN zavet_specs s ON s.repo = d.repo AND s.slug = d.slug
+             WHERE d.repo = ?1 AND d.decision_id = ?2
+             ORDER BY s.slug",
+        )
+        .bind(repo)
+        .bind(decision_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("slug"), r.get("title")))
+            .collect())
+    }
+
+    /// Commits linked to a spec: `Spec: <slug>` trailer commits plus the
+    /// spec's own first/last commits, newest first. Commits never captured
+    /// into `artifacts` still appear, with only their sha.
+    pub async fn zavet_commits_for_spec(
+        &self,
+        repo: &str,
+        slug: &str,
+    ) -> Result<Vec<ZavetCommitRef>, Error> {
+        let rows = sqlx::query(
+            "SELECT shas.sha AS sha, a.message AS message, a.authored_at AS authored_at,
+                    a.source_session AS source_session
+             FROM (
+                SELECT DISTINCT sha FROM zavet_trailers
+                    WHERE repo = ?1 AND key = 'spec' AND TRIM(value) = ?2
+                UNION
+                SELECT first_commit AS sha FROM zavet_specs
+                    WHERE repo = ?1 AND slug = ?2 AND first_commit IS NOT NULL
+                UNION
+                SELECT last_commit AS sha FROM zavet_specs
+                    WHERE repo = ?1 AND slug = ?2 AND last_commit IS NOT NULL
+             ) shas
+             LEFT JOIN artifacts a ON a.sha = shas.sha
+             ORDER BY a.authored_at DESC, shas.sha",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_zavet_commit_ref).collect())
+    }
+
+    /// The distinct session ids evidencing a spec: source sessions of its
+    /// `Spec:`-trailer commits and of the commits that introduced/last touched
+    /// the file. The session set `zavet why` prices for a spec.
+    pub async fn zavet_sessions_for_spec(
+        &self,
+        repo: &str,
+        slug: &str,
+    ) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT s FROM (
+                SELECT a.source_session AS s FROM artifacts a
+                    JOIN zavet_trailers t ON t.sha = a.sha
+                    WHERE t.repo = ?1 AND t.key = 'spec' AND TRIM(t.value) = ?2
+                      AND a.source_session IS NOT NULL
+                UNION
+                SELECT a.source_session AS s FROM artifacts a
+                    WHERE a.source_session IS NOT NULL AND a.sha IN (
+                        SELECT first_commit FROM zavet_specs
+                            WHERE repo = ?1 AND slug = ?2 AND first_commit IS NOT NULL
+                        UNION
+                        SELECT last_commit FROM zavet_specs
+                            WHERE repo = ?1 AND slug = ?2 AND last_commit IS NOT NULL
+                    )
+             ) ORDER BY s",
+        )
+        .bind(repo)
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("s")).collect())
+    }
+
+    /// Capture-health counters for `dira zavet status`.
+    pub async fn zavet_counts(&self, repo: &str) -> Result<ZavetCounts, Error> {
+        let d = sqlx::query(
+            "SELECT COUNT(*) AS total,
+                    SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active
+             FROM zavet_decisions WHERE repo = ?1",
+        )
+        .bind(repo)
+        .fetch_one(&self.pool)
+        .await?;
+        let t = sqlx::query("SELECT COUNT(*) AS n FROM zavet_trailers WHERE repo = ?1")
+            .bind(repo)
+            .fetch_one(&self.pool)
+            .await?;
+        let g = sqlx::query("SELECT COUNT(*) AS n FROM zavet_guard_events WHERE repo = ?1")
+            .bind(repo)
+            .fetch_one(&self.pool)
+            .await?;
+        let s = sqlx::query("SELECT COUNT(*) AS n FROM zavet_specs WHERE repo = ?1")
+            .bind(repo)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(ZavetCounts {
+            decisions_total: d.get::<i64, _>("total") as u64,
+            decisions_active: d.get::<Option<i64>, _>("active").unwrap_or(0) as u64,
+            trailers: t.get::<i64, _>("n") as u64,
+            guard_events: g.get::<i64, _>("n") as u64,
+            specs_total: s.get::<i64, _>("n") as u64,
+        })
+    }
 }
 
 /// Tighten `path` (and its SQLite `-wal`/`-shm` sidecars) to owner-only `0600`
 /// on unix. Best-effort: a missing file or a chmod failure is ignored — this is a
 /// hardening step, not a correctness gate. No-op on non-unix targets.
+///
+/// Windows posture (deliberate, v1): no ACL tightening. The db lives under the
+/// per-user data dir (`%APPDATA%\...`), whose default DACL already denies other
+/// non-admin users — the same protection profile the peer AI CLIs give their
+/// credential files. The db can hold the keychain-fallback device secret, so if
+/// the threat model ever tightens, the follow-up is an explicit owner-only
+/// security descriptor here (icacls or a Win32 SetSecurityInfo call), not a
+/// umask analogue — Windows has none.
 #[cfg(unix)]
 fn restrict_to_owner_0600(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -749,6 +1756,231 @@ pub struct TokenTotals {
     pub cache_read: u64,
     pub cache_create: u64,
     pub est_cost_usd: f64,
+}
+
+/// A decision record as parsed from a `.zavet/decisions/*.md` blob at capture
+/// time — the input to [`Store::zavet_upsert_decision`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetDecisionCapture {
+    pub id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub status: Option<String>,
+    /// Repo-relative file path.
+    pub path: String,
+    pub supersedes: Option<String>,
+    /// Full record body — local by default; crosses the wire only at the
+    /// knowledge channel's consent-gated full tier (M2, `[sync] knowledge =
+    /// "full"` + workspace opt-in).
+    pub body_md: Option<String>,
+    pub guards: Vec<String>,
+    /// Git blob sha of the file at the capturing commit.
+    pub content_hash: Option<String>,
+    /// `recorded` | `reverse-engineered` (frontmatter `origin`).
+    pub origin: Option<String>,
+    /// Frontmatter `verified`; reverse-engineered records start `false`.
+    pub verified: Option<bool>,
+}
+
+/// A living spec as parsed from a `.zavet/specs/*.md` blob at capture time —
+/// the input to [`Store::zavet_upsert_spec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetSpecCapture {
+    /// Filename stem — the spec's identity.
+    pub slug: String,
+    pub title: Option<String>,
+    /// Frontmatter `version` (bumped on regeneration); parse defaults to 1.
+    pub version: i64,
+    /// `designed` | `session` | `reverse-engineered`; parse defaults to the
+    /// most skeptical (`reverse-engineered`).
+    pub origin: String,
+    /// `true` only after a human confirms the spec matches the code.
+    pub verified: Option<bool>,
+    /// `low` | `med` | `high`; parse defaults to `low`.
+    pub confidence: String,
+    /// Frontmatter `date` (spec's own last-touched claim), verbatim.
+    pub date: Option<String>,
+    /// Git pathspecs the spec covers — the staleness domain.
+    pub paths: Vec<String>,
+    /// Linked decision ids: frontmatter `decisions:` ∪ body D-refs, canonical.
+    pub decisions: Vec<String>,
+    /// Repo-relative file path.
+    pub path: String,
+    /// Full spec body — local by default; never rides `AttestationBatch`
+    /// (D-0001) and crosses only the knowledge channel's consent-gated full
+    /// tier (M2).
+    pub body_md: Option<String>,
+    /// Git blob sha of the file at the capturing commit.
+    pub content_hash: Option<String>,
+}
+
+/// A stored decision row plus its guard globs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetDecisionRow {
+    pub repo: String,
+    pub id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub status: Option<String>,
+    pub path: String,
+    pub supersedes: Option<String>,
+    pub body_md: Option<String>,
+    pub first_commit: Option<String>,
+    pub last_commit: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_session: Option<String>,
+    pub content_hash: Option<String>,
+    pub origin: Option<String>,
+    pub verified: Option<bool>,
+    pub guards: Vec<String>,
+}
+
+/// One parsed commit trailer (`key` normalized to lowercase; `decision_id` is
+/// the first `D-NNNN` referenced in the value, if any).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZavetTrailer {
+    pub key: String,
+    pub value: String,
+    pub decision_id: Option<String>,
+}
+
+/// A stored trailer row with its rowid cursor, as selected for knowledge sync.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetTrailerSyncRow {
+    pub rowid: i64,
+    pub sha: String,
+    pub repo: Option<String>,
+    pub key: String,
+    pub value: Option<String>,
+    pub decision_id: Option<String>,
+    pub seq: i64,
+}
+
+/// A stored guard event as selected for knowledge sync (id is the cursor).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetGuardEventSyncRow {
+    pub id: String,
+    pub at: String,
+    pub repo: Option<String>,
+    pub decision_id: String,
+    pub kind: String,
+    pub file_path: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// A commit linked to a decision (trailer ref or the record's own commits).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetCommitRef {
+    pub sha: String,
+    pub message: Option<String>,
+    pub authored_at: Option<String>,
+    pub source_session: Option<String>,
+}
+
+/// Per-kind guard-event tallies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZavetGuardStat {
+    pub kind: String,
+    pub total: u64,
+    pub unattributed: u64,
+}
+
+/// One session's compacted + token contributions (see
+/// [`Store::zavet_session_totals`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZavetSessionTotals {
+    pub rollup_human_seconds: i64,
+    pub rollup_agent_seconds: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Capture-health counters for a repo.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZavetCounts {
+    pub decisions_total: u64,
+    pub decisions_active: u64,
+    pub trailers: u64,
+    pub guard_events: u64,
+    pub specs_total: u64,
+}
+
+/// A stored spec row plus its path globs and decision links.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetSpecRow {
+    pub repo: String,
+    pub slug: String,
+    pub title: Option<String>,
+    pub version: i64,
+    pub origin: Option<String>,
+    pub verified: Option<bool>,
+    pub confidence: Option<String>,
+    pub date: Option<String>,
+    pub path: String,
+    pub body_md: Option<String>,
+    pub content_hash: Option<String>,
+    pub first_commit: Option<String>,
+    pub last_commit: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_session: Option<String>,
+    pub paths: Vec<String>,
+    pub decisions: Vec<String>,
+}
+
+fn row_to_zavet_spec(row: &sqlx::sqlite::SqliteRow) -> ZavetSpecRow {
+    ZavetSpecRow {
+        repo: row.get("repo"),
+        slug: row.get("slug"),
+        title: row.get("title"),
+        version: row.get("version"),
+        origin: row.get("origin"),
+        verified: row.get("verified"),
+        confidence: row.get("confidence"),
+        date: row.get("date"),
+        path: row.get("path"),
+        body_md: row.get("body_md"),
+        content_hash: row.get("content_hash"),
+        first_commit: row.get("first_commit"),
+        last_commit: row.get("last_commit"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        source_session: row.get("source_session"),
+        paths: Vec::new(),
+        decisions: Vec::new(),
+    }
+}
+
+fn row_to_zavet_commit_ref(row: &sqlx::sqlite::SqliteRow) -> ZavetCommitRef {
+    ZavetCommitRef {
+        sha: row.get("sha"),
+        message: row.get("message"),
+        authored_at: row.get("authored_at"),
+        source_session: row.get("source_session"),
+    }
+}
+
+fn row_to_zavet_decision(row: &sqlx::sqlite::SqliteRow) -> ZavetDecisionRow {
+    ZavetDecisionRow {
+        repo: row.get("repo"),
+        id: row.get("id"),
+        slug: row.get("slug"),
+        title: row.get("title"),
+        status: row.get("status"),
+        path: row.get("path"),
+        supersedes: row.get("supersedes"),
+        body_md: row.get("body_md"),
+        first_commit: row.get("first_commit"),
+        last_commit: row.get("last_commit"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        source_session: row.get("source_session"),
+        content_hash: row.get("content_hash"),
+        origin: row.get("origin"),
+        verified: row.get("verified"),
+        guards: Vec::new(),
+    }
 }
 
 /// Serialize a unit enum to its snake_case wire string for storage.
@@ -823,6 +2055,7 @@ fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
         tool: row.get("tool"),
         label: row.get("label"),
         activity: row.get("activity"),
+        note: row.get("note"),
     })
 }
 
@@ -840,11 +2073,12 @@ mod tests {
             kind,
             cwd: None,
             project: Some("github.com/acme/api".to_string()),
-            identity_email: Some("dev@acme.com".to_string()),
+            identity_email: Some("dev@example.com".to_string()),
             branch: None,
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
     }
 
@@ -863,6 +2097,111 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].kind, EventKind::SessionStart);
         assert_eq!(all[1].project.as_deref(), Some("github.com/acme/api"));
+    }
+
+    #[tokio::test]
+    async fn human_signal_seed_selects_by_at_within_idle() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mk = |id: &str, secs: i64, kind: EventKind| RawEvent {
+            id: id.to_string(),
+            at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs),
+            session_id: "s1".to_string(),
+            harness: Harness::ClaudeCode,
+            kind,
+            cwd: None,
+            project: Some("p".to_string()),
+            identity_email: Some("d@example.com".to_string()),
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+        };
+        // id-order != at-order: 01C has a HIGHER id but an OLDER `at` than 01B.
+        store
+            .append(&mk("01A", 0, EventKind::UserPrompt))
+            .await
+            .unwrap();
+        store
+            .append(&mk("01B", 1250, EventKind::UserPrompt))
+            .await
+            .unwrap(); // newest at
+        store
+            .append(&mk("01C", 1000, EventKind::UserPrompt))
+            .await
+            .unwrap(); // higher id, older at
+        store
+            .append(&mk("01D", 1240, EventKind::PreTool))
+            .await
+            .unwrap(); // non-human → ignored
+
+        let at = |secs: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs);
+        let seed = store
+            .human_signal_seed(Some("01D"), at(900), at(1300))
+            .await
+            .unwrap();
+
+        // Human signals with id ≤ 01D and at ∈ [900,1300]: 01C@1000 and 01B@1250;
+        // 01A@0 is out of band, PreTool 01D is non-human. Returned at-ASC — so the
+        // HIGHER-id 01C@1000 sorts before the LOWER-id 01B@1250 (at, not id, decides).
+        let ids: Vec<&str> = seed.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["01C", "01B"]);
+
+        // A far-backdated anchor (01A@0) is reachable when the band reaches it — this
+        // is the `dira log` case where the relevant pre-cursor signal is > idle from
+        // the cursor's newest signal but ≤ idle from a backdated window signal.
+        let far = store
+            .human_signal_seed(Some("01D"), at(-100), at(1300))
+            .await
+            .unwrap();
+        assert_eq!(
+            far.first().unwrap().id,
+            "01A",
+            "far anchor included when in band"
+        );
+
+        // No cursor ⇒ no seed.
+        assert!(store
+            .human_signal_seed(None, at(0), at(9999))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_for_sessions_filters_ids_and_bounds_by_until() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mk = |id: &str, session: &str, secs: i64| RawEvent {
+            id: id.to_string(),
+            at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs),
+            session_id: session.to_string(),
+            harness: Harness::ClaudeCode,
+            kind: EventKind::UserPrompt,
+            cwd: None,
+            project: Some("p".to_string()),
+            identity_email: Some("d@example.com".to_string()),
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+        };
+        // Session s1 spans multiple ids; s2 is a different session entirely.
+        store.append(&mk("01A", "s1", 0)).await.unwrap();
+        store.append(&mk("01C", "s1", 200)).await.unwrap(); // out of at-order vs 01B
+        store.append(&mk("01B", "s1", 100)).await.unwrap();
+        store.append(&mk("01D", "s1", 300)).await.unwrap(); // above `until` — excluded
+        store.append(&mk("01X", "s2", 50)).await.unwrap(); // other session — excluded
+
+        let got = store
+            .events_for_sessions(&["s1".to_string()], "01C")
+            .await
+            .unwrap();
+
+        // Only s1's events with id <= "01C" come back, ordered by `at` ascending.
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["01A", "01B", "01C"]);
+        assert!(got.iter().all(|e| e.session_id == "s1"));
     }
 
     #[tokio::test]
@@ -949,7 +2288,7 @@ mod tests {
         let c1 = CapturedCommit {
             sha: "aaa".into(),
             authored_at: Some("2026-06-27T10:00:00Z".into()),
-            author_email: Some("dev@acme.com".into()),
+            author_email: Some("dev@example.com".into()),
             author_name: Some("Dev One".into()),
             message: "feat: one".into(),
             additions: 5,
@@ -1002,7 +2341,7 @@ mod tests {
         assert_eq!(rows[0].kind, "commit");
         // Author + observed session round-trip through the artifacts table.
         assert_eq!(rows[0].authored_at.as_deref(), Some("2026-06-27T10:00:00Z"));
-        assert_eq!(rows[0].author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(rows[0].author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(rows[0].author_name.as_deref(), Some("Dev One"));
         assert_eq!(rows[0].source_session.as_deref(), Some("sess-1"));
         // Squash-resilient signals round-trip through the JSON columns.
@@ -1081,6 +2420,7 @@ mod tests {
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
     }
 
@@ -1193,6 +2533,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_for_sessions_after_compact_returns_remainder() {
+        let store = Store::open_in_memory().await.unwrap();
+        let idle = time::Duration::minutes(5);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(30);
+        // A single long-lived session with an old, synced+aged window (eligible for
+        // compaction) and a recent window (too new to prune).
+        let old_base = now - time::Duration::days(20);
+        let mut old_events = Vec::new();
+        for i in 0..4 {
+            let at = old_base + time::Duration::seconds(60 * i);
+            old_events.push(ev_at(&format!("01OLD{i}"), "s1", at, EventKind::UserPrompt));
+        }
+        for e in &old_events {
+            store.append(e).await.unwrap();
+        }
+        let recent_a = ev_at("01REC0", "s1", now, EventKind::UserPrompt);
+        let recent_b = ev_at(
+            "01REC1",
+            "s1",
+            now + time::Duration::seconds(30),
+            EventKind::UserPrompt,
+        );
+        store.append(&recent_a).await.unwrap();
+        store.append(&recent_b).await.unwrap();
+
+        // Cursor covers the old rows only; cutoff prunes the old window.
+        let cutoff = now - time::Duration::days(14);
+        let deleted = store.compact(Some("01OLD3"), cutoff, idle).await.unwrap();
+        assert_eq!(deleted, 4, "the 4 old+synced rows are pruned");
+
+        // Best-effort semantics: the compacted rows are gone, so a rebuild over the
+        // full retained history only sees the surviving (recent) tail — a partial
+        // but still superset-of-tail history, not an error.
+        let got = store
+            .events_for_sessions(&["s1".to_string()], "01REC1")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["01REC0", "01REC1"]);
+    }
+
+    #[tokio::test]
     async fn nuke_clears_token_offsets_and_rollups() {
         let store = Store::open_in_memory().await.unwrap();
         store
@@ -1238,6 +2620,450 @@ mod tests {
         assert_eq!(mode, 0o600, "db file must be owner-only (rw-------)");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn decision(id: &str, guards: &[&str]) -> ZavetDecisionCapture {
+        ZavetDecisionCapture {
+            id: id.to_string(),
+            slug: Some("poll".into()),
+            title: Some("Poll git".into()),
+            status: Some("active".into()),
+            path: format!(".zavet/decisions/{id}-poll.md"),
+            supersedes: None,
+            body_md: Some("## Decision\npoll".into()),
+            guards: guards.iter().map(|s| s.to_string()).collect(),
+            content_hash: Some("blob1".into()),
+            origin: Some("recorded".into()),
+            verified: Some(true),
+        }
+    }
+
+    #[tokio::test]
+    async fn zavet_upsert_preserves_first_sight_and_replaces_guards() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_decision(
+                repo,
+                &decision("D-0001", &["a/**", "b.rs"]),
+                "sha1",
+                Some("2026-01-01T00:00:00Z"),
+                Some("s1"),
+            )
+            .await
+            .unwrap();
+
+        // Second capture from a later commit, different session, narrowed guards.
+        let mut cap = decision("D-0001", &["a/**"]);
+        cap.status = Some("superseded".into());
+        cap.content_hash = Some("blob2".into());
+        store
+            .zavet_upsert_decision(repo, &cap, "sha2", Some("2026-02-01T00:00:00Z"), Some("s2"))
+            .await
+            .unwrap();
+
+        let d = store
+            .zavet_decision_get(repo, "D-0001")
+            .await
+            .unwrap()
+            .unwrap();
+        // First-sight provenance survives the update…
+        assert_eq!(d.first_commit.as_deref(), Some("sha1"));
+        assert_eq!(d.created_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(d.source_session.as_deref(), Some("s1"));
+        // …while the living fields track the latest commit.
+        assert_eq!(d.last_commit.as_deref(), Some("sha2"));
+        assert_eq!(d.status.as_deref(), Some("superseded"));
+        assert_eq!(d.content_hash.as_deref(), Some("blob2"));
+        // Guards were replaced wholesale, not accumulated.
+        assert_eq!(d.guards, vec!["a/**".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn knowledge_since_queries_follow_touched_seq() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_decision(repo, &decision("D-0001", &["a/**"]), "sha1", None, None)
+            .await
+            .unwrap();
+        store
+            .zavet_upsert_decision(repo, &decision("D-0002", &["b/**"]), "sha2", None, None)
+            .await
+            .unwrap();
+
+        // Fresh cursor: both rows, oldest-touch first, guards joined.
+        let win = store.zavet_decisions_since(0, 10).await.unwrap();
+        assert_eq!(win.len(), 2);
+        assert_eq!(win[0].1.id, "D-0001");
+        assert_eq!(win[0].1.guards, vec!["a/**".to_string()]);
+        let high = win.last().unwrap().0;
+
+        // Cursor at high-water: empty window.
+        assert!(store
+            .zavet_decisions_since(high, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Re-upserting an old row bumps it past the cursor — an edit after a
+        // rebase/backfill can never be silently skipped.
+        store
+            .zavet_upsert_decision(repo, &decision("D-0001", &["a/**"]), "sha3", None, None)
+            .await
+            .unwrap();
+        let win = store.zavet_decisions_since(high, 10).await.unwrap();
+        assert_eq!(win.len(), 1);
+        assert_eq!(win[0].1.id, "D-0001");
+        assert!(win[0].0 > high);
+
+        // Trailers ride a rowid cursor; guard events ride their ULID.
+        store
+            .zavet_record_trailers(
+                Some(repo),
+                "shaT",
+                &[ZavetTrailer {
+                    key: "refs".into(),
+                    value: "D-0001".into(),
+                    decision_id: Some("D-0001".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        let trailers = store.zavet_trailers_since(0, 10).await.unwrap();
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(trailers[0].sha, "shaT");
+        assert!(store
+            .zavet_trailers_since(trailers[0].rowid, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let ev_id = store
+            .zavet_record_guard_event(
+                "2026-07-17T10:00:00Z",
+                Some(repo),
+                "D-0001",
+                "guard_blocked",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let events = store.zavet_guard_events_since("", 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, ev_id);
+        assert!(store
+            .zavet_guard_events_since(&ev_id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    fn spec(slug: &str, paths: &[&str], decisions: &[&str]) -> ZavetSpecCapture {
+        ZavetSpecCapture {
+            slug: slug.to_string(),
+            title: Some("Capture pipeline".into()),
+            version: 1,
+            origin: "session".into(),
+            verified: Some(false),
+            confidence: "high".into(),
+            date: Some("2026-07-16".into()),
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            decisions: decisions.iter().map(|s| s.to_string()).collect(),
+            path: format!(".zavet/specs/{slug}.md"),
+            body_md: Some("## Overview\nsweeps".into()),
+            content_hash: Some("blobS1".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn zavet_spec_upsert_preserves_first_sight_and_replaces_children() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_spec(
+                repo,
+                &spec(
+                    "capture-pipeline",
+                    &["cli/dirad/**", "cli/core/src/zavet.rs"],
+                    &["D-0001"],
+                ),
+                "shaS1",
+                Some("2026-07-01T00:00:00Z"),
+                Some("s1"),
+            )
+            .await
+            .unwrap();
+
+        // Second capture: later commit, other session, narrowed paths, relinked.
+        let mut cap = spec("capture-pipeline", &["cli/dirad/**"], &["D-0002"]);
+        cap.version = 2;
+        cap.confidence = "med".into();
+        cap.content_hash = Some("blobS2".into());
+        store
+            .zavet_upsert_spec(
+                repo,
+                &cap,
+                "shaS2",
+                Some("2026-07-16T00:00:00Z"),
+                Some("s2"),
+            )
+            .await
+            .unwrap();
+
+        let s = store
+            .zavet_spec_get(repo, "capture-pipeline")
+            .await
+            .unwrap()
+            .unwrap();
+        // First-sight provenance survives the update…
+        assert_eq!(s.first_commit.as_deref(), Some("shaS1"));
+        assert_eq!(s.created_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(s.source_session.as_deref(), Some("s1"));
+        // …while the living fields track the latest commit.
+        assert_eq!(s.last_commit.as_deref(), Some("shaS2"));
+        assert_eq!(s.version, 2);
+        assert_eq!(s.confidence.as_deref(), Some("med"));
+        assert_eq!(s.content_hash.as_deref(), Some("blobS2"));
+        // Paths and decision links were replaced wholesale, not accumulated.
+        assert_eq!(s.paths, vec!["cli/dirad/**".to_string()]);
+        assert_eq!(s.decisions, vec!["D-0002".to_string()]);
+
+        // Upserting the same capture again is a no-op (idempotent).
+        store
+            .zavet_upsert_spec(
+                repo,
+                &cap,
+                "shaS2",
+                Some("2026-07-16T00:00:00Z"),
+                Some("s2"),
+            )
+            .await
+            .unwrap();
+        let again = store
+            .zavet_spec_get(repo, "capture-pipeline")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, s);
+
+        let counts = store.zavet_counts(repo).await.unwrap();
+        assert_eq!(counts.specs_total, 1);
+    }
+
+    #[tokio::test]
+    async fn zavet_specs_list_bulk_loads_children_and_reverse_lookup_joins() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_spec(
+                repo,
+                &spec("auth-flow", &["src/auth/**"], &["D-0001"]),
+                "sA",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .zavet_upsert_spec(
+                repo,
+                &spec("capture-pipeline", &["cli/**"], &["D-0001", "D-0002"]),
+                "sB",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let list = store.zavet_specs_list(repo).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].slug, "auth-flow");
+        assert_eq!(list[0].paths, vec!["src/auth/**".to_string()]);
+        assert_eq!(list[0].decisions, vec!["D-0001".to_string()]);
+        assert_eq!(list[1].slug, "capture-pipeline");
+        assert_eq!(
+            list[1].decisions,
+            vec!["D-0001".to_string(), "D-0002".to_string()]
+        );
+
+        // Reverse: which specs cover D-0001 / D-0002?
+        let covering = store
+            .zavet_specs_for_decision(repo, "D-0001")
+            .await
+            .unwrap();
+        assert_eq!(
+            covering.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["auth-flow", "capture-pipeline"]
+        );
+        let covering = store
+            .zavet_specs_for_decision(repo, "D-0002")
+            .await
+            .unwrap();
+        assert_eq!(covering.len(), 1);
+        assert_eq!(covering[0].0, "capture-pipeline");
+        assert_eq!(covering[0].1.as_deref(), Some("Capture pipeline"));
+        // Another repo sees nothing.
+        assert!(store
+            .zavet_specs_for_decision("github.com/o/other", "D-0001")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn zavet_trailers_are_idempotent_by_sha_and_seq() {
+        let store = Store::open_in_memory().await.unwrap();
+        let ts = vec![
+            ZavetTrailer {
+                key: "why".into(),
+                value: "polling beats watching".into(),
+                decision_id: None,
+            },
+            ZavetTrailer {
+                key: "refs".into(),
+                value: "D-0001".into(),
+                decision_id: Some("D-0001".into()),
+            },
+        ];
+        let repo = Some("github.com/o/r");
+        store
+            .zavet_record_trailers(repo, "shaX", &ts)
+            .await
+            .unwrap();
+        // A re-walk of the same range records the same trailers again — no dupes.
+        store
+            .zavet_record_trailers(repo, "shaX", &ts)
+            .await
+            .unwrap();
+        let counts = store.zavet_counts("github.com/o/r").await.unwrap();
+        assert_eq!(counts.trailers, 2);
+    }
+
+    #[tokio::test]
+    async fn zavet_session_set_unions_guard_events_trailers_and_record_commits() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+
+        // The record itself was introduced by sha1 (session s1).
+        store
+            .zavet_upsert_decision(repo, &decision("D-0001", &[]), "sha1", None, Some("s1"))
+            .await
+            .unwrap();
+        // A captured commit references it via trailer (session s2)…
+        let c = CapturedCommit {
+            sha: "sha2".into(),
+            authored_at: Some("2026-01-02T00:00:00Z".into()),
+            author_email: None,
+            author_name: None,
+            message: "feat: x".into(),
+            additions: 1,
+            deletions: 0,
+            patch_id: None,
+        };
+        store
+            .record_commit(&c, Some(repo), None, Some("s2"), None)
+            .await
+            .unwrap();
+        store
+            .zavet_record_trailers(
+                Some(repo),
+                "sha2",
+                &[ZavetTrailer {
+                    key: "refs".into(),
+                    value: "D-0001".into(),
+                    decision_id: Some("D-0001".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        // …an attributed guard event adds s3, and an unattributed one adds nothing.
+        store
+            .zavet_record_guard_event(
+                "2026-01-03T00:00:00Z",
+                Some(repo),
+                "D-0001",
+                "guard_shown",
+                Some("a.rs"),
+                Some("s3"),
+            )
+            .await
+            .unwrap();
+        store
+            .zavet_record_guard_event(
+                "2026-01-03T00:01:00Z",
+                Some(repo),
+                "D-0001",
+                "guard_blocked",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // sha1 (first_commit) was never captured into artifacts, so it cannot
+        // contribute a session — but s2 (trailer) and s3 (guard event) do.
+        let sessions = store
+            .zavet_sessions_for_decision(repo, "D-0001")
+            .await
+            .unwrap();
+        assert_eq!(sessions, vec!["s2".to_string(), "s3".to_string()]);
+
+        // Once sha1 IS captured, its source session joins the set.
+        let c1 = CapturedCommit {
+            sha: "sha1".into(),
+            authored_at: Some("2026-01-01T00:00:00Z".into()),
+            author_email: None,
+            author_name: None,
+            message: "docs: decide".into(),
+            additions: 1,
+            deletions: 0,
+            patch_id: None,
+        };
+        store
+            .record_commit(&c1, Some(repo), None, Some("s1"), None)
+            .await
+            .unwrap();
+        let sessions = store
+            .zavet_sessions_for_decision(repo, "D-0001")
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions,
+            vec!["s1".to_string(), "s2".to_string(), "s3".to_string()]
+        );
+
+        // Stats keep the honest unattributed tally per kind.
+        let stats = store
+            .zavet_guard_event_stats(repo, Some("D-0001"))
+            .await
+            .unwrap();
+        let blocked = stats.iter().find(|s| s.kind == "guard_blocked").unwrap();
+        assert_eq!((blocked.total, blocked.unattributed), (1, 1));
+        let shown = stats.iter().find(|s| s.kind == "guard_shown").unwrap();
+        assert_eq!((shown.total, shown.unattributed), (1, 0));
+
+        // Linked commits list both shas, captured or not.
+        let commits = store
+            .zavet_commits_for_decision(repo, "D-0001")
+            .await
+            .unwrap();
+        let shas: Vec<&str> = commits.iter().map(|c| c.sha.as_str()).collect();
+        assert!(shas.contains(&"sha1") && shas.contains(&"sha2"));
+    }
+
+    #[tokio::test]
+    async fn zavet_override_round_trips_and_clears() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        assert_eq!(store.zavet_override_get(repo).await.unwrap(), None);
+        store.zavet_override_set(repo, Some(true)).await.unwrap();
+        assert_eq!(store.zavet_override_get(repo).await.unwrap(), Some(true));
+        store.zavet_override_set(repo, Some(false)).await.unwrap();
+        assert_eq!(store.zavet_override_get(repo).await.unwrap(), Some(false));
+        store.zavet_override_set(repo, None).await.unwrap();
+        assert_eq!(store.zavet_override_get(repo).await.unwrap(), None);
     }
 
     #[tokio::test]

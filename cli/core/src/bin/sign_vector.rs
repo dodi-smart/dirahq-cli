@@ -11,6 +11,14 @@ use dira_core::signing::DeviceKey;
 // Fixed 32-byte seed (base64) so the vector is reproducible.
 const SEED_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
+// Every value below is synthetic on purpose, and must stay that way: this
+// fixture is attached as an asset to every GitHub release and is vendored by
+// the cloud repo, so anything in it is public and permanent with no retraction
+// path. `example.com` is reserved by RFC 2606 §3 — it can never be registered,
+// so the address can never route or be harvested. Never substitute a real
+// address here, personal or corporate; the value only exists to make the JCS
+// byte stream non-trivial and carries no information.
+
 fn main() {
     let key = DeviceKey::from_secret_base64(SEED_B64).expect("valid seed");
 
@@ -21,7 +29,7 @@ fn main() {
         intervals: vec![Interval {
             id: "01INTERVAL00000000000000000".to_string(),
             repo_canonical: Some("github.com/dodi-smart/dira".to_string()),
-            identity_email: "asenlekoff@gmail.com".to_string(),
+            identity_email: "dev@example.com".to_string(),
             started_at: "2026-06-27T09:00:00Z".to_string(),
             ended_at: "2026-06-27T09:45:00Z".to_string(),
             human_seconds: 2700,
@@ -33,13 +41,15 @@ fn main() {
             harness: Harness::ClaudeCode,
             kind: SessionKind::Agent,
             repo_canonical: Some("github.com/dodi-smart/dira".to_string()),
-            identity_email: "asenlekoff@gmail.com".to_string(),
+            identity_email: "dev@example.com".to_string(),
             started_at: "2026-06-27T09:00:00Z".to_string(),
             ended_at: Some("2026-06-27T09:45:00Z".to_string()),
             agent_wall_seconds: 2700,
             prompts: None,
             // Omitted-when-None on the wire, so the signing vector stays byte-identical.
             branch: None,
+            note: None,
+            label: None,
         }],
         token_usage: vec![],
         artifacts: vec![],

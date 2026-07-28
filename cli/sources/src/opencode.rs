@@ -11,10 +11,12 @@
 //! `{ kind, session_id, cwd?, tool_name?, transcript_path? }` where `kind` is one
 //! of the [`EventKind`]-aligned strings below. `normalize()` maps `kind` directly.
 //!
-//! TODO(version-verify): the plugin hook names (`event` with
-//! `session.idle`/`session.start`, `tool.execute.before/after`, `permission.ask`,
-//! `chat.message`) are mapped in the bundled plugin, not here. Re-verify those
-//! against the shipping OpenCode plugin API before GA.
+//! Plugin hook names are confirmed against the shipping OpenCode plugin API:
+//! the event stream carries `session.created`/`session.idle`/`session.deleted`
+//! (there is no `session.start`/`session.end`); `chat.message`,
+//! `tool.execute.before`/`tool.execute.after`, and `permission.ask` are top-level
+//! **hook keys** (not `event.type`s), and the plugin factory receives `directory`
+//! as the cwd. The bundled template below reflects this.
 
 use crate::{HarnessSource, Normalized};
 use dira_contract::Harness;
@@ -123,15 +125,16 @@ export const DiraPlugin = async ({ directory }) => {
   const cwd = directory;
   return {
     event: async ({ event }) => {
-      if (event.type === "session.start") {
+      if (event.type === "session.created") {
         await send("SessionStart", { session_id: event.properties?.sessionID, cwd });
       } else if (event.type === "session.idle") {
         await send("Stop", { session_id: event.properties?.sessionID, cwd });
-      } else if (event.type === "session.deleted" || event.type === "session.end") {
+      } else if (event.type === "session.deleted") {
         await send("SessionEnd", { session_id: event.properties?.sessionID, cwd });
-      } else if (event.type === "chat.message") {
-        await send("UserPrompt", { session_id: event.properties?.sessionID, cwd });
       }
+    },
+    "chat.message": async (input) => {
+      await send("UserPrompt", { session_id: input?.sessionID, cwd });
     },
     "tool.execute.before": async (input) => {
       await send("PreTool", { session_id: input?.sessionID, cwd, tool_name: input?.tool });

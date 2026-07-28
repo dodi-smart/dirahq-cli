@@ -22,6 +22,8 @@ pub enum Request {
         project: Option<String>,
         label: Option<String>,
         activity: Option<String>,
+        /// Free-text description for the manual session (`--note`).
+        note: Option<String>,
         /// Working dir to resolve a project from when `project` is omitted.
         cwd: Option<String>,
     },
@@ -32,6 +34,10 @@ pub enum Request {
         duration_secs: u64,
         project: Option<String>,
         note: Option<String>,
+        /// Activity classification (`--activity`), e.g. "meeting".
+        activity: Option<String>,
+        /// Operational tag (`--label`).
+        label: Option<String>,
         cwd: Option<String>,
     },
     /// Local report for a scope.
@@ -48,6 +54,60 @@ pub enum Request {
     Nuke,
     /// Build + runtime info for the running daemon (`dira version`).
     DaemonInfo,
+    /// Manual escape hatch (`dira device resync`): rewind the sync cursor so the
+    /// daemon re-sends events to the cloud, then trigger a flush. `from = None`
+    /// rewinds to the beginning (full re-send); `Some(id)` rewinds to that event
+    /// id. Safe — the cloud dedups (no double counting).
+    ResyncCursor { from: Option<String> },
+    /// Forward a raw zavet guard event (from the `dira zavet emit` shim — the
+    /// plugin's fire-and-forget channel). Parsed permissively daemon-side so
+    /// the event schema can evolve without protocol churn; the daemon resolves
+    /// the repo from the payload's `cwd` and never trusts a caller-supplied
+    /// repo identity.
+    IngestZavet { payload: serde_json::Value },
+    /// Zavet activation + capture health for a repo (resolved from `repo`, or
+    /// `cwd`, or the daemon's own cwd — same ladder as `Start`).
+    ZavetStatus {
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// Answer "why?" from recorded knowledge (`dira zavet why`). `query` is a
+    /// decision id (`D-0042`) or free text; free text is searched across
+    /// titles, slugs, guards, bodies, and trailers — a single confident hit
+    /// answers in full, several return ranked matches.
+    ZavetWhy {
+        query: String,
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// Browse the knowledge base (`dira zavet wiki`): overview without a
+    /// topic, ranked matches with one.
+    ZavetWiki {
+        topic: Option<String>,
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// List a repo's captured decisions.
+    ZavetDecisions {
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// Set or clear the per-repo zavet override (`dira zavet enable|disable`).
+    /// `mode` is `on`, `off`, or `clear`.
+    ZavetSetMode {
+        cwd: Option<String>,
+        repo: Option<String>,
+        mode: String,
+    },
+    /// Ask the daemon to shut down gracefully over the control channel — the
+    /// platform-neutral SIGTERM equivalent. Unix already has SIGTERM (and
+    /// keeps it; see `dirad::wait_for_shutdown_signal`), but windows has no
+    /// signal of that shape at all, so `dira daemon stop` and self-restarts
+    /// (`dira update`) need an in-band way to ask the resident daemon to wind
+    /// down instead of being hard-killed. This is the internal CLI↔daemon
+    /// control protocol — distinct from the cloud wire contract under
+    /// `/contract`, which this does not touch.
+    Shutdown,
 }
 
 /// Which manual session(s) to stop.
@@ -84,8 +144,12 @@ pub enum Response {
     Error { message: String },
     /// Daemon is alive (`Ping`).
     Pong,
-    /// `Status`.
-    Status(StatusView),
+    /// `Status`. Boxed (WP-B9): `StatusView` grew past clippy's large-variant
+    /// threshold against the small `Ok`/`Pong`/etc. arms once `sync_health`
+    /// (WP-B9) joined `writer_health` (WP-B7) — the same fix `tui::Live`/
+    /// `PollResult` already applied for the same reason. One allocation per
+    /// `status` response, nowhere near a hot path.
+    Status(Box<StatusView>),
     /// `Sessions`.
     Sessions { sessions: Vec<SessionView> },
     /// `Start`.
@@ -101,6 +165,9 @@ pub enum Response {
     Report(Report),
     /// `Nuke`: how many rows were wiped from each stats table.
     Nuked { events: u64, tokens: u64 },
+    /// `ResyncCursor`: the cursor was rewound and a flush was triggered; `pending`
+    /// is how many events will now re-sync, from `from` (None = the beginning).
+    ResyncQueued { pending: u64, from: Option<String> },
     /// `DaemonInfo`: the running daemon's build + runtime info.
     DaemonInfo {
         /// Daemon binary version (`CARGO_PKG_VERSION`).
@@ -111,7 +178,44 @@ pub enum Response {
         pid: u32,
         /// Seconds since the daemon started.
         uptime_seconds: u64,
+        /// Why the loopback hook ingress is not serving, or `None` when it is
+        /// healthy. A daemon whose ingress port is taken keeps answering here
+        /// but captures nothing, so it must not be indistinguishable from a
+        /// healthy one (D-0009). `default` so a newer `dira` can still read an
+        /// older daemon's reply during a partial update.
+        #[serde(default)]
+        http_ingress_error: Option<String>,
     },
+    /// `ZavetStatus`. Boxed like `Status` to keep small arms small.
+    ZavetStatus(Box<ZavetStatusView>),
+    /// `ZavetWhy`.
+    ZavetWhy(Box<ZavetWhyView>),
+    /// `ZavetDecisions`.
+    ZavetDecisions { decisions: Vec<ZavetDecisionView> },
+    /// `ZavetWhy` with an ambiguous free-text query: ranked matches instead
+    /// of a single answer. Also `ZavetWiki` with a topic. `trailers` are
+    /// matching orphan commit trailers — micro-decisions that never got a
+    /// record; they can be the whole answer when `hits` is empty.
+    ZavetSearch {
+        query: String,
+        hits: Vec<ZavetSearchHit>,
+        /// Matching living specs, ranked with the same weights.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        specs: Vec<ZavetSpecHit>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        trailers: Vec<ZavetTrailerHit>,
+    },
+    /// `ZavetWiki` without a topic: the knowledge-base overview.
+    ZavetWiki(Box<ZavetWikiView>),
+    /// `ZavetWhy` when the confident winner is a living spec. Skew note:
+    /// unlike the additive `specs` fields elsewhere, a NEW variant makes an
+    /// older `dira` error (not degrade) when a newer daemon answers with a
+    /// spec — accepted deliberately: the shapes genuinely differ, both
+    /// binaries ship from one workspace, and the failure is a clean error on
+    /// a query an old CLI couldn't render anyway.
+    ZavetSpec(Box<ZavetSpecWhyView>),
+    /// `ZavetSetMode`: the applied override (`on`/`off`) or `clear`.
+    ZavetModeSet { repo: String, mode: String },
 }
 
 /// A live or recent session as shown by `status` / `sessions`.
@@ -124,10 +228,28 @@ pub struct SessionView {
     pub kind: String,
     pub project: Option<String>,
     pub label: Option<String>,
+    /// Activity classification + free-text note for manual sessions (display).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub started_at: String,
     pub human_seconds: i64,
     pub agent_seconds: i64,
+    /// `true` when no *human* signal (prompt / permission / manual tick) has
+    /// arrived within the idle window — i.e. you are not currently driving this
+    /// session. This is the human-engagement basis and is deliberately blind to
+    /// agent activity: a session whose agent is churning away with no recent
+    /// prompt is still `idle` here (but see [`SessionView::agent_active`]).
     pub idle: bool,
+    /// `true` when this session saw activity of *any* kind — the agent's own tool
+    /// calls included — within the idle window. Distinct from `idle`: it lets the
+    /// live view surface an agent working on its own as `active` rather than
+    /// misreporting it as `idle`, matching the cloud's activity-based "Right Now".
+    /// Defaulted so a newer CLI stays wire-compatible with an older daemon (which
+    /// omits it → `false`, i.e. degrades to the prior engaged/idle-only view).
+    #[serde(default)]
+    pub agent_active: bool,
     /// RFC3339 timestamp of this session's last event of any kind, if live. Lets
     /// the `watch` dashboard grow the agent timer by `now - last_activity_at`
     /// (clamped to idle) between polls so it ticks smoothly. Display-only;
@@ -138,6 +260,35 @@ pub struct SessionView {
     /// engagement tail for the human timer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_human_at: Option<String>,
+}
+
+/// The live engagement state of a session for the STATE column, with precedence
+/// `engaged > active > idle`. "Engaged" means *you* signalled it recently;
+/// "active" means its agent is working but you haven't; "idle" means neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveState {
+    /// A human signal arrived within the idle window — you are driving it.
+    Engaged,
+    /// No recent human signal, but the agent has been active within the window.
+    Active,
+    /// Nothing — human or agent — within the idle window.
+    Idle,
+}
+
+impl SessionView {
+    /// Fold [`SessionView::idle`] and [`SessionView::agent_active`] into the
+    /// three-way [`LiveState`] the renderers display. Human engagement wins over
+    /// agent activity, so a session you just prompted reads `Engaged` even while
+    /// its agent runs.
+    pub fn live_state(&self) -> LiveState {
+        if !self.idle {
+            LiveState::Engaged
+        } else if self.agent_active {
+            LiveState::Active
+        } else {
+            LiveState::Idle
+        }
+    }
 }
 
 /// `status` payload: what's live plus today's rollup.
@@ -153,4 +304,521 @@ pub struct StatusView {
     /// activity. Defaulted so older CLIs stay wire-compatible.
     #[serde(default)]
     pub hydrating: bool,
+    /// Today's token totals + local cost estimate, for the status compute row.
+    /// `None` from an older daemon (skew) or when the read fails — the renderer
+    /// omits the row. Defaulted + omitted-when-None so both directions of
+    /// dira↔dirad skew stay wire-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<ComputeView>,
+    /// The cloud-computed billable summary (last successful fetch, possibly
+    /// stale — see `fetched_at`). `None` when the device is unlinked, offline
+    /// since startup with no cache, or the daemon is older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<BillingView>,
+    /// Writer-task health (WP-B7): panics caught + dropped at the message
+    /// grain, watchdog stall count, and whether it looks wedged right now.
+    /// `None` from an older daemon (skew) — the renderer omits the health
+    /// line then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_health: Option<WriterHealthView>,
+    /// Sync-task health (WP-B9): the last flush attempt's outcome, consecutive
+    /// failure count, current backoff, and cursor/watermark, plus process-wide
+    /// flush counters — the daemon's own honest view of "is sync actually
+    /// working" (a stalled sync and a quiet because-nothing-changed sync both
+    /// otherwise look identical from `sync_pending` alone). `None` from an
+    /// older daemon (skew) — the renderer omits the health line then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_health: Option<SyncHealthView>,
+}
+
+/// The writer task's self-reported health, attached to `status` (WP-B7). The
+/// writer catches and drops any panic tripped by a single message rather than
+/// dying, so `panics > 0` is an operator signal worth investigating — not
+/// itself an outage. `wedged` is the same definition the watchdog uses: no
+/// progress past the stall threshold while messages are backed up.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct WriterHealthView {
+    /// Messages whose processing panicked and were dropped since daemon start.
+    pub panics: u64,
+    /// How many times the watchdog has observed the writer stalled.
+    pub stalls: u64,
+    /// Seconds since the writer last drained a message, or `None` if it never
+    /// has (a fresh, still-hydrating daemon).
+    pub idle_secs: Option<i64>,
+    /// True when the writer currently looks wedged (no progress past the
+    /// stall threshold while messages are backed up).
+    pub wedged: bool,
+}
+
+/// The sync task's self-reported health, attached to `status` (WP-B9). Mirrors
+/// `dira_core::sync::SyncHealth` (the persisted snapshot `sync.rs` writes
+/// after every flush attempt) plus process-wide flush counters from
+/// `ProgressTracker` — defined here rather than reusing the sync-module type
+/// directly so the protocol doesn't depend on sync internals; the daemon maps
+/// between them. Every field defaults, so an old/short-written snapshot (or a
+/// daemon that has never yet attempted a flush) still renders sensibly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncHealthView {
+    /// RFC 3339 timestamp of the most recent flush attempt, or `None` before
+    /// the first one.
+    pub last_attempt_at: Option<String>,
+    /// RFC 3339 timestamp of the most recent flush that fully succeeded.
+    pub last_success_at: Option<String>,
+    /// A stable, short code for the most recent failure kind (e.g.
+    /// `"signature_rejected"`, `"unknown_device"`, `"transient"`), or `None`
+    /// right after a success / before the first attempt.
+    pub last_error_kind: Option<String>,
+    /// Consecutive failed flush attempts since the last success.
+    pub consecutive_failures: u32,
+    /// The backoff the sync loop is currently sleeping (or just slept) for,
+    /// in seconds. `0` in steady state.
+    pub backoff_secs: u64,
+    /// The sync cursor (last confirmed-synced event id) as of the snapshot.
+    pub cursor: Option<String>,
+    /// The cloud's last-reported persisted watermark, as of the snapshot.
+    pub cloud_watermark: Option<String>,
+    /// Total flush attempts since daemon start.
+    pub flush_attempts: u64,
+    /// Total flush attempts that fully succeeded since daemon start.
+    pub flush_successes: u64,
+    /// Total flush attempts that failed since daemon start.
+    pub flush_failures: u64,
+}
+
+/// Today's compute totals for the status summary. Defined here (not reusing the
+/// store's row type) so the wire protocol never depends on storage shapes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ComputeView {
+    /// All tokens through the pipe today: input + output + cache read/create.
+    pub total_tokens: u64,
+    /// Estimated USD cost from the bundled pricing table. A local estimate and
+    /// always a label — never a billing base (that's the cloud's job).
+    pub est_cost_usd: f64,
+}
+
+/// The cloud's billable rollup as attached to `status`. Mirrors
+/// [`crate::sync::BillingSummary`] but is defined here so the protocol doesn't
+/// depend on sync types; the daemon maps between them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BillingView {
+    /// Engaged hours of billable intervals in the period (raw, not rounded).
+    pub billable_hours: f64,
+    /// Policy-priced value of those intervals, in `currency`.
+    pub unbilled_amount: f64,
+    /// Currency symbol from the workspace policy, e.g. `"€"`.
+    pub currency: String,
+    /// The period the summary covers, e.g. `"week"`.
+    pub period: String,
+    /// RFC 3339 timestamp of the daemon's successful fetch — lets the renderer
+    /// flag a stale value ("as of 32m ago") instead of presenting it as live.
+    pub fetched_at: String,
+}
+
+/// Zavet activation + capture health for one repo (`dira zavet status`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetStatusView {
+    /// Canonical repo the view describes.
+    pub repo: String,
+    /// The resolved activation verdict.
+    pub active: bool,
+    /// The global `modules.zavet` knob (`auto`/`on`/`off`).
+    pub knob: String,
+    /// Per-repo override, if set (`on`/`off`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_mode: Option<String>,
+    /// Whether the repo carries `.zavet/` at its toplevel (the `auto` probe);
+    /// `None` when the daemon has no working dir for the repo yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zavet_dir: Option<bool>,
+    pub decisions_total: u64,
+    pub decisions_active: u64,
+    pub trailers: u64,
+    pub guard_events: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_stats: Vec<ZavetGuardStatView>,
+}
+
+/// Per-kind guard-event tallies with the honest unattributed count.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetGuardStatView {
+    pub kind: String,
+    pub total: u64,
+    pub unattributed: u64,
+}
+
+/// One captured decision (list row; `zavet why` carries the body separately).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetDecisionView {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session: Option<String>,
+    /// `recorded` | `reverse-engineered` (absent = recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Explicit verification flag; `Some(false)` renders as an unverified
+    /// hypothesis, never as fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+}
+
+/// One ranked hit for a free-text `why`/`wiki` query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSearchHit {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// First plain-prose sentence of the record body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    pub score: u32,
+}
+
+/// One matching orphan commit trailer — a micro-decision with no record.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetTrailerHit {
+    pub sha: String,
+    /// Normalized trailer key (`why`, `constraint`, …).
+    pub key: String,
+    pub value: String,
+    pub score: u32,
+}
+
+/// One captured living spec (`.zavet/specs/<slug>.md`), with its computed
+/// staleness when the daemon had a working directory to ask git in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecView {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub version: i64,
+    /// `designed` | `session` | `reverse-engineered`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// `true` only after a human confirmed the spec matches the code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// `low` | `med` | `high`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    pub path: String,
+    /// Git pathspecs the spec covers — the staleness domain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Linked decision ids (spec-side links; decisions stay append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session: Option<String>,
+    /// Commits touching `paths` after `last_commit` — computed at query time
+    /// from git. `None` when no working directory was available to ask in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_commits: Option<u64>,
+}
+
+/// One ranked spec hit for a free-text `why`/`wiki` query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecHit {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// First plain-prose sentence of the spec body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    pub score: u32,
+}
+
+/// A `(slug, title)` pointer to a spec that links a decision — the reverse
+/// direction shown on `zavet why D-NNNN`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecRef {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// `dira zavet wiki` — the knowledge-base overview for a repo.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetWikiView {
+    pub repo: String,
+    pub decisions_total: u64,
+    pub trailers: u64,
+    pub guard_events: u64,
+    #[serde(default)]
+    pub specs_total: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active: Vec<ZavetDecisionView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<ZavetDecisionView>,
+    /// Living specs with staleness + confidence badges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs: Vec<ZavetSpecView>,
+    /// Latest captured trailers, newest first: `(sha, key, value)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<(String, String, String)>,
+}
+
+/// A commit linked to a decision.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetCommitView {
+    pub sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Per-session cost line for a decision (`zavet why`'s time panel).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSessionCostView {
+    pub session_id: String,
+    pub human_seconds: i64,
+    pub agent_seconds: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// `dira zavet why <id>` — the recorded knowledge plus what it cost.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetWhyView {
+    pub repo: String,
+    /// When a free-text query resolved to this decision, what it matched on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_query: Option<String>,
+    pub decision: ZavetDecisionView,
+    /// Full record body (local-only data; shown, never synced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+    /// The decision that replaced this one, if any (reverse `supersedes` link).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<ZavetCommitView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_stats: Vec<ZavetGuardStatView>,
+    /// Priced sessions evidencing this decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<ZavetSessionCostView>,
+    /// Summed cost over `sessions`.
+    pub total_human_seconds: i64,
+    pub total_agent_seconds: i64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    /// Evidence that could not be attributed to a session — reported so the
+    /// cost reads as an honest lower bound.
+    pub unattributed_commits: u64,
+    pub unattributed_guard_events: u64,
+    /// Specs that link this decision (the reverse of the spec-side links).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs: Vec<ZavetSpecRef>,
+}
+
+/// `dira zavet why <spec query>` — a living spec plus what it cost.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecWhyView {
+    pub repo: String,
+    /// When a free-text query resolved to this spec, what it matched on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_query: Option<String>,
+    pub spec: ZavetSpecView,
+    /// Full spec body (local-only data; shown, never synced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+    /// Commits linked via `Spec:` trailers plus the spec's own first/last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<ZavetCommitView>,
+    /// Priced sessions evidencing this spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<ZavetSessionCostView>,
+    /// Summed cost over `sessions`.
+    pub total_human_seconds: i64,
+    pub total_agent_seconds: i64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    /// Commits that could not be attributed to a session — the cost is an
+    /// honest lower bound.
+    pub unattributed_commits: u64,
+}
+
+/// True when the operator is in the loop — at least one of these sessions has a
+/// recent *human* signal (`LiveState::Engaged`). Drives the "and you" marker in
+/// the CLI renderers, mirroring the cloud's engaged badge. Deliberately keyed off
+/// human engagement, not agent activity: an agent working alone is `active` but
+/// does not put *you* in the loop.
+pub fn any_engaged(sessions: &[SessionView]) -> bool {
+    sessions
+        .iter()
+        .any(|s| s.live_state() == LiveState::Engaged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(idle: bool, agent_active: bool) -> SessionView {
+        SessionView {
+            handle: "h".into(),
+            session_id: "s".into(),
+            harness: "claude".into(),
+            kind: "agent".into(),
+            project: None,
+            label: None,
+            activity: None,
+            note: None,
+            started_at: "now".into(),
+            human_seconds: 0,
+            agent_seconds: 0,
+            idle,
+            agent_active,
+            last_activity_at: None,
+            last_human_at: None,
+        }
+    }
+
+    #[test]
+    fn live_state_prefers_engaged_then_active_then_idle() {
+        // Recent human signal → engaged, regardless of agent activity.
+        assert_eq!(view(false, false).live_state(), LiveState::Engaged);
+        assert_eq!(view(false, true).live_state(), LiveState::Engaged);
+        // No recent human signal but the agent is churning → active.
+        assert_eq!(view(true, true).live_state(), LiveState::Active);
+        // Nothing recent → idle.
+        assert_eq!(view(true, false).live_state(), LiveState::Idle);
+    }
+
+    #[test]
+    fn any_engaged_tracks_human_not_agent() {
+        // An agent working alone (active, not engaged) does not put you in the loop.
+        assert!(!any_engaged(&[view(true, true)]));
+        // A recent human signal does.
+        assert!(any_engaged(&[view(true, true), view(false, false)]));
+    }
+
+    #[test]
+    fn status_view_tolerates_older_daemon_without_tokens_or_billing() {
+        // An older daemon omits `tokens`/`billing`; both must deserialize to
+        // `None` so the new CLI simply omits the compute row and billable footer.
+        let json = r#"{
+            "active": [],
+            "today": {"projects":[],"total_human_seconds":0,"total_agent_seconds":0,"session_count":0},
+            "sync_pending": 0
+        }"#;
+        let v: StatusView = serde_json::from_str(json).unwrap();
+        assert!(v.tokens.is_none());
+        assert!(v.billing.is_none());
+        assert!(!v.hydrating);
+        assert!(v.writer_health.is_none());
+        assert!(v.sync_health.is_none());
+    }
+
+    #[test]
+    fn status_view_omits_absent_tokens_and_billing_on_the_wire() {
+        // `None` must not serialize its key, so an older CLI (serde: unknown
+        // fields ignored, but keep the payload minimal) sees the pre-field shape.
+        let v = StatusView {
+            active: vec![],
+            today: Report {
+                projects: vec![],
+                total_human_seconds: 0,
+                total_agent_seconds: 0,
+                session_count: 0,
+            },
+            sync_pending: 0,
+            hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(!json.contains("tokens"));
+        assert!(!json.contains("billing"));
+        assert!(!json.contains("writer_health"));
+        assert!(!json.contains("sync_health"));
+
+        let v = StatusView {
+            tokens: Some(ComputeView {
+                total_tokens: 2_060_000,
+                est_cost_usd: 15.2,
+            }),
+            billing: Some(BillingView {
+                billable_hours: 10.4,
+                unbilled_amount: 1064.0,
+                currency: "€".into(),
+                period: "week".into(),
+                fetched_at: "2026-07-02T09:00:00Z".into(),
+            }),
+            writer_health: Some(WriterHealthView {
+                panics: 2,
+                stalls: 0,
+                idle_secs: Some(5),
+                wedged: false,
+            }),
+            sync_health: Some(SyncHealthView {
+                last_attempt_at: Some("2026-07-09T10:00:00Z".into()),
+                last_success_at: Some("2026-07-09T09:55:00Z".into()),
+                last_error_kind: None,
+                consecutive_failures: 0,
+                backoff_secs: 0,
+                cursor: Some("01J0EVENT".into()),
+                cloud_watermark: Some("01J0WATERMARK".into()),
+                flush_attempts: 10,
+                flush_successes: 9,
+                flush_failures: 1,
+            }),
+            ..v
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: StatusView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tokens.unwrap().total_tokens, 2_060_000);
+        assert_eq!(back.billing.unwrap().currency, "€");
+        assert_eq!(back.writer_health.unwrap().panics, 2);
+        assert_eq!(back.sync_health.unwrap().flush_attempts, 10);
+    }
+
+    #[test]
+    fn agent_active_defaults_false_from_older_daemon() {
+        // An older daemon omits `agent_active`; it must deserialize to `false` so a
+        // busy-agent session degrades to the prior engaged/idle-only view.
+        let json = r#"{
+            "handle":"h","session_id":"s","harness":"claude","kind":"agent",
+            "project":null,"started_at":"now","human_seconds":0,"agent_seconds":0,
+            "idle":true
+        }"#;
+        let v: SessionView = serde_json::from_str(json).unwrap();
+        assert!(!v.agent_active);
+        assert_eq!(v.live_state(), LiveState::Idle);
+    }
 }

@@ -38,28 +38,23 @@ pub fn build(events: &[RawEvent], idle: Duration) -> Report {
         .collect();
     let human_by_project = accounting::per_project_seconds(&signals, idle);
 
-    // --- agent wall-clock: per session, summed freely ---
-    let mut sessions: BTreeMap<
-        &str,
-        (
-            Option<String>,
-            time::OffsetDateTime,
-            time::OffsetDateTime,
-            bool,
-        ),
-    > = BTreeMap::new();
+    // --- agent wall-clock: idle-trimmed active time per session, summed freely ---
+    // The wall-clock is the idle-trimmed active span over each session's own event
+    // timestamps ([`accounting::active_seconds`]), NOT the raw `last - first`
+    // lifetime: a session left open for hours between bursts of work reads as the
+    // time it was actually active, so dead spans can't inflate it. This is the same
+    // measure the sync/rollup path (`sync::batch`) and the cloud already use, so the
+    // local report, the historical rollups folded in by [`build_merged`], and the
+    // synced totals all agree.
+    let mut sessions: BTreeMap<&str, (Option<String>, Vec<time::OffsetDateTime>, bool)> =
+        BTreeMap::new();
     for e in events {
         let entry = sessions
             .entry(e.session_id.as_str())
-            .or_insert_with(|| (e.project.clone(), e.at, e.at, false));
-        if e.at < entry.1 {
-            entry.1 = e.at;
-        }
-        if e.at > entry.2 {
-            entry.2 = e.at;
-        }
+            .or_insert_with(|| (e.project.clone(), Vec::new(), false));
+        entry.1.push(e.at);
         if e.kind.is_agent_activity() {
-            entry.3 = true;
+            entry.2 = true;
         }
         if entry.0.is_none() && e.project.is_some() {
             entry.0 = e.project.clone();
@@ -67,10 +62,10 @@ pub fn build(events: &[RawEvent], idle: Duration) -> Report {
     }
 
     let mut agent_by_project: BTreeMap<Option<String>, i64> = BTreeMap::new();
-    for (project, first, last, had_activity) in sessions.values() {
+    for (project, times, had_activity) in sessions.values() {
         if *had_activity {
             *agent_by_project.entry(project.clone()).or_insert(0) +=
-                (*last - *first).whole_seconds();
+                accounting::active_seconds(times, idle);
         }
     }
 
@@ -172,6 +167,7 @@ mod tests {
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
     }
 
@@ -190,9 +186,27 @@ mod tests {
         let r = build(&events, Duration::minutes(5));
         // Human: gaps 10-20, 20-60 -> 50s, deduped across both sessions.
         assert_eq!(r.total_human_seconds, 50);
-        // Agent wall: s1 spans 0..60 = 60, s2 spans 0..40 = 40 -> 100s summed.
+        // Agent wall: all gaps are within idle, so idle-trimmed active == the span:
+        // s1 [0,10,30,60] = 60s, s2 [0,20,40] = 40s -> 100s summed.
         assert_eq!(r.total_agent_seconds, 100);
         assert_eq!(r.session_count, 2);
+    }
+
+    #[test]
+    fn agent_wall_is_idle_trimmed_not_raw_span() {
+        // One session: a burst of activity, a long idle gap (>5min), then a final
+        // burst. The raw last-first span is ~1h, but the wall-clock must count only
+        // the two active bursts — the dead gap is trimmed.
+        let events = vec![
+            ev("s", 0, EventKind::SessionStart, "p"),
+            ev("s", 10, EventKind::PreTool, "p"),
+            ev("s", 20, EventKind::PostTool, "p"), // burst 1: 0..20 = 20s
+            ev("s", 3600, EventKind::PreTool, "p"), // +1h idle gap (trimmed)
+            ev("s", 3630, EventKind::PostTool, "p"), // burst 2: 3600..3630 = 30s
+        ];
+        let r = build(&events, Duration::minutes(5));
+        // Idle-trimmed active = 20 + 30 = 50s, NOT the ~3630s raw span.
+        assert_eq!(r.total_agent_seconds, 50);
     }
 
     /// Compaction is lossless for reports: the full raw report equals the merged
@@ -221,6 +235,7 @@ mod tests {
                 tool: None,
                 label: None,
                 activity: None,
+                note: None,
             });
         }
         for i in 0..3 {
@@ -237,6 +252,7 @@ mod tests {
                 tool: None,
                 label: None,
                 activity: None,
+                note: None,
             });
         }
         for e in &all {

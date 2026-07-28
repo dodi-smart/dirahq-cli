@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BillingSummaryEnvelope",
+  "description": "A signed billing-summary request as it travels over the wire.\n\nMirrors [`Envelope`] exactly (same framing, same signing rule): the signature\nis computed over the canonical-JSON (RFC 8785) encoding of `payload` only.",
+  "type": "object",
+  "properties": {
+    "deviceId": {
+      "description": "ULID of the device that produced and signed this request.",
+      "type": "string"
+    },
+    "payload": {
+      "description": "The billing-summary request being attested to.",
+      "$ref": "#/$defs/BillingSummaryRequest"
+    },
+    "schemaVersion": {
+      "description": "Semver of this contract, e.g. `\"1.1.0\"`.",
+      "type": "string"
+    },
+    "sig": {
+      "description": "`ed25519(JCS(payload))`, base64 (standard, no padding).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "deviceId",
+    "payload",
+    "sig"
+  ],
+  "$defs": {
+    "BillingSummaryRequest": {
+      "description": "A request for the device owner's billing summary, sent to\n`POST /api/v1/billing/summary`.\n\nThe request is a *query*, not a fact: it names the device asking, when it\nasked (freshness window, like presence), and the period it wants. It stays\npolicy-free — no money, rate, or currency field. The cloud's *response*\ncarries those, and is deliberately **not** part of this contract (billing is\nresolved late, in the cloud; the daemon parses the response tolerantly, see\nthe module invariants).",
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "description": "ULID of the device asking (matches the envelope).",
+          "type": "string"
+        },
+        "period": {
+          "description": "The summary period, e.g. `\"week\"` (rolling 7 days ending now). A string,\nnot an enum, so new periods are additive without a schema major bump.",
+          "type": "string"
+        },
+        "sentAt": {
+          "description": "RFC 3339 timestamp the request was assembled. The cloud rejects requests\noutside its freshness window (`stale_request`), bounding replays.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "deviceId",
+        "sentAt",
+        "period"
+      ]
+    }
+  }
+}

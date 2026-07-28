@@ -36,10 +36,18 @@ use crate::signing::DeviceKey;
 use crate::store::Store;
 use crate::Error;
 
-/// Keychain service name for the device secret seed.
+/// Keychain service name for the device secret seed. Shared by `dira` and
+/// `dirad` — both read/write the same service+account pairs, which is what
+/// lets the daemon's `try_pending_key_flush` self-heal path resolve a pending
+/// key the CLI persisted (or vice versa).
 const KEYCHAIN_SERVICE: &str = "sh.dirahq.dira";
-/// Keychain account (entry) name for the device secret seed.
+/// Keychain account (entry) name for the ACTIVE device secret seed.
 const KEYCHAIN_ACCOUNT: &str = "device-secret";
+/// Keychain account (entry) name for the PENDING rotation key's secret seed —
+/// a distinct account from [`KEYCHAIN_ACCOUNT`] so an in-flight rotation's
+/// pending key and the currently-active key never collide in the OS
+/// keychain (both can be present at once mid-rotation).
+const KEYCHAIN_ACCOUNT_PENDING: &str = "device-pending-secret";
 /// Env var supplying the device secret seed out-of-band (standard base64 of the
 /// 32-byte seed). Takes precedence over the keychain/meta and is never persisted.
 pub const ENV_DEVICE_SECRET: &str = "DIRA_DEVICE_SECRET";
@@ -90,7 +98,7 @@ pub async fn load_key(store: &Store) -> Result<Option<DeviceKey>, Error> {
     if let Some(key) = env_key() {
         return Ok(Some(key));
     }
-    if let Some(secret) = keychain_get() {
+    if let Some(secret) = keychain_get(KEYCHAIN_ACCOUNT) {
         return Ok(Some(DeviceKey::from_secret_base64(&secret)?));
     }
     if let Some(secret) = store.meta_get(META_SECRET_FALLBACK).await? {
@@ -102,7 +110,7 @@ pub async fn load_key(store: &Store) -> Result<Option<DeviceKey>, Error> {
 /// Persist the device secret: keychain first, `meta` fallback if that fails.
 async fn persist_secret(store: &Store, key: &DeviceKey) -> Result<(), Error> {
     let secret = key.secret_base64();
-    if keychain_set(&secret).is_ok() {
+    if keychain_set(KEYCHAIN_ACCOUNT, &secret).is_ok() {
         // Clear any stale fallback so the keychain is the single source.
         let _ = store.meta_set(META_SECRET_FALLBACK, "").await;
         return Ok(());
@@ -131,6 +139,136 @@ pub async fn install_rotated_key(store: &Store, key: &DeviceKey) -> Result<(), E
     store.meta_set(META_PUBKEY, &key.public_base64()).await
 }
 
+/// `meta` key holding the base64 public key of a rotation IN FLIGHT — set
+/// **before** the rotation is POSTed to the cloud, promoted to [`META_PUBKEY`]
+/// (or discarded) once the swap resolves (WP-B1b two-phase rotation). Absent
+/// (empty) ⇒ no rotation in flight.
+pub const META_PENDING_PUBKEY: &str = "device_pending_pubkey_b64";
+/// `meta` key holding the pending key's secret seed — used only as the
+/// fallback when the OS keychain is unavailable.
+///
+/// Mirrors [`META_SECRET_FALLBACK`] exactly: the pending key follows the
+/// SAME keychain-first, meta-fallback ladder as the active key (just under
+/// the distinct [`KEYCHAIN_ACCOUNT_PENDING`] account, so the two never
+/// collide), rather than skipping the keychain entirely. A pending seed sat
+/// here in plaintext even when a working keychain was available; treating it
+/// as lower-assurance than the active key was never justified by anything
+/// about the rotation protocol, and it left the seed at rest exactly when a
+/// crash mid-rotation is most likely to be inspected.
+const META_PENDING_SECRET: &str = "device_pending_secret_b64";
+/// `meta` key holding the pending rotation's RFC 3339 `rotatedAt`, persisted
+/// alongside the pending keypair so a retried `rotate-key` rebuilds the
+/// *identical* envelope (same key, same timestamp) — the determinism that
+/// makes a re-POST idempotent against the cloud's replay guard (strictly
+/// increasing `rotatedAt`; see `dira/src/device.rs`).
+pub const META_PENDING_ROTATED_AT: &str = "device_pending_rotated_at";
+
+/// Persist a freshly-generated PENDING rotation key + its `rotated_at`,
+/// **before** the rotation is POSTed to the cloud (WP-B1b). A crash any time
+/// after this call leaves enough on disk for a retry to resume deterministically
+/// (see [`load_pending_key`]). Call this only when starting a FRESH rotation
+/// attempt — a retry of an interrupted one loads the existing pending key
+/// instead, so the same keypair/timestamp is reused across retries.
+pub async fn persist_pending_key(
+    store: &Store,
+    key: &DeviceKey,
+    rotated_at: &str,
+) -> Result<(), Error> {
+    persist_pending_secret(store, key).await?;
+    store
+        .meta_set(META_PENDING_PUBKEY, &key.public_base64())
+        .await?;
+    store.meta_set(META_PENDING_ROTATED_AT, rotated_at).await
+}
+
+/// Persist the PENDING key's secret: keychain first (under the distinct
+/// [`KEYCHAIN_ACCOUNT_PENDING`] account), `meta` fallback if that fails —
+/// mirrors [`persist_secret`]'s ladder exactly, for the same reasons.
+async fn persist_pending_secret(store: &Store, key: &DeviceKey) -> Result<(), Error> {
+    let secret = key.secret_base64();
+    if keychain_set(KEYCHAIN_ACCOUNT_PENDING, &secret).is_ok() {
+        // Clear any stale fallback so the keychain is the single source.
+        let _ = store.meta_set(META_PENDING_SECRET, "").await;
+        return Ok(());
+    }
+    tracing::warn!(
+        "OS keychain unavailable: storing the PENDING device key at rest in {db} \
+         (plaintext base64, db file is chmod 0600 on unix). Same lower-assurance \
+         fallback the active key uses when the keychain is unavailable — see \
+         {fallback}'s doc comment.",
+        db = META_PENDING_SECRET,
+        fallback = "META_SECRET_FALLBACK",
+    );
+    store.meta_set(META_PENDING_SECRET, &secret).await
+}
+
+/// Load the in-flight pending rotation key + its `rotated_at`, if a rotation
+/// is currently in flight. `None` in the common case (no rotation pending).
+///
+/// [`META_PENDING_ROTATED_AT`] (always meta-stored — never gated behind the
+/// keychain) is the source of truth for "is a rotation pending at all", since
+/// the secret itself may now live only in the keychain. Secret resolution then
+/// mirrors [`load_key`]'s ladder: keychain first, `meta` fallback.
+pub async fn load_pending_key(store: &Store) -> Result<Option<(DeviceKey, String)>, Error> {
+    let Some(rotated_at) = store
+        .meta_get(META_PENDING_ROTATED_AT)
+        .await?
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let secret = match keychain_get(KEYCHAIN_ACCOUNT_PENDING) {
+        Some(secret) => Some(secret),
+        None => store
+            .meta_get(META_PENDING_SECRET)
+            .await?
+            .filter(|s| !s.is_empty()),
+    };
+    let Some(secret) = secret else {
+        return Ok(None);
+    };
+    Ok(Some((DeviceKey::from_secret_base64(&secret)?, rotated_at)))
+}
+
+/// Promote the pending rotation key to ACTIVE — install it exactly like
+/// [`install_rotated_key`] — and clear the pending markers. Call this only
+/// once the cloud is CONFIRMED to have the pending key installed (a 2xx on the
+/// rotation POST, or a successful probe/flush signed with it): see
+/// `dira/src/device.rs::resume_rotation` (CLI-driven retry) and
+/// `dirad/src/sync.rs::try_pending_key_flush` (daemon self-heal on
+/// `SignatureRejected`) for the two call sites. A no-op (not an error) when
+/// nothing is pending, so it's safe to call defensively.
+pub async fn promote_pending_key(store: &Store) -> Result<(), Error> {
+    let Some((key, _rotated_at)) = load_pending_key(store).await? else {
+        return Ok(());
+    };
+    install_rotated_key(store, &key).await?;
+    clear_pending_key(store).await
+}
+
+/// Discard the pending rotation key WITHOUT promoting it.
+///
+/// Only call this once a retry has PROVEN the pending key will never become
+/// the cloud's active key (a different, concurrent rotation attempt won a
+/// race — see `resume_rotation`'s doc comment for exactly when this fires).
+/// Safe: the ACTIVE key ([`META_PUBKEY`]/the keychain) is completely
+/// untouched, so the device keeps working on whatever key IS currently live;
+/// a fresh `rotate-key` starts a brand-new attempt (new keypair) next time.
+///
+/// Clears BOTH locations the pending secret might be sitting in — the
+/// keychain entry (under [`KEYCHAIN_ACCOUNT_PENDING`]) and the `meta`
+/// fallback — since [`persist_pending_secret`] may have used either one, and
+/// leaving a stale keychain entry behind would let a later `load_pending_key`
+/// resurrect a discarded key. Deleting a keychain entry that was never
+/// written (the common case — most runs never fall back to meta) is a
+/// harmless no-op, same as clearing an already-empty meta key.
+pub async fn clear_pending_key(store: &Store) -> Result<(), Error> {
+    let _ = keychain_delete(KEYCHAIN_ACCOUNT_PENDING);
+    store.meta_set(META_PENDING_SECRET, "").await?;
+    store.meta_set(META_PENDING_PUBKEY, "").await?;
+    store.meta_set(META_PENDING_ROTATED_AT, "").await
+}
+
 /// The cloud-assigned device id, or `None` if the device is not yet linked.
 pub async fn device_id(store: &Store) -> Result<Option<String>, Error> {
     Ok(store
@@ -157,19 +295,33 @@ pub async fn clear_device_id(store: &Store) -> Result<(), Error> {
     store.meta_set(META_DEVICE_ID, "").await
 }
 
-fn keychain_entry() -> Result<keyring::Entry, keyring::Error> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+/// Build a keychain entry under [`KEYCHAIN_SERVICE`] + the given `account` —
+/// [`KEYCHAIN_ACCOUNT`] for the active key, [`KEYCHAIN_ACCOUNT_PENDING`] for
+/// an in-flight rotation's pending key. Both `dira` and `dirad` resolve the
+/// same service+account pairs, so either process can read what the other
+/// wrote.
+fn keychain_entry(account: &str) -> Result<keyring::Entry, keyring::Error> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account)
 }
 
-/// Read the secret seed from the OS keychain; `None` on any keychain error or
-/// missing entry (callers fall back to the meta-stored seed).
-fn keychain_get() -> Option<String> {
-    keychain_entry().ok()?.get_password().ok()
+/// Read a secret seed from the OS keychain under `account`; `None` on any
+/// keychain error or missing entry (callers fall back to the meta-stored
+/// seed).
+fn keychain_get(account: &str) -> Option<String> {
+    keychain_entry(account).ok()?.get_password().ok()
 }
 
-/// Store the secret seed in the OS keychain.
-fn keychain_set(secret: &str) -> Result<(), keyring::Error> {
-    keychain_entry()?.set_password(secret)
+/// Store a secret seed in the OS keychain under `account`.
+fn keychain_set(account: &str, secret: &str) -> Result<(), keyring::Error> {
+    keychain_entry(account)?.set_password(secret)
+}
+
+/// Delete a keychain entry under `account`, if one exists. Errors (including
+/// "no such entry") are the caller's to ignore — clearing a secret that was
+/// never written to the keychain (e.g. it only ever lived in the `meta`
+/// fallback) is expected, not a failure.
+fn keychain_delete(account: &str) -> Result<(), keyring::Error> {
+    keychain_entry(account)?.delete_credential()
 }
 
 #[cfg(test)]
@@ -177,10 +329,11 @@ mod tests {
     use super::*;
     use std::sync::Once;
 
-    /// Serializes every test that reads or mutates `DIRA_DEVICE_SECRET`. The env
-    /// var is process-global and `cargo test` runs this module's tests in parallel
-    /// in one binary, so without this lock the env-override test could leak the
-    /// seed into a concurrent `load_or_create_unlinked` and skip its pubkey persist.
+    /// Serializes every test that reads or mutates `DIRA_DEVICE_SECRET` *or* the shared
+    /// mock keychain. Both are process-global and `cargo test` runs this module's tests
+    /// in parallel in one binary, so without this lock the env-override test could leak
+    /// the seed into a concurrent `load_or_create_unlinked`, or one test's keychain reset
+    /// could clobber another's mid-op — either of which skips the expected pubkey persist.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Acquire [`ENV_LOCK`]. A tokio mutex is used (not `std`) so the guard can be
@@ -199,14 +352,27 @@ mod tests {
         }
     }
 
-    /// Install keyring's in-memory mock credential store once per test process,
-    /// so tests never touch (or block on) the real OS keychain. This is the
-    /// documented test hook; production uses the platform-native store.
+    /// Install a *fresh, empty* keyring-core mock store as the process-global default,
+    /// so tests never touch (or block on) the real OS keychain — call it at the start of
+    /// every keychain-touching test.
+    ///
+    /// Unlike keyring 3's mock (a fresh credential per `Entry`), keyring-core's mock is a
+    /// single persistent store, so a secret written by one test would otherwise be read
+    /// back by the next and skip its mint-and-persist path. Resetting to an empty store
+    /// per test restores that isolation; callers serialize via [`env_lock`] so the reset
+    /// can't race a concurrent keychain op.
+    ///
+    /// keyring 4's `v1` `Entry` wrapper lazily installs the platform-native store on its
+    /// first `Entry::new`, which would clobber our mock. We force that one-time init now
+    /// with a throwaway entry (result ignored — it errors when no platform store exists,
+    /// e.g. headless CI, and never touches the keychain) so every later `Entry::new`
+    /// reuses the already-fired init and resolves against whichever mock we set here.
     fn use_mock_keychain() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+            let _ = keyring::Entry::new("dira-test-init", "dira-test-init");
         });
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
     }
 
     #[tokio::test]
@@ -241,6 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_rotated_key_swaps_pubkey() {
+        let _lock = env_lock().await;
         use_mock_keychain();
         let store = Store::open_in_memory().await.unwrap();
 
@@ -346,5 +513,245 @@ mod tests {
         assert!(!is_linked(&store).await.unwrap());
         clear_device_id(&store).await.unwrap();
         assert!(!is_linked(&store).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn no_pending_key_is_none() {
+        let store = Store::open_in_memory().await.unwrap();
+        assert!(load_pending_key(&store).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn persist_and_load_pending_key_roundtrips() {
+        let _lock = env_lock().await;
+        use_mock_keychain();
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DeviceKey::generate();
+        let pub_b64 = key.public_base64();
+        persist_pending_key(&store, &key, "2026-07-09T10:00:00Z")
+            .await
+            .unwrap();
+
+        let (loaded, rotated_at) = load_pending_key(&store).await.unwrap().unwrap();
+        assert_eq!(loaded.public_base64(), pub_b64);
+        assert_eq!(rotated_at, "2026-07-09T10:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn promote_pending_key_installs_it_active_and_clears_pending() {
+        let _lock = env_lock().await;
+        use_mock_keychain();
+        let store = Store::open_in_memory().await.unwrap();
+
+        let pending = DeviceKey::generate();
+        let pending_pub = pending.public_base64();
+        persist_pending_key(&store, &pending, "2026-07-09T10:00:00Z")
+            .await
+            .unwrap();
+
+        promote_pending_key(&store).await.unwrap();
+
+        // Now the ACTIVE pubkey (survives a keychain-mocked install).
+        assert_eq!(
+            store.meta_get(META_PUBKEY).await.unwrap().as_deref(),
+            Some(pending_pub.as_str())
+        );
+        // Pending markers are cleared.
+        assert!(load_pending_key(&store).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn promote_pending_key_with_nothing_pending_is_a_harmless_noop() {
+        let _lock = env_lock().await;
+        use_mock_keychain();
+        let store = Store::open_in_memory().await.unwrap();
+        // No pending key was ever persisted.
+        promote_pending_key(&store).await.unwrap();
+        assert!(load_pending_key(&store).await.unwrap().is_none());
+        assert_eq!(store.meta_get(META_PUBKEY).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn clear_pending_key_discards_it_without_touching_the_active_key() {
+        let _lock = env_lock().await;
+        use_mock_keychain();
+        let store = Store::open_in_memory().await.unwrap();
+
+        // Establish an active key first.
+        let active = load_or_create_unlinked(&store).await.unwrap();
+        let active_pub = active.public_base64();
+
+        let pending = DeviceKey::generate();
+        persist_pending_key(&store, &pending, "2026-07-09T10:00:00Z")
+            .await
+            .unwrap();
+        assert!(load_pending_key(&store).await.unwrap().is_some());
+
+        clear_pending_key(&store).await.unwrap();
+
+        assert!(load_pending_key(&store).await.unwrap().is_none());
+        // The active key is completely untouched.
+        assert_eq!(
+            store.meta_get(META_PUBKEY).await.unwrap().as_deref(),
+            Some(active_pub.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_reuses_the_identical_pending_key_and_timestamp() {
+        // The determinism a retried rotation relies on: loading a pending key
+        // twice (simulating two `rotate_key` invocations against the same
+        // interrupted attempt) must yield the SAME keypair and `rotated_at` —
+        // never a freshly-generated one — so a re-POSTed envelope is
+        // byte-identical and the cloud's replay guard treats it as the same
+        // request, not a new one.
+        let _lock = env_lock().await;
+        use_mock_keychain();
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DeviceKey::generate();
+        persist_pending_key(&store, &key, "2026-07-09T10:00:00Z")
+            .await
+            .unwrap();
+
+        let (first, first_at) = load_pending_key(&store).await.unwrap().unwrap();
+        let (second, second_at) = load_pending_key(&store).await.unwrap().unwrap();
+        assert_eq!(first.public_base64(), second.public_base64());
+        assert_eq!(first.secret_base64(), second.secret_base64());
+        assert_eq!(first_at, second_at);
+    }
+
+    // --- Finding 2: the pending key mirrors the active key's keychain-first
+    // ladder (rather than always landing in `meta` as plaintext) -----------
+
+    #[tokio::test]
+    async fn pending_key_secret_lands_in_the_keychain_not_meta() {
+        let _lock = env_lock().await;
+        use_mock_keychain();
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DeviceKey::generate();
+        persist_pending_key(&store, &key, "2026-07-09T10:00:00Z")
+            .await
+            .unwrap();
+
+        // The secret landed in the keychain, under its OWN distinct account
+        // (never the active key's) — exactly mirroring `persist_secret`.
+        assert_eq!(
+            keychain_get(KEYCHAIN_ACCOUNT_PENDING).as_deref(),
+            Some(key.secret_base64().as_str())
+        );
+        // ...and the meta fallback was left empty — the pending seed is NOT
+        // sitting at rest in the db as plaintext when the keychain works.
+        assert_eq!(
+            store
+                .meta_get(META_PENDING_SECRET)
+                .await
+                .unwrap()
+                .filter(|s| !s.is_empty()),
+            None,
+            "the pending secret must not be persisted to meta when the keychain succeeded"
+        );
+
+        // load_pending_key resolves it via the keychain.
+        let (loaded, rotated_at) = load_pending_key(&store).await.unwrap().unwrap();
+        assert_eq!(loaded.secret_base64(), key.secret_base64());
+        assert_eq!(rotated_at, "2026-07-09T10:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn pending_key_falls_back_to_meta_when_the_keychain_has_no_entry() {
+        // Mirrors the ACTIVE key's meta-fallback resolution (`load_key`
+        // falls through to `META_SECRET_FALLBACK` when the keychain has
+        // nothing under its account): the same end state a keychain-
+        // unavailable `persist_pending_secret` would have left — the secret
+        // sitting ONLY in `META_PENDING_SECRET` — must still resolve.
+        let _lock = env_lock().await;
+        use_mock_keychain(); // fresh, empty store — no entry under either account
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DeviceKey::generate();
+
+        store
+            .meta_set(META_PENDING_SECRET, &key.secret_base64())
+            .await
+            .unwrap();
+        store
+            .meta_set(META_PENDING_PUBKEY, &key.public_base64())
+            .await
+            .unwrap();
+        store
+            .meta_set(META_PENDING_ROTATED_AT, "2026-07-09T10:00:00Z")
+            .await
+            .unwrap();
+
+        let (loaded, rotated_at) = load_pending_key(&store).await.unwrap().unwrap();
+        assert_eq!(loaded.secret_base64(), key.secret_base64());
+        assert_eq!(rotated_at, "2026-07-09T10:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn clear_pending_key_clears_both_the_keychain_and_the_meta_fallback() {
+        let _lock = env_lock().await;
+        use_mock_keychain();
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DeviceKey::generate();
+        persist_pending_key(&store, &key, "2026-07-09T10:00:00Z")
+            .await
+            .unwrap();
+        // Confirm it actually landed in the keychain before clearing.
+        assert!(keychain_get(KEYCHAIN_ACCOUNT_PENDING).is_some());
+
+        // Also simulate a stale leftover in the meta fallback slot (e.g. an
+        // earlier attempt fell back to meta before a working keychain came
+        // back) — clearing must not leave THIS behind either.
+        store
+            .meta_set(META_PENDING_SECRET, "stale-leftover-b64")
+            .await
+            .unwrap();
+
+        clear_pending_key(&store).await.unwrap();
+
+        assert!(
+            keychain_get(KEYCHAIN_ACCOUNT_PENDING).is_none(),
+            "the keychain entry must be deleted, not just shadowed by an empty meta value"
+        );
+        assert_eq!(
+            store
+                .meta_get(META_PENDING_SECRET)
+                .await
+                .unwrap()
+                .filter(|s| !s.is_empty()),
+            None
+        );
+        assert!(load_pending_key(&store).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn try_pending_key_flush_shares_the_same_keychain_ladder() {
+        // The daemon (`dirad::sync::try_pending_key_flush`) and the CLI
+        // (`dira::device::resume_rotation`) both resolve a pending key
+        // through `load_pending_key`/`promote_pending_key`, which now read
+        // the SAME keychain service+account this test writes to directly —
+        // this is the shared code path both processes rely on, exercised
+        // here without pulling in either binary crate.
+        let _lock = env_lock().await;
+        use_mock_keychain();
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DeviceKey::generate();
+        persist_pending_key(&store, &key, "2026-07-09T10:00:00Z")
+            .await
+            .unwrap();
+
+        // A fresh `keyring::Entry` for the SAME service+account (as a second
+        // process attaching to the same OS keychain would use) reads it back.
+        let reattached = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_PENDING)
+            .unwrap()
+            .get_password()
+            .unwrap();
+        assert_eq!(reattached, key.secret_base64());
+
+        promote_pending_key(&store).await.unwrap();
+        assert_eq!(
+            store.meta_get(META_PUBKEY).await.unwrap().as_deref(),
+            Some(key.public_base64().as_str())
+        );
     }
 }

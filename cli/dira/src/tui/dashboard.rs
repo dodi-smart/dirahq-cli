@@ -2,10 +2,14 @@
 //! watch` dashboard. Everything that turns a [`StatusView`] into displayable
 //! numbers lives here (and is unit-tested) so the draw code stays dumb.
 
-use crate::format::{bar, hms, project_label, repo_short, truncate};
-use dira_core::protocol::{SessionView, StatusView};
+use crate::format::{
+    bar, billing_line, hms, parse_ts, project_label, repo_short, tokens_compact, truncate,
+    usd_approx,
+};
+use crate::theme::{self, Role};
+use dira_core::protocol::{any_engaged, BillingView, LiveState, SessionView, StatusView};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
@@ -88,11 +92,6 @@ pub fn lanes(s: &StatusView) -> Vec<Lane> {
     lanes
 }
 
-/// Parse an RFC3339 timestamp from the daemon; `None` if absent/unparseable.
-fn parse_ts(s: Option<&str>) -> Option<time::OffsetDateTime> {
-    time::OffsetDateTime::parse(s?, &time::format_description::well_known::Rfc3339).ok()
-}
-
 /// Seconds elapsed from `ts` to `now`, clamped to `[0, idle]`. The clamp matches
 /// the accounting idle-trim: once a session has been quiet longer than the idle
 /// threshold its live tail stops growing (the daemon will report it idle, and the
@@ -111,7 +110,9 @@ fn live_tail(now: time::OffsetDateTime, ts: Option<time::OffsetDateTime>, idle: 
 /// the daemon's settled values whenever a fresh snapshot arrives.
 ///
 /// This is display-only: the daemon's `human_seconds`/`agent_seconds` stay the
-/// settled snapshot values; we add the open tail here. Idle sessions are frozen.
+/// settled snapshot values; we add the open tail here. Fully-idle sessions are
+/// frozen; an `active` session (agent working, no recent prompt) still grows its
+/// agent tail, but not the human tail.
 /// The "today" totals + per-project rollup are advanced consistently so the rows
 /// still sum to the total: agent grows by the sum of per-session agent tails;
 /// the de-duplicated human total grows by the single largest (most-recent) human
@@ -125,15 +126,24 @@ pub fn tick(s: &StatusView, now: time::OffsetDateTime, idle: i64) -> StatusView 
     let mut human_project: Option<Option<String>> = None;
 
     for sess in &mut s.active {
-        if sess.idle {
-            continue;
+        let state = sess.live_state();
+        if state == LiveState::Idle {
+            continue; // nothing recent — freeze both timers
         }
-        let h = live_tail(now, parse_ts(sess.last_human_at.as_deref()), idle);
-        sess.human_seconds += h;
-        if h > human_tail || human_project.is_none() {
-            human_tail = h;
-            human_project = Some(sess.project.clone());
+        // The human tail grows only while *you* are engaged; an agent working on
+        // its own (active, not engaged) accrues no human time, keeping the
+        // no-double-count base honest.
+        if state == LiveState::Engaged {
+            let h = live_tail(now, parse_ts(sess.last_human_at.as_deref()), idle);
+            sess.human_seconds += h;
+            if h > human_tail || human_project.is_none() {
+                human_tail = h;
+                human_project = Some(sess.project.clone());
+            }
         }
+        // The agent tail grows whenever the session is live — engaged *or* active —
+        // so a busy agent's lane keeps ticking even when you last prompted it long
+        // ago (previously it froze the moment the session went human-idle).
         if sess.kind != "manual" {
             let a = live_tail(now, parse_ts(sess.last_activity_at.as_deref()), idle);
             sess.agent_seconds += a;
@@ -158,12 +168,14 @@ pub fn tick(s: &StatusView, now: time::OffsetDateTime, idle: i64) -> StatusView 
     s
 }
 
-/// The colour for a session row / lane based on engagement.
-fn engaged_style(idle: bool) -> Style {
-    if idle {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default().fg(Color::Green)
+/// The STATE label + colour for a session row, from its three-way live state:
+/// `engaged` (you're driving it, teal), `active` (its agent is working on its own,
+/// purple), or `idle` (nothing recent, faint).
+fn state_label_style(s: &SessionView) -> (&'static str, Style) {
+    match s.live_state() {
+        LiveState::Engaged => ("engaged", theme::style(Role::Engaged)),
+        LiveState::Active => ("active", theme::style(Role::Agent)),
+        LiveState::Idle => ("idle", theme::style(Role::Faint)),
     }
 }
 
@@ -196,34 +208,52 @@ pub fn draw(frame: &mut Frame, conn: &Conn) {
 fn header_block() -> Block<'static> {
     Block::default().borders(Borders::ALL).title(Span::styled(
         " Dira · Right Now ",
-        Style::default().add_modifier(Modifier::BOLD),
+        theme::style(Role::Accent).add_modifier(Modifier::BOLD),
     ))
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, s: &StatusView) {
     let h = Headline::from_status(s);
     let mut spans = vec![
-        Span::raw("today  "),
+        Span::styled("today  ", theme::style(Role::Muted)),
         Span::styled(
             format!("human {}", hms(h.human_seconds)),
-            Style::default().fg(Color::Cyan),
+            theme::style(Role::Engaged),
         ),
         Span::raw("   "),
         Span::styled(
             format!("agent {}", hms(h.agent_seconds)),
-            Style::default().fg(Color::Magenta),
+            theme::style(Role::Agent),
         ),
         Span::raw("   "),
         Span::styled(
             h.multiplier_label(),
-            Style::default().add_modifier(Modifier::BOLD),
+            theme::style(Role::Accent).add_modifier(Modifier::BOLD),
         ),
     ];
+    // Mark the operator in when they're actively supervising (see `any_engaged`).
+    if any_engaged(&s.active) {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled("· and you", theme::style(Role::Engaged)));
+    }
+    // Today's compute (tokens + local USD estimate), matching `dira status`'s
+    // ◇ row. Absent when zero or when an older daemon didn't send totals.
+    if let Some(t) = s.tokens.filter(|t| t.total_tokens > 0) {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!(
+                "{} tok {}",
+                tokens_compact(t.total_tokens),
+                usd_approx(t.est_cost_usd)
+            ),
+            theme::style(Role::Compute),
+        ));
+    }
     if h.sync_pending > 0 {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
             format!("⇡ {} pending sync", h.sync_pending),
-            Style::default().fg(Color::Yellow),
+            theme::style(Role::Compute),
         ));
     }
     frame.render_widget(
@@ -236,7 +266,7 @@ fn draw_header_down(frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "daemon not running — retrying…",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            theme::style(Role::Negative).add_modifier(Modifier::BOLD),
         )))
         .block(header_block()),
         area,
@@ -254,8 +284,12 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
     } else {
         s.today.projects.len() as u16 + 4 // projects + header + total + borders
     };
+    let billing_h = if s.billing.is_some() { 1 } else { 0 };
     let sessions_need = s.active.len().max(1) as u16 + 3; // rows + header + borders
-    let sessions_cap = area.height.saturating_sub(lanes_h + rollup_h).max(3);
+    let sessions_cap = area
+        .height
+        .saturating_sub(lanes_h + rollup_h + billing_h)
+        .max(3);
     let sessions_h = sessions_need.min(sessions_cap).max(3);
 
     let chunks = Layout::new(
@@ -264,6 +298,7 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
             Constraint::Length(sessions_h), // active sessions table (content-sized)
             Constraint::Length(lanes_h),    // parallel lanes
             Constraint::Length(rollup_h),   // per-project rollup
+            Constraint::Length(billing_h),  // cloud billable footer (when known)
             Constraint::Min(0),             // slack falls to the bottom
         ],
     )
@@ -271,6 +306,23 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
     draw_sessions(frame, chunks[0], &s.active);
     draw_lanes(frame, chunks[1], s);
     draw_rollup(frame, chunks[2], s);
+    if let Some(b) = &s.billing {
+        draw_billing(frame, chunks[3], b);
+    }
+}
+
+/// The cloud billable footer — the same role-tagged segments `dira status`
+/// prints (see [`billing_line`]), mapped to spans with the amount bolded.
+fn draw_billing(frame: &mut Frame, area: Rect, b: &BillingView) {
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(billing_line(b).into_iter().map(|(text, role)| {
+        let style = match role {
+            Role::Ink => theme::style(role).add_modifier(Modifier::BOLD),
+            _ => theme::style(role),
+        };
+        Span::styled(text, style)
+    }));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
@@ -281,7 +333,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "no active sessions",
-                Style::default().fg(Color::DarkGray),
+                theme::style(Role::Faint),
             ))
             .block(block),
             area,
@@ -296,7 +348,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
         Cell::from("AGENT"),
         Cell::from("STATE"),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(theme::style(Role::Muted).add_modifier(Modifier::BOLD));
 
     // The PROJECT column flexes to fill whatever's left after the fixed columns
     // (handle 11 + harness 11 + human 9 + agent 9 + state 8 = 48), the 5 inter-
@@ -305,14 +357,14 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
         .saturating_sub(48 + 5 + 2)
         .clamp(12, 200);
     let rows = active.iter().map(|sess| {
-        let style = engaged_style(sess.idle);
+        let (state, style) = state_label_style(sess);
         Row::new([
             Cell::from(truncate(&sess.handle, 10)),
             Cell::from(truncate(&sess.harness, 10)),
             Cell::from(truncate(&project_label(&sess.project), project_w)),
             Cell::from(hms(sess.human_seconds)),
             Cell::from(hms(sess.agent_seconds)),
-            Cell::from(if sess.idle { "idle" } else { "engaged" }),
+            Cell::from(state),
         ])
         .style(style)
     });
@@ -347,18 +399,18 @@ fn draw_lanes(frame: &mut Frame, area: Rect, s: &StatusView) {
     let lines: Vec<Line> = lanes
         .iter()
         .map(|l| {
-            let color = if l.is_human {
-                Color::Cyan
+            let role = if l.is_human {
+                Role::Engaged
             } else {
-                Color::Green
+                Role::Agent
             };
             Line::from(vec![
                 Span::styled(
                     format!("{:<width$}", truncate(&l.label, label_w), width = label_w),
-                    Style::default().fg(color),
+                    theme::style(role),
                 ),
                 Span::raw(" "),
-                Span::styled(bar(l.seconds, max, bar_w), Style::default().fg(color)),
+                Span::styled(bar(l.seconds, max, bar_w), theme::style(role)),
                 Span::raw(format!(" {:>9}", hms(l.seconds))),
             ])
         })
@@ -372,11 +424,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
         .title(" Today by project ");
     if s.today.projects.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                "no time tracked",
-                Style::default().fg(Color::DarkGray),
-            ))
-            .block(block),
+            Paragraph::new(Span::styled("no time tracked", theme::style(Role::Faint))).block(block),
             area,
         );
         return;
@@ -386,7 +434,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
         Cell::from("HUMAN"),
         Cell::from("AGENT"),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(theme::style(Role::Muted).add_modifier(Modifier::BOLD));
     // PROJECT flexes to fill the width left after HUMAN (11) + AGENT (11), the 2
     // inter-column gaps and 2 borders.
     let project_w = (area.width as usize)
@@ -410,7 +458,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
             Cell::from(hms(s.today.total_human_seconds)),
             Cell::from(hms(s.today.total_agent_seconds)),
         ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
+        .style(theme::style(Role::Ink).add_modifier(Modifier::BOLD)),
     );
     let table = Table::new(
         rows,
@@ -432,15 +480,12 @@ fn draw_down_body(frame: &mut Frame, area: Rect, err: &str) {
     let lines = vec![
         Line::from(Span::styled(
             "Can't reach the daemon.",
-            Style::default().fg(Color::Red),
+            theme::style(Role::Negative),
         )),
         Line::from(Span::raw(
             "Start it with `dira daemon start`. Polling continues.",
         )),
-        Line::from(Span::styled(
-            truncate(err, 80),
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(truncate(err, 80), theme::style(Role::Faint))),
     ];
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -455,7 +500,7 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
             Span::styled("Ctrl-C", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" quit   live"),
         ]))
-        .style(Style::default().fg(Color::DarkGray)),
+        .style(theme::style(Role::Faint)),
         area,
     );
 }
@@ -482,10 +527,15 @@ mod tests {
             kind: "agent".to_string(),
             project: project.map(|p| p.to_string()),
             label: None,
+            activity: None,
+            note: None,
             started_at: "now".to_string(),
             human_seconds: 0,
             agent_seconds: agent,
             idle,
+            // Default the activity basis to match `idle` (engaged or fully idle);
+            // tests that exercise the `active` state set it explicitly.
+            agent_active: false,
             last_activity_at: None,
             last_human_at: None,
         }
@@ -498,6 +548,10 @@ mod tests {
             today: report(600, 1800, vec![]),
             sync_pending: 3,
             hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
         };
         let h = Headline::from_status(&s);
         assert_eq!(h.human_seconds, 600);
@@ -533,6 +587,10 @@ mod tests {
             today: report(600, 1200, vec![]),
             sync_pending: 0,
             hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
         };
         let lanes = lanes(&s);
         assert_eq!(lanes.len(), 2);
@@ -572,6 +630,10 @@ mod tests {
             ),
             sync_pending: 0,
             hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
         };
         let out = tick(&s, now, 300);
         // Engaged agent grows by its 5s tail; idle session is untouched.
@@ -594,5 +656,44 @@ mod tests {
         assert_eq!(human_sum, out.today.total_human_seconds);
         // The tail is clamped to idle: a tiny idle window caps the growth.
         assert_eq!(tick(&s, now, 2).active[0].agent_seconds, 102);
+    }
+
+    #[test]
+    fn tick_grows_active_agent_but_not_its_human_tail() {
+        use time::macros::datetime;
+        let now = datetime!(2026-06-27 10:00:10 UTC);
+        // Active: the agent worked 4s ago, but the last human prompt was long ago
+        // (human-idle). Its agent lane must keep ticking; its human tail must not.
+        let mut a = sess("a1", Some("acme/api"), 100, true); // idle (human) …
+        a.agent_active = true; // … but its agent is active
+        a.last_activity_at = Some("2026-06-27T10:00:06Z".into()); // 4s tail
+        a.last_human_at = Some("2026-06-27T09:00:00Z".into()); // an hour ago
+        let s = StatusView {
+            active: vec![a],
+            today: report(
+                10,
+                100,
+                vec![ProjectReport {
+                    project: Some("acme/api".into()),
+                    human_seconds: 10,
+                    agent_wall_seconds: 100,
+                }],
+            ),
+            sync_pending: 0,
+            hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
+        };
+        let out = tick(&s, now, 300);
+        assert_eq!(out.active[0].agent_seconds, 104, "agent tail should grow");
+        assert_eq!(
+            out.active[0].human_seconds, 0,
+            "no human tail when not engaged"
+        );
+        // Totals: agent advances by the 4s tail; human is untouched.
+        assert_eq!(out.today.total_agent_seconds, 104);
+        assert_eq!(out.today.total_human_seconds, 10);
     }
 }

@@ -81,6 +81,63 @@ daemon-restart:
     "{{bin_dir}}/dira" daemon start
     "{{bin_dir}}/dira" daemon status
 
+# ---------- Packaging (reproduce the CI release archive shape locally) ----------
+
+# Where `just install-local` installs into. Deliberately never {{bin_dir}}/~/.local/bin:
+# that's the real dogfood install `just install` manages, and install.sh refuses to
+# overwrite it anyway. This is a disposable rehearsal of the installer only. Override
+# with DIRA_INSTALL_LOCAL_DIR if dist/local-bin doesn't suit; never point it at a real
+# PATH-visible bin dir.
+local_bin_dir := env_var_or_default("DIRA_INSTALL_LOCAL_DIR", justfile_directory() + "/dist/local-bin")
+
+# Build release binaries, tar dira+dirad flat (no leading dir, matching
+# taiki-e/upload-rust-binary-action's `leading-dir: false` default) into
+# dist/dira-<version>-<host-target>.tar.gz, and emit a matching .sha256 in the same
+# multi-line `sha256sum`-style format (`<hash>  <filename>`) the CI upload action
+# produces -- so an archive built here and one built in CI are byte-compatible in shape.
+package: release
+    mkdir -p dist && \
+    stage="$(mktemp -d "${TMPDIR:-/tmp}/dira-package.XXXXXX")" && \
+    trap 'rm -rf "$stage"' EXIT && \
+    version="$(./target/release/dira --version | head -n1 | awk '{print $2}')" && \
+    target="$(rustc -vV | sed -n 's/^host: //p')" && \
+    archive="dira-${version}-${target}" && \
+    cp target/release/dira target/release/dirad "$stage/" && \
+    tar -czf "dist/${archive}.tar.gz" -C "$stage" dira dirad && \
+    ( cd dist && \
+      if command -v sha256sum >/dev/null 2>&1; then \
+        sha256sum "${archive}.tar.gz" >"${archive}.sha256"; \
+      else \
+        shasum -a 256 "${archive}.tar.gz" >"${archive}.sha256"; \
+      fi ) && \
+    echo "packaged dist/${archive}.tar.gz + dist/${archive}.sha256"
+
+# Run install.sh end-to-end against a `just package`d archive via a file:// URL, so the
+# installer is testable on a laptop with no GitHub release cut. NEVER defaults to
+# ~/.local/bin -- see {{local_bin_dir}} above. Extra install.sh flags may be appended,
+# e.g. `just install-local -- --daemon`.
+install-local *FLAGS: package
+    mkdir -p "{{local_bin_dir}}" && \
+    version="$(./target/release/dira --version | head -n1 | awk '{print $2}')" && \
+    target="$(rustc -vV | sed -n 's/^host: //p')" && \
+    DIRA_DOWNLOAD_URL="file://{{justfile_directory()}}/dist" DIRA_VERSION="$version" DIRA_TARGET="$target" DIRA_BIN_DIR="{{local_bin_dir}}" DIRA_NO_UPDATE_CHECK=1 sh install.sh --no-daemon {{FLAGS}} && \
+    "{{local_bin_dir}}/dira" --version && \
+    echo "installed into {{local_bin_dir}} (scratch dir, not on PATH, never ~/.local/bin)"
+
+# ---------- Dependency licenses ----------
+
+# Mirror CI's license gate (policy + carve-outs live in deny.toml). Deliberately
+# NOT part of `just ci`: cargo-deny isn't in mise.toml, so requiring it would
+# make the standard pre-PR check depend on a tool most contributors don't have.
+# CI runs it on every PR regardless.
+licenses:
+    @command -v cargo-deny >/dev/null 2>&1 || { \
+        echo "cargo-deny not found. Install it with:"; \
+        echo "  cargo install cargo-deny --locked"; \
+        echo "  # or grab a prebuilt binary from https://github.com/EmbarkStudios/cargo-deny/releases"; \
+        exit 1; }
+    cargo deny check licenses
+
 # ---------- CI aggregate ----------
 
 ci: check test contract

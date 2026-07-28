@@ -9,19 +9,69 @@ mod duration;
 mod format;
 mod init;
 mod render;
+#[cfg(test)]
+mod test_support;
+mod theme;
 mod tui;
+mod update;
+mod zavet_install;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use dira_core::protocol::{ReportScope, Request, Response, StopSelector};
 use dira_core::Config;
 use std::io::Read;
+use std::path::PathBuf;
+
+/// Help styling — ANSI-16 only, deliberately: clap renders help before we can
+/// probe `COLORTERM`, and theme.rs's own ANSI fallback maps Engaged→cyan and
+/// Agent/Accent→magenta, so cyan literals + magenta headers ARE the sanctioned
+/// degraded palette. clap (via anstream) auto-disables styling for non-TTY
+/// output and honors NO_COLOR, so piped `--help` stays plain.
+const HELP_STYLES: clap::builder::Styles = clap::builder::Styles::styled()
+    .header(
+        clap::builder::styling::AnsiColor::Magenta
+            .on_default()
+            .bold(),
+    )
+    .usage(
+        clap::builder::styling::AnsiColor::Magenta
+            .on_default()
+            .bold(),
+    )
+    .literal(clap::builder::styling::AnsiColor::Cyan.on_default())
+    .placeholder(clap::builder::styling::AnsiColor::BrightBlack.on_default());
+
+/// `--version` output including the wire-schema version, so a bug report shows
+/// which contract this build speaks without a second command. Returns
+/// `&'static str` because clap's `Str` only accepts owned strings behind its
+/// `string` feature; a process-lifetime `OnceLock` is the cheaper contract.
+fn long_version() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        format!(
+            "{}\nwire schema: {}",
+            env!("CARGO_PKG_VERSION"),
+            dira_contract::SCHEMA_VERSION
+        )
+    })
+}
 
 #[derive(Parser)]
 #[command(
     name = "dira",
     version,
-    about = "AI-first time tracker — if you can clone it, you can bill it."
+    long_version = long_version(),
+    about = "AI-first time tracker — if you can clone it, you can bill it.",
+    styles = HELP_STYLES,
+    after_help = "\
+Getting started:
+  dira init             wire Claude Code hooks (also: codex, gemini, cursor, opencode, grok)
+  dira daemon start     start the resident tracker daemon
+  dira status           today's summary — engaged, agent, compute, unbilled
+  dira device link      link this device to the cloud for sync + billables
+
+Run `dira help <command>` for details and examples of each command."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,58 +80,192 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Active sessions + today's per-project human vs agent time.
-    Status,
+    /// Today's summary: engaged / agent / compute + the unbilled value.
+    #[command(
+        long_about = "\
+Today's summary, mirroring the cloud dashboard:
+
+  ● engaged   de-duplicated human time — the billable base
+  ◆ agent     agent wall-clock across sessions (evidence, never billed)
+  ◇ compute   tokens through the pipe + a local ~$ cost estimate
+
+The footer (`10.4h billable → €1,064 unbilled, this week`) is priced by the
+cloud's billing policy and appears once this device is linked (`dira device
+link`) and the daemon has fetched it; the compute estimate is always local.
+Piped output is plain (no color) and 80-column stable.",
+        after_help = "\
+Examples:
+  dira status               the summary block
+  dira status --detailed    + parallel lanes, active sessions, today's rollup
+  dira status | cat         plain, parseable output for scripts"
+    )]
+    Status {
+        /// Also show the PARALLEL lanes, ACTIVE SESSIONS table, and TODAY report.
+        #[arg(long, alias = "full")]
+        detailed: bool,
+    },
     /// Live auto-refreshing dashboard of the "Right Now" view (q/Esc to quit).
-    #[command(alias = "top")]
+    #[command(
+        alias = "top",
+        long_about = "\
+A full-screen live dashboard of the \"Right Now\" view: active sessions,
+parallel lanes, today's rollup, compute, and the unbilled value. Timers
+interpolate client-side between daemon polls, so seconds tick smoothly.
+Quit with q, Esc, or Ctrl-C.",
+        after_help = "\
+Examples:
+  dira watch                 refresh once a second
+  dira watch --interval 250  smoother, chattier polling
+  dira top                   same command, shorter to type"
+    )]
     Watch {
         /// Refresh interval in milliseconds.
-        #[arg(long, default_value_t = 1000)]
+        #[arg(long, value_name = "MS", default_value_t = 1000)]
         interval: u64,
     },
     /// Open a manual session (meeting, manual testing, …). Several may run at once.
+    #[command(
+        long_about = "\
+Open a manual session for work no agent harness observes — meetings, manual
+testing, pairing, review calls. The session accrues engaged time until you
+`dira stop` it. Several manual sessions may run at once; the accounting
+de-duplicates overlapping human time, so parallel sessions never double-bill.
+When --project is omitted, the project resolves from the current directory's
+git repo.",
+        after_help = "\
+Examples:
+  dira start --activity meeting --note \"sprint planning\"
+  dira start --project github.com/acme/api --label deploy
+  dira stop                  close it when you're done"
+    )]
     Start {
-        #[arg(long)]
+        /// Repo/project to attribute the time to (default: resolved from cwd).
+        #[arg(long, value_name = "REPO")]
         project: Option<String>,
-        #[arg(long)]
+        /// Operational tag, for selecting the session later (`dira stop --label`).
+        #[arg(long, value_name = "TAG")]
         label: Option<String>,
-        #[arg(long)]
+        /// Activity classification, e.g. "meeting", "manual testing".
+        #[arg(long, value_name = "KIND")]
         activity: Option<String>,
+        /// Free-text description for the session.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
     },
     /// Stop a manual session: by handle, by --label, or --all. Bare = the only one open.
+    #[command(
+        long_about = "\
+Stop one or more manual sessions. Selector precedence:
+
+  1. a handle argument       stop that session (`dira stop k3v9`)
+  2. --label <TAG>           stop every session carrying the label
+  3. --all                   stop every open manual session
+  4. bare `dira stop`        the single open session; errors if several are open",
+        after_help = "\
+Examples:
+  dira stop                  the only open manual session
+  dira stop k3v9             by handle (shown by `dira start` / `dira sessions`)
+  dira stop --label deploy   everything tagged #deploy
+  dira stop --all            close every open manual session"
+    )]
     Stop {
-        /// Session handle from `start`.
+        /// Session handle from `start` (e.g. `k3v9`).
+        #[arg(value_name = "HANDLE")]
         handle: Option<String>,
-        #[arg(long, conflicts_with = "handle")]
+        /// Stop every manual session carrying this label.
+        #[arg(long, value_name = "TAG", conflicts_with = "handle")]
         label: Option<String>,
+        /// Stop every open manual session.
         #[arg(long, conflicts_with_all = ["handle", "label"])]
         all: bool,
     },
     /// List active + recent sessions.
+    #[command(after_help = "\
+Examples:
+  dira sessions              handles, projects, human/agent time, state")]
     Sessions,
-    /// Retroactive manual entry, e.g. `dira log 45 --note "review"` (bare = minutes).
+    /// Retroactive manual entry, e.g. `dira invoice 1h Meeting with Fol` (bare = minutes).
+    #[command(
+        alias = "invoice",
+        long_about = "\
+Record work after the fact — the invoice line you forgot to track live. The
+duration comes first; any trailing words become the note (`--note` wins when
+both are given).
+
+Duration grammar: a bare integer is MINUTES (`dira log 45`); otherwise combine
+h/m/s units — `1h30m`, `90m`, `2h`, `45s`.",
+        after_help = "\
+Examples:
+  dira invoice 1h Meeting with Fol
+  dira log 90 --project github.com/acme/api --activity \"code review\"
+  dira log 2h30m --label onsite --note \"customer workshop\""
+    )]
     Log {
+        /// How long, e.g. `45` (minutes), `1h30m`, `90m`, `2h`.
+        #[arg(value_name = "DURATION")]
         duration: String,
-        #[arg(long)]
+        /// Free-text comment — the trailing words after the duration.
+        #[arg(value_name = "COMMENT")]
+        comment: Vec<String>,
+        /// Repo/project to attribute the time to (default: resolved from cwd).
+        #[arg(long, value_name = "REPO")]
         project: Option<String>,
-        #[arg(long)]
+        /// Free-text description; overrides the trailing comment words.
+        #[arg(long, value_name = "TEXT")]
         note: Option<String>,
+        /// Activity classification, e.g. "meeting", "code review".
+        #[arg(long, value_name = "KIND")]
+        activity: Option<String>,
+        /// Operational tag for the entry.
+        #[arg(long, value_name = "TAG")]
+        label: Option<String>,
     },
     /// Local report straight from the on-device store.
+    #[command(
+        long_about = "\
+A per-project report computed from the on-device event log — no cloud, no
+network. Scopes are mutually exclusive; the default is --today. History past
+the raw-event retention window survives as daily rollups, so --all stays
+accurate after compaction.",
+        after_help = "\
+Examples:
+  dira report                today (default)
+  dira report --week         the last 7 days
+  dira report --all          everything on this device
+  dira report --project github.com/acme/api"
+    )]
     Report {
+        /// Today only (the default).
         #[arg(long, group = "scope")]
         today: bool,
+        /// The last 7 days.
         #[arg(long, group = "scope")]
         week: bool,
+        /// Everything on this device.
         #[arg(long, group = "scope")]
         all: bool,
-        #[arg(long)]
+        /// Only this repo/project (any scope).
+        #[arg(long, value_name = "REPO")]
         project: Option<String>,
     },
     /// Wire a harness's hooks to report to the daemon (default: claude).
+    #[command(
+        long_about = "\
+Wire an AI coding harness so its lifecycle hooks report to the daemon. Writes
+the harness's settings file (or prints the snippet with --print). Run it once
+per harness you use; `dira hook <harness>` is what the written hooks invoke.",
+        after_help = "\
+Examples:
+  dira init                  Claude Code, current project
+  dira init --global         Claude Code, all projects
+  dira init codex --print    show what would be written, write nothing
+  dira init opencode         also: gemini, cursor, grok"
+    )]
     Init {
-        /// Harness to wire: `claude` (default), `codex`, or `opencode`.
+        /// Harness to wire: `claude` (default), `codex`, `gemini`, `cursor`, `opencode`, or `grok`.
+        #[arg(value_name = "HARNESS")]
         harness: Option<String>,
+        /// Write to the user-level settings instead of the project's.
         #[arg(long)]
         global: bool,
         /// Print the resulting settings/snippet without writing.
@@ -89,38 +273,262 @@ enum Command {
         print: bool,
     },
     /// Manage the resident daemon.
+    #[command(
+        long_about = "\
+Control the resident `dirad` daemon — the single process that ingests hook
+events, keeps the live registry, and syncs to the cloud. `install` registers
+an OS service (launchd on macOS, systemd --user on Linux) so it survives
+reboots; `start` is the ad-hoc alternative, tracked by a pidfile.",
+        after_help = "\
+Examples:
+  dira daemon start          run it now
+  dira daemon status         is it up?
+  dira daemon install        start on login, restart on crash"
+    )]
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
     /// Inspect the effective config or persist overrides to the XDG config.toml.
+    #[command(
+        long_about = "\
+Inspect the effective configuration (defaults → config.toml → DIRA_* env) or
+persist an override. Only user-tunable knobs are settable — transport and
+identity values (socket path, db path, http port) are derived and read-only.",
+        after_help = config_cmd::knobs_after_help()
+    )]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
     /// Link this device to the cloud, or show its link status.
+    #[command(
+        long_about = "\
+Manage this device's cloud link. Linking claims a one-time code from the cloud
+Connections page and binds this device's Ed25519 signing key to your account;
+from then on the daemon signs and ships attestations, presence, and fetches
+the billable summary `dira status` shows.",
+        after_help = "\
+Examples:
+  dira device link --code ABCD-1234
+  dira device status         linked? cloud URL? sync backlog?
+  dira device rotate-key     new keypair, signed over by the old one
+  dira device resync         re-send everything; dedup-safe on the cloud"
+    )]
     Device {
         #[command(subcommand)]
         action: DeviceAction,
     },
     /// Hook shim: read a harness hook on stdin and forward it to the daemon.
+    #[command(long_about = "\
+The shim `dira init` wires into each harness: it reads one hook payload from
+stdin, forwards it to the daemon, and always exits 0 — a tracker must never
+break an agent loop, so failures (daemon down, bad JSON) are silently dropped.
+Not intended for interactive use.")]
     Hook {
         /// Harness name, e.g. `claude`.
+        #[arg(value_name = "HARNESS")]
         harness: String,
     },
     /// Wipe ALL local events + token usage for a fresh start (keeps the device link).
+    #[command(
+        long_about = "\
+Delete every locally-stored event and token row — the full statistics history
+on this device. The device identity, signing key, cloud link, and config are
+kept. Asks for confirmation unless --yes. Does NOT touch anything already
+synced to the cloud.",
+        after_help = "\
+Examples:
+  dira nuke                  asks before deleting
+  dira nuke --yes            no prompt (scripts)"
+    )]
     Nuke {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
     },
     /// Print shell completions for the given shell.
+    #[command(
+        long_about = "\
+Generate a completion script for your shell. Completions are derived from the
+CLI definition itself, so they're always in sync with this binary — re-run
+after upgrading dira to pick up new commands and flags.",
+        after_help = "\
+Install:
+  bash        dira completions bash > ~/.local/share/bash-completion/completions/dira
+  zsh         dira completions zsh > \"${fpath[1]}/_dira\"   # then restart or compinit
+  fish        dira completions fish > ~/.config/fish/completions/dira.fish
+  powershell  dira completions powershell | Out-String | Invoke-Expression
+              # persist: add that line to $PROFILE
+  elvish      dira completions elvish > ~/.config/elvish/lib/dira.elv
+              # then `use dira` in rc.elv"
+    )]
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
     /// Show the CLI and running-daemon versions (and flag any skew).
+    #[command(after_help = "\
+Examples:
+  dira version               CLI + daemon build, wire schema, uptime — and a
+                             warning when the CLI and daemon builds differ")]
     Version,
+    /// Update dira to the latest release (resolve, verify, atomic swap, restart).
+    #[command(
+        long_about = "\
+Resolve the current (or a chosen) release, download the platform artifact,
+verify its sha256 against the published checksum, and atomically swap both
+`dira` and `dirad` in place. Restarts the daemon afterward unless
+--no-restart is given or the daemon wasn't running to begin with.
+
+`--check` only resolves — it never downloads and never touches a binary —
+and exits 0 in every non-error case, including offline, so it's safe to run
+speculatively (it also refreshes the cache behind the passive update
+notice). `--version` allows downgrading to any published release, not only
+upgrading to a newer one.",
+        after_help = "\
+Examples:
+  dira update --check               is a newer release available?
+  dira update                       update to the latest release, restart the daemon
+  dira update --channel prerelease  opt into a prerelease build
+  dira update --version 0.2.0       pin to (or downgrade to) an exact version
+  dira update --no-restart          swap the binaries, leave the running daemon alone"
+    )]
+    Update {
+        /// Resolve only — report what's available, change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Update (or downgrade) to this exact version instead of the latest.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+        /// Release channel to resolve against: stable (default) or prerelease.
+        #[arg(long, value_name = "CHANNEL")]
+        channel: Option<String>,
+        /// Skip the dev-install guard (never bypasses sha256 verification).
+        #[arg(long)]
+        force: bool,
+        /// Swap the binaries but leave a running daemon on the old version.
+        #[arg(long)]
+        no_restart: bool,
+        /// Install directory for the new binaries (default: alongside the running `dira`).
+        #[arg(long, value_name = "DIR", env = "DIRA_BIN_DIR")]
+        bin_dir: Option<PathBuf>,
+    },
+    /// Zavet knowledge module: what the tracked time produced, and why.
+    #[command(
+        long_about = "\
+Zavet is dira's knowledge sibling: repos that carry a .zavet/ directory (see
+the zavet plugin, github.com/dodi-smart/dirahq-zavet) record decisions as
+append-only markdown with guard globs, and commits carry Why:/Refs: trailers.
+The daemon captures those alongside its ordinary git polling and correlates
+them with sessions, so every decision has both recall and a time cost.
+Activation: modules.zavet knob (auto = repos with .zavet/), overridable per
+repo with enable/disable.",
+        after_help = "\
+Examples:
+  dira zavet status          is zavet active here? capture health
+  dira zavet why D-0042      the decision — and what it cost
+  dira zavet wiki            decisions + living specs, staleness badges
+  dira zavet decisions       every captured decision in this repo
+  dira zavet enable          force-on for this repo (beats the global knob)"
+    )]
+    Zavet {
+        #[command(subcommand)]
+        action: ZavetAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZavetAction {
+    /// Activation + capture health for this repo.
+    Status {
+        /// Canonical repo (e.g. github.com/org/repo); default: resolve from cwd.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Answer "why?" — by decision id or plain question — with what it cost.
+    #[command(after_help = "\
+Examples:
+  dira zavet why D-0042      one decision: record, guards, commits, time cost
+  dira zavet why capture-pipeline
+                             a living spec by slug: document, staleness, cost
+  dira zavet why polling instead of a filesystem watcher
+                             free text — searches decisions AND specs;
+                             a confident match answers, several list matches
+  dira zavet why D-0042 --project github.com/org/repo")]
+    Why {
+        /// A decision id (D-0042), a spec slug, or a plain-language question.
+        #[arg(value_name = "QUESTION", required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Browse the knowledge base: overview, or search a topic.
+    #[command(after_help = "\
+Examples:
+  dira zavet wiki            decisions, living specs (staleness + confidence),
+                             recent knowledge
+  dira zavet wiki polling    ranked matches with excerpts")]
+    Wiki {
+        /// Optional topic to search for.
+        #[arg(value_name = "TOPIC", num_args = 0..)]
+        topic: Vec<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// List the captured decisions for this repo.
+    Decisions {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Force zavet ON for this repo (overrides the global modules.zavet knob).
+    Enable {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Force zavet OFF for this repo.
+    Disable {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Clear the per-repo override (fall back to the global knob).
+    Reset {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Emit shim: read one guard-event JSON on stdin and forward it to the
+    /// daemon (fire-and-forget; always exits 0). Wired by the zavet plugin.
+    Emit,
+    /// Install (or update) the zavet Claude Code plugin.
+    #[command(
+        long_about = "\
+Installs the zavet Claude Code plugin by shelling out to the `claude` CLI —
+never by hand-editing its config: `claude plugin marketplace add
+dodi-smart/dirahq-zavet`, then `claude plugin install zavet@dirahq --scope
+<scope>`. Detects the current state first (`claude plugin list --json`,
+falling back to Claude Code's own installed_plugins.json) so a repeat run
+is a clean no-op instead of a duplicate install. Reports the installed
+version, scope, install path, and an advisory skew line comparing this dira
+build against the plugin's declared minimum — advisory only, never a hard
+error, since each product works fully without the other.",
+        after_help = "\
+Examples:
+  dira zavet install                 install at user scope (the default)
+  dira zavet install --scope project
+  dira zavet install --update        already installed: refresh it
+  dira zavet install --dry-run       print the exact `claude` invocations only"
+    )]
+    Install {
+        /// Installation scope passed to `claude plugin install` (default: user).
+        #[arg(long, default_value = "user", value_name = "SCOPE")]
+        scope: String,
+        /// Already installed: refresh the marketplace + plugin instead of a no-op.
+        #[arg(long)]
+        update: bool,
+        /// Print the exact `claude` invocations without running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -144,20 +552,35 @@ enum DeviceAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Rewind the sync cursor and re-send events to the cloud (manual recovery).
+    /// Safe — the cloud dedups, so a re-send never double-counts.
+    Resync {
+        /// Rewind to this event id instead of the beginning (full re-send default).
+        #[arg(long)]
+        from: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Print the effective resolved config, or just one key.
+    #[command(after_help = "\
+Examples:
+  dira config get            every resolved key (defaults + file + env)
+  dira config get idle_seconds")]
     Get {
         /// A single config key (e.g. `idle_seconds`); omit to print all.
+        #[arg(value_name = "KEY")]
         key: Option<String>,
     },
     /// Persist a key to the XDG config.toml (created if absent; comments kept).
+    #[command(after_help = config_cmd::knobs_after_help())]
     Set {
         /// The config key, e.g. `cloud_url` or `idle_seconds`.
+        #[arg(value_name = "KEY")]
         key: String,
         /// The new value.
+        #[arg(value_name = "VALUE")]
         value: String,
     },
     /// Print the path of the config.toml `set` writes to.
@@ -170,10 +593,27 @@ enum DaemonAction {
     Start,
     /// Stop the daemon.
     Stop,
-    /// Show whether the daemon is up.
+    /// Show whether the daemon is up (exit 0 if any daemon is running — even
+    /// a pre-upgrade one; 1 if none).
     Status,
-    /// Install an OS service (launchd/systemd-user) so it survives reboots.
+    /// Install an OS service (launchd/systemd-user/scheduled task) so it survives reboots.
     Install,
+    /// Remove the OS service `install` set up (binaries and data are untouched).
+    Uninstall,
+    /// Restart the daemon, however it's currently supervised.
+    #[command(
+        long_about = "\
+Restart the daemon, working out how it's currently supervised (launchd,
+systemd --user, or a bare pidfile-tracked process) and restarting it the
+way that supervisor expects, then waiting for it to answer again and
+reporting the version that comes back up. A daemon that wasn't running is
+a no-op, not an error; a service-managed restart that fails prints the
+exact manual command to run instead of pretending it succeeded.",
+        after_help = "\
+Examples:
+  dira daemon restart        works for launchd, systemd --user, or a bare process"
+    )]
+    Restart,
 }
 
 #[tokio::main]
@@ -191,12 +631,18 @@ async fn main() -> Result<()> {
             global,
             print,
         } => {
-            return match harness.as_deref().unwrap_or("claude") {
-                "claude" | "claude_code" | "claudecode" => init::run(*global, *print),
-                "codex" => init::run_codex(*print),
-                "opencode" => init::run_opencode(&config, *print).await,
-                other => Err(anyhow::anyhow!(
-                    "unknown harness '{other}' (expected: claude, codex, opencode)"
+            let id = harness.as_deref().unwrap_or("claude");
+            // Alias spelling lives in the sources crate so it can't drift from
+            // what the hook dispatch accepts.
+            return match dira_sources::canonical_harness_id(id) {
+                Some("claude") => init::run(*global, *print),
+                Some("codex") => init::run_codex(*print),
+                Some("gemini") => init::run_gemini(*global, *print),
+                Some("cursor") => init::run_cursor(*global, *print),
+                Some("opencode") => init::run_opencode(&config, *print).await,
+                Some("grok") => init::run_grok(*global, *print),
+                _ => Err(anyhow::anyhow!(
+                    "unknown harness '{id}' (expected: claude, codex, gemini, cursor, opencode, grok)"
                 )),
             };
         }
@@ -212,8 +658,18 @@ async fn main() -> Result<()> {
             return match action {
                 DaemonAction::Start => daemon::start(&config).await,
                 DaemonAction::Stop => daemon::stop(&config).await,
-                DaemonAction::Status => daemon::status(&config).await,
+                DaemonAction::Status => {
+                    let running = daemon::status(&config).await?;
+                    print_supervision(&config).await;
+                    update::notice::maybe_print(&config);
+                    if !running {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
                 DaemonAction::Install => daemon::install(&config),
+                DaemonAction::Uninstall => daemon::uninstall(&config),
+                DaemonAction::Restart => daemon::restart(&config).await,
             };
         }
         Command::Config { action } => {
@@ -224,8 +680,50 @@ async fn main() -> Result<()> {
             };
         }
         Command::Hook { harness } => return forward_hook(&config, harness).await,
+        Command::Zavet {
+            action: ZavetAction::Emit,
+        } => return forward_zavet_event(&config).await,
+        Command::Zavet {
+            action:
+                ZavetAction::Install {
+                    scope,
+                    update,
+                    dry_run,
+                },
+        } => {
+            return zavet_install::install(zavet_install::InstallArgs {
+                scope: scope.clone(),
+                update: *update,
+                dry_run: *dry_run,
+            });
+        }
         Command::Nuke { yes } => return nuke(&config, *yes).await,
-        Command::Version => return print_version(&config).await,
+        Command::Version => {
+            print_version(&config).await?;
+            update::notice::maybe_print(&config);
+            return Ok(());
+        }
+        Command::Update {
+            check,
+            version,
+            channel,
+            force,
+            no_restart,
+            bin_dir,
+        } => {
+            return update::run(
+                &config,
+                update::UpdateArgs {
+                    check: *check,
+                    version: version.clone(),
+                    channel: channel.clone(),
+                    force: *force,
+                    no_restart: *no_restart,
+                    bin_dir: bin_dir.clone(),
+                },
+            )
+            .await;
+        }
         Command::Device { action } => {
             return match action {
                 DeviceAction::Link { code, label } => {
@@ -234,23 +732,52 @@ async fn main() -> Result<()> {
                 DeviceAction::Status => device::status(&config).await,
                 DeviceAction::RotateKey => device::rotate_key(&config).await,
                 DeviceAction::Unlink { yes } => device::unlink(&config, *yes).await,
+                DeviceAction::Resync { from } => device::resync(&config, from.clone()).await,
             };
         }
         _ => {}
     }
 
+    // `status` renders with a client-side flag (summary vs detailed), so it
+    // sends + renders here instead of the generic print path below.
+    if let Command::Status { detailed } = &cli.command {
+        let resp = client::send(&config.socket_path, &Request::Status).await?;
+        match resp {
+            Response::Status(s) => render::print_status(&s, *detailed),
+            other => {
+                if !render::print(&other) {
+                    std::process::exit(1);
+                }
+            }
+        }
+        update::notice::maybe_print(&config);
+        return Ok(());
+    }
+
+    // `dira zavet status` gets an extra client-side plugin summary line
+    // after the daemon's own capture-health response — same detection path
+    // as `dira zavet install`, read-only. Captured by reference before the
+    // by-value match below moves `cli.command`.
+    let is_zavet_status = matches!(
+        &cli.command,
+        Command::Zavet {
+            action: ZavetAction::Status { .. }
+        }
+    );
+
     // Commands that talk to the daemon.
     let req = match cli.command {
-        Command::Status => Request::Status,
         Command::Sessions => Request::Sessions,
         Command::Start {
             project,
             label,
             activity,
+            note,
         } => Request::Start {
             project,
             label,
             activity,
+            note,
             cwd,
         },
         Command::Stop { handle, label, all } => Request::Stop {
@@ -266,14 +793,24 @@ async fn main() -> Result<()> {
         },
         Command::Log {
             duration,
+            comment,
             project,
             note,
+            activity,
+            label,
         } => {
             let secs = duration::parse(&duration).map_err(|e| anyhow::anyhow!(e))?;
+            // `--note` wins; otherwise the trailing positional words form the note.
+            let note = note.or_else(|| {
+                let joined = comment.join(" ");
+                (!joined.trim().is_empty()).then_some(joined)
+            });
             Request::Log {
                 duration_secs: secs,
                 project,
                 note,
+                activity,
+                label,
                 cwd,
             }
         }
@@ -295,8 +832,41 @@ async fn main() -> Result<()> {
             };
             Request::Report { scope }
         }
+        Command::Zavet { action } => match action {
+            ZavetAction::Status { project } => Request::ZavetStatus { cwd, repo: project },
+            ZavetAction::Why { query, project } => Request::ZavetWhy {
+                query: query.join(" "),
+                cwd,
+                repo: project,
+            },
+            ZavetAction::Wiki { topic, project } => Request::ZavetWiki {
+                topic: Some(topic.join(" ")).filter(|t| !t.trim().is_empty()),
+                cwd,
+                repo: project,
+            },
+            ZavetAction::Decisions { project } => Request::ZavetDecisions { cwd, repo: project },
+            ZavetAction::Enable { project } => Request::ZavetSetMode {
+                cwd,
+                repo: project,
+                mode: "on".into(),
+            },
+            ZavetAction::Disable { project } => Request::ZavetSetMode {
+                cwd,
+                repo: project,
+                mode: "off".into(),
+            },
+            ZavetAction::Reset { project } => Request::ZavetSetMode {
+                cwd,
+                repo: project,
+                mode: "clear".into(),
+            },
+            // handled client-side above
+            ZavetAction::Emit => unreachable!(),
+            ZavetAction::Install { .. } => unreachable!(),
+        },
         // already handled above
-        Command::Init { .. }
+        Command::Status { .. }
+        | Command::Init { .. }
         | Command::Watch { .. }
         | Command::Daemon { .. }
         | Command::Device { .. }
@@ -304,20 +874,31 @@ async fn main() -> Result<()> {
         | Command::Hook { .. }
         | Command::Nuke { .. }
         | Command::Completions { .. }
-        | Command::Version => unreachable!(),
+        | Command::Version
+        | Command::Update { .. } => unreachable!(),
     };
 
     let resp = client::send(&config.socket_path, &req).await?;
     let ok = render::print(&resp);
+    if is_zavet_status {
+        if let Some(line) = zavet_install::status_line() {
+            println!("{line}");
+        }
+    }
     if !ok {
         std::process::exit(1);
     }
     Ok(())
 }
 
-/// Forward a hook payload from stdin to the daemon. Must never break the agent
-/// loop: any failure (daemon down, bad JSON) exits 0 silently.
-async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
+/// Forward a JSON payload from stdin to the daemon, wrapped into a request by
+/// `wrap`. Hook shims are fire-and-forget and must never break the agent loop:
+/// any failure (daemon down, bad JSON, old daemon) exits 0 silently, and the
+/// send is bounded so a wedged daemon can't stall the caller.
+async fn forward_stdin(
+    config: &Config,
+    wrap: impl FnOnce(serde_json::Value) -> Request,
+) -> Result<()> {
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         return Ok(());
@@ -326,17 +907,28 @@ async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    let req = Request::IngestHook {
-        harness: harness.to_string(),
-        payload,
-    };
-    // Bounded so a wedged daemon can't stall the agent.
+    let req = wrap(payload);
     let _ = tokio::time::timeout(
         std::time::Duration::from_millis(500),
         client::send(&config.socket_path, &req),
     )
     .await;
     Ok(())
+}
+
+/// Forward a harness hook payload from stdin to the daemon.
+async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
+    let harness = harness.to_string();
+    forward_stdin(config, move |payload| Request::IngestHook {
+        harness,
+        payload,
+    })
+    .await
+}
+
+/// Forward a zavet guard event from stdin to the daemon.
+async fn forward_zavet_event(config: &Config) -> Result<()> {
+    forward_stdin(config, |payload| Request::IngestZavet { payload }).await
 }
 
 /// Print the CLI version (and wire schema), then best-effort query the running
@@ -352,11 +944,15 @@ async fn print_version(config: &Config) -> Result<()> {
             schema_version,
             pid,
             uptime_seconds,
+            http_ingress_error,
         }) => {
             println!(
                 "dirad   {version}  (schema {schema_version}, pid {pid}, up {})",
                 format::hms(uptime_seconds as i64)
             );
+            if let Some(reason) = http_ingress_error {
+                println!("warning: daemon is DEGRADED — {reason}");
+            }
             if version != cli {
                 println!(
                     "warning: CLI ({cli}) and daemon ({version}) differ — restart the daemon \
@@ -365,9 +961,37 @@ async fn print_version(config: &Config) -> Result<()> {
             }
         }
         Ok(_) => println!("dirad   (unexpected daemon response)"),
-        Err(_) => println!("dirad   not running"),
+        Err(_) => println!(
+            "{}",
+            daemon::version_not_running_message(
+                daemon::legacy_daemon_socket_default(config)
+                    .await
+                    .as_deref()
+            )
+        ),
     }
     Ok(())
+}
+
+/// Extra line for `dira daemon status`: which supervisor (if any) is keeping
+/// the daemon alive — the same probe `dira daemon restart` uses internally to
+/// pick a restart strategy, surfaced here so a user can tell why a bare `kill`
+/// isn't enough before reaching for `restart`.
+async fn print_supervision(config: &Config) {
+    let label = match daemon::detect_supervision(config).await {
+        daemon::Supervision::Launchd => "launchd".to_string(),
+        daemon::Supervision::SystemdUser => "systemd --user".to_string(),
+        daemon::Supervision::ScheduledTask => "scheduled task".to_string(),
+        daemon::Supervision::Pidfile(pid) => format!("pidfile (pid {pid})"),
+        daemon::Supervision::Socket(pid) => format!("unmanaged (pid {pid}, no pidfile)"),
+        daemon::Supervision::LegacySocket { pid, sock } => format!(
+            "pre-upgrade daemon on legacy socket {} (pid {})",
+            sock.display(),
+            pid.map_or("unknown".into(), |p| p.to_string())
+        ),
+        daemon::Supervision::NotRunning => return,
+    };
+    println!("supervised by: {label}");
 }
 
 /// Wipe all local statistics via the daemon (so its live-session registry is
@@ -406,5 +1030,81 @@ async fn nuke(config: &Config, yes: bool) -> Result<()> {
             );
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// clap's built-in consistency audit: conflicting args, duplicate names,
+    /// broken groups — anything that would panic at runtime panics here instead.
+    #[test]
+    fn clap_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    /// Every subcommand ships a long help; the flagship ones ship examples.
+    /// Rendering the help exercises the runtime-built attributes
+    /// (`knobs_after_help`, `long_version`) so a drift panics a test, not a user.
+    #[test]
+    fn help_carries_examples_for_flagship_commands() {
+        let mut cmd = Cli::command();
+        for name in [
+            "status",
+            "log",
+            "completions",
+            "stop",
+            "init",
+            "device",
+            "zavet",
+            "update",
+        ] {
+            let sub = cmd
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("subcommand {name} exists"))
+                .clone();
+            let help = sub.clone().render_long_help().to_string();
+            assert!(
+                help.contains("Examples:") || help.contains("Install:"),
+                "{name} --help must carry an Examples/Install block:\n{help}"
+            );
+        }
+    }
+
+    /// `dira config set --help` lists every settable knob — generated from the
+    /// same KNOBS table `set()` validates against, so they cannot drift.
+    #[test]
+    fn config_set_help_lists_every_knob() {
+        let mut cmd = Cli::command();
+        let config = cmd
+            .find_subcommand_mut("config")
+            .expect("config subcommand")
+            .clone();
+        let mut set = config
+            .find_subcommand("set")
+            .expect("config set subcommand")
+            .clone();
+        let help = set.render_long_help().to_string();
+        for key in [
+            "cloud_url",
+            "idle_seconds",
+            "heartbeat_active_secs",
+            "heartbeat_idle_secs",
+            "coalesce_seconds",
+            "retention_days",
+            "partial_rollup_after_secs",
+            "report_local_day",
+            "update.check",
+        ] {
+            assert!(help.contains(key), "config set --help must list `{key}`");
+        }
+    }
+
+    /// The long version mentions the wire schema, so `dira --version` identifies
+    /// the contract a build speaks.
+    #[test]
+    fn long_version_carries_the_wire_schema() {
+        assert!(long_version().contains(dira_contract::SCHEMA_VERSION));
     }
 }

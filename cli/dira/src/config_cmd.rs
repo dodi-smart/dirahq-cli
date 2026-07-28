@@ -32,6 +32,8 @@ enum Kind {
     Str,
     /// A non-negative integer of seconds/days.
     U64,
+    /// One of a fixed set of lowercase values.
+    Enum(&'static [&'static str]),
 }
 
 /// The keys `dira config set` understands. Keeping this as an explicit table (vs.
@@ -78,10 +80,51 @@ const KNOBS: &[Knob] = &[
         kind: Kind::U64, // accepts 0/1 or true/false; parsed in set()
         help: "compute report day boundaries in local time (0/1); default 0 (UTC)",
     },
+    Knob {
+        key: "deep_idle_after_secs",
+        kind: Kind::U64,
+        help: "quiet time before the heartbeat goes deep idle; clamped to a 60s floor",
+    },
+    Knob {
+        key: "presence_ttl_deep_idle_secs",
+        kind: Kind::U64,
+        help: "presence TTL advertised while deep idle; clamped to [presence_ttl_secs, 600]",
+    },
+    Knob {
+        key: "modules.zavet",
+        kind: Kind::Enum(&["auto", "on", "off"]),
+        help: "zavet knowledge module: auto (active when a repo has .zavet/), on, off",
+    },
+    // `Config.update.check` is a plain `bool` (see `dira_core::config::UpdateKnobs`),
+    // not an enum type — unlike `modules.zavet`'s `ZavetMode`, there's no
+    // `Deserialize`/`Serialize` impl mapping "on"/"off" to it for free. So this
+    // knob gets its own `parse_and_validate` arm (bool <- "on"/"off") and its own
+    // `get()` rendering (bool -> "on"/"off") below, instead of relying on the
+    // generic `Kind::Enum` path the way `modules.zavet` does.
+    Knob {
+        key: "update.check",
+        kind: Kind::Enum(&["on", "off"]),
+        help: "passive update-available notice after status/version/daemon status: on, off",
+    },
 ];
 
 fn knob(key: &str) -> Option<&'static Knob> {
     KNOBS.iter().find(|k| k.key == key)
+}
+
+/// The "Settable keys" help block, rendered from [`KNOBS`] so `dira config set
+/// --help` can never drift from what [`set`] actually validates: adding a knob
+/// to the table updates the help (and the error message) in one place.
+pub(crate) fn knobs_after_help() -> String {
+    let mut s = String::from("Settable keys:\n");
+    for k in KNOBS {
+        s.push_str(&format!("  {:<26} {}\n", k.key, k.help));
+    }
+    s.push_str(
+        "\nDaemon-side changes take effect after a daemon restart\n\
+         (`dira daemon stop` then `dira daemon start`).",
+    );
+    s
 }
 
 /// The XDG path of the writable `config.toml`.
@@ -107,9 +150,14 @@ pub fn get(config: &Config, key: Option<&str>) -> Result<()> {
         .ok_or_else(|| anyhow!("config did not serialize to an object"))?;
 
     if let Some(k) = key {
-        match map.get(k) {
+        // Dotted keys (`modules.zavet`) traverse into nested tables.
+        let mut cur = Some(&value);
+        for seg in k.split('.') {
+            cur = cur.and_then(|v| v.get(seg));
+        }
+        match cur {
             Some(v) => {
-                println!("{}", render_json_scalar(v));
+                println!("{}", render_scalar(k, v));
                 Ok(())
             }
             None => bail!("unknown config key `{k}` (try `dira config get` to list all)"),
@@ -133,6 +181,20 @@ fn render_json_scalar(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// Like [`render_json_scalar`], but lets a dotted-key lookup render in the
+/// vocabulary its `set` counterpart accepts. Only `update.check` needs this:
+/// its backing field is a plain `bool` (see `UpdateKnobs`), but `set` speaks
+/// "on"/"off" like the enum knobs do, so `get` echoes the same words rather
+/// than leaking the wire representation.
+fn render_scalar(key: &str, v: &serde_json::Value) -> String {
+    if key == "update.check" {
+        if let Some(b) = v.as_bool() {
+            return if b { "on" } else { "off" }.to_string();
+        }
+    }
+    render_json_scalar(v)
 }
 
 /// `dira config set <key> <value>` — validate then persist to `config.toml`.
@@ -162,13 +224,30 @@ pub fn set(config: &Config, key: &str, raw: &str) -> Result<()> {
     let mut doc: DocumentMut = existing
         .parse()
         .with_context(|| format!("parse existing {}", path.display()))?;
-    doc[key] = item;
+    assign(&mut doc, key, item);
     std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
 
     println!("set {key} = {raw}");
     println!("wrote {}", path.display());
     println!("note: restart the daemon for daemon-side changes to take effect (`dira daemon stop` then `dira daemon start`)");
     Ok(())
+}
+
+/// Write `item` at `key` in the document, where a dotted key (`modules.zavet`)
+/// addresses a nested table — toml_edit creates intermediate tables implicitly.
+fn assign(doc: &mut DocumentMut, key: &str, item: toml_edit::Item) {
+    let mut segs: Vec<&str> = key.split('.').collect();
+    let last = segs.pop().expect("knob keys are non-empty");
+    let mut cur = doc.as_item_mut();
+    for seg in segs {
+        // Materialize intermediate segments as real `[table]`s (indexing alone
+        // would create an inline table on assignment).
+        if cur.get(seg).is_none_or(toml_edit::Item::is_none) {
+            cur[seg] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        cur = &mut cur[seg];
+    }
+    cur[last] = item;
 }
 
 /// Parse `raw` per the knob's kind and enforce validation, returning the TOML item
@@ -194,6 +273,15 @@ fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_ed
             }
             Ok(value(v))
         }
+        // Bridges the "on"/"off" vocabulary (matching the other enum-shaped
+        // knobs) onto the real `bool` `Config.update.check` field — a real
+        // TOML boolean, not the string "on"/"off", since that's what
+        // `UpdateKnobs` deserializes.
+        "update.check" => match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Ok(value(true)),
+            "off" => Ok(value(false)),
+            _ => bail!("update.check must be one of: on, off (got `{raw}`)"),
+        },
         key => match knob.kind {
             Kind::U64 => {
                 let n: u64 = raw
@@ -204,6 +292,13 @@ fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_ed
                 Ok(value(n as i64))
             }
             Kind::Str => Ok(value(raw.trim())),
+            Kind::Enum(allowed) => {
+                let v = raw.trim().to_ascii_lowercase();
+                if !allowed.contains(&v.as_str()) {
+                    bail!("{key} must be one of: {} (got `{raw}`)", allowed.join(", "));
+                }
+                Ok(value(v))
+            }
         },
     }
 }
@@ -314,6 +409,88 @@ mod tests {
         assert!(out.contains("idle_seconds = 300"));
         assert!(out.contains("cloud_url = \"https://old\""));
         assert!(out.contains("retention_days = 30"));
+    }
+
+    #[test]
+    fn modules_zavet_accepts_only_the_three_modes() {
+        let knob = knob("modules.zavet").unwrap();
+        assert!(parse_and_validate(&cfg(), knob, "auto").is_ok());
+        assert!(parse_and_validate(&cfg(), knob, "ON").is_ok()); // case-folded
+        assert!(parse_and_validate(&cfg(), knob, "off").is_ok());
+        assert!(parse_and_validate(&cfg(), knob, "maybe").is_err());
+    }
+
+    #[test]
+    fn update_check_accepts_only_on_off() {
+        let knob = knob("update.check").unwrap();
+        assert!(parse_and_validate(&cfg(), knob, "on").is_ok());
+        assert!(parse_and_validate(&cfg(), knob, "OFF").is_ok()); // case-folded
+        assert!(parse_and_validate(&cfg(), knob, "true").is_err());
+        assert!(parse_and_validate(&cfg(), knob, "maybe").is_err());
+    }
+
+    #[test]
+    fn update_check_writes_a_real_toml_bool_not_a_string() {
+        let knob = knob("update.check").unwrap();
+        let item = parse_and_validate(&cfg(), knob, "off").unwrap();
+        assert_eq!(item.as_bool(), Some(false));
+        let item = parse_and_validate(&cfg(), knob, "on").unwrap();
+        assert_eq!(item.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn update_check_round_trips_through_set_and_get() {
+        // The same dotted-table assign `set()` uses, then the same traversal
+        // `get()` uses, then rendered the way `get`'s CLI path renders it
+        // (on/off, not true/false) — end-to-end proof of the T5 acceptance
+        // criterion without touching the real XDG config path.
+        let original = "idle_seconds = 300\n";
+        let mut doc: DocumentMut = original.parse().unwrap();
+        let item = parse_and_validate(&cfg(), knob("update.check").unwrap(), "off").unwrap();
+        assign(&mut doc, "update.check", item);
+        let out = doc.to_string();
+        assert!(out.contains("[update]"));
+        assert!(out.contains("check = false"));
+
+        use figment::providers::Format as _;
+        let resolved: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(figment::providers::Toml::string(&out))
+                .extract()
+                .unwrap();
+        assert!(!resolved.update.check);
+
+        let v = serde_json::to_value(&resolved).unwrap();
+        let got = v.get("update").and_then(|u| u.get("check")).unwrap();
+        assert_eq!(render_scalar("update.check", got), "off");
+    }
+
+    #[test]
+    fn dotted_key_writes_a_nested_table_and_preserves_the_rest() {
+        let original = "# my config\nidle_seconds = 300\n";
+        let mut doc: DocumentMut = original.parse().unwrap();
+        assign(&mut doc, "modules.zavet", value("on"));
+        let out = doc.to_string();
+        assert!(out.contains("# my config"));
+        assert!(out.contains("idle_seconds = 300"));
+        assert!(out.contains("[modules]"));
+        assert!(out.contains("zavet = \"on\""));
+        // And the round-trip parses back into Config with the mode applied.
+        use figment::providers::Format as _;
+        let cfg: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(figment::providers::Toml::string(&out))
+                .extract()
+                .unwrap();
+        assert_eq!(cfg.modules.zavet, dira_core::config::ZavetMode::On);
+    }
+
+    #[test]
+    fn get_resolves_dotted_keys() {
+        // The same traversal `get` uses, against the serialized config.
+        let v = serde_json::to_value(cfg()).unwrap();
+        let got = v.get("modules").and_then(|m| m.get("zavet")).unwrap();
+        assert_eq!(got, &serde_json::json!("auto"));
     }
 
     #[test]

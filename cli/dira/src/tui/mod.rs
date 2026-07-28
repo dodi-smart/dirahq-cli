@@ -32,8 +32,13 @@ use std::time::Duration;
 const FRAME: Duration = Duration::from_millis(250);
 
 /// The latest daemon state — a fresh snapshot, or the last error string.
+///
+/// `StatusView` is boxed here (and in `PollResult` below): its `writer_health`
+/// field (WP-B7) pushed the enum past clippy's large-variant threshold against
+/// the small `Down(String)` arm — boxing is the standard fix, and this is a
+/// once-per-poll allocation, nowhere near a hot path.
 enum Live {
-    Up(StatusView),
+    Up(Box<StatusView>),
     Down(String),
 }
 
@@ -112,7 +117,7 @@ async fn event_loop(
 
 /// Outcome of one status poll: the parsed view, or a human error string.
 enum PollResult {
-    Up(StatusView),
+    Up(Box<StatusView>),
     Down(String),
 }
 

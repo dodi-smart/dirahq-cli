@@ -31,9 +31,15 @@
 //! access). The daemon re-reads `device_id` from `meta` every sync run, so the
 //! link takes effect without restarting the daemon.
 
+use crate::client;
 use anyhow::{anyhow, Context, Result};
-use dira_contract::{RotateKeyEnvelope, RotateKeyRequest};
+use dira_contract::{
+    BillingSummaryEnvelope, BillingSummaryRequest, RotateKeyEnvelope, RotateKeyRequest,
+    SCHEMA_VERSION,
+};
+use dira_core::protocol::{Request, Response};
 use dira_core::signing::DeviceKey;
+use dira_core::sync::META_CLOUD_WATERMARK;
 use dira_core::{identity, Config, Store};
 use std::io::Write;
 use time::format_description::well_known::Rfc3339;
@@ -169,6 +175,7 @@ fn build_rotate_envelope(
         .sign_payload(&payload)
         .map_err(|e| anyhow!("sign rotation request: {e}"))?;
     Ok(RotateKeyEnvelope {
+        schema_version: SCHEMA_VERSION.to_string(),
         device_id: device_id.to_string(),
         payload,
         sig,
@@ -177,17 +184,86 @@ fn build_rotate_envelope(
 
 /// `dira device rotate-key`: rotate this device's signing key.
 ///
-/// Generates a fresh keypair, signs a [`RotateKeyRequest`] with the **old** key
-/// (so the cloud can verify against the currently-registered pubkey), POSTs it to
-/// `/api/v1/devices/rotate-key`, and only on a 2xx swaps the stored secret/pubkey
-/// to the new key. The old key is kept until success, so a failed/lost response
-/// leaves the device fully functional on its existing key (re-run to retry).
+/// **Two-phase, crash-safe (WP-B1b).** The cloud's rotation is a single atomic
+/// CAS (`UPDATE devices SET ed25519Pubkey = new WHERE id = ? AND ed25519Pubkey
+/// = old`, see `cloud/app/api/v1/devices/rotate-key/route.ts`) — at every
+/// instant either the OLD key or the NEW key is the one the cloud accepts, and
+/// there's no window where both or neither work. Our job is to make the LOCAL
+/// bookkeeping survive a crash at any point without ever leaving the device
+/// unable to figure out which key is actually live:
 ///
-/// NOTE: cloud-side verification (check the signature against the registered
-/// pubkey, then install `newPubkey`) lives in the separate cloud repo and is out
-/// of scope here — this is the producer side only.
+/// 1. Generate the new keypair and [`identity::persist_pending_key`] it —
+///    **before** any network call. A crash here just means: nothing was sent
+///    yet, so the OLD key is still the cloud's active key; the next run loads
+///    this SAME pending key (never generates a fresh one over it) and picks up
+///    where we left off.
+/// 2. **Probe first.** Sign a cheap, side-effect-free authenticated request
+///    (a billing-summary POST — the cheapest signed device route) with the
+///    PENDING key. If the cloud accepts it, the CAS has ALREADY committed
+///    (either our own earlier POST landed but its response was lost, or the
+///    swap otherwise already happened) — promote immediately, no need to
+///    touch the rotation endpoint again.
+/// 3. Otherwise **(re-)POST the rotation envelope**, signed by the OLD key,
+///    with the SAME pending pubkey + `rotatedAt` every time (determinism is
+///    what makes a retry idempotent against the cloud's strictly-increasing
+///    replay guard):
+///    - **2xx** — the CAS just committed — promote.
+///    - **409 `stale_rotation`** or **401 `bad_signature`** — the OLD key no
+///      longer verifies / our `rotatedAt` is no longer newer than the floor.
+///      Re-probe once more (closes the tiny window between step 2 and this
+///      POST) and inspect what it PROVES, via [`ProbeOutcome`]:
+///      - **`Live`** — a concurrent rotation (or our own earlier, lost-response
+///        POST) already committed this SAME pending key — promote.
+///      - **`NotRegistered`** — a definitive, typed `bad_signature` 401 from
+///        the probe itself: the pending key is PROVABLY not the cloud's
+///        registered key. That combination (rotate-key rejected it AND the
+///        probe definitively rejects it) only arises from a genuinely
+///        different, concurrent rotation (two `rotate-key` runs racing) — not
+///        from any single-process crash-and-retry sequence. Clear it and
+///        report the conflict; a fresh `rotate-key` starts over with a new
+///        keypair.
+///      - **`Ambiguous`** — anything else the probe returned (untyped 4xx,
+///        404 on an older cloud without this route, 429 from the shared
+///        billing-poller budget, 400 `stale_request` under clock skew — the
+///        probe enforces a tighter freshness window than rotate-key does —
+///        5xx, or a transport error). None of these PROVE the pending key
+///        isn't live, so we must NOT clear it: treat this exactly like a
+///        transient failure below and keep the pending key for the next
+///        retry, logging why the evidence was inconclusive.
+///    - **401 `unknown_device`** — the device isn't linked cloud-side.
+///    - anything else (network error, 5xx, ...) — transient; the pending key
+///      is left exactly as-is (same keypair, same `rotatedAt`) for the next
+///      retry to reuse.
+///
+/// **Invariant:** at every crash point, exactly one of (old key, pending key)
+/// authenticates against the cloud, and re-running `rotate-key` converges to
+/// promoting the pending key, clearing it (only on a DEFINITIVE, typed
+/// rejection proving a concurrent rotation won), or retrying (every other
+/// non-2xx outcome, which is at most ambiguous, never proof of death) — see
+/// the module tests for the crash-point matrix this claims to satisfy.
+/// Promote-or-clear is really promote-or-clear-or-retry: clearing requires
+/// definitive evidence, not just "this attempt didn't succeed."
 pub async fn rotate_key(config: &Config) -> Result<()> {
     let base = cloud_url(config)?;
+
+    // Issue #22: `identity::load_key` gives the env seed absolute precedence,
+    // but rotation installs the NEW key into the keychain/meta only — with the
+    // env var still set, every later load returns the OLD key and each
+    // signature is rejected, with the pending key already promoted away. The
+    // rotation is only safe when the operator updates the var themselves, so
+    // warn up front and print the new secret at the end (see below).
+    let env_seeded = std::env::var(identity::ENV_DEVICE_SECRET).is_ok();
+    if env_seeded {
+        eprintln!(
+            "WARNING: {env} is set and takes precedence over the stored device key.\n\
+             The rotated key is installed to the keychain only — the daemon keeps\n\
+             signing with the OLD key from {env} until you update the variable.\n\
+             The new secret is printed after the rotation completes; update {env}\n\
+             and restart dirad immediately, or Ctrl-C now to abort.",
+            env = identity::ENV_DEVICE_SECRET,
+        );
+    }
+
     let store = Store::open(&config.db_path)
         .await
         .with_context(|| format!("open store at {}", config.db_path.display()))?;
@@ -196,44 +272,250 @@ pub async fn rotate_key(config: &Config) -> Result<()> {
         .await?
         .ok_or_else(|| anyhow!("device is not linked — run `dira device link` first"))?;
 
-    // Load the CURRENT (old) key; we sign with it and keep it until the cloud acks.
+    // Load the CURRENT (old) key; we sign with it and keep it until the cloud
+    // confirms the swap.
     let old_key = identity::load_key(&store)
         .await?
         .ok_or_else(|| anyhow!("no device key found — run `dira device link` first"))?;
 
-    let new_key = DeviceKey::generate();
-    let rotated_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_default();
-    let envelope = build_rotate_envelope(&device_id, &old_key, &new_key, &rotated_at)?;
+    // Resume an interrupted rotation if one is pending (SAME keypair + SAME
+    // `rotatedAt` — never a fresh generation over an unresolved attempt), else
+    // start a brand-new one: generate, persist as pending BEFORE any network
+    // call, then proceed identically.
+    let (pending_key, rotated_at) = match identity::load_pending_key(&store).await? {
+        Some(existing) => existing,
+        None => {
+            let new_key = DeviceKey::generate();
+            let rotated_at = OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_default();
+            identity::persist_pending_key(&store, &new_key, &rotated_at)
+                .await
+                .context("persist pending rotation key")?;
+            (new_key, rotated_at)
+        }
+    };
 
-    let url = format!("{}/api/v1/devices/rotate-key", base.trim_end_matches('/'));
     let client = reqwest::Client::new();
+    resume_rotation(
+        &client,
+        &base,
+        &store,
+        &device_id,
+        &old_key,
+        &pending_key,
+        &rotated_at,
+    )
+    .await?;
+
+    println!("rotated device key for {device_id}");
+    println!("new pubkey: {}", pending_key.public_base64());
+    if env_seeded {
+        // The only copy the operator can put into the env var — without this
+        // the device is bricked (env seed wins every load, cloud already
+        // swapped to the new pubkey). Deliberately printed only in the
+        // env-seeded flow; keychain-managed devices never see their secret.
+        println!(
+            "IMPORTANT: {env} still holds the OLD key — update it to the new secret\n\
+             below and restart dirad, or every request will be rejected:\n{secret}",
+            env = identity::ENV_DEVICE_SECRET,
+            secret = pending_key.secret_base64(),
+        );
+    }
+    Ok(())
+}
+
+/// Drive (or resume) a two-phase key rotation to completion. See
+/// [`rotate_key`]'s doc comment for the full ladder + the crash-safety
+/// argument; this is its implementation.
+async fn resume_rotation(
+    client: &reqwest::Client,
+    base: &str,
+    store: &Store,
+    device_id: &str,
+    old_key: &DeviceKey,
+    pending_key: &DeviceKey,
+    rotated_at: &str,
+) -> Result<()> {
+    // Step 1: probe. If the pending key already authenticates, the CAS
+    // already committed — nothing left to POST. A non-`Live` outcome here
+    // (whether `NotRegistered` or merely `Ambiguous`) just means "not
+    // confirmed live yet" — either way we fall through to the POST path,
+    // which produces its own, more informative outcome.
+    if matches!(
+        probe_key(client, base, device_id, pending_key).await,
+        ProbeOutcome::Live
+    ) {
+        return identity::promote_pending_key(store)
+            .await
+            .context("promote pending key");
+    }
+
+    // Step 2: (re-)send the rotation envelope, signed by the OLD key, over the
+    // SAME pending pubkey + rotatedAt (determinism ⇒ idempotent retry).
+    let envelope = build_rotate_envelope(device_id, old_key, pending_key, rotated_at)?;
+    let url = format!("{}/api/v1/devices/rotate-key", base.trim_end_matches('/'));
     let resp = client
         .post(&url)
         .json(&envelope)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
-
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        // The old key is untouched — the device keeps working; just retry later.
+
+    if status.is_success() {
+        return identity::promote_pending_key(store)
+            .await
+            .context("promote pending key");
+    }
+
+    if status.as_u16() == 409 || is_error_code(&text, "bad_signature") {
+        // The OLD key no longer verifies (or the cloud says our rotatedAt is
+        // stale). Re-probe once more to close the tiny window between step 1
+        // and this POST (e.g. a concurrent `rotate-key` run sharing this SAME
+        // pending key just committed it in between) — and inspect what the
+        // re-probe actually PROVES before deciding anything irreversible.
+        match probe_key(client, base, device_id, pending_key).await {
+            ProbeOutcome::Live => {
+                return identity::promote_pending_key(store)
+                    .await
+                    .context("promote pending key");
+            }
+            ProbeOutcome::NotRegistered => {
+                // Provably dead: the probe's own typed `bad_signature` proves
+                // this pending key is not (and per the CAS, never can become)
+                // the cloud's registered key — some OTHER rotation won. Clear
+                // it — a fresh `rotate-key` will start over with a new
+                // keypair, which is safe because nothing here was left
+                // half-applied.
+                identity::clear_pending_key(store).await.ok();
+                return Err(anyhow!(
+                    "key rotation conflict ({status}): {} — a different rotation already \
+                     changed this device's key (only possible from a concurrent `rotate-key` \
+                     run); the pending attempt was discarded. Run `dira device rotate-key` \
+                     again to start a fresh rotation, or `dira device link` if that also fails.",
+                    message_of(&text)
+                ));
+            }
+            ProbeOutcome::Ambiguous(reason) => {
+                // The probe did NOT prove the pending key is dead — it could
+                // still be the cloud's live key (e.g. the rotate-key POST's
+                // CAS committed but its response was lost, and the re-probe
+                // itself hit clock skew, a rate limit, or an older cloud
+                // without this route). Clearing here could brick a device
+                // that's holding the actually-live key. Keep it and let the
+                // caller retry — identical to the plain-transient path below.
+                eprintln!(
+                    "warning: key rotation: re-probe after {status} was ambiguous ({reason}) — \
+                     keeping the pending key rather than risk clearing a live one; \
+                     re-run `dira device rotate-key` to retry"
+                );
+                return Err(anyhow!(
+                    "key rotation failed ({status}): {} — the re-probe was inconclusive \
+                     ({reason}), so the pending key was kept rather than risk discarding a \
+                     live one; this attempt is safely resumable — just re-run `dira device \
+                     rotate-key`",
+                    message_of(&text)
+                ));
+            }
+        }
+    }
+
+    if is_error_code(&text, "unknown_device") {
         return Err(anyhow!(
-            "key rotation failed ({status}): {}",
-            message_of(&text)
+            "key rotation failed ({status}): device is not linked cloud-side — run \
+             `dira device link`"
         ));
     }
 
-    // 2xx: the cloud accepted the new pubkey. Swap the stored secret/pubkey now.
-    identity::install_rotated_key(&store, &new_key)
-        .await
-        .context("install rotated key")?;
+    // Transient / unexpected (network error, 5xx, ...): the pending key is
+    // left exactly as-is — the SAME keypair and `rotatedAt` are reused on the
+    // next `rotate-key`, which is what keeps the retry idempotent.
+    Err(anyhow!(
+        "key rotation failed ({status}): {} — the old key is still installed locally and \
+         this attempt is safely resumable; just re-run `dira device rotate-key`",
+        message_of(&text)
+    ))
+}
 
-    println!("rotated device key for {device_id}");
-    println!("new pubkey: {}", new_key.public_base64());
-    Ok(())
+/// What a [`probe_key`] call proved about whether `key` is currently the
+/// cloud's registered key for a device. Deliberately TRI-STATE rather than a
+/// bool: the probe endpoint (`POST /api/v1/billing/summary`) can return a
+/// non-2xx against a key that IS actually live for reasons that have nothing
+/// to do with the key itself — a tighter `sentAt` freshness window than
+/// rotate-key's under clock skew (`400 stale_request`), an older cloud
+/// without this route (`404`), the 6/min budget shared with the daemon's
+/// billing poller (`429`), a plain `5xx`, or a transport error. Only a
+/// definitive, typed `bad_signature` 401 proves the key is NOT registered —
+/// everything else is [`Ambiguous`](ProbeOutcome::Ambiguous) and must never
+/// be treated as proof of death (see `resume_rotation`).
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// 2xx — the key currently authenticates.
+    Live,
+    /// A definitive, typed `bad_signature` 401 — the key is provably not the
+    /// cloud's registered key.
+    NotRegistered,
+    /// Every other outcome (untyped 4xx, 404, 429, `400 stale_request`, 5xx,
+    /// transport error, or a local signing failure) — inconclusive; carries a
+    /// short human-readable reason for logging.
+    Ambiguous(String),
+}
+
+/// Cheap, side-effect-free probe: does `key` currently authenticate against
+/// the cloud for `device_id`? Uses the billing-summary endpoint (the cheapest
+/// signed device route — a read-only query, no state it mutates) rather than
+/// re-POSTing the rotation itself, so asking "is this key already live" never
+/// risks a second CAS attempt. See [`ProbeOutcome`] for why the result is
+/// tri-state rather than a bool — collapsing every non-2xx to "not live"
+/// would let a false negative (clock skew, a rate limit, ...) look identical
+/// to a definitive rejection, and callers must NOT treat them the same way.
+async fn probe_key(
+    client: &reqwest::Client,
+    base: &str,
+    device_id: &str,
+    key: &DeviceKey,
+) -> ProbeOutcome {
+    let request = BillingSummaryRequest {
+        device_id: device_id.to_string(),
+        sent_at: OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_default(),
+        period: "week".to_string(),
+    };
+    let Ok(sig) = key.sign_payload(&request) else {
+        return ProbeOutcome::Ambiguous("failed to sign the probe request locally".to_string());
+    };
+    let envelope = BillingSummaryEnvelope {
+        schema_version: SCHEMA_VERSION.to_string(),
+        device_id: device_id.to_string(),
+        payload: request,
+        sig,
+    };
+    let url = format!("{}/api/v1/billing/summary", base.trim_end_matches('/'));
+    let resp = match client.post(&url).json(&envelope).send().await {
+        Ok(resp) => resp,
+        Err(e) => return ProbeOutcome::Ambiguous(format!("probe request failed: {e}")),
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return ProbeOutcome::Live;
+    }
+    let text = resp.text().await.unwrap_or_default();
+    if status.as_u16() == 401 && is_error_code(&text, "bad_signature") {
+        return ProbeOutcome::NotRegistered;
+    }
+    ProbeOutcome::Ambiguous(format!("probe returned {status}: {}", message_of(&text)))
+}
+
+/// Whether a JSON error body's `error` field equals `code`. Unparseable ⇒
+/// `false` (never misread a proxy's plain-text error as a typed signal).
+fn is_error_code(body: &str, code: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s == code))
+        .unwrap_or(false)
 }
 
 /// `dira device status`: print linkage, cloud URL, and the un-synced backlog.
@@ -263,7 +545,60 @@ pub async fn status(config: &Config) -> Result<()> {
         None => println!("cursor:    (none — nothing synced yet)"),
     }
     println!("pending:   {pending} event(s) awaiting sync");
+
+    // Cloud coverage, from the watermark the daemon cached on its last flush.
+    let cloud_wm = store
+        .meta_get(META_CLOUD_WATERMARK)
+        .await?
+        .filter(|s| !s.is_empty());
+    let local_head = store.max_event_id().await?;
+    println!(
+        "{}",
+        cloud_status_line(cloud_wm.as_deref(), local_head.as_deref(), pending)
+    );
     Ok(())
+}
+
+/// `dira device resync`: ask the daemon (over the control socket, so the live flush
+/// task acts) to rewind the sync cursor and re-send. The cloud dedups, so this can
+/// never double-count.
+pub async fn resync(config: &Config, from: Option<String>) -> Result<()> {
+    match client::send(&config.socket_path, &Request::ResyncCursor { from }).await? {
+        Response::ResyncQueued { pending, from } => {
+            match from {
+                Some(id) => println!("resync:    cursor rewound to {id}"),
+                None => println!("resync:    cursor rewound to the beginning (full re-send)"),
+            }
+            println!(
+                "pending:   {pending} event(s) will re-sync now — safe; the cloud dedups (no double counting)"
+            );
+            Ok(())
+        }
+        Response::Error { message } => Err(anyhow!("resync failed: {message}")),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// Honest one-line cloud-coverage summary for `device status`. Compares the cloud's
+/// cached watermark (a batch ULID, timestamp-stamped with the latest event it
+/// covers) against the local event head to judge drift. Pure, so it's unit-testable.
+fn cloud_status_line(cloud_wm: Option<&str>, local_head: Option<&str>, pending: u64) -> String {
+    let Some(wm) = cloud_wm else {
+        return "cloud:     (no handshake yet — sync at least once)".into();
+    };
+    // The cloud persisted noticeably less than the local head while nothing is
+    // queued ⇒ a silent gap the reconciler/epoch didn't cover; resync forces it.
+    let behind = matches!(
+        (Ulid::from_string(wm), local_head.and_then(|h| Ulid::from_string(h).ok())),
+        (Ok(w), Some(h)) if w.timestamp_ms() + 1000 < h.timestamp_ms()
+    ) && pending == 0;
+    if behind {
+        "cloud:     behind — cloud is missing data; run `dira device resync`".into()
+    } else if pending == 0 {
+        format!("cloud:     in sync (watermark {wm})")
+    } else {
+        format!("cloud:     {pending} event(s) queued for the next sync")
+    }
 }
 
 /// `dira device unlink`: locally unlink this device. Clears the cloud-assigned
@@ -315,9 +650,16 @@ fn needs_confirmation(pending: u64, yes: bool) -> bool {
 const SYNC_CURSOR_KEY: &str = "sync_cursor_event_id";
 
 /// A reasonable default device label: the machine hostname.
+///
+/// `COMPUTERNAME` is checked first — it's the Windows convention (set by the
+/// OS for every process, no subprocess needed) and reading it before falling
+/// through to the `HOSTNAME` env / `hostname` command chain is purely an
+/// optimization: `hostname.exe` exists on Windows too, so that chain would
+/// still resolve correctly there, this just avoids spawning it.
 fn default_label() -> Option<String> {
-    std::env::var("HOSTNAME")
+    std::env::var("COMPUTERNAME")
         .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(hostname_via_uname)
         .filter(|s| !s.is_empty())
 }
@@ -444,5 +786,424 @@ mod tests {
         // ...unless `--yes` is given.
         assert!(!needs_confirmation(3, true));
         assert!(!needs_confirmation(0, true));
+    }
+
+    // --- WP-B1b: two-phase key rotation ------------------------------------
+
+    use crate::test_support::{keychain_lock, use_mock_keychain, MockCloud, MockResp};
+
+    const ROTATE_PATH: &str = "/api/v1/devices/rotate-key";
+    const PROBE_PATH: &str = "/api/v1/billing/summary";
+    const DEVICE_ID: &str = "01TESTDEVICE";
+    const ROTATED_AT: &str = "2026-07-09T10:00:00Z";
+
+    /// A fresh old/pending keypair + an in-memory store with nothing pending
+    /// yet — the common setup every rotation test starts from.
+    async fn rotation_fixture() -> (Store, DeviceKey, DeviceKey) {
+        let store = Store::open_in_memory().await.unwrap();
+        let old_key = DeviceKey::generate();
+        let pending_key = DeviceKey::generate();
+        (store, old_key, pending_key)
+    }
+
+    /// Assert the rotation fully converged: the pending key is now ACTIVE and
+    /// no pending markers remain — the "promote" half of "promote-or-clear".
+    async fn assert_promoted(store: &Store, pending_key: &DeviceKey) {
+        assert!(
+            identity::load_pending_key(store).await.unwrap().is_none(),
+            "pending markers must be cleared after a promote"
+        );
+        assert_eq!(
+            store
+                .meta_get(identity::META_PUBKEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(pending_key.public_base64().as_str()),
+            "the ACTIVE pubkey must now be the pending key's"
+        );
+    }
+
+    /// WP-B1b crash point: the pending key was persisted but NOTHING was ever
+    /// POSTed (a crash between `persist_pending_key` and the network call).
+    /// At this point only the OLD key authenticates. A retry's probe
+    /// correctly reports "not live" and falls through to POST, which the
+    /// cloud accepts — converging to promoted.
+    #[tokio::test]
+    async fn crash_before_any_post_converges_via_the_post_path() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+        let (store, old_key, pending_key) = rotation_fixture().await;
+        identity::persist_pending_key(&store, &pending_key, ROTATED_AT)
+            .await
+            .unwrap();
+
+        let cloud = MockCloud::start(&[PROBE_PATH, ROTATE_PATH]).await;
+        // Only the OLD key authenticates right now — the probe (pending) fails.
+        cloud.push(
+            PROBE_PATH,
+            MockResp::status(401, r#"{"error":"bad_signature"}"#),
+        );
+        cloud.push(ROTATE_PATH, MockResp::ok(r#"{"deviceId":"01TESTDEVICE"}"#));
+
+        resume_rotation(
+            &reqwest::Client::new(),
+            cloud.base_url(),
+            &store,
+            DEVICE_ID,
+            &old_key,
+            &pending_key,
+            ROTATED_AT,
+        )
+        .await
+        .expect("must converge");
+
+        assert_promoted(&store, &pending_key).await;
+        assert_eq!(cloud.requests(ROTATE_PATH).len(), 1);
+    }
+
+    /// WP-B1b crash point: the rotation envelope was POSTed and the cloud's
+    /// atomic CAS committed it, but the RESPONSE never reached the CLI (a lost
+    /// connection / proxy timeout AFTER the commit — modeled here as an
+    /// unhelpful 500 the caller can't distinguish from "nothing happened").
+    /// At this point only the PENDING key authenticates, even though the
+    /// caller doesn't know it yet. The first `resume_rotation` call correctly
+    /// reports failure (it has no way to know better) and leaves the pending
+    /// key untouched; a RETRY's probe now sees the committed swap and
+    /// converges immediately, without ever re-hitting the rotate-key endpoint.
+    #[tokio::test]
+    async fn crash_after_commit_response_lost_then_retry_converges_via_probe() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+        let (store, old_key, pending_key) = rotation_fixture().await;
+        identity::persist_pending_key(&store, &pending_key, ROTATED_AT)
+            .await
+            .unwrap();
+
+        let cloud = MockCloud::start(&[PROBE_PATH, ROTATE_PATH]).await;
+
+        // Attempt 1: probe says not-live-yet (correct, at the time it runs);
+        // the POST reaches the cloud and its CAS commits, but the CLI only
+        // ever sees a bare 500 for it — response lost after commit.
+        cloud.push(
+            PROBE_PATH,
+            MockResp::status(401, r#"{"error":"bad_signature"}"#),
+        );
+        cloud.push(ROTATE_PATH, MockResp::status(500, "upstream timeout"));
+
+        let err = resume_rotation(
+            &reqwest::Client::new(),
+            cloud.base_url(),
+            &store,
+            DEVICE_ID,
+            &old_key,
+            &pending_key,
+            ROTATED_AT,
+        )
+        .await;
+        assert!(
+            err.is_err(),
+            "the first attempt has no way to know it actually succeeded"
+        );
+
+        // Nothing was destroyed: the SAME pending key/timestamp is still there
+        // for a retry to reuse.
+        let (still_pending, still_at) = identity::load_pending_key(&store).await.unwrap().unwrap();
+        assert_eq!(still_pending.public_base64(), pending_key.public_base64());
+        assert_eq!(still_at, ROTATED_AT);
+
+        // Attempt 2 (a retry): the cloud's CAS already committed (from attempt
+        // 1), so the probe now succeeds — promotes without ever re-POSTing
+        // the rotation itself.
+        cloud.push(PROBE_PATH, MockResp::ok("{}"));
+        resume_rotation(
+            &reqwest::Client::new(),
+            cloud.base_url(),
+            &store,
+            DEVICE_ID,
+            &old_key,
+            &pending_key,
+            ROTATED_AT,
+        )
+        .await
+        .expect("the retry must converge");
+
+        assert_promoted(&store, &pending_key).await;
+        // rotate-key was hit exactly once — by attempt 1. The retry resolved
+        // entirely through the probe.
+        assert_eq!(cloud.requests(ROTATE_PATH).len(), 1);
+    }
+
+    /// WP-B1b crash point: `resume_rotation` got a 2xx and started promoting,
+    /// but crashed BETWEEN installing the new key as ACTIVE and clearing the
+    /// pending markers (`identity::promote_pending_key`'s two sub-steps). At
+    /// this point the pending key is ALREADY the active one — a retry's probe
+    /// sees that immediately and finishes the (idempotent) promote/clear.
+    #[tokio::test]
+    async fn crash_mid_promote_converges_idempotently() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+        let (store, old_key, pending_key) = rotation_fixture().await;
+        identity::persist_pending_key(&store, &pending_key, ROTATED_AT)
+            .await
+            .unwrap();
+        // Simulate the interrupted first half of `promote_pending_key`: the
+        // new key is already installed active, but the pending markers were
+        // never cleared.
+        identity::install_rotated_key(&store, &pending_key)
+            .await
+            .unwrap();
+        assert!(identity::load_pending_key(&store).await.unwrap().is_some());
+
+        let cloud = MockCloud::start(&[PROBE_PATH, ROTATE_PATH]).await;
+        cloud.push(PROBE_PATH, MockResp::ok("{}")); // pending IS active already
+
+        resume_rotation(
+            &reqwest::Client::new(),
+            cloud.base_url(),
+            &store,
+            DEVICE_ID,
+            &old_key,
+            &pending_key,
+            ROTATED_AT,
+        )
+        .await
+        .expect("must converge");
+
+        assert_promoted(&store, &pending_key).await;
+        // The rotation endpoint was never touched — the probe alone resolved it.
+        assert!(cloud.requests(ROTATE_PATH).is_empty());
+    }
+
+    /// Not a crash point — a genuinely different, CONCURRENT `rotate-key` run
+    /// wins the race (only possible from two overlapping invocations, not
+    /// from any single-process interruption). Both the probe and the retried
+    /// POST prove the pending key never went live; `resume_rotation` must
+    /// clear it (not leave it stuck) and report a clear, actionable conflict —
+    /// the "or-clear" half of "promote-or-clear". The OLD key is left
+    /// untouched either way.
+    #[tokio::test]
+    async fn genuine_conflict_clears_pending_and_reports_it() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+        let (store, old_key, pending_key) = rotation_fixture().await;
+        identity::persist_pending_key(&store, &pending_key, ROTATED_AT)
+            .await
+            .unwrap();
+
+        let cloud = MockCloud::start(&[PROBE_PATH, ROTATE_PATH]).await;
+        // Probe (before POST): pending not live.
+        cloud.push(
+            PROBE_PATH,
+            MockResp::status(401, r#"{"error":"bad_signature"}"#),
+        );
+        // POST: the cloud reports a conflict (some other rotation won).
+        cloud.push(
+            ROTATE_PATH,
+            MockResp::status(409, r#"{"error":"stale_rotation"}"#),
+        );
+        // Re-probe (after the 409, before giving up): still not live.
+        cloud.push(
+            PROBE_PATH,
+            MockResp::status(401, r#"{"error":"bad_signature"}"#),
+        );
+
+        let err = resume_rotation(
+            &reqwest::Client::new(),
+            cloud.base_url(),
+            &store,
+            DEVICE_ID,
+            &old_key,
+            &pending_key,
+            ROTATED_AT,
+        )
+        .await
+        .expect_err("a genuine conflict must be reported, not silently swallowed");
+        assert!(
+            format!("{err:#}").contains("conflict"),
+            "the error must name the situation: {err:#}"
+        );
+
+        // Pending is cleared — NOT left stuck forever.
+        assert!(identity::load_pending_key(&store).await.unwrap().is_none());
+        // The store never had an active key installed by this path at all —
+        // this test never calls `identity::load_or_create_unlinked`/
+        // `install_rotated_key`, so there's nothing to assert "untouched"
+        // against beyond the pending markers already checked above.
+    }
+
+    /// Regression for the HIGH finding: an AMBIGUOUS re-probe (429/404/400 —
+    /// none of which prove the key is dead) must NEVER clear a pending key
+    /// that is actually still live, unlike the definitive `bad_signature` 401
+    /// in [`genuine_conflict_clears_pending_and_reports_it`]. Exercises the
+    /// three concrete non-typed statuses the finding calls out: a 429 from
+    /// the probe's shared rate budget, a 404 from an older cloud without the
+    /// route, and a 400 `stale_request` from clock skew (the probe enforces a
+    /// tighter freshness window than rotate-key does). In every case: attempt
+    /// 1 fails without clearing, and a RETRY's first-step probe (now seeing
+    /// the key actually IS live — e.g. attempt 1's own POST committed but hit
+    /// this same ambiguity on its confirming re-probe) converges to promote
+    /// without ever re-hitting the rotation endpoint.
+    #[tokio::test]
+    async fn ambiguous_reprobe_keeps_pending_key_then_retry_converges_via_probe() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+        for (status, body) in [
+            (429u16, "rate limited"),
+            (404u16, "not found"),
+            (400u16, r#"{"error":"stale_request"}"#),
+        ] {
+            let (store, old_key, pending_key) = rotation_fixture().await;
+            identity::persist_pending_key(&store, &pending_key, ROTATED_AT)
+                .await
+                .unwrap();
+
+            let cloud = MockCloud::start(&[PROBE_PATH, ROTATE_PATH]).await;
+            // Attempt 1, step 1: pending not yet known live.
+            cloud.push(
+                PROBE_PATH,
+                MockResp::status(401, r#"{"error":"bad_signature"}"#),
+            );
+            // Attempt 1, POST: cloud reports a conflict-shaped response...
+            cloud.push(
+                ROTATE_PATH,
+                MockResp::status(409, r#"{"error":"stale_rotation"}"#),
+            );
+            // ...but the re-probe meant to confirm that is ONLY ambiguous —
+            // it does NOT prove the pending key is dead.
+            cloud.push(PROBE_PATH, MockResp::status(status, body));
+
+            let err = resume_rotation(
+                &reqwest::Client::new(),
+                cloud.base_url(),
+                &store,
+                DEVICE_ID,
+                &old_key,
+                &pending_key,
+                ROTATED_AT,
+            )
+            .await
+            .expect_err("an ambiguous re-probe must not be treated as success");
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains("conflict"),
+                "an ambiguous re-probe must not be reported as a definitive conflict: {msg}"
+            );
+
+            // KEPT — not cleared — because ambiguous evidence never proves death.
+            let (still_pending, still_at) =
+                identity::load_pending_key(&store).await.unwrap().unwrap();
+            assert_eq!(
+                still_pending.public_base64(),
+                pending_key.public_base64(),
+                "status {status}: pending key must survive an ambiguous re-probe"
+            );
+            assert_eq!(still_at, ROTATED_AT);
+
+            // Attempt 2 (a retry): the pending key is now confirmed live —
+            // the first-step probe alone resolves it, no second rotate-key
+            // POST needed.
+            cloud.push(PROBE_PATH, MockResp::ok("{}"));
+            resume_rotation(
+                &reqwest::Client::new(),
+                cloud.base_url(),
+                &store,
+                DEVICE_ID,
+                &old_key,
+                &pending_key,
+                ROTATED_AT,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("status {status}: the retry must converge: {e:#}"));
+
+            assert_promoted(&store, &pending_key).await;
+            // rotate-key was hit exactly once — by attempt 1. The retry
+            // resolved entirely through the probe.
+            assert_eq!(cloud.requests(ROTATE_PATH).len(), 1, "status {status}");
+        }
+    }
+
+    /// A transient failure (a plain 5xx, not `stale_rotation`/`bad_signature`)
+    /// must NOT clear the pending key — it might still be the one the cloud
+    /// eventually applies, so the caller must be able to retry with the
+    /// SAME keypair/timestamp.
+    #[tokio::test]
+    async fn transient_failure_keeps_pending_key_for_a_later_retry() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+        let (store, old_key, pending_key) = rotation_fixture().await;
+        identity::persist_pending_key(&store, &pending_key, ROTATED_AT)
+            .await
+            .unwrap();
+
+        let cloud = MockCloud::start(&[PROBE_PATH, ROTATE_PATH]).await;
+        cloud.push(
+            PROBE_PATH,
+            MockResp::status(401, r#"{"error":"bad_signature"}"#),
+        );
+        cloud.push(ROTATE_PATH, MockResp::status(503, "service unavailable"));
+
+        let err = resume_rotation(
+            &reqwest::Client::new(),
+            cloud.base_url(),
+            &store,
+            DEVICE_ID,
+            &old_key,
+            &pending_key,
+            ROTATED_AT,
+        )
+        .await;
+        assert!(err.is_err());
+
+        let (still_pending, still_at) = identity::load_pending_key(&store).await.unwrap().unwrap();
+        assert_eq!(still_pending.public_base64(), pending_key.public_base64());
+        assert_eq!(still_at, ROTATED_AT);
+    }
+
+    /// The re-POSTed rotation envelope must be byte-identical across retries
+    /// (same pending pubkey, same `rotatedAt`) — the determinism the cloud's
+    /// replay guard relies on to treat a retry as the SAME request rather
+    /// than a new (and thus stale-by-comparison) one.
+    #[tokio::test]
+    async fn retried_envelope_is_byte_identical_across_attempts() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+        let (store, old_key, pending_key) = rotation_fixture().await;
+        identity::persist_pending_key(&store, &pending_key, ROTATED_AT)
+            .await
+            .unwrap();
+
+        let cloud = MockCloud::start(&[PROBE_PATH, ROTATE_PATH]).await;
+        cloud.push(
+            PROBE_PATH,
+            MockResp::status(401, r#"{"error":"bad_signature"}"#),
+        );
+        cloud.push(ROTATE_PATH, MockResp::status(500, "boom"));
+        cloud.push(
+            PROBE_PATH,
+            MockResp::status(401, r#"{"error":"bad_signature"}"#),
+        );
+        cloud.push(ROTATE_PATH, MockResp::status(500, "boom again"));
+
+        let client = reqwest::Client::new();
+        for _ in 0..2 {
+            let _ = resume_rotation(
+                &client,
+                cloud.base_url(),
+                &store,
+                DEVICE_ID,
+                &old_key,
+                &pending_key,
+                ROTATED_AT,
+            )
+            .await;
+        }
+
+        let bodies = cloud.requests(ROTATE_PATH);
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(
+            bodies[0], bodies[1],
+            "a retried rotation envelope must be byte-identical"
+        );
     }
 }

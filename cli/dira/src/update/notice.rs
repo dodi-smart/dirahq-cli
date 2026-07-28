@@ -1,0 +1,514 @@
+//! Passive update notice — a cached, rate-limited nudge printed to stderr
+//! after `dira status`, `dira version`, and `dira daemon status`.
+//!
+//! Per the production-distribution plan's §A5, **the foreground process
+//! never performs network I/O for this**: [`maybe_print`] reads a small
+//! TTL'd cache file (`project_dirs()?.cache_dir()/update-check.json` — a
+//! ~100-byte `fs::read` + `serde_json::from_slice`; a missing or corrupt file
+//! just means "no notice", never an error) and, only when that cache is
+//! stale, writes a `checked_at` sentinel *before* spawning (so two
+//! concurrent invocations don't both spawn a checker) and then launches a
+//! fully detached `dira update --check` without waiting on it.
+//!
+//! Output goes to stderr, never stdout, so `dira status | cat` stays
+//! byte-identical whether or not a notice is pending. `cache_dir()` is
+//! otherwise unused in this codebase (only `config_dir`/`data_dir` are) —
+//! that's deliberate: this cache is pure disposable derived state, so
+//! deleting it is always harmless and it never ends up in a config backup.
+
+use dira_core::{config::project_dirs, Config};
+use serde::{Deserialize, Serialize};
+use std::{
+    env, fs,
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+/// On-disk shape of `update-check.json`:
+/// ```jsonc
+/// { "checked_at": 1770000000, "latest": "0.3.0", "channel": "stable", "error": null }
+/// ```
+/// Written by `dira update --check` (T4); read (never written to with real
+/// data) here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+struct Cache {
+    /// Unix seconds when this entry was written.
+    checked_at: i64,
+    /// The resolved latest version for `channel`, once a check has
+    /// succeeded. `None` for a fresh sentinel or a failed check.
+    #[serde(default)]
+    latest: Option<String>,
+    /// The channel the check resolved against (`stable`/`prerelease`).
+    #[serde(default)]
+    channel: Option<String>,
+    /// The last check's error message, if it failed. Its presence (not its
+    /// content) selects the shorter negative TTL below.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Re-check at most once a day after a successful check.
+const SUCCESS_TTL_SECS: i64 = 24 * 60 * 60;
+/// Re-check sooner after a failed check (e.g. offline), but still
+/// rate-limited — an offline laptop must not respawn a checker every command.
+const FAILURE_TTL_SECS: i64 = 6 * 60 * 60;
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn cache_path() -> Option<PathBuf> {
+    project_dirs().map(|d| d.cache_dir().join("update-check.json"))
+}
+
+/// Read the cache file. A missing path, unreadable file, or corrupt JSON all
+/// collapse to "no cache" — this must never surface as an error to the
+/// caller, and a corrupt ~100-byte file is exactly the kind of thing a user
+/// can safely `rm` if it ever matters.
+fn read_cache(path: &Path) -> Option<Cache> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// True once `cache` is old enough to warrant a refresh. `checked_at: 0`
+/// (never written) is always stale. Uses the success or failure TTL
+/// depending on whether the last check errored.
+fn is_stale(cache: &Cache, now: i64) -> bool {
+    let ttl = if cache.error.is_some() {
+        FAILURE_TTL_SECS
+    } else {
+        SUCCESS_TTL_SECS
+    };
+    now.saturating_sub(cache.checked_at) >= ttl
+}
+
+/// Environment inputs to the suppression matrix, gathered once so
+/// [`should_notify`] takes no direct env/fs dependency and the whole matrix
+/// is unit-testable without touching real env vars or the filesystem.
+#[derive(Debug, Clone, Copy, Default)]
+struct Env {
+    /// `CI` is set to anything.
+    ci: bool,
+    /// `NO_UPDATE_NOTIFIER` is set (the npm-ecosystem convention).
+    no_update_notifier: bool,
+    /// `DIRA_NO_UPDATE_CHECK=1` (or any non-`0` value).
+    no_update_check: bool,
+    /// The `update.check` config knob is `off`.
+    knob_off: bool,
+    /// The running binary looks like a `target/{release,debug}` dev build.
+    dev_build: bool,
+}
+
+/// A boolean-ish env var value counts as "set" for anything except `"0"` —
+/// lets `DIRA_NO_UPDATE_CHECK=0` explicitly mean "not disabled", distinct
+/// from the var being merely absent (both leave checking enabled, but for
+/// different reasons worth being able to state).
+fn is_truthy_env_value(v: &std::ffi::OsStr) -> bool {
+    v != std::ffi::OsStr::new("0")
+}
+
+impl Env {
+    fn from_process(config: &Config) -> Self {
+        Env {
+            ci: env::var_os("CI").is_some(),
+            no_update_notifier: env::var_os("NO_UPDATE_NOTIFIER").is_some(),
+            no_update_check: env::var_os("DIRA_NO_UPDATE_CHECK")
+                .is_some_and(|v| is_truthy_env_value(&v)),
+            knob_off: !config.update.check,
+            dev_build: is_dev_build(),
+        }
+    }
+
+    /// The subset of the matrix that means "checking should not happen at
+    /// all" (explicit user/environment intent), as opposed to "don't print
+    /// it *this time*" (`ci`/`no_update_notifier`/a non-TTY stderr, which are
+    /// about display context and still leave the background refresh free to
+    /// keep the cache warm for a later interactive session). This also gates
+    /// [`maybe_print`]'s background-refresh spawn, not just the notice text.
+    fn checking_disabled(&self) -> bool {
+        self.no_update_check || self.knob_off || self.dev_build
+    }
+}
+
+/// Minimal dev-build detection: true if the running executable's resolved
+/// path has a `target/{release,debug}` ancestor. Nagging someone running
+/// straight out of `just install` (which symlinks into `target/release`) is
+/// pure noise.
+///
+/// Duplication note for T4: `update::replace::discover_install` (plan §A3)
+/// does the same detection more precisely — via `symlink_metadata` on the
+/// *PATH entry* rather than `current_exe()`, distinguishing a dev symlink
+/// from a dev build outright — because it must decide install *behavior*
+/// (refuse a dev symlink unless `--force`; always refuse a dev build), not
+/// just whether to print a notice. This copy is deliberately independent so
+/// T5 doesn't have to land after T4; unify them once both exist.
+fn is_dev_build() -> bool {
+    let Ok(exe) = env::current_exe() else {
+        return false;
+    };
+    let mut components = exe.components().map(|c| c.as_os_str());
+    let saw_target = components.clone().any(|c| c == "target");
+    let saw_profile_dir = components.any(|c| c == "release" || c == "debug");
+    saw_target && saw_profile_dir
+}
+
+/// Decide whether a notice should be printed, and if so, its exact text.
+/// Pure — no env/fs/network access — so the whole suppression matrix is
+/// unit-testable directly.
+fn should_notify(cache: &Cache, env: &Env, is_tty: bool, current_version: &str) -> Option<String> {
+    if !is_tty || env.ci || env.no_update_notifier || env.checking_disabled() {
+        return None;
+    }
+    let latest = cache.latest.as_deref()?;
+    if latest == current_version {
+        return None;
+    }
+    Some(format!(
+        "dira {latest} is available (you have {current_version}) — run `dira update`"
+    ))
+}
+
+/// Write a `checked_at` sentinel (no `latest`/`error` yet) *before* spawning,
+/// so two concurrent `dira status` invocations don't both spawn a checker.
+/// Best-effort: failure to write is swallowed, matching the "never blocks,
+/// never errors" contract of the whole feature.
+fn write_sentinel(path: &Path, now: i64) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let sentinel = Cache {
+        checked_at: now,
+        latest: None,
+        channel: None,
+        error: None,
+    };
+    if let Ok(bytes) = serde_json::to_vec(&sentinel) {
+        let _ = fs::write(path, bytes);
+    }
+}
+
+/// Spawn a fully detached `dira update --check` to refresh the cache. Never
+/// waited on; any failure to even spawn (missing `current_exe()`, exec
+/// failure, ...) is swallowed — this must be invisible to the caller. `dira
+/// update --check` may itself still be a stub (T4 lands concurrently); that
+/// is fine, since this call site never inspects its outcome.
+fn spawn_refresh() {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.args(["update", "--check"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Without this, spawning a console-subsystem child (`dira.exe` is one)
+    // from another console app briefly flashes a new console window on
+    // Windows — visible noise for what's supposed to be a fully detached,
+    // invisible background refresh (D-0006's "never blocks the foreground"
+    // covers *behavior*; this covers the equivalent visual guarantee).
+    // `CREATE_NO_WINDOW` suppresses that; it has no unix equivalent (no
+    // console to flash), hence the platform gate rather than a portable flag.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd.spawn();
+}
+
+/// Print a cached "update available" notice to stderr, if one is warranted.
+///
+/// Never performs network I/O itself: reads the small TTL'd cache file and,
+/// only when it's stale (and checking isn't disabled), writes a `checked_at`
+/// sentinel and spawns a fully detached `dira update --check` without
+/// waiting on it. See the module docs for the full design.
+pub fn maybe_print(config: &Config) {
+    let is_tty = std::io::stderr().is_terminal();
+    let env = Env::from_process(config);
+    let now = now_unix();
+
+    let Some(path) = cache_path() else {
+        return;
+    };
+    let cache = read_cache(&path).unwrap_or_default();
+
+    if !env.checking_disabled() && is_stale(&cache, now) {
+        write_sentinel(&path, now);
+        spawn_refresh();
+    }
+
+    if let Some(msg) = should_notify(&cache, &env, is_tty, env!("CARGO_PKG_VERSION")) {
+        eprintln!("{msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache(checked_at: i64, latest: Option<&str>, error: Option<&str>) -> Cache {
+        Cache {
+            checked_at,
+            latest: latest.map(str::to_string),
+            channel: Some("stable".to_string()),
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn allow_env() -> Env {
+        Env {
+            ci: false,
+            no_update_notifier: false,
+            no_update_check: false,
+            knob_off: false,
+            dev_build: false,
+        }
+    }
+
+    // --- serde round-trip -------------------------------------------------
+
+    #[test]
+    fn cache_serde_round_trips_the_documented_shape() {
+        let c = cache(1_770_000_000, Some("0.3.0"), None);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Cache = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn cache_round_trips_through_the_documented_json_literal() {
+        let raw = r#"{ "checked_at": 1770000000, "latest": "0.3.0", "channel": "stable", "error": null }"#;
+        let c: Cache = serde_json::from_str(raw).unwrap();
+        assert_eq!(c.checked_at, 1_770_000_000);
+        assert_eq!(c.latest.as_deref(), Some("0.3.0"));
+        assert_eq!(c.channel.as_deref(), Some("stable"));
+        assert_eq!(c.error, None);
+    }
+
+    #[test]
+    fn missing_or_corrupt_cache_reads_as_none_never_an_error() {
+        let dir = tempfile_dir();
+        let path = dir.join("update-check.json");
+        // Missing file.
+        assert_eq!(read_cache(&path), None);
+        // Corrupt file.
+        fs::write(&path, b"not json").unwrap();
+        assert_eq!(read_cache(&path), None);
+        // Empty file.
+        fs::write(&path, b"").unwrap();
+        assert_eq!(read_cache(&path), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_cache_behaves_as_an_always_stale_default() {
+        // `maybe_print` treats a read failure as `Cache::default()`, which
+        // must be stale (checked_at: 0) so a first-ever run always refreshes.
+        let c = Cache::default();
+        assert!(is_stale(&c, now_unix()));
+        assert_eq!(c.latest, None);
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dira-notice-test-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // --- TTL arithmetic -----------------------------------------------------
+
+    #[test]
+    fn success_cache_is_fresh_under_24h_and_stale_at_24h() {
+        let now = 1_000_000_000;
+        let fresh = cache(now - (SUCCESS_TTL_SECS - 1), Some("0.3.0"), None);
+        assert!(!is_stale(&fresh, now));
+        let boundary = cache(now - SUCCESS_TTL_SECS, Some("0.3.0"), None);
+        assert!(is_stale(&boundary, now));
+    }
+
+    #[test]
+    fn failure_cache_is_fresh_under_6h_and_stale_at_6h() {
+        let now = 1_000_000_000;
+        let fresh = cache(now - (FAILURE_TTL_SECS - 1), None, Some("offline"));
+        assert!(!is_stale(&fresh, now));
+        let boundary = cache(now - FAILURE_TTL_SECS, None, Some("offline"));
+        assert!(is_stale(&boundary, now));
+    }
+
+    #[test]
+    fn failure_ttl_is_shorter_than_success_ttl() {
+        const { assert!(FAILURE_TTL_SECS < SUCCESS_TTL_SECS) };
+    }
+
+    #[test]
+    fn never_written_cache_checked_at_zero_is_always_stale() {
+        let c = Cache::default();
+        assert!(is_stale(&c, now_unix()));
+    }
+
+    #[test]
+    fn future_checked_at_never_underflows_and_is_not_stale() {
+        // Defensive: a clock skew that makes checked_at look like it's in the
+        // future must saturate, not panic or wrap, and reads as fresh.
+        let now = 1_000_000_000;
+        let c = cache(now + 1000, Some("0.3.0"), None);
+        assert!(!is_stale(&c, now));
+    }
+
+    // --- suppression matrix (should_notify) ----------------------------------
+
+    #[test]
+    fn notifies_when_nothing_suppresses_and_a_newer_version_is_cached() {
+        let c = cache(0, Some("0.3.0"), None);
+        let msg = should_notify(&c, &allow_env(), true, "0.2.0").unwrap();
+        assert_eq!(
+            msg,
+            "dira 0.3.0 is available (you have 0.2.0) — run `dira update`"
+        );
+    }
+
+    #[test]
+    fn suppressed_when_stderr_is_not_a_tty() {
+        let c = cache(0, Some("0.3.0"), None);
+        assert!(should_notify(&c, &allow_env(), false, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn suppressed_when_ci_is_set() {
+        let c = cache(0, Some("0.3.0"), None);
+        let env = Env {
+            ci: true,
+            ..allow_env()
+        };
+        assert!(should_notify(&c, &env, true, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn suppressed_when_no_update_notifier_is_set() {
+        let c = cache(0, Some("0.3.0"), None);
+        let env = Env {
+            no_update_notifier: true,
+            ..allow_env()
+        };
+        assert!(should_notify(&c, &env, true, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn suppressed_when_dira_no_update_check_is_set() {
+        let c = cache(0, Some("0.3.0"), None);
+        let env = Env {
+            no_update_check: true,
+            ..allow_env()
+        };
+        assert!(should_notify(&c, &env, true, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn suppressed_when_the_config_knob_is_off() {
+        let c = cache(0, Some("0.3.0"), None);
+        let env = Env {
+            knob_off: true,
+            ..allow_env()
+        };
+        assert!(should_notify(&c, &env, true, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn suppressed_on_a_dev_build() {
+        let c = cache(0, Some("0.3.0"), None);
+        let env = Env {
+            dev_build: true,
+            ..allow_env()
+        };
+        assert!(should_notify(&c, &env, true, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn suppressed_when_cache_has_no_resolved_latest() {
+        // Sentinel-only cache (a refresh is in flight, or the only prior
+        // check failed): nothing to report yet.
+        let c = cache(0, None, None);
+        assert!(should_notify(&c, &allow_env(), true, "0.2.0").is_none());
+        let c = cache(0, None, Some("offline"));
+        assert!(should_notify(&c, &allow_env(), true, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn suppressed_when_already_current() {
+        let c = cache(0, Some("0.2.0"), None);
+        assert!(should_notify(&c, &allow_env(), true, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn env_var_value_of_zero_is_not_truthy_but_other_values_are() {
+        // `DIRA_NO_UPDATE_CHECK=0` is the explicit "not disabled" spelling.
+        // Pure predicate test — no real process env touched, so it's safe
+        // under parallel test execution.
+        use std::ffi::OsStr;
+        assert!(!is_truthy_env_value(OsStr::new("0")));
+        assert!(is_truthy_env_value(OsStr::new("1")));
+        assert!(is_truthy_env_value(OsStr::new("")));
+        assert!(is_truthy_env_value(OsStr::new("true")));
+    }
+
+    #[test]
+    fn checking_disabled_is_the_hard_disable_subset_only() {
+        // ci/no_update_notifier alone must NOT disable checking (background
+        // refresh should still keep the cache warm for a later interactive
+        // session) — only no_update_check/knob_off/dev_build do.
+        assert!(!Env {
+            ci: true,
+            ..allow_env()
+        }
+        .checking_disabled());
+        assert!(!Env {
+            no_update_notifier: true,
+            ..allow_env()
+        }
+        .checking_disabled());
+        assert!(Env {
+            no_update_check: true,
+            ..allow_env()
+        }
+        .checking_disabled());
+        assert!(Env {
+            knob_off: true,
+            ..allow_env()
+        }
+        .checking_disabled());
+        assert!(Env {
+            dev_build: true,
+            ..allow_env()
+        }
+        .checking_disabled());
+    }
+
+    // --- Env::from_process wiring -------------------------------------------
+
+    #[test]
+    fn from_process_maps_the_config_knob() {
+        let off = Config {
+            update: dira_core::config::UpdateKnobs { check: false },
+            ..Config::default()
+        };
+        assert!(Env::from_process(&off).knob_off);
+        let on = Config {
+            update: dira_core::config::UpdateKnobs { check: true },
+            ..Config::default()
+        };
+        assert!(!Env::from_process(&on).knob_off);
+    }
+}

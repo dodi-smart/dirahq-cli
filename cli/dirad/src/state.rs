@@ -8,12 +8,13 @@ use crate::sync::SyncHandle;
 use dira_contract::{Harness, SessionKind};
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::signing::DeviceKey;
+use dira_core::sync::CachedBillingSummary;
 use dira_core::{Config, Store};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::{mpsc, Notify};
 
 /// A message bound for the writer task.
 #[derive(Debug)]
@@ -35,19 +36,34 @@ pub struct AppState {
     pub tx: mpsc::Sender<EventMsg>,
     pub sessions: Arc<Mutex<SessionRegistry>>,
     pub config: Config,
+    /// Shared `reqwest::Client` for every device→cloud task (heartbeat, sync,
+    /// billing, the schema handshake). Built ONCE in `build_state` with a pooled
+    /// keep-alive connection so repeat POSTs to the same cloud host reuse the
+    /// TCP/TLS connection instead of paying a fresh handshake every tick. Carries
+    /// no default timeout — each call site sets its own `RequestBuilder::timeout`
+    /// sized to that request (heartbeat/billing/handshake short, sync longer).
+    pub http: reqwest::Client,
     /// When this daemon process started, for `dira version` uptime reporting.
     pub started_at: std::time::Instant,
     /// Bearer token required on the loopback HTTP ingress.
     pub bearer: Arc<String>,
     /// Handle to the background cloud-sync task (trigger channel).
     pub sync: SyncHandle,
+    /// Handle to the knowledge sync task (M2; consent-gated, own cursors).
+    pub knowledge_sync: crate::knowledge_sync::KnowledgeSyncHandle,
     /// This device's signing key, used to sign attestation batches. Loaded
     /// **lazily** off the startup critical path: the key is only needed for
     /// sync/signing, never to answer a control request, and loading it can block
     /// on a keychain unlock prompt. The control socket binds and answers
     /// `Ping`/`Status` long before this resolves. Access via
     /// [`AppState::device_key`].
-    pub device_key: Arc<OnceCell<DeviceKey>>,
+    ///
+    /// An `RwLock<Option<..>>` rather than the former `OnceCell` (WP-B1b): a
+    /// completed key rotation must invalidate the cache so the very next
+    /// sync/heartbeat/billing tick signs with the newly-promoted key instead
+    /// of the dead old one — a `OnceCell` can only ever be set once. See
+    /// [`AppState::invalidate_device_key`].
+    pub device_key: Arc<tokio::sync::RwLock<Option<DeviceKey>>>,
     /// Writer/ticker liveness, for the watchdog supervisor (Commit 1).
     pub progress: Arc<ProgressTracker>,
     /// `false` until the background hydrate finishes replaying the recent log into
@@ -64,6 +80,41 @@ pub struct AppState {
     /// heartbeat (Phase 6): the heartbeat task writes these on each 2xx; nothing
     /// reads them yet. Held as atomics so a reader needs no lock.
     pub presence_hints: Arc<PresenceHints>,
+    /// The last successfully-fetched cloud billing summary, served on `status`.
+    /// Written by the billing task (which also persists it to the store's meta
+    /// table); `None` until the first fetch/hydrate — the renderers omit the
+    /// billable footer then. Never hold this lock across an await.
+    pub billing: Arc<Mutex<Option<CachedBillingSummary>>>,
+    /// Poked by the sync task after a successful flush so the billing task
+    /// refreshes shortly after new facts land on the cloud.
+    pub billing_refresh: Arc<Notify>,
+    /// Fired at the same sites that already fire the sync trigger (writer,
+    /// control's manual resync, capture's commit-recorded path) so the heartbeat
+    /// loop can wake instantly out of a (potentially long, deep-idle) sleep
+    /// instead of waiting out its cadence (WP-A3). Uses `notify_waiters` — the
+    /// heartbeat loop spends nearly all its time parked in the
+    /// `select! { sleep, wake.notified() }`, so an edge fired while it's briefly
+    /// off doing a beat is the acceptable, rare miss (the sleep still bounds the
+    /// wait to at most one cadence, and jitter already keeps that bounded).
+    pub presence_wake: Arc<Notify>,
+    /// Fired (at most once, ever) by `control::handle_conn` after it has
+    /// written the response to a `Request::Shutdown` — the in-band,
+    /// platform-neutral SIGTERM equivalent `dirad::wait_for_shutdown_signal`
+    /// also selects on, required on windows where no SIGTERM exists to send.
+    /// Deliberately `notify_one`, not `notify_waiters`, at the call site: a
+    /// `Notify` only stores a permit for `notify_one`, so a `Shutdown` request
+    /// that lands before `run()` reaches its `select!` (e.g. mid-startup)
+    /// still wakes it the instant it starts waiting, instead of the
+    /// notification being silently dropped for lack of a parked waiter.
+    pub shutdown: Arc<Notify>,
+    /// Why the loopback hook ingress is not serving, or `None` when it is
+    /// healthy. Set when its port cannot be bound — a conflict is survivable
+    /// (the control socket is bound first and stays live), so the daemon runs
+    /// **degraded** rather than exiting, and a background task retries until
+    /// the port frees and clears this. Surfaced over `DaemonInfo` so
+    /// `dira daemon status` can say so instead of the daemon silently
+    /// capturing nothing. Never hold this lock across an await. See D-0009.
+    pub http_ingress_error: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -71,14 +122,61 @@ impl AppState {
     /// only if loading the key fails (a logged, non-fatal condition — the device
     /// simply can't sign/sync yet). Kept off the startup critical path so a
     /// keychain prompt never delays control-socket readiness (Commit 2).
-    pub async fn device_key(&self) -> Option<&DeviceKey> {
-        self.device_key
-            .get_or_try_init(|| async {
-                dira_core::identity::load_or_create_unlinked(&self.store).await
-            })
-            .await
-            .map_err(|e| tracing::warn!("device identity load failed: {e}"))
-            .ok()
+    ///
+    /// Returns an owned clone (WP-B1b; `DeviceKey` is cheap to clone — see its
+    /// doc comment) rather than a borrow tied to the lock guard, so callers
+    /// don't hold the `RwLock` across their own signing/HTTP awaits.
+    pub async fn device_key(&self) -> Option<DeviceKey> {
+        // Fast path: already loaded.
+        {
+            let guard = self.device_key.read().await;
+            if let Some(k) = guard.as_ref() {
+                return Some(k.clone());
+            }
+        }
+        // Not loaded (or just invalidated by a promoted rotation) — load under
+        // the write lock, double-checking in case another caller raced us here.
+        let mut guard = self.device_key.write().await;
+        if let Some(k) = guard.as_ref() {
+            return Some(k.clone());
+        }
+        match dira_core::identity::load_or_create_unlinked(&self.store).await {
+            Ok(k) => {
+                let out = k.clone();
+                *guard = Some(k);
+                Some(out)
+            }
+            Err(e) => {
+                tracing::warn!("device identity load failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Discard the cached device key so the NEXT [`AppState::device_key`] call
+    /// reloads it from the store (WP-B1b). Call this immediately after
+    /// promoting a pending rotation key (`dira_core::identity::promote_pending_key`)
+    /// so every subsequent sync/heartbeat/billing tick picks up the newly-active
+    /// key without requiring a daemon restart.
+    pub async fn invalidate_device_key(&self) {
+        *self.device_key.write().await = None;
+    }
+
+    /// The cloud-link gate every device→cloud task re-checks per tick:
+    /// `Some((cloud_url, device_id))` only when a cloud URL is configured AND
+    /// the device is linked. Re-reading both each call is the point — `dira
+    /// device link` / a config change takes effect without a daemon restart.
+    /// `task` names the caller in the read-failure log line.
+    pub async fn cloud_link(&self, task: &str) -> Option<(String, String)> {
+        let cloud_url = self.config.cloud_url.clone()?;
+        match dira_core::identity::device_id(&self.store).await {
+            Ok(Some(id)) => Some((cloud_url, id)),
+            Ok(None) => None, // not linked yet
+            Err(e) => {
+                tracing::warn!("{task}: read device_id failed: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -88,10 +186,50 @@ impl AppState {
 /// stored as an atomic so the supervisor reads it without a lock. `0` means
 /// "never progressed yet" (just-started). The writer marks progress on every
 /// drained message; the idle ticker marks on every tick.
-#[derive(Debug, Default)]
+///
+/// `started_at` (set at construction) is the watchdog's fallback baseline for
+/// the never-progressed case: a task that has made NO progress since daemon
+/// start is measured from `started_at`, so a hang inside a task's very first
+/// unit of work is just as detectable as one after years of uptime.
+#[derive(Debug)]
 pub struct ProgressTracker {
+    started_at: AtomicI64,
     writer_at: AtomicI64,
     ticker_at: AtomicI64,
+    /// Messages whose processing panicked and were caught + dropped by the
+    /// writer's per-message `catch_unwind` (WP-B7). Surfaced on `dira status`:
+    /// a nonzero count means the writer is silently shedding bad events even
+    /// though accrual for everything else kept running — worth investigating,
+    /// not itself an outage.
+    writer_panics: AtomicU64,
+    /// How many times the watchdog has observed the writer stalled (queue
+    /// backed up with no progress past the stall threshold). Distinct from
+    /// `writer_panics`: a stall means the writer isn't making progress at
+    /// all, not that it caught and recovered from a bad message.
+    writer_stalls: AtomicU64,
+    /// Sync flush attempts/successes/failures since daemon start (WP-B9),
+    /// mirroring the writer-health counters above. An "attempt" is every wake
+    /// that reaches `sync::flush` (whether or not it finds anything to send);
+    /// `successes + failures <= attempts` (a `Skipped` outcome — not
+    /// configured/linked yet — counts as neither).
+    flush_attempts: AtomicU64,
+    flush_successes: AtomicU64,
+    flush_failures: AtomicU64,
+}
+
+impl Default for ProgressTracker {
+    fn default() -> Self {
+        Self {
+            started_at: AtomicI64::new(Self::now()),
+            writer_at: AtomicI64::new(0),
+            ticker_at: AtomicI64::new(0),
+            writer_panics: AtomicU64::new(0),
+            writer_stalls: AtomicU64::new(0),
+            flush_attempts: AtomicU64::new(0),
+            flush_successes: AtomicU64::new(0),
+            flush_failures: AtomicU64::new(0),
+        }
+    }
 }
 
 impl ProgressTracker {
@@ -106,6 +244,14 @@ impl ProgressTracker {
     pub fn mark_ticker(&self) {
         self.ticker_at.store(Self::now(), Ordering::Relaxed);
     }
+    /// Record that one message's processing panicked and was dropped.
+    pub fn mark_writer_panic(&self) {
+        self.writer_panics.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that the watchdog observed the writer stalled.
+    pub fn mark_writer_stall(&self) {
+        self.writer_stalls.fetch_add(1, Ordering::Relaxed);
+    }
     /// Seconds since the writer last made progress, or `None` if it never has.
     pub fn writer_idle_secs(&self) -> Option<i64> {
         Self::elapsed(self.writer_at.load(Ordering::Relaxed))
@@ -113,6 +259,59 @@ impl ProgressTracker {
     /// Seconds since the idle ticker last ran, or `None` if it never has.
     pub fn ticker_idle_secs(&self) -> Option<i64> {
         Self::elapsed(self.ticker_at.load(Ordering::Relaxed))
+    }
+    /// Watchdog baseline: seconds since the writer last made progress, falling
+    /// back to seconds since daemon start when it never has — a hang on the
+    /// very first message must be as detectable as any later one.
+    pub fn writer_idle_or_start_secs(&self) -> i64 {
+        self.writer_idle_secs()
+            .unwrap_or_else(|| self.since_start_secs())
+    }
+    /// Watchdog baseline for the idle ticker; see [`Self::writer_idle_or_start_secs`].
+    pub fn ticker_idle_or_start_secs(&self) -> i64 {
+        self.ticker_idle_secs()
+            .unwrap_or_else(|| self.since_start_secs())
+    }
+    fn since_start_secs(&self) -> i64 {
+        (Self::now() - self.started_at.load(Ordering::Relaxed)).max(0)
+    }
+    /// Test-only: pretend the daemon started `secs` seconds earlier, so stall
+    /// thresholds can be crossed without real sleeps.
+    #[cfg(test)]
+    pub fn backdate_start_for_test(&self, secs: i64) {
+        self.started_at.store(Self::now() - secs, Ordering::Relaxed);
+    }
+    /// Total messages dropped to a caught per-message panic since daemon start.
+    pub fn writer_panics(&self) -> u64 {
+        self.writer_panics.load(Ordering::Relaxed)
+    }
+    /// Total times the watchdog has observed the writer stalled since daemon start.
+    pub fn writer_stalls(&self) -> u64 {
+        self.writer_stalls.load(Ordering::Relaxed)
+    }
+    /// Record that the sync task attempted a flush (WP-B9).
+    pub fn mark_flush_attempt(&self) {
+        self.flush_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that a flush attempt fully succeeded (accepted or a no-op tick).
+    pub fn mark_flush_success(&self) {
+        self.flush_successes.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that a flush attempt failed (any `SyncError` variant).
+    pub fn mark_flush_failure(&self) {
+        self.flush_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Total flush attempts since daemon start.
+    pub fn flush_attempts(&self) -> u64 {
+        self.flush_attempts.load(Ordering::Relaxed)
+    }
+    /// Total flush attempts that fully succeeded since daemon start.
+    pub fn flush_successes(&self) -> u64 {
+        self.flush_successes.load(Ordering::Relaxed)
+    }
+    /// Total flush attempts that failed since daemon start.
+    pub fn flush_failures(&self) -> u64 {
+        self.flush_failures.load(Ordering::Relaxed)
     }
     fn elapsed(at: i64) -> Option<i64> {
         if at == 0 {
@@ -143,20 +342,24 @@ pub struct PresenceHints {
 /// as each event is folded in, so the heartbeat reads them straight off the
 /// registry instead of re-scanning SQLite every tick:
 ///
-/// - `engaged_seconds` — de-duplicated, idle-trimmed human time for this session,
-///   the per-session analogue of [`dira_core::accounting::total_human_seconds`]
-///   over the session's own human signals.
+/// - `engaged_seconds` — de-duplicated, idle-trimmed human time attributed to this
+///   session by the opening-signal policy: each counted gap on the *merged*
+///   all-session signal timeline is credited to the session that opened it. So the
+///   per-session values sum to the deduped grand total
+///   ([`dira_core::accounting::total_human_seconds`]) and match
+///   [`dira_core::accounting::per_key_seconds`] keyed by session — a session with a
+///   single prompt is still credited for the gap it opens rather than reading 0.
+///   Attribution uses registry-level state, so it lives in [`SessionRegistry`].
 /// - `active_seconds` — idle-trimmed active wall time over *all* of the session's
 ///   event timestamps, the per-session analogue of
 ///   [`dira_core::accounting::active_seconds`].
 ///
-/// Both are computed by the exact same gap rule the batch scan uses: when an
-/// event arrives, add `gap = at - <previous timestamp of the same class>` to the
-/// running counter iff `0 < gap <= idle`. Accumulating consecutive in-window gaps
-/// telescopes to the same sum a one-shot sort-and-sum over the whole sequence
-/// produces, so the incremental value equals the accounting-core value (events
-/// arrive in non-decreasing `at` order on the writer path; the registry tracks the
-/// last-seen timestamp regardless). The cold-start hydrate replays the recent log
+/// Both are computed by the same gap rule the batch scan uses: add `gap = at -
+/// <previous timestamp>` to the running counter iff `0 < gap <= idle` — `active`
+/// against the session's own previous event, `engaged` against the previous human
+/// signal on the merged timeline. Accumulating consecutive in-window gaps telescopes
+/// to the same sum a one-shot sort-and-sum produces (events arrive in non-decreasing
+/// `at` order on the writer path). The cold-start hydrate replays the recent log
 /// through `observe`, so a daemon bounce reconstructs the same totals.
 #[derive(Debug, Clone)]
 pub struct LiveSession {
@@ -166,11 +369,18 @@ pub struct LiveSession {
     pub project: Option<String>,
     pub identity_email: Option<String>,
     pub label: Option<String>,
+    /// Activity classification + free-text note for manual sessions (surfaced live
+    /// in `dira status`/`watch` and on the synced rollup).
+    pub activity: Option<String>,
+    pub note: Option<String>,
     pub started_at: OffsetDateTime,
     pub last_event_at: OffsetDateTime,
     pub last_signal_at: Option<OffsetDateTime>,
     pub ended: bool,
-    /// Rolling de-duplicated human-engaged seconds for this session (6b).
+    /// Rolling de-duplicated human-engaged seconds attributed to this session by the
+    /// opening-signal policy (the gaps this session *opened* on the merged, all-session
+    /// timeline). Maintained at the registry level so these per-session values sum to
+    /// the deduped grand total — see [`SessionRegistry::observe`].
     pub engaged_seconds: u64,
     /// Rolling idle-trimmed active wall seconds over all this session's events (6b).
     pub active_seconds: u64,
@@ -184,6 +394,14 @@ pub struct LiveSession {
     /// or `None` if none yet. Used to decide "new activity since the last partial"
     /// (6c) without re-scanning.
     pub last_partial_active_seconds: Option<u64>,
+    /// Human prompts (`UserPrompt` events) observed so far.
+    pub prompts: u64,
+    /// Last resolved (non-null) branch across the session's events. Deliberately
+    /// last-wins — a *live* session's current branch is the honest answer for a
+    /// partial rollup — unlike `build_sessions`' start-branch-with-frequency-
+    /// fallback policy for ended rollups, whose terminal write overwrites this
+    /// anyway (issue #40).
+    pub branch: Option<String>,
 }
 
 impl LiveSession {
@@ -210,6 +428,13 @@ impl LiveSession {
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
     sessions: HashMap<String, LiveSession>,
+    /// `at` of the most recent human signal across *all* sessions, and the session
+    /// that fired it. Together they drive the de-duplicated, opening-signal
+    /// attribution of `engaged_seconds` (below): each counted gap is credited to the
+    /// session that *opened* it, so the per-session counters sum to the deduped grand
+    /// total instead of each counting its own signals in isolation.
+    last_human_signal_at: Option<OffsetDateTime>,
+    last_human_signal_session: Option<String>,
 }
 
 impl SessionRegistry {
@@ -235,6 +460,8 @@ impl SessionRegistry {
                 project: ev.project.clone(),
                 identity_email: ev.identity_email.clone(),
                 label: ev.label.clone(),
+                activity: ev.activity.clone(),
+                note: ev.note.clone(),
                 started_at: ev.at,
                 last_event_at: ev.at,
                 last_signal_at: None,
@@ -244,6 +471,8 @@ impl SessionRegistry {
                 last_human_signal_at: None,
                 last_active_at: None,
                 last_partial_active_seconds: None,
+                prompts: 0,
+                branch: ev.branch.clone(),
             });
 
         // Active gap (all events): add the gap from the previous event of any kind
@@ -263,14 +492,19 @@ impl SessionRegistry {
         if entry.label.is_none() && ev.label.is_some() {
             entry.label = ev.label.clone();
         }
+        if entry.activity.is_none() && ev.activity.is_some() {
+            entry.activity = ev.activity.clone();
+        }
+        if entry.note.is_none() && ev.note.is_some() {
+            entry.note = ev.note.clone();
+        }
+        if ev.branch.is_some() {
+            entry.branch = ev.branch.clone();
+        }
+        if matches!(ev.kind, EventKind::UserPrompt) {
+            entry.prompts += 1;
+        }
         if ev.kind.is_human_signal() {
-            // Engaged gap (human signals only): same rule over consecutive signals.
-            if let Some(prev) = entry.last_human_signal_at {
-                let gap = ev.at - prev;
-                if gap > Duration::ZERO && gap <= idle {
-                    entry.engaged_seconds += gap.whole_seconds() as u64;
-                }
-            }
             entry.last_human_signal_at = Some(ev.at);
             entry.last_signal_at = Some(ev.at);
         }
@@ -280,12 +514,46 @@ impl SessionRegistry {
         // on compaction mid-conversation, so a long session would otherwise vanish
         // from `active` even while it keeps working.
         entry.ended = matches!(ev.kind, EventKind::SessionEnd | EventKind::ManualStop);
+
+        // Engaged gap — de-duplicated across ALL sessions and attributed to the
+        // session that *opens* the gap (the v1 opening-signal policy, identical to
+        // `accounting::per_key_seconds` keyed by session). Maintained at the registry
+        // level (not per session) so the per-session `engaged_seconds` counters sum to
+        // the deduped grand total: a session with a single prompt still gets credited
+        // for the gap it opens, instead of reading 0 because it has no *second* signal
+        // of its own. Done in a fresh borrow so we can credit a different session than
+        // the one this event belongs to.
+        if ev.kind.is_human_signal() {
+            let prev = self.last_human_signal_at;
+            let opener = self.last_human_signal_session.clone();
+            if let (Some(prev_at), Some(opener)) = (prev, opener) {
+                let gap = ev.at - prev_at;
+                if gap > Duration::ZERO && gap <= idle {
+                    if let Some(op) = self.sessions.get_mut(&opener) {
+                        op.engaged_seconds += gap.whole_seconds() as u64;
+                    }
+                }
+            }
+            self.last_human_signal_at = Some(ev.at);
+            self.last_human_signal_session = Some(ev.session_id.clone());
+        }
     }
 
     /// Drop all live sessions. Called on `nuke` so the registry doesn't keep
     /// showing "active" sessions whose backing events were just wiped.
     pub fn clear(&mut self) {
         self.sessions.clear();
+        self.last_human_signal_at = None;
+        self.last_human_signal_session = None;
+    }
+
+    /// The newest event timestamp observed across ALL known sessions (active or
+    /// ended), or `None` if the registry has never observed a single event.
+    /// Used by the heartbeat's deep-idle predicate (WP-A3) as "the newest
+    /// activity" — a session that just ended still counts, so the daemon doesn't
+    /// snap to deep idle the instant the last session's final event lands.
+    pub fn last_activity_at(&self) -> Option<OffsetDateTime> {
+        self.sessions.values().map(|s| s.last_event_at).max()
     }
 
     /// All sessions that have not ended.
@@ -400,6 +668,61 @@ mod tests {
     use super::*;
     use dira_core::accounting::{self, Signal};
 
+    /// WP-B1b: `device_key()` caches on first load, and
+    /// `invalidate_device_key()` forces the NEXT call to reload rather than
+    /// keep serving the stale cached key — the mechanism `sync.rs`'s
+    /// `try_pending_key_flush` relies on after promoting a rotation.
+    ///
+    /// Uses `DIRA_DEVICE_SECRET` (never touches the OS keychain) so this is
+    /// safe to run in any environment; this is the only test in this binary
+    /// that calls `device_key()` without an explicit override, so the
+    /// process-global env var can't race a concurrent test.
+    #[tokio::test]
+    async fn device_key_reloads_after_invalidation() {
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                std::env::remove_var(dira_core::identity::ENV_DEVICE_SECRET);
+            }
+        }
+        let _clear = ClearEnv;
+
+        let first = dira_core::signing::DeviceKey::generate();
+        std::env::set_var(
+            dira_core::identity::ENV_DEVICE_SECRET,
+            first.secret_base64(),
+        );
+
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        let config = dira_core::Config::default();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
+
+        let loaded = state.device_key().await.expect("loads via env seed");
+        assert_eq!(loaded.public_base64(), first.public_base64());
+        // Cached: a second call returns the same key without re-reading env
+        // (env doesn't change between calls here, so this mainly proves the
+        // fast path doesn't error).
+        let cached = state.device_key().await.expect("cached read");
+        assert_eq!(cached.public_base64(), first.public_base64());
+
+        // Swap the env seed and invalidate — the NEXT call must pick up the
+        // NEW key, proving the cache doesn't silently keep serving the old one.
+        let second = dira_core::signing::DeviceKey::generate();
+        assert_ne!(first.public_base64(), second.public_base64());
+        std::env::set_var(
+            dira_core::identity::ENV_DEVICE_SECRET,
+            second.secret_base64(),
+        );
+        state.invalidate_device_key().await;
+
+        let reloaded = state
+            .device_key()
+            .await
+            .expect("reloads after invalidation");
+        assert_eq!(reloaded.public_base64(), second.public_base64());
+    }
+
     const IDLE: Duration = Duration::minutes(5);
 
     fn ev(session: &str, kind: EventKind, project: Option<&str>) -> RawEvent {
@@ -421,7 +744,52 @@ mod tests {
             tool: None,
             label: None,
             activity: None,
+            note: None,
         }
+    }
+
+    /// Like `ev_at`, but carries a `branch` — for the last-wins branch tracking
+    /// tests, which need events that actually set it.
+    fn ev_at_branch(
+        session: &str,
+        kind: EventKind,
+        project: Option<&str>,
+        secs: i64,
+        branch: Option<&str>,
+    ) -> RawEvent {
+        RawEvent {
+            branch: branch.map(str::to_string),
+            ..ev_at(session, kind, project, secs)
+        }
+    }
+
+    #[test]
+    fn last_activity_at_tracks_the_newest_event_including_ended_sessions() {
+        let repo = "github.com/acme/api";
+        let mut reg = SessionRegistry::default();
+        assert_eq!(
+            reg.last_activity_at(),
+            None,
+            "empty registry ⇒ no activity yet"
+        );
+
+        reg.observe(&ev_at("s1", EventKind::SessionStart, Some(repo), 0), IDLE);
+        assert_eq!(reg.last_activity_at(), Some(OffsetDateTime::UNIX_EPOCH));
+
+        // A later event on a second session moves the newest-activity mark.
+        reg.observe(&ev_at("s2", EventKind::SessionStart, Some(repo), 100), IDLE);
+        assert_eq!(
+            reg.last_activity_at(),
+            Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(100))
+        );
+
+        // Ending s2 still counts as the newest activity — a just-ended session
+        // must not make the registry look older than it is.
+        reg.observe(&ev_at("s2", EventKind::SessionEnd, Some(repo), 150), IDLE);
+        assert_eq!(
+            reg.last_activity_at(),
+            Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(150))
+        );
     }
 
     #[test]
@@ -597,5 +965,102 @@ mod tests {
         ]);
         // A single event ⇒ both zero.
         registry_counter_equals_accounting(&[(SessionStart, 0)]);
+    }
+
+    #[test]
+    fn engaged_seconds_are_deduped_and_attributed_across_sessions() {
+        // The parallel-supervision case: two sessions, ONE prompt each, interleaved.
+        // In isolation each session has a single signal, so the old per-session
+        // counter read 0 for both. With registry-level opening-signal attribution,
+        // each counted gap is credited to the session that opened it, so the
+        // per-session counters are non-zero and sum to the deduped grand total.
+        let p = Some("github.com/acme/api");
+        let mut reg = SessionRegistry::default();
+        reg.observe(&ev_at("s1", EventKind::UserPrompt, p, 0), IDLE); // opens 0..60
+        reg.observe(&ev_at("s2", EventKind::UserPrompt, p, 60), IDLE); // opens 60..120
+        reg.observe(&ev_at("s1", EventKind::UserPrompt, p, 120), IDLE); // last signal
+
+        let s1 = reg.sessions.get("s1").unwrap().engaged_seconds;
+        let s2 = reg.sessions.get("s2").unwrap().engaged_seconds;
+
+        // Cross-check against the one-shot accounting core: per-session values must
+        // equal per_key_seconds keyed by session, and sum to total_human_seconds.
+        let keyed: Vec<(OffsetDateTime, &str)> = [(0, "s1"), (60, "s2"), (120, "s1")]
+            .into_iter()
+            .map(|(secs, sid)| (OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs), sid))
+            .collect();
+        let by = accounting::per_key_seconds(&keyed, IDLE);
+        assert_eq!(s1 as i64, by[&"s1"]); // gap 0..60
+        assert_eq!(s2 as i64, by[&"s2"]); // gap 60..120
+        assert_eq!(s1, 60);
+        assert_eq!(s2, 60);
+
+        let signals: Vec<Signal> = [0i64, 60, 120]
+            .into_iter()
+            .map(|secs| Signal {
+                at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs),
+                project: p.map(str::to_string),
+            })
+            .collect();
+        assert_eq!(
+            s1 + s2,
+            accounting::total_human_seconds(&signals, IDLE) as u64,
+            "per-session engaged must sum to the deduped grand total",
+        );
+    }
+
+    /// Issue #40: a partial rollup for a still-live session needs `prompts` and
+    /// `branch` filled in instead of `None`/0. `prompts` counts `UserPrompt`
+    /// events; `branch` is last-wins over any event that carries one, and a
+    /// branchless event must never clear a previously-resolved branch.
+    #[test]
+    fn observe_counts_prompts_and_tracks_last_branch() {
+        let p = Some("github.com/acme/api");
+        let mut reg = SessionRegistry::default();
+
+        reg.observe(
+            &ev_at_branch("s1", EventKind::SessionStart, p, 0, Some("main")),
+            IDLE,
+        );
+        reg.observe(
+            &ev_at_branch("s1", EventKind::UserPrompt, p, 10, Some("main")),
+            IDLE,
+        );
+        reg.observe(&ev_at("s1", EventKind::PreTool, p, 20), IDLE);
+        reg.observe(&ev_at("s1", EventKind::PostTool, p, 30), IDLE);
+        // Branch flips mid-session.
+        reg.observe(
+            &ev_at_branch("s1", EventKind::UserPrompt, p, 40, Some("feat/x")),
+            IDLE,
+        );
+        // A branchless event must NOT clear the resolved branch.
+        reg.observe(&ev_at("s1", EventKind::PostTool, p, 50), IDLE);
+
+        let s1 = reg.sessions.get("s1").expect("session present");
+        assert_eq!(s1.prompts, 2, "two UserPrompt events observed");
+        assert_eq!(
+            s1.branch.as_deref(),
+            Some("feat/x"),
+            "last non-null branch wins, and a later branchless event doesn't clear it"
+        );
+
+        // Replay-equivalence: a fresh registry fed the identical sequence
+        // reproduces the same (prompts, branch) — the guarantee `hydrate` relies
+        // on to reconstruct live state after a daemon restart.
+        let seq = [
+            ev_at_branch("s1", EventKind::SessionStart, p, 0, Some("main")),
+            ev_at_branch("s1", EventKind::UserPrompt, p, 10, Some("main")),
+            ev_at("s1", EventKind::PreTool, p, 20),
+            ev_at("s1", EventKind::PostTool, p, 30),
+            ev_at_branch("s1", EventKind::UserPrompt, p, 40, Some("feat/x")),
+            ev_at("s1", EventKind::PostTool, p, 50),
+        ];
+        let mut replay = SessionRegistry::default();
+        for ev in &seq {
+            replay.observe(ev, IDLE);
+        }
+        let replayed = replay.sessions.get("s1").expect("session present");
+        assert_eq!(replayed.prompts, s1.prompts);
+        assert_eq!(replayed.branch, s1.branch);
     }
 }

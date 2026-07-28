@@ -4,32 +4,52 @@ members = [
     "contract",
     "cli/core",
     "cli/sources",
+    "cli/ipc",
     "cli/dirad",
     "cli/dira",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-develop.17"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/dodi-smart/dirahq-cli"
-rust-version = "1.80"
+# Nothing here goes to crates.io. Internal deps are path-only (`dira-contract =
+# { path = "contract" }`, no `version`), so `cargo publish` could not succeed
+# anyway — it would just fail late with a confusing error. Say so up front.
+# Binaries ship as release archives (see .github/workflows/build-release.yml).
+publish = false
+# 1.88 required by zip 8 (Windows-only dep, but the workspace floor is one
+# number); 1.85 was the previous floor, set by ed25519-dalek 3 (edition 2024).
+rust-version = "1.88"
 
 # Centralized dependency versions. Members opt in via `dep.workspace = true`.
 [workspace.dependencies]
 # Async runtime + ingress
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+# `flock(2)` for the daemon's single-instance lock (D-0009); already in the
+# tree transitively, MSRV-safe where `std`'s file locks (1.89) are not.
+libc = "0.2"
 axum = "0.8"
 tower = "0.5"
 
 # HTTP client (daemon → cloud ingest, CLI → device claim). rustls so we never
 # depend on a system OpenSSL; json for (de)serializing envelope/claim bodies.
+# HELD at 0.12 — this is not a cosmetic bump. 0.13 renamed `rustls-tls` → `rustls`
+# and, behind that rename, changed both halves of our TLS posture: the crypto
+# provider becomes aws-lc-rs (a C/asm build, new toolchain weight in the static
+# musl cross-compile — D-0002) and cert validation moves from the bundled Mozilla
+# roots to `rustls-platform-verifier`, i.e. the HOST trust store. A static musl
+# binary shipped to an arbitrary Linux box must carry its own roots; 0.13 has no
+# feature that restores them (0.12's webpki-roots path is gone), so the migration
+# needs an explicit root store + `ring` provider install and a release-matrix
+# build to prove it. Tracked separately — do not bump this line in a batch PR.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 
 # Terminal UI (the `dira watch` live dashboard). crossterm's `event-stream`
 # feature gives an async `EventStream` we can poll alongside the refresh timer;
@@ -38,11 +58,16 @@ ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 # `StreamExt::next` for crossterm's async `EventStream`; no executor pulled in.
 futures-util = { version = "0.3", default-features = false }
+# `FutureExt::catch_unwind` for the writer's per-message panic isolation
+# (dirad only, WP-B7). Needs the "std" feature that the minimal `futures-util`
+# above deliberately doesn't enable, so it's a separate full `futures` dep
+# rather than widening the crossterm-only entry.
+futures = "0.3"
 
 # Storage
 # `macros` provides `migrate!` + `query!`; we use runtime queries only, so builds
 # and CI never need a live DB (no `query!` calls = no compile-time DB check).
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 
 # Serialization + schema
 serde = { version = "1", features = ["derive"] }
@@ -50,17 +75,43 @@ serde_json = "1"
 schemars = "1"
 
 # Crypto + identity
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
-keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
-serde_jcs = "0.1"
-base64 = "0.22"
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+# `dira update`'s sha256 artifact verification (WP-A3). Both sha2 major lines are
+# in the tree regardless (sqlx-core pins 0.10, ed25519-dalek 3 pins 0.11), so this
+# tracks 0.11 — the line the crypto we actually care about already resolves.
+# Note: sha2 0.11 (digest 0.11) dropped the hasher's `io::Write` impl, so
+# `verify_sha256` streams the file through `update()` instead of `io::copy`.
+sha2 = "0.11"
+# Hex-encode/decode the sha256 digest `dira update` compares against the
+# published `.sha256` asset. Already resolved transitively (sqlx-macros-core);
+# promoted to a direct dep rather than added fresh.
+hex = "0.4"
+# Parse + order GitHub release tags for `dira update`'s channel/latest
+# resolution (SemVer 2.0.0 prerelease-identifier comparison handles
+# `0.2.0-develop.9 < 0.2.0-develop.10 < 0.2.0` correctly, unlike a naive
+# string sort). Already resolved transitively (rustc_version's build-dep
+# chain); promoted to a direct dep rather than added fresh.
+semver = "1"
+# ed25519-dalek 3 moved to rand_core 0.10, which dropped `OsRng`; the OS CSPRNG
+# now comes straight from getrandom (`SysRng`, behind the `sys_rng` feature).
+getrandom = { version = "0.4", features = ["sys_rng"] }
+# keyring 4 was rewritten: the platform backends now live in separate store crates and
+# the old `*-native` features are gone. The `v1` feature re-exposes the original drop-in
+# `Entry` API (Keychain on macOS, Credential Manager on Windows, Secret Service on *nix).
+# `keyring-core` (test-only) provides the in-memory mock store so tests never touch the
+# real OS keychain — it must track the version keyring depends on.
+keyring = { version = "4", features = ["v1"] }
+keyring-core = "1"
+serde_jcs = "0.2"
+base64 = "0.23"
 
 # Config + ids + logging
 figment = { version = "0.10", features = ["toml", "env"] }
 # Surgical, comment-preserving edits to the XDG `config.toml` (`dira config set`).
-# Already in the tree transitively via figment; pinned to the same 0.22 line.
-toml_edit = "0.22"
+# No longer shares figment's copy (figment 0.10 → toml 0.8 → toml_edit 0.22), so
+# the tree carries both lines; the cost is build time only, and pinning back to
+# 0.22 to dedupe would hold this crate behind figment's release cadence.
+toml_edit = "0.25"
 ulid = { version = "1", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -69,15 +120,31 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
 thiserror = "2"
 anyhow = "1"
-directories = "5"
+directories = "6"
+# Canonicalize without the `\\?\` verbatim prefix on windows (no-op elsewhere):
+# std::fs::canonicalize's verbatim paths break when embedded into harness hook
+# configs (Git Bash / PowerShell can't run them) and schtasks arguments.
+dunce = "1"
+# Timer jitter (dirad only): small, fast, non-cryptographic RNG for spreading
+# background POST timers so many daemons don't beat the cloud in lockstep.
+fastrand = "2"
 
 # Internal crates
 dira-contract = { path = "contract" }
 dira-core = { path = "cli/core" }
 dira-sources = { path = "cli/sources" }
+# UDS (unix) / named-pipe (windows) transport + shared length-prefixed-JSON framing;
+# the only framing implementation in the workspace — both dira and dirad go through it.
+dira-ipc = { path = "cli/ipc" }
+
+# windows-sys: only `ClientOptions::open`'s `ERROR_PIPE_BUSY` retry-loop (cli/ipc) needs
+# it directly. Pinned to "0.61" to match the version already dominant in the tree
+# (tokio/mio's own windows backend, `keyring`'s windows-native-keyring-store, etc.) so
+# cargo resolves one copy instead of two.
+windows-sys = "0.61"
 
 # Dev-only
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1"
 tempfile = "3"
 

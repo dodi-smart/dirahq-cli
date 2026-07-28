@@ -7,14 +7,16 @@
 //! There is deliberately **no SessionEnd hook** in Codex — we do not synthesize
 //! one here; the daemon's idle machinery closes a session that goes quiet.
 //!
-//! TODO(version-verify): confirmed against Codex's documented hook event names
-//! (`SessionStart`, `Stop`/`SubagentStop`, `UserPromptSubmit`, `PreToolUse`,
-//! `PostToolUse`, `PermissionRequest`, `Pre/PostCompact`, `SubagentStart`).
-//! Re-verify the exact strings against the shipping Codex release before GA.
+//! The hook event names (`SessionStart`, `Stop`/`SubagentStop`, `UserPromptSubmit`,
+//! `PreToolUse`, `PostToolUse`, `PermissionRequest`, plus the ignored
+//! `Pre/PostCompact`/`SubagentStart`) are confirmed against Codex's documented
+//! hooks system (stdin JSON, snake_case fields).
 //!
-//! The `codex-notify` variant (kebab-case `thread-id` / `agent-turn-complete` /
-//! `approval-requested`) is handled as an alternate deserializer below so both
-//! shapes route through the same `codex` source.
+//! The legacy `notify` mechanism is a separate, narrower channel: it emits exactly
+//! one notification, `type: "agent-turn-complete"`, as a kebab-case JSON object
+//! with `thread-id`. (Note: real Codex `notify` delivers that JSON as an argv
+//! argument, not on stdin, so the stdin→socket shim only ever sees the hooks
+//! shape; we still accept the notify shape here for completeness / HTTP posters.)
 
 use crate::{HarnessSource, Normalized};
 use dira_contract::Harness;
@@ -39,19 +41,18 @@ pub struct CodexHook {
     pub transcript_path: Option<String>,
 }
 
-/// The alternate kebab-case `codex-notify` shape. Optional/cheap to support: it
-/// carries `thread-id` and a `notification`/event name plus an optional tool.
+/// The alternate kebab-case `notify` shape. The notification kind is tagged by a
+/// `type` field; the only kind Codex emits is `agent-turn-complete`. Carries
+/// `thread-id` (the session id) and `cwd`.
 #[derive(Debug, Clone, Deserialize)]
 struct CodexNotify {
     #[serde(rename = "thread-id", default)]
     thread_id: Option<String>,
-    /// The notify event name, e.g. `agent-turn-complete`, `approval-requested`.
-    #[serde(default)]
-    notification: Option<String>,
+    /// The notify kind, e.g. `agent-turn-complete`.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
-    #[serde(rename = "tool-name", default)]
-    tool_name: Option<String>,
 }
 
 /// Map a Codex hook to a normalized event. Returns `None` for hook names we don't
@@ -85,15 +86,13 @@ fn map_event(name: &str) -> Option<EventKind> {
     })
 }
 
-/// Map a `codex-notify` kebab-case event name to our [`EventKind`].
+/// Map a `notify` kebab-case kind to our [`EventKind`]. Codex emits only
+/// `agent-turn-complete` (the agent finished a turn and is waiting on the human).
 fn map_notify(name: &str) -> Option<EventKind> {
-    Some(match name {
-        "session-start" => EventKind::SessionStart,
-        "agent-turn-complete" => EventKind::Stop,
-        "user-prompt" | "user-prompt-submit" => EventKind::UserPrompt,
-        "approval-requested" => EventKind::PermissionDecision,
-        _ => return None,
-    })
+    match name {
+        "agent-turn-complete" => Some(EventKind::Stop),
+        _ => None,
+    }
 }
 
 /// The Codex source. Accepts both the snake_case hook shape and, as a fallback,
@@ -114,14 +113,14 @@ impl HarnessSource for CodexSource {
                 return normalize(&hook);
             }
         }
-        // Fallback: the kebab-case codex-notify shape.
+        // Fallback: the kebab-case notify shape.
         let n: CodexNotify = serde_json::from_value(payload).ok()?;
-        let kind = map_notify(n.notification.as_deref()?)?;
+        let kind = map_notify(n.kind.as_deref()?)?;
         Some(Normalized {
             session_id: n.thread_id.unwrap_or_else(|| "unknown".to_string()),
             kind,
             cwd: n.cwd,
-            tool: n.tool_name,
+            tool: None,
             transcript_path: None,
         })
     }
@@ -206,14 +205,23 @@ mod tests {
     fn source_handles_codex_notify_shape() {
         let src = CodexSource;
         let payload = serde_json::json!({
+            "type": "agent-turn-complete",
             "thread-id": "t-1",
-            "notification": "agent-turn-complete",
             "cwd": "/repo"
         });
         let n = src.normalize(payload).unwrap();
         assert_eq!(n.kind, EventKind::Stop);
         assert_eq!(n.session_id, "t-1");
         assert_eq!(n.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn notify_only_maps_agent_turn_complete() {
+        // The fictional notify kinds we used to map no longer resolve.
+        for name in ["session-start", "user-prompt", "approval-requested"] {
+            assert!(map_notify(name).is_none(), "{name} should not map");
+        }
+        assert_eq!(map_notify("agent-turn-complete"), Some(EventKind::Stop));
     }
 
     #[test]

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 description = "The Dira CLI: a thin control client over the daemon's Unix domain socket."
 
 [[bin]]
@@ -14,6 +15,7 @@ path = "src/main.rs"
 dira-core.workspace = true
 dira-sources.workspace = true
 dira-contract.workspace = true
+dira-ipc.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 tokio.workspace = true
@@ -27,3 +29,40 @@ ratatui.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 toml_edit.workspace = true
+# `dira update` (WP-A3): sha256 artifact verification, hex digest comparison,
+# and GitHub release tag / channel ordering. All three are already resolved
+# transitively in Cargo.lock (see the workspace Cargo.toml comments) — this
+# adds zero new crates.
+sha2.workspace = true
+hex.workspace = true
+semver.workspace = true
+# Verbatim-prefix-free canonicalize for paths embedded into harness hook configs
+# and schtasks arguments (no-op on unix).
+dunce.workspace = true
+
+# Windows release artifacts are .zip (unix ships .tar.gz and keeps shelling out
+# to tar): no guaranteed tar/gzip on Windows, and Expand-Archive is PowerShell,
+# not something `dira update` can assume. Deflate-only keeps the compile cost
+# bounded; the updater only reads archives our own release workflow produced.
+[target.'cfg(windows)'.dependencies]
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# `config_cmd`'s round-trip test re-layers a written config.toml the same way
+# `Config::load` does.
+figment.workspace = true
+# Mock-cloud test server for `device.rs`'s two-phase rotation tests (WP-B1b) —
+# the same axum version `dirad` already runs in production, test-only here.
+axum.workspace = true
+# A successful two-phase rotation calls `dira_core::identity::promote_pending_key`,
+# which installs the new key via the same keychain-or-meta-fallback path
+# `dira_core::identity` uses in production. Mirrors
+# `dira_core::identity::tests::use_mock_keychain` so these tests never touch
+# the real OS keychain either.
+keyring.workspace = true
+keyring-core.workspace = true
+# `dira update`'s unit tests (`discover_install`, `swap_in`) and its
+# `tests/update_e2e.rs` integration test build every fixture — fake installs,
+# staged tarballs, mock-served archives — under an isolated temp dir, never
+# under `~/.local/bin` or the real `target/{release,debug}`.
+tempfile.workspace = true

@@ -1,0 +1,7 @@
+block-paths	src/checkout/**
+block-paths	src/cart/
+comment-only-origin	src/x/**
+defaults-apply	lib/defaults/**
+happy-spec	cli/dirad/src/capture.rs
+happy-spec	cli/core/src/zavet.rs
+no-title-spec	lib/untitled/**

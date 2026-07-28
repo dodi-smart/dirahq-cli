@@ -19,50 +19,95 @@ jobs:
     timeout-minutes: 5
     if: github.event.pull_request.draft == false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: wagoid/commitlint-github-action@v6
         with:
           configFile: commitlint.config.mjs
 
-  # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
-  # to `ubuntu-latest` when none are available. Downstream jobs read the chosen
-  # label set from `outputs.runner` via `fromJson()`.
-  check-runners:
-    name: Pick runner
+  # Lint install.sh: POSIX-only shellcheck plus canonical shfmt formatting.
+  # Lightweight — stays on GitHub-hosted runners, same as commit-lint.
+  shell-lint:
+    name: Shell Lint (install.sh)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: github.event.pull_request.draft == false
-    outputs:
-      runner: ${{ steps.set-runner.outputs.use-runner }}
     steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v3
+      - uses: actions/checkout@v7
+      - name: Install shfmt
+        uses: taiki-e/install-action@v2
         with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
+          tool: shfmt
+      - name: shellcheck -s sh install.sh
+        run: shellcheck -s sh install.sh
+      - name: shfmt -d -s -ln posix -i 2 install.sh
+        run: shfmt -d -s -ln posix -i 2 install.sh
 
-      - name: Check runner availability
-        id: set-runner
-        uses: dodi-smart/runner-fallback-action@v2
-        with:
-          organization: ${{ github.repository_owner }}
-          primary-runner: "self-hosted,build"
-          fallback-runner: "ubuntu-latest"
-          github-token: ${{ steps.app-token.outputs.token }}
-          fallback-on-error: true
-
-  rust:
-    name: Rust (capture layer)
-    needs: [check-runners]
-    runs-on: ${{ fromJson(needs.check-runners.outputs.runner) }}
+  # Lint install.ps1: PSScriptAnalyzer at Warning severity, install.sh's Windows sibling.
+  # Lightweight — stays on GitHub-hosted runners, same as shell-lint above. `shell: pwsh`
+  # runs PowerShell 7+ (only what ubuntu-latest ships); install.ps1's own compatibility
+  # floor is Windows PowerShell 5.1, but PSScriptAnalyzer's rules are version-agnostic
+  # static analysis, so linting under pwsh here still catches what matters.
+  powershell-lint:
+    name: PowerShell Lint (install.ps1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: github.event.pull_request.draft == false
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - name: Invoke-ScriptAnalyzer install.ps1
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          Invoke-ScriptAnalyzer -Path install.ps1 -Severity Warning -EnableExit
+
+  # Dependency license gate. Renovate auto-merges minor/patch bumps, so without
+  # this a transitive copyleft dep can reach a release build with nobody reading
+  # a diff. Policy + per-crate carve-outs live in deny.toml. Licenses only —
+  # advisories are deliberately not gated on the PR path (see deny.toml).
+  licenses:
+    name: Dependency licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check licenses
+        run: cargo deny check licenses
+
+  # GitHub-hosted, never self-hosted. This job builds and runs a contributor's
+  # code (`cargo test`, `build.rs`, proc-macro expansion) straight off a
+  # `pull_request` trigger, so on a public repo it is arbitrary code execution
+  # by anyone who can get a PR approved. The org's `self-hosted,build` pool is
+  # persistent and lives inside our network — one poisoned PR there buys
+  # lateral access and a foothold that survives into later legitimate runs.
+  # Ephemeral GitHub-hosted runners bound that blast radius to a throwaway VM.
+  # `build-release.yml` still uses the self-hosted pool: it triggers only on
+  # `workflow_run`/`workflow_dispatch`, which a fork PR cannot reach.
+  rust:
+    name: Rust (capture layer)
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      # Set up the Rust toolchain directly instead of via mise — mise's
+      # `rust = "stable"` is a silent no-op on runners without rustup. The
+      # GitHub-hosted images ship rustup, so this just pins stable and adds
+      # the components fmt/clippy need.
+      - name: Set up Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all -- --check
@@ -80,3 +125,29 @@ jobs:
           cargo run -q -p dira-core --bin sign_vector > contract/testdata/signing-vector.json
           git diff --exit-code contract/testdata/signing-vector.json \
             || (echo "signing-vector fixture is stale — run 'just vector'"; exit 1)
+
+  # Windows build/test lane (native, not WSL): validates the named-pipe IPC transport
+  # (`cli/ipc`) and everything else in the workspace on the actual target platform.
+  # Independent of `rust` above — fmt/contract-schema stay Linux-only intentionally
+  # (see module doc), so this job only runs clippy + tests.
+  rust-windows:
+    name: Rust (windows)
+    runs-on: windows-latest
+    if: github.event.pull_request.draft == false
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace

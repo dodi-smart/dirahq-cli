@@ -13,9 +13,26 @@ on:
         description: "tag to build (e.g. v1.2.3)"
         required: true
         type: string
+      dry_run:
+        description: "build + package only, skip every upload (release assets, checksums.txt, smoke)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+# Serialize runs for the same tag/commit so two dispatches (or a dispatch
+# racing the automatic workflow_run trigger) never upload to the same
+# release concurrently. The exact resolved tag is only known inside the
+# `resolve` job, so this is a best-effort key computed at trigger time:
+# `inputs.tag` pins it exactly for workflow_dispatch; `head_sha` pins it to
+# the underlying commit for the automatic workflow_run path. `resolve`'s own
+# idempotency check (skip if the release already has assets) is the actual
+# correctness backstop.
+concurrency:
+  group: build-release-${{ inputs.tag || github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   # Find the tag to build and whether its release still needs artifacts.
@@ -29,7 +46,7 @@ jobs:
       version: ${{ steps.pick.outputs.version }}
       proceed: ${{ steps.pick.outputs.proceed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Pick tag
@@ -50,7 +67,12 @@ jobs:
           fi
           # Stable releases only: skip prerelease tags (a SemVer suffix like
           # v0.2.0-develop.1). Binaries ship for clean vX.Y.Z tags cut on main.
-          # A manual workflow_dispatch can still force a build for any tag.
+          # A manual workflow_dispatch can still force a build for any tag —
+          # this is deliberate while the repo is private: it keeps prerelease
+          # builds off every develop merge (billed self-hosted runner
+          # minutes) while still letting us dogfood the pipeline on demand.
+          # TODO(public): remove this hard-skip once the repo is public and
+          # runner minutes are free — prereleases can build automatically too.
           case "$tag" in
             *-*)
               if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
@@ -68,8 +90,9 @@ jobs:
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Idempotency: skip if this release already has tarball assets.
-          count=$(gh release view "$tag" --json assets -q '[.assets[] | select(.name | endswith(".tar.gz"))] | length' 2>/dev/null || echo 0)
+          # Idempotency: skip if this release already has archive assets -- .tar.gz for
+          # the unix legs, .zip for the Windows legs (D-0010).
+          count=$(gh release view "$tag" --json assets -q '[.assets[] | select((.name | endswith(".tar.gz")) or (.name | endswith(".zip")))] | length' 2>/dev/null || echo 0)
           if [ "${count:-0}" -gt 0 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "Release $tag already has $count artifact(s) — skipping."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -80,7 +103,7 @@ jobs:
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
   # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
-  # to `ubuntu-latest`. Used for the heaviest native compile (x86_64 linux).
+  # to `ubuntu-latest`. Used for the heaviest native compile (x86_64 linux musl).
   check-runners:
     name: Pick runner
     runs-on: ubuntu-latest
@@ -107,32 +130,90 @@ jobs:
           github-token: ${{ steps.app-token.outputs.token }}
           fallback-on-error: true
 
+  # musl is statically linked, so the build host's glibc floor is irrelevant — one binary
+  # per Linux arch covers Alpine, containers, and old-glibc distros alike. The x86_64 leg
+  # matters most here since it runs on a self-hosted runner whose glibc version is unknown
+  # and can drift without notice. `universal-apple-darwin` is a lipo fat binary the upload
+  # action builds itself (both rustup targets + `lipo -create`), so Apple Silicon and Intel
+  # ship from one leg — no separate x86_64-apple-darwin leg needed. The two Windows legs
+  # (D-0010) both build on `windows-latest`: x86_64-pc-windows-msvc natively, and
+  # aarch64-pc-windows-msvc cross-compiled -- MSVC's linker can target a foreign
+  # architecture from an x86_64 host with nothing beyond `rustup target add` (no separate
+  # cross-linker/sysroot the way the musl legs need), and the native `windows-11-arm`
+  # runner label fails outright on private repos, which this one still is.
   build:
     name: Build ${{ matrix.target }}
     needs: [resolve, check-runners]
     if: needs.resolve.outputs.proceed == 'true'
     timeout-minutes: 45
-    # x86_64 linux (the heaviest) runs on the self-hosted runner when available;
-    # every other target builds natively on its matching GitHub-hosted runner.
+    # x86_64 linux musl (the heaviest) runs on the self-hosted runner when
+    # available; every other target builds natively on its matching
+    # GitHub-hosted runner.
     runs-on: ${{ matrix.use_fallback && fromJson(needs.check-runners.outputs.runner) || matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             use_fallback: true
-          - target: aarch64-unknown-linux-gnu
+            cross: true
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            runner: macos-13
-          - target: aarch64-apple-darwin
-            runner: macos-14
+            cross: true
+          - target: universal-apple-darwin
+            runner: macos-latest
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
+          # TODO(public): once this repo is public, move this leg to a native
+          # windows-11-arm runner (that label only works on public repos today) and give
+          # it its own native smoke leg instead of relying on the x86_64 Windows leg below.
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
-      - uses: jdx/mise-action@v2
+      # Set up the Rust toolchain directly instead of via mise: the self-hosted
+      # `build` runner (used for x86_64-linux-musl) doesn't ship rustup, so mise's
+      # `rust = "stable"` silently no-ops and `cargo` goes missing. Install rustup
+      # when absent and pin stable. Target rustup targets are added by whichever
+      # of the two steps below applies to this leg — never here, so an empty
+      # `rustup target add` invocation is never possible.
+      - name: Set up Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # musl legs only: sets up the musl cross-linker/sysroot and runs
+      # `rustup target add` itself. Deliberately explicit here rather than
+      # letting the upload action fall through to `cross` on its own — that
+      # path exists in its main.sh but is undocumented, and it pulls in
+      # Docker, which the artifact every user downloads shouldn't depend on.
+      - name: Set up musl cross toolchain
+        if: matrix.cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      # Windows legs only: `rustup target add` is the entire cross-compile setup here
+      # (unlike the musl legs above, MSVC needs no separate cross-linker or sysroot to
+      # target a foreign architecture from an x86_64 host). x86_64-pc-windows-msvc is the
+      # runner's own host triple and typically already installed, so this is a harmless
+      # no-op for that leg; aarch64-pc-windows-msvc is the genuine cross-compile.
+      - name: Add Windows rustup target
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
       - name: Build & upload binaries
         uses: taiki-e/upload-rust-binary-action@v1
         with:
@@ -141,26 +222,211 @@ jobs:
           archive: dira-${{ needs.resolve.outputs.version }}-$target
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           tar: unix
+          zip: windows
+          checksum: sha256
+          dry-run: ${{ inputs.dry_run == true }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Attach the contract artifacts (schema + signing fixture) to the release so the
-  # cloud repo's `just contract-pull` can fetch them when no sibling checkout exists.
-  contract-assets:
-    name: Publish contract artifacts
+  # Attach the contract artifacts (schema + signing fixture) and both installers to the
+  # release so the cloud repo's `just contract-pull` and
+  # https://github.com/dodi-smart/dirahq-cli/releases/latest/download/{install.sh,install.ps1}
+  # (permanent fallback URLs) all work with no sibling checkout.
+  release-assets:
+    name: Publish release assets
     needs: [resolve]
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: needs.resolve.outputs.proceed == 'true'
+    if: needs.resolve.outputs.proceed == 'true' && inputs.dry_run != true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
-      - name: Upload contract artifacts to release
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.resolve.outputs.tag }}" \
             contract/attestation.schema.json \
             contract/testdata/signing-vector.json \
+            install.sh \
+            install.ps1 \
             --clobber
+
+  # Human-facing convenience only — install.sh verifies each download against
+  # its own per-asset .sha256 file, it never reads checksums.txt.
+  checksums:
+    name: Publish checksums.txt
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: needs.resolve.outputs.proceed == 'true' && inputs.dry_run != true
+    steps:
+      - name: Aggregate per-asset checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.resolve.outputs.tag }}"
+          dir=$(mktemp -d)
+          gh release download "$tag" --repo "${{ github.repository }}" --pattern '*.sha256' --dir "$dir"
+          # Deterministic, readable order; each .sha256 asset is already one
+          # `sha256sum`-style line per archive built in that matrix leg.
+          cat "$dir"/*.sha256 | sort -k2 > "$dir/checksums.txt"
+          gh release upload "$tag" "$dir/checksums.txt" --repo "${{ github.repository }}" --clobber
+
+  # The acceptance gate: install.sh, for real, against the just-built release,
+  # on every platform shape it claims to support. GITHUB_TOKEN is what makes
+  # this work while the repo is private (install.sh's authenticated asset
+  # path). Runs on every manual dispatch and every stable release — the thing
+  # that turns "the pipeline compiled" into "the pipeline actually installs".
+  smoke:
+    name: Smoke ${{ matrix.leg }}
+    needs: [resolve, build]
+    if: needs.resolve.outputs.proceed == 'true' && inputs.dry_run != true
+    timeout-minutes: 20
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: linux-x64
+            runner: ubuntu-latest
+          - leg: linux-arm64
+            runner: ubuntu-24.04-arm
+          # Alpine has neither curl, tar, nor jq by default, and no git
+          # (actions/checkout falls back to the REST API for the file
+          # download, which works fine without git).
+          - leg: alpine
+            runner: ubuntu-latest
+            container: alpine:3.20
+          - leg: macos-arm64
+            runner: macos-latest
+          # The only leg that proves the lipo fat binary actually contains a
+          # working x86_64 slice. macos-13 has been fully retired (GitHub
+          # deprecated it in Sept 2025, unsupported since Dec 2025) — the
+          # current GitHub-hosted Intel macOS image is macos-15-intel.
+          - leg: macos-intel
+            runner: macos-15-intel
+          # install.ps1, for real, against the just-built release. NOTE: this leg only
+          # goes green once the Rust-side Windows target support (landing in a parallel
+          # package) is in the released tag being smoked here -- acceptable because
+          # releases are manual-dispatch-only while the repo is private (D-0005), so
+          # nothing forces this leg to pass before that sibling work lands.
+          - leg: windows-x64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+      - name: Install curl, tar, jq (alpine has none of them by default)
+        if: matrix.leg == 'alpine'
+        run: apk add --no-cache curl tar jq
+      - name: Install dira via install.sh and exercise it
+        # Static `sh`, not `bash`: alpine has no bash, and the script bodies
+        # below are already POSIX-`sh`-safe (no bashisms), so one shell works
+        # identically everywhere. (`shell:` doesn't support the `matrix`
+        # context anyway — only a fixed value or `github`/`env`/`vars`/`inputs`
+        # contexts are allowed there.)
+        # Skipped on Windows: install.sh is the POSIX installer, exercised by every
+        # other leg here; the Windows leg below exercises install.ps1 instead.
+        if: runner.os != 'Windows'
+        shell: sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIRA_REPO: ${{ github.repository }}
+          DIRA_VERSION: ${{ needs.resolve.outputs.version }}
+          DIRA_BIN_DIR: ${{ runner.temp }}/dira-bin
+        run: |
+          sh ./install.sh
+          export PATH="$DIRA_BIN_DIR:$PATH"
+          test "$(dira --version | head -n1 | awk '{print $2}')" = "$DIRA_VERSION"
+          dirad --version
+          dira daemon start && dira daemon status
+          # Resolves against the release we just published and must report
+          # "up to date". Exits 0 even offline, so a network blip here is a
+          # real failure signal, not flake.
+          dira update --check
+          dira daemon restart && dira daemon stop
+      # Runs between install and uninstall, deliberately: the binary must
+      # still be on disk to inspect it.
+      - name: lipo -info proves both slices shipped in the universal binary
+        if: runner.os == 'macOS'
+        env:
+          DIRA_BIN_DIR: ${{ runner.temp }}/dira-bin
+        run: |
+          info=$(lipo -info "$DIRA_BIN_DIR/dira")
+          echo "$info"
+          echo "$info" | grep -q x86_64
+          echo "$info" | grep -q arm64
+      # install.ps1's Windows counterpart to the "Install dira via install.sh" step
+      # above. `shell: powershell` pins Windows PowerShell 5.1, install.ps1's actual
+      # compatibility floor and the default host behind `irm | iex` -- not pwsh/Core,
+      # which is a separate, newer binary that wouldn't catch a 5.1-only regression.
+      - name: Install dira via install.ps1 and exercise it (windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIRA_REPO: ${{ github.repository }}
+          DIRA_VERSION: ${{ needs.resolve.outputs.version }}
+          DIRA_BIN_DIR: ${{ runner.temp }}\dira-bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\install.ps1
+          $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
+          $reported = ((dira --version | Select-Object -First 1) -split '\s+')[1]
+          if ($LASTEXITCODE -ne 0) { throw "dira --version failed" }
+          if ($reported -ne $env:DIRA_VERSION) { throw "dira --version reported '$reported', expected '$env:DIRA_VERSION'" }
+          dirad --version
+          if ($LASTEXITCODE -ne 0) { throw "dirad --version failed" }
+          dira daemon start
+          if ($LASTEXITCODE -ne 0) { throw "dira daemon start failed" }
+          dira daemon status
+          if ($LASTEXITCODE -ne 0) { throw "dira daemon status failed" }
+          # Resolves against the release we just published and must report "up to
+          # date". Exits 0 even offline, so a network blip here is a real failure
+          # signal, not flake -- same rationale as the unix legs above.
+          dira update --check
+          if ($LASTEXITCODE -ne 0) { throw "dira update --check failed" }
+          dira daemon restart
+          if ($LASTEXITCODE -ne 0) { throw "dira daemon restart failed" }
+          dira daemon stop
+          if ($LASTEXITCODE -ne 0) { throw "dira daemon stop failed" }
+      - name: Idempotent re-run, then uninstall
+        # Static `sh`, not `bash`: alpine has no bash, and the script bodies
+        # below are already POSIX-`sh`-safe (no bashisms), so one shell works
+        # identically everywhere. (`shell:` doesn't support the `matrix`
+        # context anyway — only a fixed value or `github`/`env`/`vars`/`inputs`
+        # contexts are allowed there.)
+        # Skipped on Windows: see "Idempotent re-run + uninstall (windows)" below.
+        if: runner.os != 'Windows'
+        shell: sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIRA_REPO: ${{ github.repository }}
+          DIRA_VERSION: ${{ needs.resolve.outputs.version }}
+          DIRA_BIN_DIR: ${{ runner.temp }}/dira-bin
+        run: |
+          export PATH="$DIRA_BIN_DIR:$PATH"
+          # Re-running over an identical install is a no-op, exit 0.
+          sh ./install.sh
+          sh ./install.sh --uninstall
+          ! command -v dira
+      - name: Idempotent re-run + uninstall (windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIRA_REPO: ${{ github.repository }}
+          DIRA_VERSION: ${{ needs.resolve.outputs.version }}
+          DIRA_BIN_DIR: ${{ runner.temp }}\dira-bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
+          # Re-running over an identical install is a no-op.
+          .\install.ps1
+          .\install.ps1 -Uninstall -Force
+          if (Test-Path "$env:DIRA_BIN_DIR\dira.exe") { throw "dira.exe still present after -Uninstall" }
+          if (Test-Path "$env:DIRA_BIN_DIR\dirad.exe") { throw "dirad.exe still present after -Uninstall" }

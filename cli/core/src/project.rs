@@ -35,6 +35,198 @@ pub fn resolve(cwd: &Path) -> Resolved {
     }
 }
 
+/// The repo toplevel for `cwd`, if inside a git work tree.
+pub fn toplevel(cwd: &Path) -> Option<std::path::PathBuf> {
+    git(cwd, &["rev-parse", "--show-toplevel"]).map(std::path::PathBuf::from)
+}
+
+/// Raw trailer pairs for each of `shas`, in one batched `git log --no-walk`
+/// call: `%x1e`-separated records of `SHA%x1f<trailers, unfolded>`. Commits
+/// with no trailers return an empty list. Best-effort — a git failure yields
+/// an empty map.
+pub fn commit_trailers(root: &Path, shas: &[String]) -> Vec<(String, Vec<(String, String)>)> {
+    if shas.is_empty() {
+        return Vec::new();
+    }
+    let mut args: Vec<&str> = vec![
+        "log",
+        "--no-walk=unsorted",
+        "--no-color",
+        "--pretty=format:%H%x1f%(trailers:only,unfold)%x1e",
+    ];
+    args.extend(shas.iter().map(String::as_str));
+    let Some(out) = git(root, &args) else {
+        return Vec::new();
+    };
+    out.split('\u{1e}')
+        .filter_map(|record| {
+            let record = record.trim_start_matches(['\n', '\r']);
+            let (sha, block) = record.split_once('\u{1f}')?;
+            let sha = sha.trim();
+            if sha.is_empty() {
+                return None;
+            }
+            Some((sha.to_string(), crate::zavet::parse_trailer_block(block)))
+        })
+        .collect()
+}
+
+/// Repo-relative paths added/modified/renamed-to by `sha` (deleted files
+/// excluded — the zavet layers never parse a deletion). `--root` covers the
+/// initial commit. One call serves every zavet path filter (see
+/// `crate::zavet::{is_decision_path, is_spec_path}`) — don't diff-tree twice.
+pub fn changed_paths(root: &Path, sha: &str) -> Vec<String> {
+    let Some(out) = git(
+        root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "--root",
+            sha,
+        ],
+    ) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| {
+            let (status, path) = line.split_once('\t')?;
+            // A(dded)/M(odified)/R(enamed; path is "old\tnew" — take the new).
+            let path = match status.chars().next()? {
+                'A' | 'M' => path,
+                'R' | 'C' => path.rsplit('\t').next()?,
+                _ => return None,
+            };
+            Some(path.to_string())
+        })
+        .collect()
+}
+
+/// Shas of commits after `since_sha` (exclusive) that touch any of
+/// `pathspecs` — zavet's spec-staleness primitive, computed at query time
+/// because no table stores per-commit paths. Globs go through git's own
+/// `:(glob)` magic so `**` behaves like the spec authored it. Best-effort:
+/// a git failure (unknown sha, unborn branch) yields an empty list.
+pub fn commits_touching_since(root: &Path, since_sha: &str, pathspecs: &[String]) -> Vec<String> {
+    if pathspecs.is_empty() {
+        return Vec::new();
+    }
+    let range = format!("{since_sha}..HEAD");
+    let mut args: Vec<String> = vec!["log".into(), "--format=%H".into(), range, "--".into()];
+    args.extend(pathspecs.iter().map(|p| format!(":(glob){p}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    git(root, &args)
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Recent-window activity for the knowledge repo-stats snapshot: distinct
+/// non-`.zavet/` paths touched inside the rolling window, plus the shas of the
+/// non-merge commits that touched at least one such path ("non-trivial").
+/// One `git log --name-only` pass; `.zavet/` files are knowledge, not code,
+/// so they count toward neither the coverage denominator nor triviality.
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeActivity {
+    pub paths: Vec<String>,
+    pub nontrivial_commits: Vec<String>,
+}
+
+pub fn knowledge_activity(root: &Path, window_days: u32) -> KnowledgeActivity {
+    let since = format!("--since={window_days}.days");
+    let out = match git(
+        root,
+        &[
+            "log",
+            "--no-merges",
+            &since,
+            "--format=%x01%H",
+            "--name-only",
+        ],
+    ) {
+        Some(out) => out,
+        None => return KnowledgeActivity::default(),
+    };
+    let mut paths: Vec<String> = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut commits: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    let mut current_counts = false;
+    for line in out.lines() {
+        if let Some(sha) = line.strip_prefix('\u{1}') {
+            if let (Some(sha), true) = (current.take(), current_counts) {
+                commits.push(sha);
+            }
+            current = Some(sha.to_string());
+            current_counts = false;
+            continue;
+        }
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(".zavet/") {
+            continue;
+        }
+        current_counts = true;
+        if seen_paths.insert(line.to_string()) {
+            paths.push(line.to_string());
+        }
+    }
+    if let (Some(sha), true) = (current, current_counts) {
+        commits.push(sha);
+    }
+    KnowledgeActivity {
+        paths,
+        nontrivial_commits: commits,
+    }
+}
+
+/// Distinct non-`.zavet/` paths touched inside the rolling window AND matching
+/// one of `pathspecs` (git `:(glob)` semantics — the same dialect the
+/// staleness query uses). The knowledge coverage numerator.
+pub fn paths_touched_since_days(
+    root: &Path,
+    window_days: u32,
+    pathspecs: &[String],
+) -> Vec<String> {
+    if pathspecs.is_empty() {
+        return Vec::new();
+    }
+    let since = format!("--since={window_days}.days");
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "--no-merges".into(),
+        since,
+        "--format=".into(),
+        "--name-only".into(),
+        "--".into(),
+    ];
+    args.extend(pathspecs.iter().map(|p| format!(":(glob){p}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out_paths = Vec::new();
+    if let Some(out) = git(root, &args) {
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(".zavet/") {
+                continue;
+            }
+            if seen.insert(line.to_string()) {
+                out_paths.push(line.to_string());
+            }
+        }
+    }
+    out_paths
+}
+
+/// The content of `path` as of `sha` (`git show sha:path`).
+pub fn show_blob(root: &Path, sha: &str, path: &str) -> Option<String> {
+    git(root, &["show", &format!("{sha}:{path}")])
+}
+
+/// The blob object id of `path` as of `sha` — zavet's `content_hash`.
+pub fn blob_oid(root: &Path, sha: &str, path: &str) -> Option<String> {
+    git(root, &["rev-parse", &format!("{sha}:{path}")])
+}
+
 /// A commit captured from `git log`, ready to record locally and ship as an
 /// [`dira_contract::ArtifactRef`]. Metadata only — no diff or file contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +351,7 @@ fn cumulative_change_id(root: &Path, range: &str) -> Option<String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let diff = Command::new("git")
+    let diff = git_command()
         .arg("-C")
         .arg(root)
         .args(["diff", "--no-color", range])
@@ -169,7 +361,7 @@ fn cumulative_change_id(root: &Path, range: &str) -> Option<String> {
         return None;
     }
 
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .arg("-C")
         .arg(root)
         .args(["patch-id", "--stable"])
@@ -196,7 +388,7 @@ fn cumulative_change_id(root: &Path, range: &str) -> Option<String> {
 /// Repo-relative paths changed across `<base>..<head>` (`git diff --name-only`).
 /// `None` on git failure; an empty (but successful) result is `Some(vec![])`.
 fn touched_paths(root: &Path, base: &str, head: &str) -> Option<Vec<String>> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(root)
         .args(["diff", "--name-only", "--no-color", base, head])
@@ -280,7 +472,7 @@ fn patch_id(root: &Path, sha: &str) -> Option<String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let diff = Command::new("git")
+    let diff = git_command()
         .arg("-C")
         .arg(root)
         .args(["diff-tree", "-p", "--no-color", "--root", sha])
@@ -290,7 +482,7 @@ fn patch_id(root: &Path, sha: &str) -> Option<String> {
         return None;
     }
 
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .arg("-C")
         .arg(root)
         .args(["patch-id", "--stable"])
@@ -373,14 +565,28 @@ fn extract_count(line: &str, noun: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Build a `git` [`Command`], platform-adjusted. Every git spawn in this module
+/// must go through here: `dirad` runs console-less on windows (spawned with
+/// `CREATE_NO_WINDOW`), and a console subprocess launched from a console-less
+/// parent without that same flag makes Windows allocate — and briefly flash — a
+/// brand-new console window. These spawns fire from the capture path on every
+/// idle-ticker sweep, so an unflagged spawn is a visible window strobe in the
+/// user's session.
+fn git_command() -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Run a git command in `dir`, returning trimmed stdout on success.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = git_command().arg("-C").arg(dir).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -405,10 +611,8 @@ pub fn canonicalize_remote(url: &str) -> Option<String> {
         rest.trim_start_matches("git@").to_string()
     } else if let Some(rest) = stripped.strip_prefix("https://") {
         rest.to_string()
-    } else if let Some(rest) = stripped.strip_prefix("http://") {
-        rest.to_string()
     } else {
-        return None;
+        stripped.strip_prefix("http://")?.to_string()
     };
 
     // Drop any userinfo and port, keep host/owner/repo, require at least 3 parts.
@@ -475,9 +679,9 @@ mod tests {
     fn parses_log_with_shortstat() {
         // Two commits; the first has a full shortstat, the second only insertions.
         // Header shape: sha / author-date / author-email / author-name / subject.
-        let out = "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@acme.com\u{1f}Dev One\u{1f}feat: add thing\n \
+        let out = "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@example.com\u{1f}Dev One\u{1f}feat: add thing\n \
                    2 files changed, 10 insertions(+), 3 deletions(-)\n\
-                   def456\u{1f}2026-06-27T09:00:00+00:00\u{1f}two@acme.com\u{1f}Dev Two\u{1f}fix: a tab\there\n \
+                   def456\u{1f}2026-06-27T09:00:00+00:00\u{1f}two@example.com\u{1f}Dev Two\u{1f}fix: a tab\there\n \
                    1 file changed, 1 insertion(+)\n";
         let commits = parse_git_log(out);
         assert_eq!(commits.len(), 2);
@@ -489,11 +693,11 @@ mod tests {
             commits[0].authored_at.as_deref(),
             Some("2026-06-27T10:00:00+00:00")
         );
-        assert_eq!(commits[0].author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(commits[0].author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(commits[0].author_name.as_deref(), Some("Dev One"));
         // Subject with an embedded tab survives (unit-separator framing).
         assert_eq!(commits[1].message, "fix: a tab\there");
-        assert_eq!(commits[1].author_email.as_deref(), Some("two@acme.com"));
+        assert_eq!(commits[1].author_email.as_deref(), Some("two@example.com"));
         assert_eq!(commits[1].author_name.as_deref(), Some("Dev Two"));
         assert_eq!(commits[1].additions, 1);
         assert_eq!(commits[1].deletions, 0);
@@ -503,10 +707,10 @@ mod tests {
     fn parses_commit_without_shortstat() {
         // An empty commit (no diff) has no shortstat line.
         let out =
-            "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@acme.com\u{1f}Dev One\u{1f}chore: empty\n";
+            "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@example.com\u{1f}Dev One\u{1f}chore: empty\n";
         let commits = parse_git_log(out);
         assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(commits[0].author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(commits[0].author_name.as_deref(), Some("Dev One"));
         assert_eq!(commits[0].additions, 0);
         assert_eq!(commits[0].deletions, 0);
@@ -517,10 +721,10 @@ mod tests {
         // A `\x1f` inside the subject must not shift earlier fields — subject is the
         // last `splitn(5)` field, so it absorbs the extra separator.
         let out =
-            "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@acme.com\u{1f}Dev One\u{1f}weird\u{1f}subject\n";
+            "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@example.com\u{1f}Dev One\u{1f}weird\u{1f}subject\n";
         let commits = parse_git_log(out);
         assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(commits[0].author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(commits[0].author_name.as_deref(), Some("Dev One"));
         assert_eq!(commits[0].message, "weird\u{1f}subject");
     }
@@ -539,20 +743,19 @@ mod tests {
 
     // --- Squash-resilient session signals -----------------------------------
 
-    use super::{session_signals, SessionSignals};
+    use super::{git_command, session_signals, SessionSignals};
     use std::path::Path;
-    use std::process::Command;
 
     /// Run a git command in `dir`, panicking on failure (test setup helper).
     fn run_git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
             .env("GIT_AUTHOR_NAME", "T")
-            .env("GIT_AUTHOR_EMAIL", "t@t.co")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "T")
-            .env("GIT_COMMITTER_EMAIL", "t@t.co")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
             .output()
             .expect("git runs");
         assert!(
@@ -564,7 +767,7 @@ mod tests {
 
     /// Capture trimmed stdout of a git command (test helper).
     fn out_git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -598,7 +801,7 @@ mod tests {
     fn init_repo_with_upstream(tag: &str) -> std::path::PathBuf {
         let root = temp_repo_dir(tag);
         run_git(&root, &["init", "-q", "-b", "main"]);
-        run_git(&root, &["config", "user.email", "t@t.co"]);
+        run_git(&root, &["config", "user.email", "t@example.com"]);
         run_git(&root, &["config", "user.name", "T"]);
         write(&root, "f1.txt", "a\n");
         run_git(&root, &["add", "."]);
@@ -667,13 +870,13 @@ mod tests {
         run_git(&root, &["merge", "--squash", "-q", "feat"]);
         run_git(&root, &["commit", "-q", "-m", "squashed"]);
         let squash_pid = {
-            let diff = Command::new("git")
+            let diff = git_command()
                 .arg("-C")
                 .arg(&root)
                 .args(["diff-tree", "-p", "--no-color", "--root", "HEAD"])
                 .output()
                 .unwrap();
-            let mut child = Command::new("git")
+            let mut child = git_command()
                 .arg("-C")
                 .arg(&root)
                 .args(["patch-id", "--stable"])
@@ -746,14 +949,14 @@ mod tests {
         let tip = out_git(&root, &["rev-parse", "HEAD"]);
         let parent = out_git(&root, &["rev-parse", "HEAD~1"]);
         run_git(&root, &["reset", "--hard", "-q", "origin/main"]);
-        let status = Command::new("git")
+        let status = git_command()
             .arg("-C")
             .arg(&root)
             .args(["cherry-pick", &parent, &tip])
             .env("GIT_AUTHOR_NAME", "T")
-            .env("GIT_AUTHOR_EMAIL", "t@t.co")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "T")
-            .env("GIT_COMMITTER_EMAIL", "t@t.co")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
             // A fixed timestamp far from "now" guarantees a different commit hash.
             .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00 +0000")
             .output()
@@ -783,7 +986,7 @@ mod tests {
         // all-None signals.
         let root = temp_repo_dir("noupstream");
         run_git(&root, &["init", "-q", "-b", "main"]);
-        run_git(&root, &["config", "user.email", "t@t.co"]);
+        run_git(&root, &["config", "user.email", "t@example.com"]);
         run_git(&root, &["config", "user.name", "T"]);
         write(&root, "f1.txt", "a\n");
         run_git(&root, &["add", "."]);

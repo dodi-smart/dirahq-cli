@@ -1,0 +1,19 @@
+[package]
+name = "dira-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Cross-platform IPC transport for dira <-> dirad: Unix domain sockets on unix, named pipes on windows."
+
+[dependencies]
+tokio.workspace = true
+
+# `ClientOptions::open`'s `ERROR_PIPE_BUSY` retry loop (see src/listener.rs) needs the
+# raw Win32 error code. `Win32_Foundation` only — no other Win32 surface is touched.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile.workspace = true

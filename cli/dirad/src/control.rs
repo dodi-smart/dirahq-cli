@@ -1,4 +1,6 @@
-//! The Unix domain socket control server: handles `dira` CLI commands.
+//! The control server: handles `dira` CLI commands over the platform IPC
+//! channel (a Unix domain socket on unix, a named pipe on windows — see
+//! `dira_ipc`).
 //!
 //! Unlike the HTTP hot path, these are human-initiated and may resolve git
 //! synchronously — millisecond latency is fine. Each connection carries exactly
@@ -6,16 +8,17 @@
 
 use crate::events::{handle_of, manual_event, materialize_interval};
 use crate::state::{AppState, EventMsg};
-use dira_core::accounting::{self, Signal};
+use dira_core::accounting;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::project;
-use dira_core::protocol::{ReportScope, Request, Response, SessionView, StatusView, StopSelector};
+use dira_core::protocol::{
+    BillingView, ComputeView, ReportScope, Request, Response, SessionView, StatusView,
+    StopSelector, SyncHealthView, WriterHealthView,
+};
 use dira_core::report;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use time::{Duration, OffsetDateTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use ulid::Ulid;
 
 /// Lock a mutex, recovering the guard even if it was poisoned.
@@ -36,40 +39,37 @@ pub fn lock_recover_map<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     lock_recover(m)
 }
 
-/// Read one framed JSON value (4-byte BE length prefix + payload).
-pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(buf)
-}
-
-/// Write one framed JSON value.
-pub async fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> std::io::Result<()> {
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await?;
-    stream.write_all(bytes).await?;
-    stream.flush().await
-}
-
 /// Serve a single CLI connection.
-pub async fn handle_conn(state: AppState, mut stream: UnixStream) {
-    let resp = match read_frame(&mut stream).await {
-        Ok(buf) => match serde_json::from_slice::<Request>(&buf) {
-            Ok(req) => dispatch(&state, req).await,
-            Err(e) => Response::Error {
-                message: format!("bad request: {e}"),
-            },
-        },
-        Err(e) => Response::Error {
-            message: format!("read error: {e}"),
-        },
+///
+/// `Request::Shutdown` gets one piece of special handling here (everything
+/// else is a plain dispatch-then-reply): the daemon's shutdown notify is
+/// fired *after* the response is written, not inside `dispatch` itself, so
+/// the CLI's `Ok` is durably queued on the wire before `run()`'s shutdown
+/// select can wake up and start tearing the process down. `dispatch` staying
+/// pure (compute a `Response`, no side channel to the transport) also keeps
+/// it trivially callable by tests without a real connection — see
+/// `tests/daemon_stability.rs`'s direct `dispatch(&state, Request::Status)`
+/// calls.
+pub async fn handle_conn(state: AppState, mut stream: dira_ipc::Stream) {
+    let parsed = match dira_ipc::read_frame(&mut stream).await {
+        Ok(buf) => serde_json::from_slice::<Request>(&buf).map_err(|e| format!("bad request: {e}")),
+        Err(e) => Err(format!("read error: {e}")),
+    };
+    let (resp, is_shutdown) = match parsed {
+        Ok(req) => {
+            let is_shutdown = matches!(req, Request::Shutdown);
+            (dispatch(&state, req).await, is_shutdown)
+        }
+        Err(message) => (Response::Error { message }, false),
     };
     let bytes = serde_json::to_vec(&resp).unwrap_or_default();
-    let _ = write_frame(&mut stream, &bytes).await;
+    let _ = dira_ipc::write_frame(&mut stream, &bytes).await;
+    if is_shutdown {
+        // See the field doc on `AppState::shutdown`: `notify_one` stores a
+        // permit even if `run()`'s select! hasn't started waiting yet, so
+        // this can never race a startup window and drop the request.
+        state.shutdown.notify_one();
+    }
 }
 
 /// Dispatch a single control request to its handler. Public so integration tests
@@ -83,20 +83,73 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             project,
             label,
             activity,
+            note,
             cwd,
-        } => start(state, project, label, activity, cwd).await,
+        } => start(state, project, label, activity, note, cwd).await,
         Request::Stop { selector } => stop(state, selector).await,
         Request::Log {
             duration_secs,
             project,
             note,
+            activity,
+            label,
             cwd,
-        } => log(state, duration_secs, project, note, cwd).await,
+        } => log(state, duration_secs, project, note, activity, label, cwd).await,
         Request::Report { scope } => report_cmd(state, scope).await,
         Request::IngestHook { harness, payload } => ingest_hook(state, harness, payload).await,
         Request::Nuke => nuke(state).await,
         Request::DaemonInfo => daemon_info(state),
+        Request::ResyncCursor { from } => resync_cursor(state, from).await,
+        Request::IngestZavet { payload } => crate::zavet::ingest(state, payload).await,
+        Request::ZavetStatus { cwd, repo } => crate::zavet::status(state, cwd, repo).await,
+        Request::ZavetWhy { query, cwd, repo } => crate::zavet::why(state, query, cwd, repo).await,
+        Request::ZavetWiki { topic, cwd, repo } => {
+            crate::zavet::wiki(state, topic, cwd, repo).await
+        }
+        Request::ZavetDecisions { cwd, repo } => crate::zavet::decisions(state, cwd, repo).await,
+        Request::ZavetSetMode { cwd, repo, mode } => {
+            crate::zavet::set_mode(state, cwd, repo, mode).await
+        }
+        // The actual `state.shutdown.notify_one()` happens in `handle_conn`,
+        // AFTER this `Ok` is written to the client — see its doc comment for
+        // why the ordering matters and `dispatch` doesn't touch `shutdown`
+        // itself.
+        Request::Shutdown => Response::Ok,
     }
+}
+
+/// Rewind the sync cursor and trigger a flush so the daemon re-sends events to the
+/// cloud (`dira device resync`). `from = None` rewinds to the beginning (full
+/// re-send); `Some(id)` to that event id. Safe — the cloud dedups attestations by
+/// id and intervals by content, so a re-send never double-counts.
+async fn resync_cursor(state: &AppState, from: Option<String>) -> Response {
+    use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR};
+    let new_cursor = from.clone().unwrap_or_default();
+    if let Err(e) = state.store.meta_set(META_SYNC_CURSOR, &new_cursor).await {
+        return Response::Error {
+            message: format!("resync failed (set cursor): {e}"),
+        };
+    }
+    // A full rewind also re-sends artifacts (they ride their own rowid cursor).
+    if from.is_none() {
+        if let Err(e) = state.store.meta_set(META_ARTIFACTS_CURSOR, "").await {
+            return Response::Error {
+                message: format!("resync failed (reset artifacts cursor): {e}"),
+            };
+        }
+    }
+    let cursor_ref = Some(new_cursor.as_str()).filter(|s| !s.is_empty());
+    let pending = state
+        .store
+        .count_events_after(cursor_ref)
+        .await
+        .unwrap_or(0);
+    // Nudge the sync task to drain now rather than waiting for the backstop.
+    let _ = state.sync.trigger.try_send(());
+    // A manual resync is user-initiated activity — wake the heartbeat too (WP-A3).
+    state.presence_wake.notify_waiters();
+    tracing::info!(pending, from = ?from, "resync: cursor rewound, flush triggered");
+    Response::ResyncQueued { pending, from }
 }
 
 /// Build + runtime info for the running daemon (`dira version`). The version is
@@ -108,6 +161,7 @@ fn daemon_info(state: &AppState) -> Response {
         schema_version: dira_contract::SCHEMA_VERSION.to_string(),
         pid: std::process::id(),
         uptime_seconds: state.started_at.elapsed().as_secs(),
+        http_ingress_error: state.http_ingress_error.lock().unwrap().clone(),
     }
 }
 
@@ -175,6 +229,7 @@ async fn start(
     project: Option<String>,
     label: Option<String>,
     activity: Option<String>,
+    note: Option<String>,
     cwd: Option<String>,
 ) -> Response {
     let (project, identity) = resolve(project, cwd.clone());
@@ -193,6 +248,7 @@ async fn start(
         identity,
         label,
         activity,
+        note,
     );
     if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_err() {
         return Response::Error {
@@ -258,6 +314,8 @@ async fn stop(state: &AppState, selector: StopSelector) -> Response {
             identity,
             label,
             None,
+            // Note rides the ManualStart event; build_sessions takes first non-null.
+            None,
         );
         if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_ok() {
             count += 1;
@@ -266,11 +324,14 @@ async fn stop(state: &AppState, selector: StopSelector) -> Response {
     Response::Stopped { count }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log(
     state: &AppState,
     duration_secs: u64,
     project: Option<String>,
     note: Option<String>,
+    activity: Option<String>,
+    label: Option<String>,
     cwd: Option<String>,
 ) -> Response {
     let (project, identity) = resolve(project, cwd);
@@ -278,7 +339,16 @@ async fn log(
     let start = end - Duration::seconds(duration_secs as i64);
     let session_id = Ulid::new().to_string();
     let handle = handle_of(&session_id);
-    let events = materialize_interval(&session_id, start, end, project, identity, note, None);
+    let events = materialize_interval(
+        &session_id,
+        start,
+        end,
+        project,
+        identity,
+        label,
+        activity,
+        note,
+    );
     for ev in events {
         if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_err() {
             return Response::Error {
@@ -311,12 +381,76 @@ async fn status(state: &AppState) -> Response {
         .count_events_after(cursor.as_deref())
         .await
         .unwrap_or(0);
-    Response::Status(StatusView {
+    // Today's compute totals for the summary row. Best-effort: a read failure
+    // (or an all-zero day) renders as "no compute row", never a failed status.
+    let tokens = state
+        .store
+        .token_totals_since(Some(since))
+        .await
+        .ok()
+        .map(|t| ComputeView {
+            total_tokens: t.input + t.output + t.cache_read + t.cache_create,
+            est_cost_usd: t.est_cost_usd,
+        });
+    // Last-known cloud billing summary (fetched + hydrated by the billing task).
+    let billing = state
+        .billing
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .map(|c| BillingView {
+            billable_hours: c.summary.billable_hours,
+            unbilled_amount: c.summary.unbilled_amount,
+            currency: c.summary.currency,
+            period: c.summary.period,
+            fetched_at: c.fetched_at,
+        });
+    // Writer self-report (WP-B7): panics caught + dropped, watchdog stalls, and
+    // whether it looks wedged right now, using the same definition the
+    // supervisor's watchdog uses (`supervisor::writer_wedged`).
+    let writer_health = Some(WriterHealthView {
+        panics: state.progress.writer_panics(),
+        stalls: state.progress.writer_stalls(),
+        idle_secs: state.progress.writer_idle_secs(),
+        wedged: crate::supervisor::writer_wedged(state),
+    });
+    // Sync self-report (WP-B9): the persisted per-flush snapshot `sync.rs`
+    // writes after every attempt, plus the process-wide flush counters —
+    // mirrors the writer-health pattern above. Always `Some` (unlike
+    // `billing`), same as `writer_health`: a fresh daemon that has never
+    // flushed still reports a well-defined all-zero/all-`None` snapshot.
+    let sync_health = {
+        let persisted = state
+            .store
+            .meta_get(dira_core::sync::META_SYNC_HEALTH)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|j| dira_core::sync::parse_sync_health(&j))
+            .unwrap_or_default();
+        Some(SyncHealthView {
+            last_attempt_at: persisted.last_attempt_at,
+            last_success_at: persisted.last_success_at,
+            last_error_kind: persisted.last_error_kind,
+            consecutive_failures: persisted.consecutive_failures,
+            backoff_secs: persisted.backoff_secs,
+            cursor: persisted.cursor,
+            cloud_watermark: persisted.cloud_watermark,
+            flush_attempts: state.progress.flush_attempts(),
+            flush_successes: state.progress.flush_successes(),
+            flush_failures: state.progress.flush_failures(),
+        })
+    };
+    Response::Status(Box::new(StatusView {
         active,
         today,
         sync_pending,
         hydrating: !state.hydrated.load(std::sync::atomic::Ordering::Relaxed),
-    })
+        tokens,
+        billing,
+        writer_health,
+        sync_health,
+    }))
 }
 
 async fn sessions(state: &AppState) -> Response {
@@ -383,9 +517,31 @@ fn build_session_views(
     let now = OffsetDateTime::now_utc();
     let idle = state.config.idle();
 
+    // De-duplicated human time attributed **per session** by the opening-signal
+    // policy — the exact global attribution `report::build` uses per project. The
+    // old path recomputed each session's human time from only *its own* signals, so
+    // a session holding fewer than two prompts within the idle window read 0; in
+    // parallel supervision (one prompt per session, then move on) that meant an
+    // "engaged" session routinely showed HUMAN 0s. Attributing across the merged
+    // timeline reconciles the per-session column to the TODAY total instead.
+    let human_signals: Vec<(OffsetDateTime, String)> = events
+        .iter()
+        .filter(|e| e.kind.is_human_signal())
+        .map(|e| (e.at, e.session_id.clone()))
+        .collect();
+    let human_by_session = accounting::per_key_seconds(&human_signals, idle);
+
     live.into_iter()
         .map(|s| {
-            let (human, agent) = session_seconds(events, &s.session_id, idle);
+            let human = human_by_session.get(&s.session_id).copied().unwrap_or(0);
+            let agent = session_agent_seconds(events, &s.session_id, idle);
+            // Two independent notions of "recent": `idle` tracks the last *human*
+            // signal (are you driving it?), `agent_active` tracks the last event of
+            // any kind (is its agent working?). The activity basis mirrors the
+            // presence heartbeat's "Right Now" idle, so a busy agent reads `active`
+            // rather than `idle` even when you last prompted it long ago.
+            let human_idle = s.is_idle(now, idle);
+            let agent_active = human_idle && (now - s.last_event_at) <= idle;
             SessionView {
                 handle: s.handle(),
                 session_id: s.session_id.clone(),
@@ -393,13 +549,16 @@ fn build_session_views(
                 kind: format!("{:?}", s.kind),
                 project: s.project.clone(),
                 label: s.label.clone(),
+                activity: s.activity.clone(),
+                note: s.note.clone(),
                 started_at: s
                     .started_at
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default(),
                 human_seconds: human,
                 agent_seconds: agent,
-                idle: s.is_idle(now, idle),
+                idle: human_idle,
+                agent_active,
                 // Live tails for the `watch` dashboard: it grows the timers by
                 // `now - these` (clamped to idle) between polls.
                 last_activity_at: Some(fmt_ts(s.last_active_at.unwrap_or(s.last_event_at))),
@@ -416,52 +575,49 @@ fn fmt_ts(t: OffsetDateTime) -> String {
         .unwrap_or_default()
 }
 
-/// Per-session (non-deduped) human + agent seconds, for display only. The
-/// authoritative de-duplicated totals live in the report.
-fn session_seconds(events: &[RawEvent], session_id: &str, idle: Duration) -> (i64, i64) {
-    let mut signals = Vec::new();
-    let mut first = None;
-    let mut last = None;
+/// Per-session agent wall-clock seconds for display: the idle-trimmed active span
+/// over the session's own event timestamps ([`accounting::active_seconds`]) when it
+/// has any agent activity, else 0 — the same measure [`report::build`], the
+/// sync/rollup path, and the cloud use, so a session left open for hours between
+/// bursts of work reads as time actually worked, not its raw lifetime. Human time is
+/// deliberately *not* computed here: it is a global, de-duplicated measure
+/// attributed across all sessions (see [`accounting::per_key_seconds`] in
+/// [`build_session_views`]), which a single session viewed in isolation cannot
+/// reproduce.
+pub(crate) fn session_agent_seconds(events: &[RawEvent], session_id: &str, idle: Duration) -> i64 {
+    let mut times = Vec::new();
     let mut had_activity = false;
     for e in events.iter().filter(|e| e.session_id == session_id) {
-        first.get_or_insert(e.at);
-        last = Some(e.at);
-        if e.kind.is_human_signal() {
-            signals.push(Signal {
-                at: e.at,
-                project: e.project.clone(),
-            });
-        }
+        times.push(e.at);
         if e.kind.is_agent_activity() {
             had_activity = true;
         }
     }
-    let human = accounting::total_human_seconds(&signals, idle);
-    let agent = match (first, last, had_activity) {
-        (Some(f), Some(l), true) => (l - f).whole_seconds(),
-        _ => 0,
-    };
-    (human, agent)
+    if had_activity {
+        accounting::active_seconds(&times, idle)
+    } else {
+        0
+    }
 }
 
 /// The start of "today" for report windows, as a UTC instant.
 ///
 /// By default this is UTC midnight (`config.report_local_day == false`), which
-/// preserves the original Phase 1 behavior. When `report_local_day` is enabled
-/// the boundary is computed in the system local timezone via
-/// [`dira_core::config::start_of_day`]. Resolving the local offset can fail in a
-/// multithreaded process (`UtcOffset::current_local_offset` returns an error when
-/// it can't prove soundness); on failure we log at debug and fall back to UTC so
-/// reporting never breaks.
+/// preserves the original Phase 1 behavior. When `report_local_day` is enabled the
+/// boundary is computed in the system local timezone via
+/// [`dira_core::config::start_of_day`], using the offset captured at daemon startup
+/// ([`crate::local_offset`]) — resolving it per-request would fail in the
+/// multithreaded runtime. If no offset was captured we fall back to UTC so reporting
+/// never breaks.
 fn start_of_today(state: &AppState) -> OffsetDateTime {
     let now = OffsetDateTime::now_utc();
     if !state.config.report_local_day {
         return now.replace_time(time::Time::MIDNIGHT);
     }
-    match time::UtcOffset::current_local_offset() {
-        Ok(offset) => dira_core::config::start_of_day(now, offset),
-        Err(e) => {
-            tracing::debug!(error = %e, "local offset unavailable; using UTC day boundary");
+    match crate::local_offset() {
+        Some(offset) => dira_core::config::start_of_day(now, offset),
+        None => {
+            tracing::debug!("local offset unavailable; using UTC day boundary");
             now.replace_time(time::Time::MIDNIGHT)
         }
     }

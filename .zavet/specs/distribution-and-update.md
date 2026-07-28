@@ -12,7 +12,7 @@ paths:
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0002, D-0003, D-0004, D-0005, D-0006, D-0007, D-0008, D-0009, D-0010, D-0011]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014]
 ---
 
 ## Overview
@@ -45,7 +45,10 @@ both executables and restarts whatever is supervising the daemon.
   grep/sed and constructs asset URLs — no `jq`. Authenticated (a token in the
   environment) resolves asset ids via `jq` and fetches with
   `Accept: application/octet-stream`, because `browser_download_url` is not
-  bearer-fetchable on a private repo. Only maintainers and CI take that path.
+  bearer-fetchable on a private repo. Now that the repo is public the
+  unauthenticated path is the one real users take; a token is worth setting
+  only to lift GitHub's 60 req/hr per-IP anonymous rate limit, which is the
+  failure the installer's error text points at.
 - `dira update` resolves → downloads → verifies → swaps → restarts, then
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
@@ -127,8 +130,13 @@ both executables and restarts whatever is supervising the daemon.
 - The gnu Linux targets are dropped rather than deprecated over a release or
   two. If a musl-specific problem surfaces (DNS resolution differences, the
   allocator under sustained load) there is no published fallback artifact.
-- Windows arm64 ships untested (GitHub's `windows-11-arm` runner label fails
-  on private repos — TODO(public) in build-release.yml), the exes are
-  unsigned (Authenticode is a pre-public-launch follow-up; unsigned
-  logon-task daemons are prime AV false-positive material), and the schtasks
-  ONLOGON + HKCU-fallback path needs validation on a real Windows machine.
+- Windows arm64 now builds and smokes natively on `windows-11-arm` (D-0014),
+  closing the "ships untested" gap; the exes are still unsigned (Authenticode
+  remains a follow-up — unsigned logon-task daemons are prime AV
+  false-positive material), and the schtasks ONLOGON + HKCU-fallback path
+  still needs validation on a real Windows machine.
+- The Windows binaries link the MSVC CRT dynamically, so they require the VC++
+  Redistributable on the target host — see #60. Every GitHub Windows runner
+  image ships it, so CI cannot catch this; it only bites clean user machines.
+  This is the one place the distribution story diverges from the
+  self-contained posture D-0002 and D-0011 set for the other targets.

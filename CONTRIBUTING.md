@@ -51,17 +51,19 @@ release-triggering, cuts a `v<version>` tag, a GitHub Release, and a `CHANGELOG.
 a prerelease (`…-develop.N`) on `develop`, a clean `x.y.z` on `main`.
 
 `.github/workflows/build-release.yml` reacts once that Release workflow finishes and builds
-the actual binaries: three matrix legs (`x86_64-unknown-linux-musl`,
-`aarch64-unknown-linux-musl`, `universal-apple-darwin` — a `lipo` fat binary covering both
-Apple Silicon and Intel), each producing `dira-<version>-<target>.tar.gz` + a matching
-`.sha256`, plus an aggregate `checksums.txt` and `install.sh` attached to the release.
+the actual binaries across five matrix legs: `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`, `universal-apple-darwin` (a `lipo` fat binary covering both
+Apple Silicon and Intel), `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc` (native
+on `windows-11-arm`, D-0014). Each produces `dira-<version>-<target>` plus a matching
+`.sha256` — `.tar.gz` on unix, **`.zip` on Windows** — with an aggregate `checksums.txt`,
+both installers, and the contract artifacts attached to the release. Seven smoke legs then
+install each artifact for real and exercise the daemon lifecycle.
 
-**Prereleases are dispatch-only while the repo is private.** A `develop` merge tags a
-prerelease, but the build workflow's `resolve` job skips it automatically — burning
-self-hosted runner minutes on every `develop` merge isn't worth it before the repo is
-public — *except* on a manual `workflow_dispatch`, which always proceeds. That skip is
-marked `# TODO(public):` in `build-release.yml`; remove it once the repo goes public and
-prerelease builds become free again.
+**Prereleases build automatically** (D-0013). A `develop` merge tags a prerelease and the
+build workflow packages it exactly like a stable tag, so `--channel prerelease` is a real
+dogfooding path. This used to be dispatch-only to avoid billed runner minutes on a private
+repo; the repo is public, GitHub-hosted minutes are free, and only the
+`x86_64-unknown-linux-musl` leg can land on the self-hosted pool at all.
 
 ### Dry-running a build
 
@@ -72,8 +74,8 @@ Exercise the whole pipeline (build + package, no uploads — no release assets, 
 gh workflow run build-release.yml -f tag=v0.1.0-develop.10 -f dry_run=true
 ```
 
-Drop `dry_run` to actually publish artifacts for that tag — the only way to produce a
-downloadable prerelease build while the repo is private:
+Drop `dry_run` to actually publish artifacts for that tag. Prereleases now build on their
+own, so this is a backfill for a tag that predates that change or whose build failed:
 
 ```sh
 gh workflow run build-release.yml -f tag=v0.1.0-develop.10

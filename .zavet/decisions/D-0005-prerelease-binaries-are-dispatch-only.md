@@ -1,7 +1,8 @@
 ---
 id: D-0005
 title: Prerelease binaries build on manual dispatch only, while the repo is private
-status: active
+status: superseded
+superseded-by: D-0013
 guards:
   - .github/workflows/build-release.yml
 origin: recorded

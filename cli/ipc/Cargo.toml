@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 description = "Cross-platform IPC transport for dira <-> dirad: Unix domain sockets on unix, named pipes on windows."
 
 [dependencies]

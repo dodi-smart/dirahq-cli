@@ -63,7 +63,7 @@ universal macOS binary and the statically-linked musl binaries make both unneces
 | `DIRA_REPO` | GitHub repo to install from | `dodi-smart/dirahq-cli` |
 | `DIRA_API_URL` | GitHub API base URL | `https://api.github.com` |
 | `DIRA_DOWNLOAD_URL` | Override the release-asset base URL (air-gapped / local installs, also accepts `file://`) | unset — derived from `DIRA_REPO` + the resolved tag |
-| `GITHUB_TOKEN` / `GH_TOKEN` | Bearer token for the authenticated-asset path (needed while the repo is private); `GH_TOKEN` wins if both are set | unset — unauthenticated public path |
+| `GITHUB_TOKEN` / `GH_TOKEN` | Bearer token for the authenticated-asset path — raises GitHub's 60/hr-per-IP anonymous rate limit; `GH_TOKEN` wins if both are set | unset — unauthenticated public path |
 | `DIRA_START_DAEMON` | Same as `--daemon` (set to `1`) | `0` |
 | `DIRA_INSTALL_SERVICE` | Same as `--service` (set to `1`) | `0` |
 | `DIRA_ALLOW_ROOT` | Silence the "running as root" warning (set to `1`) | `0` |

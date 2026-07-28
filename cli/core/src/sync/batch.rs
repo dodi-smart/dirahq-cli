@@ -877,7 +877,7 @@ mod tests {
             kind,
             cwd: None,
             project: Some(project.to_string()),
-            identity_email: Some("dev@acme.com".to_string()),
+            identity_email: Some("dev@example.com".to_string()),
             branch: None,
             tool: None,
             label: None,
@@ -980,7 +980,7 @@ mod tests {
         assert_eq!(batch.intervals[0].ended_at, batch.intervals[1].started_at);
         assert_eq!(batch.intervals[0].source_session, "s1");
         assert_eq!(batch.intervals[0].repo_canonical.as_deref(), Some("p"));
-        assert_eq!(batch.intervals[0].identity_email, "dev@acme.com");
+        assert_eq!(batch.intervals[0].identity_email, "dev@example.com");
         // Total still equals the deduped accounting truth.
         let total: u64 = batch.intervals.iter().map(|i| i.human_seconds).sum();
         assert_eq!(total, 60);
@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(s.session_id, "s1");
         assert_eq!(s.agent_wall_seconds, 20); // span 0..20 with activity
         assert!(s.ended_at.is_some());
-        assert_eq!(s.identity_email, "dev@acme.com");
+        assert_eq!(s.identity_email, "dev@example.com");
     }
 
     #[test]
@@ -1262,7 +1262,7 @@ mod tests {
             git_ref: Some("main".into()),
             kind: "commit".into(),
             authored_at: Some("2026-06-27T10:00:00Z".into()),
-            author_email: Some("dev@acme.com".into()),
+            author_email: Some("dev@example.com".into()),
             author_name: Some("Dev One".into()),
             source_session: Some("sess-1".into()),
             patch_id: Some("pid-1".into()),
@@ -1284,7 +1284,7 @@ mod tests {
         assert_eq!(a.kind, dira_contract::ArtifactKind::Commit);
         // New anchoring fields propagate to the wire ref.
         assert_eq!(a.authored_at.as_deref(), Some("2026-06-27T10:00:00Z"));
-        assert_eq!(a.author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(a.author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(a.source_session.as_deref(), Some("sess-1"));
         assert_eq!(a.patch_id.as_deref(), Some("pid-1"));
         // Squash-resilient session signals propagate too.
@@ -1367,7 +1367,7 @@ mod tests {
             harness: Harness::ClaudeCode,
             kind: SessionKind::Agent,
             repo_canonical: Some("p".into()),
-            identity_email: Some("dev@acme.com".into()),
+            identity_email: Some("dev@example.com".into()),
             started_at: OffsetDateTime::UNIX_EPOCH,
             active_seconds: 4242,
             prompts: Some(7),
@@ -1388,7 +1388,7 @@ mod tests {
         );
         assert_eq!(s.prompts, Some(7));
         assert_eq!(s.branch.as_deref(), Some("feat/x"));
-        assert_eq!(s.identity_email, "dev@acme.com");
+        assert_eq!(s.identity_email, "dev@example.com");
     }
 
     #[test]
@@ -1405,7 +1405,7 @@ mod tests {
             harness: Harness::ClaudeCode,
             kind: SessionKind::Agent,
             repo_canonical: Some("p".into()),
-            identity_email: Some("dev@acme.com".into()),
+            identity_email: Some("dev@example.com".into()),
             started_at: OffsetDateTime::UNIX_EPOCH,
             active_seconds: 999,
             prompts: None,
@@ -1433,7 +1433,7 @@ mod tests {
             harness: Harness::ClaudeCode,
             kind: SessionKind::Agent,
             repo_canonical: Some("p".into()),
-            identity_email: Some("dev@acme.com".into()),
+            identity_email: Some("dev@example.com".into()),
             started_at: OffsetDateTime::UNIX_EPOCH,
             active_seconds: 0,
             prompts: None,

@@ -679,9 +679,9 @@ mod tests {
     fn parses_log_with_shortstat() {
         // Two commits; the first has a full shortstat, the second only insertions.
         // Header shape: sha / author-date / author-email / author-name / subject.
-        let out = "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@acme.com\u{1f}Dev One\u{1f}feat: add thing\n \
+        let out = "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@example.com\u{1f}Dev One\u{1f}feat: add thing\n \
                    2 files changed, 10 insertions(+), 3 deletions(-)\n\
-                   def456\u{1f}2026-06-27T09:00:00+00:00\u{1f}two@acme.com\u{1f}Dev Two\u{1f}fix: a tab\there\n \
+                   def456\u{1f}2026-06-27T09:00:00+00:00\u{1f}two@example.com\u{1f}Dev Two\u{1f}fix: a tab\there\n \
                    1 file changed, 1 insertion(+)\n";
         let commits = parse_git_log(out);
         assert_eq!(commits.len(), 2);
@@ -693,11 +693,11 @@ mod tests {
             commits[0].authored_at.as_deref(),
             Some("2026-06-27T10:00:00+00:00")
         );
-        assert_eq!(commits[0].author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(commits[0].author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(commits[0].author_name.as_deref(), Some("Dev One"));
         // Subject with an embedded tab survives (unit-separator framing).
         assert_eq!(commits[1].message, "fix: a tab\there");
-        assert_eq!(commits[1].author_email.as_deref(), Some("two@acme.com"));
+        assert_eq!(commits[1].author_email.as_deref(), Some("two@example.com"));
         assert_eq!(commits[1].author_name.as_deref(), Some("Dev Two"));
         assert_eq!(commits[1].additions, 1);
         assert_eq!(commits[1].deletions, 0);
@@ -707,10 +707,10 @@ mod tests {
     fn parses_commit_without_shortstat() {
         // An empty commit (no diff) has no shortstat line.
         let out =
-            "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@acme.com\u{1f}Dev One\u{1f}chore: empty\n";
+            "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@example.com\u{1f}Dev One\u{1f}chore: empty\n";
         let commits = parse_git_log(out);
         assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(commits[0].author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(commits[0].author_name.as_deref(), Some("Dev One"));
         assert_eq!(commits[0].additions, 0);
         assert_eq!(commits[0].deletions, 0);
@@ -721,10 +721,10 @@ mod tests {
         // A `\x1f` inside the subject must not shift earlier fields — subject is the
         // last `splitn(5)` field, so it absorbs the extra separator.
         let out =
-            "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@acme.com\u{1f}Dev One\u{1f}weird\u{1f}subject\n";
+            "abc123\u{1f}2026-06-27T10:00:00+00:00\u{1f}dev@example.com\u{1f}Dev One\u{1f}weird\u{1f}subject\n";
         let commits = parse_git_log(out);
         assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(commits[0].author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(commits[0].author_name.as_deref(), Some("Dev One"));
         assert_eq!(commits[0].message, "weird\u{1f}subject");
     }
@@ -753,9 +753,9 @@ mod tests {
             .arg(dir)
             .args(args)
             .env("GIT_AUTHOR_NAME", "T")
-            .env("GIT_AUTHOR_EMAIL", "t@t.co")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "T")
-            .env("GIT_COMMITTER_EMAIL", "t@t.co")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
             .output()
             .expect("git runs");
         assert!(
@@ -801,7 +801,7 @@ mod tests {
     fn init_repo_with_upstream(tag: &str) -> std::path::PathBuf {
         let root = temp_repo_dir(tag);
         run_git(&root, &["init", "-q", "-b", "main"]);
-        run_git(&root, &["config", "user.email", "t@t.co"]);
+        run_git(&root, &["config", "user.email", "t@example.com"]);
         run_git(&root, &["config", "user.name", "T"]);
         write(&root, "f1.txt", "a\n");
         run_git(&root, &["add", "."]);
@@ -954,9 +954,9 @@ mod tests {
             .arg(&root)
             .args(["cherry-pick", &parent, &tip])
             .env("GIT_AUTHOR_NAME", "T")
-            .env("GIT_AUTHOR_EMAIL", "t@t.co")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "T")
-            .env("GIT_COMMITTER_EMAIL", "t@t.co")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
             // A fixed timestamp far from "now" guarantees a different commit hash.
             .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00 +0000")
             .output()
@@ -986,7 +986,7 @@ mod tests {
         // all-None signals.
         let root = temp_repo_dir("noupstream");
         run_git(&root, &["init", "-q", "-b", "main"]);
-        run_git(&root, &["config", "user.email", "t@t.co"]);
+        run_git(&root, &["config", "user.email", "t@example.com"]);
         run_git(&root, &["config", "user.name", "T"]);
         write(&root, "f1.txt", "a\n");
         run_git(&root, &["add", "."]);

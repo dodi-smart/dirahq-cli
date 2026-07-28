@@ -2073,7 +2073,7 @@ mod tests {
             kind,
             cwd: None,
             project: Some("github.com/acme/api".to_string()),
-            identity_email: Some("dev@acme.com".to_string()),
+            identity_email: Some("dev@example.com".to_string()),
             branch: None,
             tool: None,
             label: None,
@@ -2110,7 +2110,7 @@ mod tests {
             kind,
             cwd: None,
             project: Some("p".to_string()),
-            identity_email: Some("d@e.com".to_string()),
+            identity_email: Some("d@example.com".to_string()),
             branch: None,
             tool: None,
             label: None,
@@ -2179,7 +2179,7 @@ mod tests {
             kind: EventKind::UserPrompt,
             cwd: None,
             project: Some("p".to_string()),
-            identity_email: Some("d@e.com".to_string()),
+            identity_email: Some("d@example.com".to_string()),
             branch: None,
             tool: None,
             label: None,
@@ -2288,7 +2288,7 @@ mod tests {
         let c1 = CapturedCommit {
             sha: "aaa".into(),
             authored_at: Some("2026-06-27T10:00:00Z".into()),
-            author_email: Some("dev@acme.com".into()),
+            author_email: Some("dev@example.com".into()),
             author_name: Some("Dev One".into()),
             message: "feat: one".into(),
             additions: 5,
@@ -2341,7 +2341,7 @@ mod tests {
         assert_eq!(rows[0].kind, "commit");
         // Author + observed session round-trip through the artifacts table.
         assert_eq!(rows[0].authored_at.as_deref(), Some("2026-06-27T10:00:00Z"));
-        assert_eq!(rows[0].author_email.as_deref(), Some("dev@acme.com"));
+        assert_eq!(rows[0].author_email.as_deref(), Some("dev@example.com"));
         assert_eq!(rows[0].author_name.as_deref(), Some("Dev One"));
         assert_eq!(rows[0].source_session.as_deref(), Some("sess-1"));
         // Squash-resilient signals round-trip through the JSON columns.

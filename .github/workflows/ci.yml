@@ -62,58 +62,49 @@ jobs:
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
           Invoke-ScriptAnalyzer -Path install.ps1 -Severity Warning -EnableExit
 
-  # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
-  # to `ubuntu-latest` when none are available. Downstream jobs read the chosen
-  # label set from `outputs.runner` via `fromJson()`.
-  check-runners:
-    name: Pick runner
+  # Dependency license gate. Renovate auto-merges minor/patch bumps, so without
+  # this a transitive copyleft dep can reach a release build with nobody reading
+  # a diff. Policy + per-crate carve-outs live in deny.toml. Licenses only —
+  # advisories are deliberately not gated on the PR path (see deny.toml).
+  licenses:
+    name: Dependency licenses
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     if: github.event.pull_request.draft == false
-    outputs:
-      runner: ${{ steps.set-runner.outputs.use-runner }}
     steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v3
+      - uses: actions/checkout@v7
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
+          tool: cargo-deny
+      - name: cargo deny check licenses
+        run: cargo deny check licenses
 
-      - name: Check runner availability
-        id: set-runner
-        uses: dodi-smart/runner-fallback-action@v2
-        with:
-          organization: ${{ github.repository_owner }}
-          primary-runner: "self-hosted,build"
-          fallback-runner: "ubuntu-latest"
-          github-token: ${{ steps.app-token.outputs.token }}
-          fallback-on-error: true
-
+  # GitHub-hosted, never self-hosted. This job builds and runs a contributor's
+  # code (`cargo test`, `build.rs`, proc-macro expansion) straight off a
+  # `pull_request` trigger, so on a public repo it is arbitrary code execution
+  # by anyone who can get a PR approved. The org's `self-hosted,build` pool is
+  # persistent and lives inside our network — one poisoned PR there buys
+  # lateral access and a foothold that survives into later legitimate runs.
+  # Ephemeral GitHub-hosted runners bound that blast radius to a throwaway VM.
+  # `build-release.yml` still uses the self-hosted pool: it triggers only on
+  # `workflow_run`/`workflow_dispatch`, which a fork PR cannot reach.
   rust:
     name: Rust (capture layer)
-    needs: [check-runners]
-    runs-on: ${{ fromJson(needs.check-runners.outputs.runner) }}
+    runs-on: ubuntu-latest
     if: github.event.pull_request.draft == false
     env:
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v7
-      # Set up the Rust toolchain directly instead of via mise. The self-hosted
-      # `build` runners don't ship rustup, so mise's `rust = "stable"` silently
-      # no-ops there and `cargo` ends up missing (`cargo: command not found`).
-      # Install rustup when absent, then pin stable with the components fmt/clippy need.
+      # Set up the Rust toolchain directly instead of via mise — mise's
+      # `rust = "stable"` is a silent no-op on runners without rustup. The
+      # GitHub-hosted images ship rustup, so this just pins stable and adds
+      # the components fmt/clippy need.
       - name: Set up Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --profile minimal --default-toolchain stable
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-            export PATH="$HOME/.cargo/bin:$PATH"
-          fi
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add rustfmt clippy
@@ -137,9 +128,8 @@ jobs:
 
   # Windows build/test lane (native, not WSL): validates the named-pipe IPC transport
   # (`cli/ipc`) and everything else in the workspace on the actual target platform.
-  # Independent of `rust` above (GitHub-hosted `windows-latest`, not the self-hosted
-  # `build` pool) — fmt/contract-schema stay Linux-only intentionally (see module doc),
-  # so this job only runs clippy + tests.
+  # Independent of `rust` above — fmt/contract-schema stay Linux-only intentionally
+  # (see module doc), so this job only runs clippy + tests.
   rust-windows:
     name: Rust (windows)
     runs-on: windows-latest

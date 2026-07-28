@@ -23,17 +23,22 @@ round-trip silently breaks billing proofs, and a leaked or mishandled key forges
   the serialized form on only one side. The cross-language sign→verify vector
   (`cli/core` `sign_vector` bin → `cloud/scripts/verify-vector.ts`) is the contract — if a
   change could shift bytes, it must still pass.
-- **Ed25519 usage.** `ed25519-dalek` (Rust) and `@noble/curves` (TS). Check that verify is
-  actually wired (a known TODO left it stubbed to `true` — flag any path that trusts an
-  unverified signature), that public keys are bound to the right device, and that domain
-  separation / message framing can't be confused across event types.
+- **Ed25519 usage.** `ed25519-dalek` (Rust) and `@noble/curves` (TS). Confirm verify is
+  actually wired and reached on every authenticated path — flag any route that accepts a
+  payload without checking its signature, any helper that returns a constant instead of a
+  real verification result, and any early-return or cache fast-path that skips the check.
+  Confirm public keys are bound to the right device, that verification uses the *stored*
+  key rather than one carried in the request, and that domain separation / message framing
+  can't be confused across event types.
 - **Device identity & key storage.** `cli/core/src/identity.rs`, `cli/dira/src/device.rs`.
   The device secret lives in the OS keychain (`keyring`). Flag any path that logs, prints,
   serializes into events, syncs to the cloud, or writes the secret to disk. The wire/meta
   may carry `device_id` + public key only — never the secret.
 - **Credentials at rest.** GitHub tokens and auth secrets in `cloud/src/lib/auth/**`
-  (Better Auth). A known TODO is unencrypted GitHub-token storage — flag plaintext secrets,
-  missing encryption, and over-broad scopes.
+  (Better Auth). Flag plaintext secrets, tokens persisted without encryption at rest,
+  OAuth scopes broader than the feature needs, and long-lived tokens where a short-lived
+  one would do. A config flag that enables encryption usually does NOT rewrite rows written
+  before it landed — if you see one, check for a backfill and say whether it has been run.
 
 ## How to review
 

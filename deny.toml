@@ -1,0 +1,81 @@
+# cargo-deny — dependency license gate.
+#
+# Why this exists: Renovate auto-merges minor/patch bumps, so without a gate a
+# transitive copyleft dependency can land in a release build with nobody
+# reading a diff. This repo ships Apache-2.0 binaries; every dependency has to
+# be distributable under that.
+#
+# CI runs `cargo deny check licenses` (see .github/workflows/ci.yml). Advisories
+# are deliberately NOT gated here — a newly published advisory would fail an
+# unrelated PR's CI, which trains people to ignore the job. Vulnerability
+# tracking belongs on its own schedule, not on the PR path.
+#
+# Run locally:  cargo deny check licenses
+
+[graph]
+# Check every target we actually ship (see D-0002/D-0010 for the release
+# matrix), so a platform-specific dependency can't slip its license past us.
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
+all-features = true
+
+[licenses]
+# Permissive only. Anything not on this list fails the build and needs a
+# deliberate decision — either an `exceptions` entry below with a reason, or
+# dropping the dependency.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.9
+# The allow list above is a policy statement, not an inventory of what's in the
+# tree today. Don't warn about entries nothing currently uses.
+unused-allowed-license = "allow"
+
+# Per-crate carve-outs. Each one is a decision, not a rubber stamp — if you add
+# a line here, say why.
+exceptions = [
+  # MPL-2.0 is file-level copyleft: shipping the crate unmodified inside an
+  # Apache-2.0 binary is fine; modifying its files would oblige us to publish
+  # those files' source. We don't vendor or patch it. Transitive and real —
+  # dira-core -> directories -> dirs-sys -> option-ext (config/data dir
+  # resolution), reachable on every shipped target.
+  { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+# Note: `terminfo` (WTFPL) and `termwiz` appear in Cargo.lock but are not
+# reachable from any shipped target, so WTFPL is deliberately NOT allowed
+# above. If a future change pulls them into the graph, this gate fails — that
+# is the intended behavior, not a bug. Decide then whether WTFPL is acceptable.
+
+[bans]
+# Duplicate versions are noise in a workspace this size, not a license or
+# security problem. Left as a warning so `cargo deny check bans` stays useful
+# ad hoc without failing the license gate.
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -402,7 +402,7 @@ _resolve_unauthenticated() {
   elif [ "$channel" = "prerelease" ]; then
     local body tags
     body=$(_gh_get "/repos/${repo}/releases?per_page=30") ||
-      err "failed to list releases for ${repo} (network error, or the repo is private -- set GITHUB_TOKEN/GH_TOKEN)"
+      err "failed to list releases for ${repo} (GitHub rate-limits anonymous requests to 60/hr per IP -- set GITHUB_TOKEN/GH_TOKEN to raise it; otherwise a network error)"
     tags=$(printf '%s' "$body" |
       grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' |
       sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
@@ -412,7 +412,7 @@ _resolve_unauthenticated() {
   else
     local body
     body=$(_gh_get "/repos/${repo}/releases/latest") ||
-      err "failed to resolve the latest stable release for ${repo} (no stable release yet? try --channel prerelease, or the repo is private -- set GITHUB_TOKEN/GH_TOKEN)"
+      err "failed to resolve the latest stable release for ${repo} (no stable release yet? try --channel prerelease. GitHub also rate-limits anonymous requests to 60/hr per IP -- set GITHUB_TOKEN/GH_TOKEN to raise it)"
     tag=$(printf '%s' "$body" |
       grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' |
       head -n1 |

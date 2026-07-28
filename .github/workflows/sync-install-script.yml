@@ -1,9 +1,14 @@
 name: Sync installers to landing
 
-# The landing repo (dirahq-landing) cannot read this private repo, so the
-# sync has to originate here: whenever a canonical installer changes on
-# `main`, mirror it into the public site's scripts/ via a PR -- never a
-# direct push, since the deploy gate on that repo matters.
+# The landing site vendors the installers byte-for-byte instead of proxying
+# them (D-0007): @astrojs/vercel writes the Build Output config itself, so a
+# `vercel.json` rewrite to raw.githubusercontent.com is silently ignored --
+# and even working it would put githubusercontent in the install path and
+# serve whatever is on the branch right now, with no deploy gate and no
+# rollback. So the copy is pushed, and the sync originates here because this
+# is where the canonical file lives: whenever an installer changes on `main`,
+# mirror it into the site's scripts/ via a PR -- never a direct push, since
+# that deploy gate is the point.
 on:
   push:
     branches: [main]

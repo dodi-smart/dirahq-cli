@@ -459,7 +459,7 @@ function Resolve-ReleaseUnauthenticated {
         $body = Invoke-GhApi -Path "/repos/$Repo/releases/latest" -ApiUrl $ApiUrl -Token ''
         $tag = $body.tag_name
         if (-not $tag) {
-            Write-Err "failed to resolve the latest stable release for $Repo (no stable release yet? try -Channel prerelease, or the repo is private -- set GITHUB_TOKEN/GH_TOKEN)"
+            Write-Err "failed to resolve the latest stable release for $Repo (no stable release yet? try -Channel prerelease. GitHub also rate-limits anonymous requests to 60/hr per IP -- set GITHUB_TOKEN/GH_TOKEN to raise it)"
         }
         $version = Get-BareVersion $tag
     }

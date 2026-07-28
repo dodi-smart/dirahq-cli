@@ -4,6 +4,13 @@ Thank you for your interest in contributing. This repository is the **open-sourc
 CLI (the `cli/` and `contract/` directories), licensed under Apache-2.0. The hosted Dira
 cloud is proprietary and lives in a separate repository.
 
+By participating, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+**Found a security issue?** Don't open a public issue — see [SECURITY.md](SECURITY.md) for
+private reporting. That includes anything that would put prompt text, file contents, or
+diffs into the store or onto the wire: capture is metadata-only by design, and a breach of
+that is a vulnerability, not a bug.
+
 ## Developer Certificate of Origin (DCO)
 
 We use the [Developer Certificate of Origin](https://developercertificate.org/). By signing

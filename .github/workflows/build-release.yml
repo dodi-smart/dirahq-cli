@@ -309,11 +309,13 @@ jobs:
           # current GitHub-hosted Intel macOS image is macos-15-intel.
           - leg: macos-intel
             runner: macos-15-intel
-          # install.ps1, for real, against the just-built release. NOTE: this leg only
-          # goes green once the Rust-side Windows target support (landing in a parallel
-          # package) is in the released tag being smoked here -- acceptable because
-          # releases are manual-dispatch-only while the repo is private (D-0005), so
-          # nothing forces this leg to pass before that sibling work lands.
+          # install.ps1, for real, against the just-built release. The caveat that
+          # used to live here -- that this leg couldn't go green until the Rust-side
+          # Windows target support reached a released tag -- is spent: v0.1.0 ships
+          # it, and a diagnostic run on windows-latest confirmed install, both
+          # binaries, the named-pipe transport, and the full daemon lifecycle
+          # (start/status/update --check/restart/stop) all work. Treat a failure
+          # here as real.
           - leg: windows-x64
             runner: windows-latest
     steps:
@@ -376,8 +378,19 @@ jobs:
           $ErrorActionPreference = 'Stop'
           .\install.ps1
           $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
-          $reported = ((dira --version | Select-Object -First 1) -split '\s+')[1]
-          if ($LASTEXITCODE -ne 0) { throw "dira --version failed" }
+          # Capture first, THEN assert. `dira --version` prints two lines, so
+          # piping it straight into `Select-Object -First 1` satisfies the cmdlet
+          # on line 1 and it stops the upstream pipeline. That terminates the
+          # native process, and PowerShell reports the stopped pipeline as
+          # $LASTEXITCODE = -1 -- so the old ordering threw even though the
+          # command had succeeded and the version had parsed correctly.
+          # Measured on windows-latest: reported=[0.1.0] with LASTEXITCODE=[-1].
+          # Assigning to a variable first runs the process to completion; the
+          # later Select-Object then operates on a plain string array, where
+          # early termination means nothing. See #58.
+          $versionOutput = & dira --version
+          if ($LASTEXITCODE -ne 0) { throw "dira --version failed (exit $LASTEXITCODE)" }
+          $reported = (($versionOutput | Select-Object -First 1) -split '\s+')[1]
           if ($reported -ne $env:DIRA_VERSION) { throw "dira --version reported '$reported', expected '$env:DIRA_VERSION'" }
           dirad --version
           if ($LASTEXITCODE -ne 0) { throw "dirad --version failed" }

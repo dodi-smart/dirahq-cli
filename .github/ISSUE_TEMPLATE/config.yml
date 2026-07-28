@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: zavet (the knowledge-layer plugin) issue
+    url: https://github.com/dodi-smart/dirahq-zavet/issues/new/choose
+    about: >-
+      Issues with the zavet plugin itself — decision records, guard hooks, commit-trailer
+      enforcement, the `.zavet/` dialect — belong in dirahq-zavet. dira only ships the
+      optional integration.
+  - name: Security vulnerability
+    url: https://github.com/dodi-smart/dirahq-cli/security/advisories/new
+    about: Please report privately via GitHub Security Advisories — see SECURITY.md.

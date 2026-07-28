@@ -21,9 +21,8 @@ D-0005 skipped them to avoid paying for billed runner minutes on a private
 repo, and said so explicitly: a cost decision tied to a temporary state, to be
 reverted once the repo went public. It went public on 2026-07-28.
 
-The cost is now near zero — GitHub-hosted minutes are free for public repos,
-and only the `x86_64-unknown-linux-musl` leg (`use_fallback: true`) can land
-on the self-hosted pool at all. The benefit is real and was just demonstrated:
+The cost is now zero — GitHub-hosted minutes are free for public repos, and
+D-0015 moved every leg onto them. The benefit is real and was just demonstrated:
 the first stable release was also the first time this pipeline had ever run,
 and it surfaced two defects immediately (#57, #58). Exercising packaging on
 every develop merge is how that stops being a release-day surprise, and it

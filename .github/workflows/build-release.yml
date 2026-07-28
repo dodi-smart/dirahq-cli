@@ -67,8 +67,8 @@ jobs:
           fi
           # Prerelease tags build exactly like stable ones (D-0013). This used to
           # hard-skip them on automatic runs to avoid billed runner minutes on a
-          # private repo; the repo is public, GitHub-hosted minutes are free, and
-          # only the x86_64-linux-musl leg can reach the self-hosted pool at all.
+          # private repo; the repo is public, every leg is GitHub-hosted (D-0015),
+          # and GitHub-hosted minutes are free for public repositories.
           # The idempotency check below is now the only guard against rebuilding
           # a release that already has assets — keep it.
           # Only build for a tag that semantic-release actually published as a GitHub
@@ -91,38 +91,19 @@ jobs:
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
-  # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
-  # to `ubuntu-latest`. Used for the heaviest native compile (x86_64 linux musl).
-  check-runners:
-    name: Pick runner
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [resolve]
-    if: needs.resolve.outputs.proceed == 'true'
-    outputs:
-      runner: ${{ steps.set-runner.outputs.use-runner }}
-    steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-      - name: Check runner availability
-        id: set-runner
-        uses: dodi-smart/runner-fallback-action@v2
-        with:
-          organization: ${{ github.repository_owner }}
-          primary-runner: "self-hosted,build"
-          fallback-runner: "ubuntu-latest"
-          github-token: ${{ steps.app-token.outputs.token }}
-          fallback-on-error: true
-
+  # NOTE: there is deliberately no `check-runners` job any more (D-0015). The
+  # org's Default runner group sets `allows_public_repositories: false`, so once
+  # this repo went public GitHub stopped scheduling anything that asks for
+  # `self-hosted,build` — the job queues forever rather than failing. The
+  # fallback action could not save us: it picks by whether runners are online and
+  # idle, which they are, and has no visibility into the group policy. Every leg
+  # now names a GitHub-hosted runner directly.
   # musl is statically linked, so the build host's glibc floor is irrelevant — one binary
-  # per Linux arch covers Alpine, containers, and old-glibc distros alike. The x86_64 leg
-  # matters most here since it runs on a self-hosted runner whose glibc version is unknown
-  # and can drift without notice. `universal-apple-darwin` is a lipo fat binary the upload
+  # per Linux arch covers Alpine, containers, and old-glibc distros alike. That mattered
+  # most while x86_64 built on a self-hosted runner of unknown, drifting glibc; it is a
+  # weaker argument now that every leg is a pinned GitHub-hosted image, but the property
+  # is what the artifact promises users, so it stands independent of the build host.
+  # `universal-apple-darwin` is a lipo fat binary the upload
   # action builds itself (both rustup targets + `lipo -create`), so Apple Silicon and Intel
   # ship from one leg — no separate x86_64-apple-darwin leg needed. Both Windows legs now
   # build natively (D-0014): x86_64-pc-windows-msvc on `windows-latest`, and
@@ -133,19 +114,21 @@ jobs:
   # smoke leg possible; the label only resolves because the repo is public.
   build:
     name: Build ${{ matrix.target }}
-    needs: [resolve, check-runners]
+    needs: [resolve]
     if: needs.resolve.outputs.proceed == 'true'
     timeout-minutes: 45
-    # x86_64 linux musl (the heaviest) runs on the self-hosted runner when
-    # available; every other target builds natively on its matching
-    # GitHub-hosted runner.
-    runs-on: ${{ matrix.use_fallback && fromJson(needs.check-runners.outputs.runner) || matrix.runner }}
+    # Every leg names its runner directly — no self-hosted fallback (D-0015).
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Was the one leg routed to the self-hosted pool, as the heaviest
+          # compile. It is now plain `ubuntu-latest`: the org runner group
+          # refuses public repositories, so asking for `self-hosted,build`
+          # queues indefinitely instead of running (D-0015).
           - target: x86_64-unknown-linux-musl
-            use_fallback: true
+            runner: ubuntu-latest
             cross: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm

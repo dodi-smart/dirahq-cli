@@ -124,6 +124,20 @@ install-local *FLAGS: package
     "{{local_bin_dir}}/dira" --version && \
     echo "installed into {{local_bin_dir}} (scratch dir, not on PATH, never ~/.local/bin)"
 
+# ---------- Dependency licenses ----------
+
+# Mirror CI's license gate (policy + carve-outs live in deny.toml). Deliberately
+# NOT part of `just ci`: cargo-deny isn't in mise.toml, so requiring it would
+# make the standard pre-PR check depend on a tool most contributors don't have.
+# CI runs it on every PR regardless.
+licenses:
+    @command -v cargo-deny >/dev/null 2>&1 || { \
+        echo "cargo-deny not found. Install it with:"; \
+        echo "  cargo install cargo-deny --locked"; \
+        echo "  # or grab a prebuilt binary from https://github.com/EmbarkStudios/cargo-deny/releases"; \
+        exit 1; }
+    cargo deny check licenses
+
 # ---------- CI aggregate ----------
 
 ci: check test contract

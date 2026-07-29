@@ -19,6 +19,7 @@
 use dira_core::{config::project_dirs, Config};
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::Ordering,
     env, fs,
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -160,12 +161,19 @@ fn is_dev_build() -> bool {
 /// Decide whether a notice should be printed, and if so, its exact text.
 /// Pure — no env/fs/network access — so the whole suppression matrix is
 /// unit-testable directly.
+/// "Newer" is SemVer 2.0 §11 ordering, not string inequality — see
+/// [`resolve::compare_versions`](super::resolve::compare_versions). Being
+/// *ahead* of the cached channel head (a prerelease build against a stable
+/// cache) is silence, not a nag to install an older release: this fires on
+/// ordinary commands like `dira status`, so the only thing worth interrupting
+/// someone for is a genuine upgrade. `update --check` is where "you are ahead"
+/// gets said out loud, because there the user asked.
 fn should_notify(cache: &Cache, env: &Env, is_tty: bool, current_version: &str) -> Option<String> {
     if !is_tty || env.ci || env.no_update_notifier || env.checking_disabled() {
         return None;
     }
     let latest = cache.latest.as_deref()?;
-    if latest == current_version {
+    if super::resolve::compare_versions(latest, current_version) != Some(Ordering::Greater) {
         return None;
     }
     Some(format!(
@@ -449,6 +457,42 @@ mod tests {
     #[test]
     fn suppressed_when_already_current() {
         let c = cache(0, Some("0.2.0"), None);
+        assert!(should_notify(&c, &allow_env(), true, "0.2.0").is_none());
+    }
+
+    #[test]
+    fn suppressed_when_the_cached_release_is_older_than_the_running_build() {
+        // #63: the v0.1.1-develop.1 smoke run nagged "dira 0.1.0 is available
+        // (you have 0.1.1-develop.1)". 0.1.0 < 0.1.1-develop.1 under SemVer
+        // §11, so it is a downgrade — the strings merely differ, which is all
+        // the old `!=` test could see.
+        let c = cache(0, Some("0.1.0"), None);
+        assert!(
+            should_notify(&c, &allow_env(), true, "0.1.1-develop.1").is_none(),
+            "a prerelease ahead of the cached stable head must not be nagged"
+        );
+    }
+
+    #[test]
+    fn notifies_a_prerelease_about_a_newer_prerelease() {
+        // Ordering is numeric, not lexical: develop.10 > develop.9.
+        let c = cache(0, Some("0.2.0-develop.10"), None);
+        assert!(should_notify(&c, &allow_env(), true, "0.2.0-develop.9").is_some());
+    }
+
+    #[test]
+    fn notifies_a_prerelease_about_its_finished_stable_release() {
+        // 0.2.0 outranks 0.2.0-develop.10 — the one case where a prerelease
+        // user genuinely should upgrade to a stable tag.
+        let c = cache(0, Some("0.2.0"), None);
+        assert!(should_notify(&c, &allow_env(), true, "0.2.0-develop.10").is_some());
+    }
+
+    #[test]
+    fn suppressed_when_a_version_cannot_be_ordered() {
+        // "Different" is not "newer" — an unorderable cache entry makes no
+        // claim rather than nagging.
+        let c = cache(0, Some("not-a-version"), None);
         assert!(should_notify(&c, &allow_env(), true, "0.2.0").is_none());
     }
 

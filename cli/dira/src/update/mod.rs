@@ -128,6 +128,20 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
         .await
         .context("resolve release")?;
 
+    // Refuse an implicit downgrade before anything is downloaded or swapped.
+    // `--check` and the passive notice already decline to *offer* an older
+    // release (see `check_message` / `notice::should_notify`), and this is the
+    // matching guard on the command they point at: a prerelease user on the
+    // default stable channel would otherwise be moved silently backwards.
+    if let Some(refusal) = downgrade_refusal(
+        &resolved.version,
+        env!("CARGO_PKG_VERSION"),
+        channel,
+        args.version.is_some(),
+    ) {
+        anyhow::bail!(refusal);
+    }
+
     let guard = replace::discover_install(args.bin_dir.as_deref())?;
     let bin_dir = guard_to_bin_dir(guard, args.force)?;
 
@@ -267,6 +281,74 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// The refusal text when the channel resolved to an *older* version than the
+/// one running, or `None` when the update may proceed. Pure, so the whole
+/// matrix is testable without the network.
+///
+/// `version_pinned` is the escape hatch: `--version` is documented as "update
+/// (or downgrade) to this exact version" (see [`UpdateArgs::version`]), so an
+/// explicit request is always honoured — it is the *implicit*, channel-resolved
+/// downgrade that is never what anyone asked for. `--force` deliberately does
+/// not override this; that flag means one thing (the D-0004 dev-install guard)
+/// and widening it would make both meanings vaguer.
+///
+/// An unparseable version on either side yields `None` — no refusal. This guard
+/// exists to stop a *known* downgrade, not to become a second, stricter version
+/// gate that could block a legitimate update over a tag it cannot order.
+fn downgrade_refusal(
+    resolved: &str,
+    current: &str,
+    channel: Channel,
+    version_pinned: bool,
+) -> Option<String> {
+    if version_pinned
+        || resolve::compare_versions(resolved, current) != Some(std::cmp::Ordering::Less)
+    {
+        return None;
+    }
+    Some(format!(
+        "refusing to downgrade: the {} channel's latest is {resolved}, but you are running \
+         {current}\n  \
+         you are ahead of that channel — most likely a prerelease build against the stable \
+         channel\n  \
+         to move anyway: `dira update --version {resolved}` (explicit downgrade)\n  \
+         to stay on prereleases: `dira update --channel prerelease`",
+        channel.label()
+    ))
+}
+
+/// What `--check` prints for a successful resolve. Pure, so the whole
+/// three-way outcome is unit-testable without the network (same reasoning as
+/// [`no_restart_notice`] above and `notice::should_notify`).
+///
+/// The third arm is the one that used to be wrong: this compared `resolved ==
+/// current` and called *any* difference an upgrade, so a `0.1.1-develop.1`
+/// build resolving stable `0.1.0` announced a **downgrade** as available. Being
+/// ahead of the channel is reported rather than silently flattened into "up to
+/// date", because a prerelease user who asked deserves to know the channel head
+/// is behind them — that is why they see no upgrade.
+///
+/// Exits 0 either way; the caller prints this and returns. That contract is
+/// load-bearing — [`notice::spawn_refresh`] runs this detached purely to warm
+/// the cache.
+fn check_message(resolved: &str, current: &str, channel: Channel) -> String {
+    match resolve::compare_versions(resolved, current) {
+        Some(std::cmp::Ordering::Greater) => {
+            format!("dira {resolved} is available (you have {current}) — run `dira update`")
+        }
+        Some(std::cmp::Ordering::Equal) => format!("dira is up to date ({current})"),
+        // Older, or a version either side of the comparison can't parse: in
+        // both cases there is nothing to offer, and claiming otherwise is the
+        // bug. `None` is near-unreachable (`pick_latest` drops unparseable
+        // tags and `current` is `CARGO_PKG_VERSION`) but must not fall through
+        // to "available".
+        _ => format!(
+            "dira is up to date ({current} — ahead of the {} channel's {resolved})",
+            channel.label()
+        ),
+    }
+}
+
 /// `--check`: resolve only, write nothing to disk except (when not pinned to
 /// an exact version) a refresh of [`notice`]'s update-check cache, and exit
 /// 0 in every non-error case — including offline. Errors are printed to
@@ -285,15 +367,10 @@ async fn run_check(http: &reqwest::Client, version_pin: Option<&str>, channel: C
 
     match resolve::resolve(http, &target, version_pin, channel).await {
         Ok(resolved) => {
-            let current = env!("CARGO_PKG_VERSION");
-            if resolved.version == current {
-                println!("dira is up to date ({current})");
-            } else {
-                println!(
-                    "dira {} is available (you have {current}) — run `dira update`",
-                    resolved.version
-                );
-            }
+            println!(
+                "{}",
+                check_message(&resolved.version, env!("CARGO_PKG_VERSION"), channel)
+            );
             // A pinned `--version` check isn't "the latest" — don't let it
             // clobber the passive notice's idea of what's current.
             if version_pin.is_none() {
@@ -418,6 +495,111 @@ mod tests {
             guard_to_bin_dir(guard, true).is_err(),
             "--force must never override a DevBuild refusal"
         );
+    }
+
+    // --- version comparison (#63) -------------------------------------------
+    //
+    // The bug these pin down: every one of these compared with `==` and read
+    // any inequality as an upgrade, so a prerelease build announced — and then
+    // installed — an older stable release.
+
+    #[test]
+    fn check_message_offers_a_genuinely_newer_release() {
+        let msg = check_message("0.3.0", "0.2.0", Channel::Stable);
+        assert_eq!(
+            msg,
+            "dira 0.3.0 is available (you have 0.2.0) — run `dira update`"
+        );
+    }
+
+    #[test]
+    fn check_message_reports_up_to_date_when_equal() {
+        assert_eq!(
+            check_message("0.2.0", "0.2.0", Channel::Stable),
+            "dira is up to date (0.2.0)"
+        );
+    }
+
+    #[test]
+    fn check_message_says_ahead_instead_of_offering_a_downgrade() {
+        // The exact v0.1.1-develop.1 smoke-run case: stable resolves 0.1.0
+        // while a prerelease is installed. 0.1.0 < 0.1.1-develop.1 under
+        // SemVer §11, so this is a downgrade and must never be "available".
+        let msg = check_message("0.1.0", "0.1.1-develop.1", Channel::Stable);
+        assert!(
+            msg.starts_with("dira is up to date (0.1.1-develop.1"),
+            "message was: {msg}"
+        );
+        assert!(msg.contains("ahead of the stable channel's 0.1.0"), "{msg}");
+        assert!(
+            !msg.contains("is available"),
+            "must not offer a downgrade: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_message_names_the_channel_it_is_ahead_of() {
+        let msg = check_message("0.2.0-develop.1", "0.3.0", Channel::Prerelease);
+        assert!(msg.contains("ahead of the prerelease channel's"), "{msg}");
+    }
+
+    #[test]
+    fn check_message_makes_no_claim_on_an_unparseable_version() {
+        // `pick_latest` drops tags it can't order, so this is near-unreachable
+        // — but it must not fall through to "available", which is precisely
+        // what string inequality did.
+        let msg = check_message("not-a-version", "0.2.0", Channel::Stable);
+        assert!(!msg.contains("is available"), "message was: {msg}");
+    }
+
+    #[test]
+    fn downgrade_refusal_blocks_an_implicit_channel_downgrade() {
+        let msg = downgrade_refusal("0.1.0", "0.1.1-develop.1", Channel::Stable, false)
+            .expect("an older channel head must be refused");
+        assert!(msg.contains("refusing to downgrade"), "{msg}");
+        // Both escape hatches have to be spelled out, or the refusal is a
+        // dead end for someone who genuinely wants to move.
+        assert!(msg.contains("--version 0.1.0"), "{msg}");
+        assert!(msg.contains("--channel prerelease"), "{msg}");
+    }
+
+    #[test]
+    fn downgrade_refusal_allows_an_explicit_version_downgrade() {
+        // `--version` is documented as "update (or downgrade) to this exact
+        // version" — an explicit request is always honoured.
+        assert!(
+            downgrade_refusal("0.1.0", "0.1.1-develop.1", Channel::Stable, true).is_none(),
+            "an explicit --version must never be refused"
+        );
+    }
+
+    #[test]
+    fn downgrade_refusal_allows_upgrades_and_reinstalls() {
+        assert!(downgrade_refusal("0.3.0", "0.2.0", Channel::Stable, false).is_none());
+        assert!(downgrade_refusal("0.2.0", "0.2.0", Channel::Stable, false).is_none());
+    }
+
+    #[test]
+    fn downgrade_refusal_allows_a_prerelease_to_its_own_newer_channel_head() {
+        // The prerelease channel legitimately serves 0.2.0-develop.10 to
+        // someone on 0.2.0-develop.9, and stable 0.2.0 outranks both.
+        assert!(downgrade_refusal(
+            "0.2.0-develop.10",
+            "0.2.0-develop.9",
+            Channel::Prerelease,
+            false
+        )
+        .is_none());
+        assert!(
+            downgrade_refusal("0.2.0", "0.2.0-develop.10", Channel::Prerelease, false).is_none()
+        );
+    }
+
+    #[test]
+    fn downgrade_refusal_makes_no_claim_on_an_unparseable_version() {
+        // This guard stops a *known* downgrade; it must not become a second
+        // version gate that blocks an update over a tag it cannot order.
+        assert!(downgrade_refusal("weird-tag", "0.2.0", Channel::Stable, false).is_none());
     }
 
     #[test]

@@ -71,6 +71,24 @@ fn tag_semver(tag: &str) -> Option<semver::Version> {
     semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()
 }
 
+/// How `candidate` orders against `current` under SemVer 2.0 §11 — `Greater`
+/// means `candidate` is genuinely newer. `None` when either side doesn't parse,
+/// which callers must read as "make no claim", never as "different, therefore
+/// newer".
+///
+/// This exists because that exact conflation was a bug: [`pick_latest`] above
+/// has always ordered *releases against each other* correctly, but the two
+/// places that compared a resolved release against the **running** version
+/// (`update --check` and the passive notice) used `==` and treated any
+/// inequality as an upgrade. A `0.1.1-develop.1` build therefore announced
+/// stable `0.1.0` as "available" — a downgrade — because the strings differ.
+/// One comparator, three callers, so they cannot drift again.
+///
+/// Both arguments accept a bare version or a `v`-prefixed tag.
+pub fn compare_versions(candidate: &str, current: &str) -> Option<std::cmp::Ordering> {
+    Some(tag_semver(candidate)?.cmp(&tag_semver(current)?))
+}
+
 /// Pick the newest non-draft release for `channel`.
 ///
 /// Stable only considers non-prerelease releases (mirrors GitHub's own
@@ -504,6 +522,62 @@ mod tests {
         ];
         let picked = pick_latest(&releases, Channel::Stable).unwrap();
         assert_eq!(picked.tag_name, "v0.1.0");
+    }
+
+    // --- compare_versions (#63) --------------------------------------------
+
+    #[test]
+    fn compare_versions_orders_a_prerelease_below_its_own_release() {
+        use std::cmp::Ordering;
+        // SemVer §11, and the exact case that produced the bug: stable 0.1.0 is
+        // *older* than the 0.1.1-develop.1 prerelease, even though the strings
+        // merely differ.
+        assert_eq!(
+            compare_versions("0.1.0", "0.1.1-develop.1"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.1.1-develop.1", "0.1.0"),
+            Some(Ordering::Greater)
+        );
+        // A finished release outranks its own prerelease, and prerelease
+        // identifiers compare numerically rather than lexically.
+        assert_eq!(
+            compare_versions("0.2.0", "0.2.0-develop.10"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.2.0-develop.10", "0.2.0-develop.9"),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn compare_versions_is_equal_for_the_same_version() {
+        assert_eq!(
+            compare_versions("1.2.3", "1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn compare_versions_accepts_a_v_prefixed_tag_on_either_side() {
+        assert_eq!(
+            compare_versions("v1.2.3", "1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_versions("1.2.3", "v1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn compare_versions_makes_no_claim_when_either_side_is_unparseable() {
+        // `None` must mean "no claim". Callers treating it as "different,
+        // therefore newer" is the bug this comparator replaced.
+        assert!(compare_versions("not-a-version", "1.2.3").is_none());
+        assert!(compare_versions("1.2.3", "not-a-version").is_none());
     }
 
     // --- asset_names / archive_extension (D-0010) --------------------------

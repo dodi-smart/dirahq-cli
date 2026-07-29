@@ -388,6 +388,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           .\install.ps1
+          # install.ps1 reports failure by throwing, so a non-zero exit code from a run
+          # that did NOT throw means it leaked one from an ignored best-effort call. That
+          # is invisible without this assertion: GitHub ends the step with
+          # `exit $LASTEXITCODE`, so a leak fails the step at its very end with nothing in
+          # the log pointing at the cause. See the uninstall step below.
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 leaked exit code $LASTEXITCODE" }
           $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
           # Capture first, THEN assert. `dira --version` prints two lines, so
           # piping it straight into `Select-Object -First 1` satisfies the cmdlet
@@ -451,6 +457,16 @@ jobs:
           $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
           # Re-running over an identical install is a no-op.
           .\install.ps1
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 (idempotent re-run) leaked exit code $LASTEXITCODE" }
+          # Assert the exit code here rather than letting GitHub's trailing
+          # `exit $LASTEXITCODE` decide the step's fate. This uninstall did its whole job
+          # -- printed "removed dira and dirad", both Test-Path guards below stayed quiet --
+          # and the step still failed 1, because `dira daemon uninstall` runs schtasks/reg,
+          # whose "ERROR: nothing to remove" stderr tripped Windows PowerShell 5.1's
+          # redirected-native-stderr rule under $ErrorActionPreference='Stop' and left
+          # $LASTEXITCODE poisoned. Fixed in install.ps1's Invoke-BestEffort; asserted here
+          # so a regression names itself instead of pointing at the end of the step.
           .\install.ps1 -Uninstall -Force
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 -Uninstall leaked exit code $LASTEXITCODE" }
           if (Test-Path "$env:DIRA_BIN_DIR\dira.exe") { throw "dira.exe still present after -Uninstall" }
           if (Test-Path "$env:DIRA_BIN_DIR\dirad.exe") { throw "dirad.exe still present after -Uninstall" }

@@ -1,10 +1,10 @@
 ---
 title: Distribution and self-update
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-07-22
+date: 2026-07-29
 paths:
   - install.sh
   - install.ps1
@@ -37,6 +37,17 @@ both executables and restarts whatever is supervising the daemon.
   (D-0003), dev-install refusal (D-0004), user-scope PATH via
   `[Environment]::SetEnvironmentVariable` (never `setx`), default bin dir
   `%USERPROFILE%\.local\bin`.
+- Both installers make the same best-effort `dira daemon` calls around the
+  swap (`status`, `stop`, `restart`, `uninstall`) and ignore their failures.
+  install.sh neutralises them with `|| true`; install.ps1 routes every one
+  through `Invoke-BestEffort`, which is not merely `|| true` in PowerShell
+  clothing. It also drops `$ErrorActionPreference` to `Continue` for the
+  duration of the call, because Windows PowerShell 5.1 converts a *redirected*
+  native command's stderr into error records that are terminating under
+  `Stop` — and `dira daemon uninstall` shells out to `schtasks`/`reg`, which
+  print `ERROR: ...` whenever there is nothing to remove. Before that, the
+  call threw on every clean machine, its exit code was never read, and the
+  scheduled-task teardown always fell through to its fallback branch.
 - Target selection is deliberately coarse: macOS maps to one universal
   binary regardless of arch, Linux to `${arch}-unknown-linux-musl`, Windows
   to `${arch}-pc-windows-msvc` zips. There is no arch branch on macOS and no
@@ -119,6 +130,14 @@ both executables and restarts whatever is supervising the daemon.
 - The control socket is never resolved through `$TMPDIR` (D-0008): it differs
   per process, so a client and a healthy daemon would silently miss each
   other and the daemon would present as "down".
+- A successful `install.ps1` run leaves `$LASTEXITCODE` at 0. The script
+  signals failure by throwing, never through an exit code, so any non-zero
+  code it leaves behind is spurious — and it is not cosmetic: GitHub Actions
+  ends every `shell: powershell` step with `exit $LASTEXITCODE`, which is how
+  a `-Uninstall` that printed every success message and removed both binaries
+  still failed both Windows smoke legs of the v0.1.1-develop.1 release. The
+  windows smoke steps in `build-release.yml` assert `$LASTEXITCODE` after each
+  `install.ps1` invocation so a regression names itself.
 
 ## Open Questions
 

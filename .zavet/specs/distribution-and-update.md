@@ -135,8 +135,12 @@ both executables and restarts whatever is supervising the daemon.
   remains a follow-up — unsigned logon-task daemons are prime AV
   false-positive material), and the schtasks ONLOGON + HKCU-fallback path
   still needs validation on a real Windows machine.
-- The Windows binaries link the MSVC CRT dynamically, so they require the VC++
-  Redistributable on the target host — see #60. Every GitHub Windows runner
-  image ships it, so CI cannot catch this; it only bites clean user machines.
-  This is the one place the distribution story diverges from the
-  self-contained posture D-0002 and D-0011 set for the other targets.
+- The Windows binaries link the MSVC CRT **statically** (`.cargo/config.toml`,
+  `-C target-feature=+crt-static`), so they need no VC++ Redistributable on the
+  target host. This closes #60 and puts Windows on the same footing as the
+  other targets: static musl on Linux (D-0002), bundled TLS roots (D-0011) —
+  the artifact carries what it needs rather than depending on the host.
+  A build-release step asserts the binaries import neither `VCRUNTIME140` nor
+  `api-ms-win-crt-*`, because nothing else can catch a regression: every GitHub
+  Windows image ships the redistributable, so the smoke legs would stay green
+  while shipping a binary that dies at process start on a clean box.

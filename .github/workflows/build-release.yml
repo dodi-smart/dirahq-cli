@@ -200,6 +200,35 @@ jobs:
           checksum: sha256
           dry-run: ${{ inputs.dry_run == true }}
           token: ${{ secrets.GITHUB_TOKEN }}
+      # Regression guard for #60. The CRT is linked statically via
+      # .cargo/config.toml so the binaries run on a machine with no Visual C++
+      # Redistributable. Nothing else can catch a regression here: every GitHub
+      # Windows image ships the redistributable, so the smoke legs would stay
+      # green while shipping a binary that dies at process start on a clean box.
+      # Runs after the build step above, against the same compiled artifact it
+      # packaged (present under target/ even on a dry run).
+      - name: Windows binaries link the CRT statically
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+          foreach ($name in 'dira', 'dirad') {
+            $exe = "target/${{ matrix.target }}/release/$name.exe"
+            if (-not (Test-Path $exe)) { throw "expected $exe to exist after the build step" }
+            # Import scan without dumpbin, which needs a VS dev shell to be on
+            # PATH. Reading the PE as ASCII and looking for the import names is
+            # enough to catch the dynamic-CRT case this guards against.
+            $bytes = [IO.File]::ReadAllBytes($exe)
+            $text  = [Text.Encoding]::ASCII.GetString($bytes)
+            foreach ($dll in 'VCRUNTIME140', 'api-ms-win-crt-runtime') {
+              if ($text -match [regex]::Escape($dll)) { $bad += "$name.exe imports $dll" }
+            }
+          }
+          if ($bad) {
+            throw "dynamic CRT detected -- these binaries need the VC++ Redistributable: $($bad -join '; ')"
+          }
+          Write-Host "both binaries are free of VCRUNTIME140 / api-ms-win-crt-* imports"
 
   # Attach the contract artifacts (schema + signing fixture) and both installers to the
   # release so the cloud repo's `just contract-pull` and

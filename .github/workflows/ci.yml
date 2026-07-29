@@ -151,3 +151,30 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      # Proves `.cargo/config.toml`'s `+crt-static` actually takes effect, from
+      # THIS branch's source (#60). build-release.yml carries the same assertion,
+      # but that job checks out `refs/tags/<tag>` — so it can only ever validate a
+      # tag that already contains the fix, never a change under review. That
+      # distinction cost a confused debugging round; keep both.
+      # Debug build: linkage is set per-target in .cargo/config.toml and applies
+      # to every profile, and the dependency graph is already warm from the two
+      # steps above, so this costs seconds.
+      - name: CRT is linked statically
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --bin dira --bin dirad
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
+          $bad = @()
+          foreach ($name in 'dira', 'dirad') {
+            $exe = "target/debug/$name.exe"
+            if (-not (Test-Path $exe)) { throw "expected $exe to exist" }
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+            foreach ($dll in 'VCRUNTIME140', 'api-ms-win-crt-runtime') {
+              if ($text -match [regex]::Escape($dll)) { $bad += "$name.exe imports $dll" }
+            }
+          }
+          if ($bad) {
+            throw "dynamic CRT -- these would need the VC++ Redistributable: $($bad -join '; ')"
+          }
+          Write-Host "both binaries link the CRT statically"

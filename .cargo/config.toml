@@ -1,0 +1,28 @@
+# Windows: link the MSVC C runtime statically.
+#
+# Without this the binaries import VCRUNTIME140.dll and the api-ms-win-crt-*
+# forwarders, so they need the Visual C++ Redistributable installed on the
+# target machine. That fails at process start, before `main`, which means our
+# own error handling can never explain it — the installer reports success and
+# then nothing runs.
+#
+# CI cannot catch it either: every GitHub Windows runner image ships the
+# redistributable, so the smoke legs pass on a machine that is not
+# representative of a clean user box. The `no dynamic CRT` step in
+# build-release.yml is the guard that does catch it.
+#
+# This restores the posture the other targets already have: Linux ships static
+# musl (D-0002) and the TLS roots are compiled in (D-0011), both so the binary
+# is a self-contained artifact rather than depending on what the host happens
+# to have. See #60.
+#
+# Set here rather than as RUSTFLAGS in the release workflow on purpose — this
+# way `cargo test` in the `rust-windows` CI job exercises the same linkage we
+# ship. Note an external RUSTFLAGS env var would override this file entirely;
+# nothing in CI sets one.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

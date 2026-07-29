@@ -86,6 +86,13 @@
     file (`-File install.ps1`), an uncaught terminating error already makes powershell.exe
     exit non-zero on its own -- no explicit `exit` needed. Running via `iex`, the same
     `throw` is reported as a normal (non-fatal-to-the-host) error in the caller's session.
+
+    The corollary is a contract worth stating outright: a successful run must never leave a
+    non-zero $LASTEXITCODE behind. Callers act on it -- GitHub Actions ends every
+    `shell: powershell` step with `exit $LASTEXITCODE` -- so an ignored failure from one of
+    the best-effort `dira daemon ...` calls below would silently become the caller's exit
+    status. `Invoke-BestEffort` is the only thing in this file that runs a native command,
+    and resetting $LASTEXITCODE is part of its job.
 #>
 
 [CmdletBinding()]
@@ -136,6 +143,45 @@ function Write-DebugLog {
     if ($script:DiraDebug -eq '1') {
         [Console]::Error.WriteLine("debug: $Message")
     }
+}
+
+# ---------------------------------------------------------------------------
+# best-effort native invocation
+# ---------------------------------------------------------------------------
+
+# Runs `& $Exe @Arguments` for its side effect only, discards its output, and returns its
+# exit code (-1 if it could not be run at all). install.sh's `|| true`, with two Windows
+# PowerShell 5.1 hazards that `|| true` never has to think about:
+#
+#   1. A native command's stderr becomes *error records* as soon as it is redirected, and
+#      under this file's `$ErrorActionPreference = 'Stop'` those records are TERMINATING --
+#      even when the command itself exited 0. `dira daemon uninstall` shells out to
+#      `schtasks` and `reg`, which print "ERROR: ..." whenever there is nothing to remove,
+#      so the plain `& $exe ... *> $null` this replaces always threw on a clean machine and
+#      its exit code was never actually read. Dropping to 'Continue' for the duration of the
+#      call is the fix; the assignment is function-scoped and cannot leak past the return.
+#
+#   2. $LASTEXITCODE lives in the GLOBAL scope -- a plain assignment here would only create
+#      a useless local copy. It has to be reset, because every caller below has *chosen* to
+#      ignore this command's failure and must not silently re-export it: install.ps1 reports
+#      failure by throwing, never through an exit code (see the truncation-safety note at the
+#      top of this file), while GitHub Actions ends every `shell: powershell` step with
+#      `exit $LASTEXITCODE` -- which is how a fully successful `install.ps1 -Uninstall`
+#      failed a release smoke leg. `Set-Variable -Scope Global` rather than
+#      `$global:LASTEXITCODE` keeps PSScriptAnalyzer's PSAvoidGlobalVars rule quiet, which
+#      CI's powershell-lint job enforces at Warning severity with -EnableExit.
+function Invoke-BestEffort {
+    param([string]$Exe, [string[]]$Arguments)
+    $code = -1
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Exe @Arguments 2>&1 | Out-Null
+        $code = $LASTEXITCODE
+    } catch {
+        Write-DebugLog "best-effort '$Exe $($Arguments -join ' ')' failed (ignored): $($_.Exception.Message)"
+    }
+    Set-Variable -Name LASTEXITCODE -Value 0 -Scope Global
+    return $code
 }
 
 # ---------------------------------------------------------------------------
@@ -726,11 +772,7 @@ function Uninstall-Dira {
         }
 
         if (Test-Path -Path $diraExe) {
-            try {
-                & $diraExe daemon stop *> $null
-            } catch {
-                Write-DebugLog "daemon stop failed (ignored, best-effort): $($_.Exception.Message)"
-            }
+            Invoke-BestEffort -Exe $diraExe -Arguments @('daemon', 'stop') | Out-Null
         }
     }
 
@@ -738,12 +780,7 @@ function Uninstall-Dira {
     # present -- a stray task from a previous install must still go.
     $tornDown = $false
     if (Test-Path -Path $diraExe) {
-        try {
-            & $diraExe daemon uninstall *> $null
-            if ($LASTEXITCODE -eq 0) { $tornDown = $true }
-        } catch {
-            Write-DebugLog "'dira daemon uninstall' failed (ignored, best-effort): $($_.Exception.Message)"
-        }
+        $tornDown = (Invoke-BestEffort -Exe $diraExe -Arguments @('daemon', 'uninstall')) -eq 0
     }
     if (-not $tornDown) {
         try {
@@ -897,8 +934,7 @@ function Invoke-Main {
         # 12. was a daemon already running, before we touch anything?
         $daemonWasRunning = $false
         if (Test-Path -Path $installedDira) {
-            & $installedDira daemon status *> $null
-            if ($LASTEXITCODE -eq 0) { $daemonWasRunning = $true }
+            $daemonWasRunning = (Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'status')) -eq 0
         }
 
         # 13. atomic install.
@@ -911,17 +947,20 @@ function Invoke-Main {
         if (-not $NoDaemon) {
             if ($daemonWasRunning) {
                 Write-Info "restarting dirad..."
-                & $installedDira daemon restart *> $null
-                if ($LASTEXITCODE -ne 0) { Write-Warn "could not restart dirad automatically -- run '$installedDira daemon restart' yourself" }
+                if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'restart')) -ne 0) {
+                    Write-Warn "could not restart dirad automatically -- run '$installedDira daemon restart' yourself"
+                }
             } elseif ($startDaemon) {
                 Write-Info "starting dirad..."
-                & $installedDira daemon start *> $null
-                if ($LASTEXITCODE -ne 0) { Write-Warn "could not start dirad automatically -- run '$installedDira daemon start' yourself" }
+                if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'start')) -ne 0) {
+                    Write-Warn "could not start dirad automatically -- run '$installedDira daemon start' yourself"
+                }
             }
             if ($installService) {
                 Write-Info "installing the dirad service..."
-                & $installedDira daemon install *> $null
-                if ($LASTEXITCODE -ne 0) { Write-Warn "could not install the dirad service automatically -- run '$installedDira daemon install' yourself" }
+                if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'install')) -ne 0) {
+                    Write-Warn "could not install the dirad service automatically -- run '$installedDira daemon install' yourself"
+                }
             }
         }
 

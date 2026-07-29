@@ -978,4 +978,17 @@ function Invoke-Main {
 }
 
 Invoke-Main -Version $Version -Channel $Channel -Prerelease:$Prerelease -BinDir $BinDir -Target $Target -Daemon:$Daemon -Service:$Service -NoDaemon:$NoDaemon -Force:$Force -Uninstall:$Uninstall -Help:$Help
+# Make the contract stated at the top of this file literally true for every
+# caller: a run that reached here did not throw, so it succeeded, and it must
+# leave $LASTEXITCODE at 0 -- not merely "at 0 or untouched". `Invoke-BestEffort`
+# resets it, but a path that runs no native command at all (a fresh install:
+# there is no existing `dira` to probe with `daemon status`) would otherwise
+# leave it *unset*, and `$null -ne 0` is TRUE in PowerShell -- so the obvious
+# caller-side check, `if ($LASTEXITCODE -ne 0) { throw }`, fires on a completely
+# successful install. That is not hypothetical: it broke both windows smoke legs
+# of v0.1.1-develop.2. Reached only on success -- a `throw` from Invoke-Main
+# skips this line, which is what leaves powershell.exe exiting non-zero for a
+# `-File` run. Deliberately the last statement in the file, so truncation can
+# only lose the reset, never apply it to a half-finished run.
+Set-Variable -Name LASTEXITCODE -Value 0 -Scope Global
 # end of install.ps1

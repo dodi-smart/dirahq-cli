@@ -393,7 +393,16 @@ jobs:
           # is invisible without this assertion: GitHub ends the step with
           # `exit $LASTEXITCODE`, so a leak fails the step at its very end with nothing in
           # the log pointing at the cause. See the uninstall step below.
-          if ($LASTEXITCODE -ne 0) { throw "install.ps1 leaked exit code $LASTEXITCODE" }
+          #
+          # `Test-Path variable:` first, exactly as GitHub's own wrapper does it, because
+          # `$null -ne 0` is TRUE in PowerShell: a script that ran no native command never
+          # creates $LASTEXITCODE, so the bare comparison throws on a perfectly successful
+          # install. This assertion shipped without the guard and did precisely that to
+          # both windows legs of v0.1.1-develop.2 -- the same null trap the #58 note below
+          # already warned about.
+          if ((Test-Path variable:\LASTEXITCODE) -and $LASTEXITCODE -ne 0) {
+            throw "install.ps1 leaked exit code $LASTEXITCODE"
+          }
           $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
           # Capture first, THEN assert. `dira --version` prints two lines, so
           # piping it straight into `Select-Object -First 1` satisfies the cmdlet
@@ -457,7 +466,12 @@ jobs:
           $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
           # Re-running over an identical install is a no-op.
           .\install.ps1
-          if ($LASTEXITCODE -ne 0) { throw "install.ps1 (idempotent re-run) leaked exit code $LASTEXITCODE" }
+          # `Test-Path variable:` first — see the note on the same assertion in the step
+          # above. The "already installed, nothing to do" path returns before running any
+          # native command, so this one hit the null trap too.
+          if ((Test-Path variable:\LASTEXITCODE) -and $LASTEXITCODE -ne 0) {
+            throw "install.ps1 (idempotent re-run) leaked exit code $LASTEXITCODE"
+          }
           # Assert the exit code here rather than letting GitHub's trailing
           # `exit $LASTEXITCODE` decide the step's fate. This uninstall did its whole job
           # -- printed "removed dira and dirad", both Test-Path guards below stayed quiet --
@@ -467,6 +481,8 @@ jobs:
           # $LASTEXITCODE poisoned. Fixed in install.ps1's Invoke-BestEffort; asserted here
           # so a regression names itself instead of pointing at the end of the step.
           .\install.ps1 -Uninstall -Force
-          if ($LASTEXITCODE -ne 0) { throw "install.ps1 -Uninstall leaked exit code $LASTEXITCODE" }
+          if ((Test-Path variable:\LASTEXITCODE) -and $LASTEXITCODE -ne 0) {
+            throw "install.ps1 -Uninstall leaked exit code $LASTEXITCODE"
+          }
           if (Test-Path "$env:DIRA_BIN_DIR\dira.exe") { throw "dira.exe still present after -Uninstall" }
           if (Test-Path "$env:DIRA_BIN_DIR\dirad.exe") { throw "dirad.exe still present after -Uninstall" }

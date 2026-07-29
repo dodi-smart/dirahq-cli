@@ -150,14 +150,22 @@ both executables and restarts whatever is supervising the daemon.
 - The control socket is never resolved through `$TMPDIR` (D-0008): it differs
   per process, so a client and a healthy daemon would silently miss each
   other and the daemon would present as "down".
-- A successful `install.ps1` run leaves `$LASTEXITCODE` at 0. The script
-  signals failure by throwing, never through an exit code, so any non-zero
-  code it leaves behind is spurious — and it is not cosmetic: GitHub Actions
-  ends every `shell: powershell` step with `exit $LASTEXITCODE`, which is how
-  a `-Uninstall` that printed every success message and removed both binaries
-  still failed both Windows smoke legs of the v0.1.1-develop.1 release. The
-  windows smoke steps in `build-release.yml` assert `$LASTEXITCODE` after each
-  `install.ps1` invocation so a regression names itself.
+- A successful `install.ps1` run leaves `$LASTEXITCODE` at 0 — set explicitly
+  as the file's last statement, not merely "0 or untouched". The script signals
+  failure by throwing, never through an exit code, so any non-zero code it
+  leaves behind is spurious — and it is not cosmetic: GitHub Actions ends every
+  `shell: powershell` step with `exit $LASTEXITCODE`, which is how a
+  `-Uninstall` that printed every success message and removed both binaries
+  still failed both Windows smoke legs of the v0.1.1-develop.1 release.
+- Any caller comparing `$LASTEXITCODE` must test `Test-Path variable:` first,
+  the way GitHub's own wrapper does. `$null -ne 0` is **TRUE** in PowerShell, so
+  a bare `if ($LASTEXITCODE -ne 0) { throw }` fires after a script that ran no
+  native command at all and therefore never created the variable. The smoke
+  assertions in `build-release.yml` shipped without that guard and failed both
+  windows legs of v0.1.1-develop.2 on a *successful* fresh install — the same
+  null trap the #58 note in that file already warned about. Normalising inside
+  `install.ps1` and guarding in the caller are both needed: one keeps the
+  contract true, the other survives an older or truncated script.
 
 ## Open Questions
 

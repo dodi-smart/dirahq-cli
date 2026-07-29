@@ -1,10 +1,10 @@
 ---
 title: Distribution and self-update
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
-date: 2026-07-29
+date: 2026-07-30
 paths:
   - install.sh
   - install.ps1
@@ -64,6 +64,14 @@ both executables and restarts whatever is supervising the daemon.
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
   is safe in a script.
+- Every comparison of a resolved release against the **running** version goes
+  through `resolve::compare_versions` (SemVer 2.0 §11), never string equality.
+  Three callers share it — `--check`'s message, the passive notice, and the
+  downgrade guard — and an unorderable version means "make no claim", never
+  "different, therefore newer". Being *ahead* of a channel is a normal state,
+  not an upgrade: a prerelease against the stable channel reports up to date
+  (`--check` names the channel head it is ahead of; the passive notice stays
+  silent, since it fires on ordinary commands).
 - Daemon restart covers launchd, systemd-user, and pidfile supervision. The
   running daemon reports its own pid over the socket, so a missing pidfile is
   not a dead end.
@@ -127,6 +135,18 @@ both executables and restarts whatever is supervising the daemon.
   (D-0004).
 - The update check never performs network I/O on the foreground path
   (D-0006), and its notice goes to stderr so piped output is unchanged.
+- `dira update` never installs a version older than the running one unless
+  `--version` asked for it by name. The channel-resolved path refuses with
+  both escape hatches spelled out; `--force` does not override it (that flag
+  means the D-0004 dev-install guard and nothing else). Without this the
+  notice and `update` disagreed: the check offered stable `0.1.0` to a
+  `0.1.1-develop.1` build and the command carried the downgrade out.
+- The post-swap `dira --version` probe retries on `ETXTBSY`. This is the
+  *other* ETXTBSY, distinct from D-0003's "never open the destination for
+  writing": Linux also refuses to **exec** an inode any process holds open for
+  writing, and staging plus a concurrent fork elsewhere in the process creates
+  exactly that window. Rename discipline cannot prevent it; a bounded retry
+  can.
 - The control socket is never resolved through `$TMPDIR` (D-0008): it differs
   per process, so a client and a healthy daemon would silently miss each
   other and the daemon would present as "down".

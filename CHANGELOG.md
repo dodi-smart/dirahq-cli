@@ -1,3 +1,15 @@
+## [0.1.1](https://github.com/dodi-smart/dirahq-cli/compare/v0.1.0...v0.1.1) (2026-07-30)
+
+### 🐛 Bug Fixes
+
+* **cli:** compare release versions by semver, never by string equality ([f7ea468](https://github.com/dodi-smart/dirahq-cli/commit/f7ea4686c2d5f1d0a8dd8b8469f85181796d0e16))
+* **cli:** fall back to anonymous in dira update when the token is rejected ([5149d79](https://github.com/dodi-smart/dirahq-cli/commit/5149d7958a44af6a6e39410161c6386479b78996))
+* **cli:** fall back to anonymous when GitHub rejects GH_TOKEN/GITHUB_TOKEN ([34a4a2a](https://github.com/dodi-smart/dirahq-cli/commit/34a4a2a588f528a3ed978570e5ed89e1a784d440))
+* **cli:** link the MSVC CRT statically so windows needs no VC++ redist ([b63b039](https://github.com/dodi-smart/dirahq-cli/commit/b63b0398675f1bd334243f490ade477b87863fda))
+* **cli:** normalize $LASTEXITCODE in install.ps1, and guard the smoke assertions ([cad2b69](https://github.com/dodi-smart/dirahq-cli/commit/cad2b6956dd1616032cab9eb72d6243b26637035)), closes [#58](https://github.com/dodi-smart/dirahq-cli/issues/58)
+* **cli:** retry the post-swap version probe on ETXTBSY ([ba1800a](https://github.com/dodi-smart/dirahq-cli/commit/ba1800a6800b3a154bba4b6ef07a71409b1fe87a))
+* **cli:** stop install.ps1 leaking $LASTEXITCODE from best-effort daemon calls ([47f0f00](https://github.com/dodi-smart/dirahq-cli/commit/47f0f00562a67e6da2e9da7decf916a70b4eeb9a))
+
 ## [0.1.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.0.0...v0.1.0) (2026-07-28)
 
 ### ✨ Features

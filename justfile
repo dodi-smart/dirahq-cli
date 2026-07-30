@@ -76,9 +76,23 @@ link:
     @echo "Linked dira + dirad -> {{bin_dir}}"
 
 # Restart the resident daemon from the freshly built binary.
+#
+# `daemon restart` — NOT `stop` + `start`. Only `restart` runs the supervision
+# detection that knows how to replace a daemon it cannot see on the configured
+# socket: a pre-D-0008 build still answering on the legacy `$TMPDIR/dira.sock`
+# (Supervision::LegacySocket), or one owned by launchd/systemd. `daemon stop`
+# only looks for a pidfile beside the CURRENT socket path, so across a
+# socket-path change it finds nothing, prints "no pidfile", exits 0 — and the
+# old daemon keeps running. `start` then binds the new socket while the old
+# process still holds :8722, leaving the new daemon DEGRADED (and, under
+# launchd, respawning every 10s against a socket it can never win).
+#
+# `restart` exits 0 having done nothing when no daemon is running, so `start`
+# still follows to cover the fresh-install case; it is allowed to fail (`-`)
+# for the commoner case where `restart` already brought one up.
 daemon-restart:
-    -"{{bin_dir}}/dira" daemon stop
-    "{{bin_dir}}/dira" daemon start
+    "{{bin_dir}}/dira" daemon restart
+    -"{{bin_dir}}/dira" daemon start
     "{{bin_dir}}/dira" daemon status
 
 # ---------- Packaging (reproduce the CI release archive shape locally) ----------

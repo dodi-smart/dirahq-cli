@@ -1,6 +1,6 @@
 ---
 title: Distribution and self-update
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
@@ -72,6 +72,17 @@ both executables and restarts whatever is supervising the daemon.
   not an upgrade: a prerelease against the stable channel reports up to date
   (`--check` names the channel head it is ahead of; the passive notice stays
   silent, since it fires on ordinary commands).
+- A `GH_TOKEN`/`GITHUB_TOKEN` the API **rejects** is never fatal, in any of the
+  three code paths that read it (`install.sh`, `install.ps1`, `dira update`).
+  On a public repo a token is purely an optimization — it lifts GitHub's
+  60 req/hr anonymous per-IP limit and nothing else — so a 401 drops the token,
+  warns once on stderr, and resolution continues anonymously. An expired or
+  wrong-account token exported in a user's shell is common and has nothing to
+  do with dira; before this it made the product uninstallable and
+  un-updatable. Dropping the token (rather than retrying the one call) is what
+  also moves the *download* off the authenticated asset-id path, which would
+  otherwise resend the same rejected bearer. Only 401 is recoverable — a 404 or
+  a 5xx stays fatal rather than being retried as if it were an auth problem.
 - Daemon restart covers launchd, systemd-user, and pidfile supervision. The
   running daemon reports its own pid over the socket, so a missing pidfile is
   not a dead end.

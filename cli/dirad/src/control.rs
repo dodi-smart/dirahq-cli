@@ -512,9 +512,13 @@ fn build_session_views(
     events: &[RawEvent],
     active_only: bool,
 ) -> Vec<SessionView> {
-    let reg = lock_recover(&state.sessions);
-    let live = if active_only { reg.active() } else { reg.all() };
     let now = OffsetDateTime::now_utc();
+    let reg = lock_recover(&state.sessions);
+    let live = if active_only {
+        reg.active(now, state.config.session_stale_after())
+    } else {
+        reg.all()
+    };
     let idle = state.config.idle();
 
     // De-duplicated human time attributed **per session** by the opening-signal

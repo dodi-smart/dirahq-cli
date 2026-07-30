@@ -179,6 +179,29 @@ pub fn knowledge_activity(root: &Path, window_days: u32) -> KnowledgeActivity {
     }
 }
 
+/// Author date (RFC 3339) of the commit that first ADDED anything under
+/// `pathspec`, or `None` when the path has no such commit (or this isn't a repo).
+///
+/// Exists to date a repo's adoption of a practice — specifically, when `.zavet/`
+/// appeared — so a rolling statistics window can be clamped to the period the
+/// practice was actually in force instead of spanning history that predates it
+/// (issue #67).
+///
+/// `git log` lists newest-first, so the ADDING commit is the LAST line. Taking it
+/// that way rather than with `--reverse --max-count=1` is deliberate: git applies
+/// `--max-count` before reversing, so that pairing returns the most recent add,
+/// which is the opposite of what's wanted whenever a path was deleted and
+/// re-added.
+pub fn first_commit_date(root: &Path, pathspec: &str) -> Option<String> {
+    let out = git(
+        root,
+        &["log", "--diff-filter=A", "--format=%aI", "--", pathspec],
+    )?;
+    // `git` already trims its output and maps an empty result to `None`, so the
+    // last line of what reaches here is always a real date.
+    out.lines().last().map(|s| s.trim().to_string())
+}
+
 /// Distinct non-`.zavet/` paths touched inside the rolling window AND matching
 /// one of `pathspecs` (git `:(glob)` semantics — the same dialect the
 /// staleness query uses). The knowledge coverage numerator.
@@ -634,7 +657,9 @@ pub fn canonicalize_remote(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::canonicalize_remote;
+    use super::{
+        canonicalize_remote, first_commit_date, knowledge_activity, paths_touched_since_days,
+    };
 
     #[test]
     fn ssh_scp_form() {
@@ -748,21 +773,180 @@ mod tests {
 
     /// Run a git command in `dir`, panicking on failure (test setup helper).
     fn run_git(dir: &Path, args: &[&str]) {
-        let status = git_command()
-            .arg("-C")
+        run_git_env(dir, args, None);
+    }
+
+    /// Like [`run_git`] but with the commit dates pinned, so window/date tests
+    /// don't depend on when they run.
+    fn run_git_at(dir: &Path, args: &[&str], date: &str) {
+        run_git_env(dir, args, Some(date));
+    }
+
+    /// Run git with the identity pinned, optionally pinning the commit dates too.
+    fn run_git_env(dir: &Path, args: &[&str], date: Option<&str>) {
+        let mut cmd = git_command();
+        cmd.arg("-C")
             .arg(dir)
             .args(args)
             .env("GIT_AUTHOR_NAME", "T")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "T")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
-            .expect("git runs");
+            .env("GIT_COMMITTER_EMAIL", "t@example.com");
+        if let Some(date) = date {
+            cmd.env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date);
+        }
+        let status = cmd.output().expect("git runs");
         assert!(
             status.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&status.stderr)
         );
+    }
+
+    /// A bare repo with one dated commit on `main`. No upstream — these tests
+    /// only walk local history.
+    fn init_plain_repo(tag: &str, date: &str) -> std::path::PathBuf {
+        let root = temp_repo_dir(tag);
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        run_git(&root, &["config", "user.email", "t@example.com"]);
+        run_git(&root, &["config", "user.name", "T"]);
+        write(&root, "src.rs", "fn main() {}\n");
+        run_git(&root, &["add", "."]);
+        run_git_at(&root, &["commit", "-q", "-m", "base"], date);
+        root
+    }
+
+    fn commit_file(root: &Path, rel: &str, body: &str, msg: &str, date: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        run_git(root, &["add", "."]);
+        run_git_at(root, &["commit", "-q", "-m", msg], date);
+    }
+
+    /// Issue #67 hinges on dating a repo's adoption of `.zavet/`. Nothing did
+    /// that before, so this helper — and these three tests — are the first
+    /// coverage of it.
+    #[test]
+    fn first_commit_date_reports_when_a_path_was_added() {
+        let root = init_plain_repo("first-add", "2026-05-01T10:00:00+00:00");
+        commit_file(
+            &root,
+            ".zavet/decisions/D-0001.md",
+            "# D-0001\n",
+            "chore(repo): adopt zavet",
+            "2026-06-15T10:00:00+00:00",
+        );
+        // Later work under the same directory must NOT move the adoption date.
+        commit_file(
+            &root,
+            ".zavet/decisions/D-0002.md",
+            "# D-0002\n",
+            "chore(repo): another decision",
+            "2026-07-20T10:00:00+00:00",
+        );
+
+        let got = first_commit_date(&root, ".zavet").expect("dated");
+        assert!(
+            got.starts_with("2026-06-15"),
+            "must report the ADDING commit, not the newest one: {got}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A repo that never adopted zavet has no date — the caller falls back to the
+    /// full window rather than clamping to nothing.
+    #[test]
+    fn first_commit_date_is_none_for_a_path_that_never_existed() {
+        let root = init_plain_repo("no-zavet", "2026-05-01T10:00:00+00:00");
+        assert_eq!(first_commit_date(&root, ".zavet"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn first_commit_date_is_none_outside_a_repo() {
+        let dir = temp_repo_dir("not-a-repo");
+        assert_eq!(first_commit_date(&dir, ".zavet"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `knowledge_activity` feeds the capture-ratio denominator and had no test.
+    /// The two things it must get right: `.zavet/` files are knowledge, not code,
+    /// so they count toward neither paths nor triviality.
+    #[test]
+    fn knowledge_activity_counts_code_and_ignores_zavet_only_commits() {
+        let root = init_plain_repo("activity", "2026-07-01T10:00:00+00:00");
+        commit_file(
+            &root,
+            "src/lib.rs",
+            "pub fn a() {}\n",
+            "feat(cli): add a",
+            "2026-07-02T10:00:00+00:00",
+        );
+        commit_file(
+            &root,
+            ".zavet/decisions/D-0001.md",
+            "# D-0001\n",
+            "chore(repo): decision only",
+            "2026-07-03T10:00:00+00:00",
+        );
+
+        let a = knowledge_activity(&root, 365);
+        assert!(
+            a.paths.contains(&"src/lib.rs".to_string()),
+            "code paths count: {:?}",
+            a.paths
+        );
+        assert!(
+            !a.paths.iter().any(|p| p.starts_with(".zavet/")),
+            "zavet paths are knowledge, not the code being covered: {:?}",
+            a.paths
+        );
+        assert_eq!(
+            a.nontrivial_commits.len(),
+            2,
+            "base + the code commit; the zavet-only commit is trivial"
+        );
+
+        // The window is a real bound, not decoration.
+        assert!(
+            knowledge_activity(&root, 1).nontrivial_commits.is_empty(),
+            "a 1-day window excludes commits dated weeks ago"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `paths_touched_since_days` is the coverage numerator and also had no test.
+    #[test]
+    fn paths_touched_since_days_matches_only_the_given_globs() {
+        let root = init_plain_repo("covered", "2026-07-01T10:00:00+00:00");
+        commit_file(
+            &root,
+            "src/lib.rs",
+            "pub fn a() {}\n",
+            "feat(cli): a",
+            "2026-07-02T10:00:00+00:00",
+        );
+        commit_file(
+            &root,
+            "docs/readme.md",
+            "hi\n",
+            "docs(repo): readme",
+            "2026-07-03T10:00:00+00:00",
+        );
+
+        let covered = paths_touched_since_days(&root, 365, &["src/**".to_string()]);
+        assert_eq!(covered, vec!["src/lib.rs".to_string()]);
+
+        assert!(
+            paths_touched_since_days(&root, 365, &[]).is_empty(),
+            "no guards means nothing is covered, not everything"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Capture trimmed stdout of a git command (test helper).

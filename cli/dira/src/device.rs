@@ -556,7 +556,53 @@ pub async fn status(config: &Config) -> Result<()> {
         "{}",
         cloud_status_line(cloud_wm.as_deref(), local_head.as_deref(), pending)
     );
+
+    // The daemon's own verdict on whether sync is working. Without it, a sync
+    // paused on `signature_rejected` shows here as nothing more than an
+    // unexplained "N event(s) queued" — the backlog is the symptom, and the
+    // reason was only ever visible in `dira status` (issue #24). Read straight
+    // from the store: this command opens `dira.db` directly and must keep
+    // working when the daemon is down, which is exactly when it's asked.
+    if let Some(h) = store
+        .meta_get(dira_core::sync::META_SYNC_HEALTH)
+        .await?
+        .as_deref()
+        .and_then(dira_core::sync::parse_sync_health)
+    {
+        if let Some(line) = crate::render::health_line(
+            h.consecutive_failures,
+            h.last_error_kind.as_deref(),
+            h.backoff_secs,
+        ) {
+            println!("{line}");
+        }
+    }
+
+    // An unresolved two-phase key rotation: the other half of the same blind
+    // spot. A rotation interrupted mid-flight is precisely what produces
+    // `signature_rejected`, and the operator has no way to see one is stuck.
+    //
+    // Read `META_PENDING_ROTATED_AT` directly rather than via `load_pending_key`:
+    // that returns `None` when the secret can't be resolved, which is one of the
+    // states most worth reporting, and it touches the keychain — which can raise
+    // a GUI prompt on macOS just for printing status.
+    if let Some(rotated_at) = store
+        .meta_get(identity::META_PENDING_ROTATED_AT)
+        .await?
+        .filter(|s| !s.is_empty())
+    {
+        println!("{}", pending_rotation_line(&rotated_at));
+    }
+
     Ok(())
+}
+
+/// The `rotation:` line for an unresolved two-phase rotation. Pure, so the
+/// wording is unit-testable.
+fn pending_rotation_line(rotated_at: &str) -> String {
+    format!(
+        "rotation:  pending since {rotated_at} — unresolved; re-run `dira device rotate-key` to finish it"
+    )
 }
 
 /// `dira device resync`: ask the daemon (over the control socket, so the live flush
@@ -796,6 +842,45 @@ mod tests {
     const PROBE_PATH: &str = "/api/v1/billing/summary";
     const DEVICE_ID: &str = "01TESTDEVICE";
     const ROTATED_AT: &str = "2026-07-09T10:00:00Z";
+
+    /// Issue #24: the operator had no way to see a rotation stuck mid-flight,
+    /// even though an unresolved rotation is exactly what produces the
+    /// `signature_rejected` pause that shows up as an unexplained backlog.
+    #[test]
+    fn pending_rotation_line_names_the_command_that_resolves_it() {
+        let line = pending_rotation_line(ROTATED_AT);
+        assert!(line.starts_with("rotation:"), "label column: {line}");
+        assert!(line.contains(ROTATED_AT), "says how long it's been stuck");
+        assert!(
+            line.contains("dira device rotate-key"),
+            "an operator-facing line must say what to run: {line}"
+        );
+    }
+
+    /// `cloud_status_line` is documented "Pure, so it's unit-testable" and had no
+    /// test. Each branch answers a different operator question, so each is pinned.
+    #[test]
+    fn cloud_status_line_distinguishes_every_coverage_state() {
+        let old = ulid::Ulid::from_parts(1_000_000, 0).to_string();
+        let new = ulid::Ulid::from_parts(9_000_000, 0).to_string();
+
+        assert!(
+            cloud_status_line(None, Some(&new), 0).contains("no handshake yet"),
+            "never synced is not the same as in sync"
+        );
+        assert!(
+            cloud_status_line(Some(&old), Some(&new), 0).contains("dira device resync"),
+            "a cloud behind the local head with nothing queued is a silent gap"
+        );
+        assert!(
+            cloud_status_line(Some(&new), Some(&new), 0).contains("in sync"),
+            "caught up"
+        );
+        // A backlog explains the gap, so it is queued work, not a silent gap.
+        let queued = cloud_status_line(Some(&old), Some(&new), 5);
+        assert!(queued.contains("5 event(s) queued"), "{queued}");
+        assert!(!queued.contains("resync"), "{queued}");
+    }
 
     /// A fresh old/pending keypair + an in-memory store with nothing pending
     /// yet — the common setup every rotation test starts from.

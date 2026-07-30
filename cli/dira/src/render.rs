@@ -67,6 +67,21 @@ fn terminal_cols() -> u16 {
     }
 }
 
+/// Does this session have any counted time to show?
+///
+/// A **presentation** rule, deliberately NOT the daemon's liveness rule. The
+/// registry's `had_signal` (issue #74) asks "did this session ever do anything" —
+/// a single tool call qualifies. This asks the narrower question a time table
+/// cares about: "is there a number to put in a row". A session with one `PreTool`
+/// and no measurable gap answers yes to the first and no to the second, and both
+/// answers are correct for their own question.
+///
+/// Named and shared so the two tables that ask it cannot drift apart, and so it
+/// reads as its own rule rather than as a third copy of the liveness one.
+fn has_time(s: &SessionView) -> bool {
+    s.human_seconds > 0 || s.agent_seconds > 0
+}
+
 /// A proportional bar `width` cells wide; `frac` is clamped to [0, 1]. Thin
 /// wrapper over [`crate::format::bar`] that takes a fraction instead of
 /// value/max, so the local call sites read unchanged.
@@ -107,14 +122,8 @@ pub fn print(resp: &Response) -> bool {
             true
         }
         Response::Sessions { sessions } => {
-            // Drop degenerate sessions — no engaged time AND no agent activity,
-            // just empty noise (mirrors the cloud dropping 0-engaged sessions
-            // that also have no agent or compute).
-            let shown: Vec<SessionView> = sessions
-                .iter()
-                .filter(|s| s.human_seconds > 0 || s.agent_seconds > 0)
-                .cloned()
-                .collect();
+            let shown: Vec<SessionView> =
+                sessions.iter().filter(|s| has_time(s)).cloned().collect();
             print_sessions(&shown, &Layout::for_width(terminal_cols()));
             true
         }
@@ -833,12 +842,7 @@ fn print_zavet_wiki(v: &dira_core::protocol::ZavetWikiView) {
 pub fn print_status(s: &StatusView, detailed: bool) {
     // Hide degenerate sessions — a bare SessionStart with no engaged time and no
     // agent activity is noise (e.g. a project you opened but didn't work in).
-    let active: Vec<SessionView> = s
-        .active
-        .iter()
-        .filter(|v| v.human_seconds > 0 || v.agent_seconds > 0)
-        .cloned()
-        .collect();
+    let active: Vec<SessionView> = s.active.iter().filter(|v| has_time(v)).cloned().collect();
 
     for line in summary_lines(s, &active, OffsetDateTime::now_utc()) {
         println!("{line}");
@@ -906,18 +910,41 @@ pub fn print_status(s: &StatusView, detailed: bool) {
 /// skipped-with-zero-failures case; any OTHER combination (a real failure
 /// kind, or `consecutive_failures > 0`) still renders as before.
 fn sync_health_line(h: &dira_core::protocol::SyncHealthView) -> Option<String> {
-    if h.consecutive_failures == 0 && h.last_error_kind.as_deref() == Some("skipped") {
+    health_line(
+        h.consecutive_failures,
+        h.last_error_kind.as_deref(),
+        h.backoff_secs,
+    )
+}
+
+/// One human-readable line about sync health, or `None` when there is nothing
+/// worth saying.
+///
+/// Takes plain fields rather than a snapshot type because its two callers hold
+/// different ones: `dira status` gets a `SyncHealthView` over the control
+/// socket, `dira device status` reads a `SyncHealth` straight off `dira.db`.
+/// They must never disagree about whether a daemon is healthy, and one function
+/// is how that is guaranteed.
+///
+/// Two silences, both deliberate:
+/// - `"skipped"` with zero failures — the device isn't configured or linked. It
+///   is a NEUTRAL outcome, never a failure, so printing it would give a
+///   never-linked daemon a permanent red line saying "0 consecutive failure(s)".
+/// - no error kind and zero failures — steady state. Silence is the good news.
+pub(crate) fn health_line(
+    consecutive_failures: u32,
+    last_error_kind: Option<&str>,
+    backoff_secs: u64,
+) -> Option<String> {
+    if consecutive_failures == 0 && matches!(last_error_kind, None | Some("skipped")) {
         return None;
     }
-    if h.consecutive_failures == 0 && h.last_error_kind.is_none() {
-        return None;
-    }
-    let mut line = format!("sync: {} consecutive failure(s)", h.consecutive_failures);
-    if let Some(kind) = &h.last_error_kind {
+    let mut line = format!("sync: {consecutive_failures} consecutive failure(s)");
+    if let Some(kind) = last_error_kind {
         line.push_str(&format!(" ({kind})"));
     }
-    if h.backoff_secs > 0 {
-        line.push_str(&format!(", backing off {}s", h.backoff_secs));
+    if backoff_secs > 0 {
+        line.push_str(&format!(", backing off {backoff_secs}s"));
     }
     Some(line)
 }

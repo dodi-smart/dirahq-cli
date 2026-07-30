@@ -33,6 +33,16 @@ pub struct Normalized {
     /// Path to the harness transcript, when the hook provides one. Used to
     /// capture token usage off the hot path; never read for prompt content.
     pub transcript_path: Option<String>,
+    /// Why a session *began*, when the harness says so (Claude Code's
+    /// `SessionStart.source`: `startup` / `resume` / `clear` / `compact` / `fork`).
+    /// Diagnostics only — nothing accounts on it. Without it a launcher spawn and a
+    /// real session are indistinguishable by the time they reach the daemon, which
+    /// is what made issue #74 invisible for so long.
+    pub source: Option<String>,
+    /// Why a session *ended*, when the harness says so (Claude Code's
+    /// `SessionEnd.reason`: `clear` / `resume` / `logout` / `prompt_input_exit` /
+    /// `bypass_permissions_disabled` / `other`). Diagnostics only, as above.
+    pub reason: Option<String>,
 }
 
 /// A pluggable harness ingress. Each source knows how to turn one harness's raw

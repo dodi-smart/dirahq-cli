@@ -40,6 +40,13 @@ pub struct ClaudeHook {
     /// on most hooks; we read it only to extract token usage counts.
     #[serde(default)]
     pub transcript_path: Option<String>,
+    /// `SessionStart.source` — `startup`, `resume`, `clear`, `compact`, or `fork`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// `SessionEnd.reason` — `clear`, `resume`, `logout`, `prompt_input_exit`,
+    /// `bypass_permissions_disabled`, or `other`.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Map a Claude Code hook to a normalized event. Returns `None` for hook names we
@@ -66,6 +73,8 @@ pub fn normalize(hook: &ClaudeHook) -> Option<Normalized> {
         cwd: hook.cwd.clone(),
         tool: hook.tool_name.clone(),
         transcript_path: hook.transcript_path.clone(),
+        source: hook.source.clone(),
+        reason: hook.reason.clone(),
     })
 }
 
@@ -94,6 +103,44 @@ mod tests {
         let n = normalize(&hook).unwrap();
         assert_eq!(n.kind, EventKind::PreTool);
         assert_eq!(n.tool.as_deref(), Some("Bash"));
+    }
+
+    /// Claude Code sends `source` on SessionStart and `reason` on SessionEnd. Both
+    /// used to be dropped on the floor, which is precisely why a launcher spawn and a
+    /// real session were indistinguishable by the time they reached the daemon
+    /// (issue #74). Nothing accounts on them — they exist to make that class of
+    /// problem diagnosable instead of invisible.
+    #[test]
+    fn carries_session_start_source_and_session_end_reason() {
+        let start: ClaudeHook = serde_json::from_str(
+            r#"{"hook_event_name":"SessionStart","session_id":"abc","source":"startup"}"#,
+        )
+        .unwrap();
+        let n = normalize(&start).unwrap();
+        assert_eq!(n.kind, EventKind::SessionStart);
+        assert_eq!(n.source.as_deref(), Some("startup"));
+        assert_eq!(n.reason, None);
+
+        let end: ClaudeHook = serde_json::from_str(
+            r#"{"hook_event_name":"SessionEnd","session_id":"abc","reason":"clear"}"#,
+        )
+        .unwrap();
+        let n = normalize(&end).unwrap();
+        assert_eq!(n.kind, EventKind::SessionEnd);
+        assert_eq!(n.reason.as_deref(), Some("clear"));
+        assert_eq!(n.source, None);
+    }
+
+    /// An older Claude Code (or any other harness) omits both fields entirely —
+    /// they must stay absent rather than fail the whole payload.
+    #[test]
+    fn missing_source_and_reason_are_absent_not_an_error() {
+        let hook: ClaudeHook =
+            serde_json::from_str(r#"{"hook_event_name":"SessionStart","session_id":"abc"}"#)
+                .unwrap();
+        let n = normalize(&hook).unwrap();
+        assert_eq!(n.source, None);
+        assert_eq!(n.reason, None);
     }
 
     #[test]

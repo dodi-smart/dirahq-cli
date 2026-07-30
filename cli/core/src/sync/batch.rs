@@ -247,6 +247,32 @@ fn assemble_batch(
 /// Default soft cap on events per sync sub-batch (see [`build_chunked_batches`]).
 pub const CHUNK_EVENTS: usize = 1000;
 
+/// Hard cap on artifacts per sync sub-batch (see [`build_chunked_batches`]).
+///
+/// Events were capped from the start; artifacts were not, and they are the fat
+/// rows — each carries `touched_paths` and `blobs`, so a single row's size is
+/// unbounded in practice. `dira device resync` rewinds the artifact cursor to the
+/// beginning, so the very first flush after one tried to ship the entire backlog
+/// in one request and was rejected `413 Payload Too Large` (issue #71). The limit
+/// is the platform's request-body ceiling, not anything the cloud chooses, so the
+/// only place it can be respected is here, at construction.
+///
+/// 100 is deliberately well under any plausible ceiling even for rows with large
+/// path/blob lists: the cost of a low cap is one extra HTTP round-trip inside a
+/// flush that is already looping over chunks, which is far cheaper than a wedged
+/// resync.
+pub const CHUNK_ARTIFACTS: usize = 100;
+
+/// Hard cap on token-usage rows per sync sub-batch (see [`build_chunked_batches`]).
+///
+/// Tokens were nominally "bounded by the event window", which stops being a bound
+/// on exactly the trigger that produced issue #71: `dira device resync` rewinds
+/// the event cursor as well as the artifact one, so the window becomes the entire
+/// log and every token row it spans rides one request. Rows are much smaller than
+/// artifacts — ids, counts, a model name, no path or blob lists — hence the higher
+/// cap. The cloud dedups `token_usage` by id, so spreading them is free.
+pub const CHUNK_TOKENS: usize = 1000;
+
 /// One deterministically-chunked sub-batch, paired with the bookkeeping the daemon
 /// needs to advance its cursors after the cloud acks it.
 pub struct ChunkBatch {
@@ -291,9 +317,19 @@ fn chunk_ranges(events: &[RawEvent], idle: Duration, min_chunk: usize) -> Vec<(u
 
 /// Build deterministic, capped sub-batches for a window. Each chunk derives its own
 /// intervals/sessions from its events (lossless thanks to [`chunk_ranges`]); the
-/// final chunk additionally carries the token rows, artifacts, and partial rollups
-/// (the cloud dedups tokens by id, artifacts by sha, sessions by id), so their
-/// cursors advance only once the whole window has drained.
+/// final chunk additionally carries the token rows and partial rollups (the cloud
+/// dedups tokens by id and sessions by id), so their cursors advance only once the
+/// whole window has drained.
+///
+/// **Artifacts are spread across the chunks**, at most [`CHUNK_ARTIFACTS`] per
+/// chunk, rather than all riding the final one (issue #71). Spreading rather than
+/// capping the store read is what keeps the artifact cursor honest: it still
+/// advances exactly once, on the true final chunk, to the same snapshot bound the
+/// caller read — so there is never a window in which the cursor has moved past a
+/// row that was never sent. A backlog larger than the event chunks can carry gets
+/// extra artifact-only chunks appended after the last event chunk, so the whole
+/// backlog still drains within ONE flush instead of one cap-sized slice per
+/// backstop tick.
 #[allow(clippy::too_many_arguments)]
 pub fn build_chunked_batches(
     events: &[RawEvent],
@@ -314,46 +350,54 @@ pub fn build_chunked_batches(
     // the others is a no-op for them, not a duplication risk.
     history: &[RawEvent],
 ) -> Vec<ChunkBatch> {
-    if events.is_empty() {
-        // Artifact/partial-only flush — one batch, no event cursor to advance.
-        let batch = assemble_batch(
-            &[],
-            &[], // no window events → no boundary gap to seed
-            history,
-            token_rows,
-            artifact_rows,
-            partials,
-            device_id,
-            idle,
-            now,
-        );
-        return vec![ChunkBatch {
-            batch,
-            cursor_event_id: None,
-            is_last: true,
-        }];
-    }
+    // Size-bounded slices of the two collections that are NOT bounded by the
+    // event window. `chunks` on an empty slice yields nothing, so a flush without
+    // artifacts or tokens behaves exactly as before.
+    let art_slices: Vec<&[ArtifactRow]> = artifact_rows.chunks(CHUNK_ARTIFACTS).collect();
+    let tok_slices: Vec<&[TokenRow]> = token_rows.chunks(CHUNK_TOKENS).collect();
 
+    // `chunk_ranges` returns empty for empty events, so an artifact/partial-only
+    // flush falls out of the same loop: every per-chunk expression below degrades
+    // to the no-events form. `.max(1)` keeps the one batch a partials-only flush
+    // needs when there is neither an event nor an artifact to chunk.
     let ranges = chunk_ranges(events, idle, CHUNK_EVENTS);
-    let n = ranges.len();
-    ranges
-        .into_iter()
-        .enumerate()
-        .map(|(i, (s, e))| {
+    // Enough chunks to carry both the events and the artifacts: the artifact
+    // backlog can outlast the event chunks (a resync rewinds only the artifact
+    // cursor), and the surplus rides artifact-only chunks appended after them.
+    let n = ranges
+        .len()
+        .max(art_slices.len())
+        .max(tok_slices.len())
+        .max(1);
+    (0..n)
+        .map(|i| {
             let is_last = i == n - 1;
-            let chunk = &events[s..=e];
-            // Only the first chunk abuts the flush cursor, so only it seeds.
-            let chunk_seed: &[RawEvent] = if i == 0 { seed } else { &[] };
-            let (toks, arts, parts): (&[TokenRow], &[ArtifactRow], &[PartialSession]) = if is_last {
-                (token_rows, artifact_rows, partials)
+            let chunk: &[RawEvent] = ranges.get(i).map_or(&[], |&(s, e)| &events[s..=e]);
+            // Only the first chunk abuts the flush cursor, so only it seeds — and
+            // only if it actually holds events; a seed exists to anchor a gap
+            // against them.
+            let chunk_seed: &[RawEvent] = if i == 0 && !chunk.is_empty() {
+                seed
             } else {
-                (&[], &[], &[])
+                &[]
             };
+            let arts: &[ArtifactRow] = art_slices.get(i).copied().unwrap_or(&[]);
+            // History only ever merges into the chunk holding a session's
+            // terminal event, so an event-free chunk would scan all of it to
+            // produce nothing.
+            let hist: &[RawEvent] = if chunk.is_empty() { &[] } else { history };
+            let toks: &[TokenRow] = tok_slices.get(i).copied().unwrap_or(&[]);
+            // Partials alone still ride the final chunk: they are a snapshot of
+            // the live registry, bounded by the number of open sessions, and
+            // their sent-watermark advances with `is_last`.
+            let parts: &[PartialSession] = if is_last { partials } else { &[] };
             let batch = assemble_batch(
-                chunk, chunk_seed, history, toks, arts, parts, device_id, idle, now,
+                chunk, chunk_seed, hist, toks, arts, parts, device_id, idle, now,
             );
             ChunkBatch {
                 batch,
+                // `None` on an artifact-only chunk past the last event range —
+                // there is no event high-water for it to advance.
                 cursor_event_id: chunk.last().map(|ev| ev.id.clone()),
                 is_last,
             }
@@ -1252,6 +1296,158 @@ mod tests {
         assert_eq!(t.repo_canonical.as_deref(), Some("p"));
         assert_eq!(t.input, 10);
         assert_eq!(t.est_cost_usd, Some(0.5));
+    }
+
+    /// A minimal artifact row — only `sha` matters to the chunking tests.
+    fn art(sha: &str) -> ArtifactRow {
+        ArtifactRow {
+            sha: sha.into(),
+            repo: Some("github.com/acme/api".into()),
+            git_ref: None,
+            kind: "commit".into(),
+            authored_at: None,
+            author_email: None,
+            author_name: None,
+            source_session: None,
+            patch_id: None,
+            session_change_id: None,
+            touched_paths: None,
+            blobs: None,
+        }
+    }
+
+    /// Every shipped artifact, in chunk order, plus the per-chunk counts.
+    fn shipped_artifacts(chunks: &[ChunkBatch]) -> (Vec<String>, Vec<usize>) {
+        let per_chunk: Vec<usize> = chunks.iter().map(|c| c.batch.artifacts.len()).collect();
+        let all: Vec<String> = chunks
+            .iter()
+            .flat_map(|c| c.batch.artifacts.iter().map(|a| a.sha.clone()))
+            .collect();
+        (all, per_chunk)
+    }
+
+    /// Issue #71: artifacts used to ride the FINAL chunk in their entirety, so a
+    /// `dira device resync` (which rewinds the artifact cursor to the beginning)
+    /// built one request out of the whole backlog and got a 413. They must now be
+    /// spread — losslessly, and without duplicating a single row.
+    #[test]
+    fn artifacts_are_spread_across_chunks_losslessly() {
+        let rows: Vec<ArtifactRow> = (0..CHUNK_ARTIFACTS * 2 + 7)
+            .map(|i| art(&format!("sha-{i:04}")))
+            .collect();
+        let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
+
+        let chunks = build_chunked_batches(&events, &[], &rows, &[], "d", IDLE, NOW, &[], &[]);
+
+        let (shipped, per_chunk) = shipped_artifacts(&chunks);
+        assert!(
+            per_chunk.iter().all(|&n| n <= CHUNK_ARTIFACTS),
+            "no request may exceed the cap: {per_chunk:?}"
+        );
+        let expected: Vec<String> = rows.iter().map(|r| r.sha.clone()).collect();
+        assert_eq!(
+            shipped, expected,
+            "every artifact ships exactly once, in order"
+        );
+    }
+
+    /// The cursor contract: the artifact cursor advances on `is_last` alone, so
+    /// exactly one chunk may carry it — and it must be the last one, or the cursor
+    /// would jump past artifacts that were never sent.
+    #[test]
+    fn only_the_final_chunk_is_last_when_artifacts_outnumber_event_chunks() {
+        let rows: Vec<ArtifactRow> = (0..CHUNK_ARTIFACTS * 3)
+            .map(|i| art(&format!("sha-{i:04}")))
+            .collect();
+        let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
+
+        let chunks = build_chunked_batches(&events, &[], &rows, &[], "d", IDLE, NOW, &[], &[]);
+
+        assert_eq!(
+            chunks.len(),
+            3,
+            "one event chunk grown to carry 3 artifact slices"
+        );
+        assert_eq!(
+            chunks.iter().filter(|c| c.is_last).count(),
+            1,
+            "exactly one chunk advances the artifact cursor"
+        );
+        assert!(chunks.last().unwrap().is_last);
+        // The surplus chunks carry no event high-water — there are no events left.
+        assert!(chunks[0].cursor_event_id.is_some());
+        assert!(chunks[1].cursor_event_id.is_none());
+        assert!(chunks[2].cursor_event_id.is_none());
+    }
+
+    /// The `dira device resync` shape: a large artifact backlog with no new events
+    /// at all. It must still be bounded, and still drain in ONE flush.
+    #[test]
+    fn an_artifact_only_flush_is_bounded_too() {
+        let rows: Vec<ArtifactRow> = (0..CHUNK_ARTIFACTS * 2 + 1)
+            .map(|i| art(&format!("sha-{i:04}")))
+            .collect();
+
+        let chunks = build_chunked_batches(&[], &[], &rows, &[], "d", IDLE, NOW, &[], &[]);
+
+        let (shipped, per_chunk) = shipped_artifacts(&chunks);
+        assert_eq!(per_chunk, vec![CHUNK_ARTIFACTS, CHUNK_ARTIFACTS, 1]);
+        assert_eq!(shipped.len(), rows.len(), "nothing dropped");
+        assert!(chunks.iter().all(|c| c.cursor_event_id.is_none()));
+        assert!(chunks.last().unwrap().is_last);
+        assert_eq!(chunks.iter().filter(|c| c.is_last).count(), 1);
+    }
+
+    fn tok(id: &str) -> TokenRow {
+        TokenRow {
+            id: id.into(),
+            session_id: "s1".into(),
+            project: Some("p".into()),
+            model: "claude-opus-4-8".into(),
+            input: 10,
+            output: 20,
+            cache_read: 0,
+            cache_create: 0,
+            est_cost_usd: None,
+            at: "2026-06-27T10:00:00Z".into(),
+        }
+    }
+
+    /// Token rows were "bounded by the event window" — which stops bounding
+    /// anything on a `dira device resync`, since that rewinds the event cursor
+    /// too and the window becomes the whole log. Same 413 as issue #71, smaller
+    /// rows, so they are spread the same way.
+    #[test]
+    fn token_rows_are_spread_across_chunks_losslessly() {
+        let rows: Vec<TokenRow> = (0..CHUNK_TOKENS * 2 + 5)
+            .map(|i| tok(&format!("t-{i:05}")))
+            .collect();
+        let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
+
+        let chunks = build_chunked_batches(&events, &rows, &[], &[], "d", IDLE, NOW, &[], &[]);
+
+        let per_chunk: Vec<usize> = chunks.iter().map(|c| c.batch.token_usage.len()).collect();
+        assert_eq!(per_chunk, vec![CHUNK_TOKENS, CHUNK_TOKENS, 5]);
+        let shipped: Vec<String> = chunks
+            .iter()
+            .flat_map(|c| c.batch.token_usage.iter().map(|t| t.id.clone()))
+            .collect();
+        let expected: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(shipped, expected, "every token row ships exactly once");
+        assert_eq!(chunks.iter().filter(|c| c.is_last).count(), 1);
+    }
+
+    /// Spreading must not disturb the no-artifact path, which is the common case.
+    #[test]
+    fn a_flush_with_no_artifacts_chunks_exactly_as_before() {
+        let events = vec![
+            ev("s1", 0, EventKind::UserPrompt, "p"),
+            ev("s1", 10, EventKind::PreTool, "p"),
+        ];
+        let chunks = build_chunked_batches(&events, &[], &[], &[], "d", IDLE, NOW, &[], &[]);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_last);
+        assert!(chunks[0].cursor_event_id.is_some());
     }
 
     #[test]

@@ -253,6 +253,28 @@ impl Store {
         Ok(row.get::<i64, _>("n") as u64)
     }
 
+    /// Delete every stored event for one session, returning how many rows went.
+    ///
+    /// Used by the writer to prune a *degenerate* session — one whose entire life
+    /// was a `SessionStart`/`SessionEnd` pair with no signal in between (issue #74).
+    /// On one observed day 113 of 126 sessions were exactly this, so the log was
+    /// ~90% noise.
+    ///
+    /// Deleting rows is not a new liberty here: [`Self::compact`] already deletes
+    /// summarized events. The difference is scope — this removes a specific
+    /// session's rows because they never carried information, rather than because
+    /// they were rolled up. Rows already below the sync cursor are safe to drop:
+    /// [`Self::events_between`] only reads `(cursor, until]`, and a degenerate
+    /// session is retained out of the batch by `assemble_batch` regardless, so
+    /// nothing that ever reached the cloud is affected.
+    pub async fn delete_session_events(&self, session_id: &str) -> Result<u64, Error> {
+        let res = sqlx::query("DELETE FROM events WHERE session_id = ?1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Load per-row token usage in the time window `(since_at, until_at]`, ordered
     /// by time. Unlike [`Self::token_totals_since`] (which sums), this yields one
     /// [`TokenRow`] per stored turn so the batch builder can emit individual
@@ -695,6 +717,18 @@ impl Store {
         // aren't ULID-ordered, so we bound them by the same `at < cutoff` only
         // (the cloud-sync cursor doesn't apply); recent tokens stay live.
         for ((day, session_id), acc) in &groups {
+            // Never immortalise a session that did nothing (issue #74). The
+            // writer prunes degenerate sessions when their `SessionEnd` arrives,
+            // but only when the daemon is up AND the registry still knows the
+            // session — a crashed harness never sends one, and hydrate replays
+            // just a day. Whatever escapes that reaches here, and a rollup row
+            // outlives the events it summarises, so writing an all-zero row
+            // would inflate `rollup_session_count` permanently. The raw rows are
+            // still deleted below by the ordinary retention sweep; only the
+            // summary is skipped, because there is nothing to summarise.
+            if acc.signals.is_empty() && acc.activity.is_empty() {
+                continue;
+            }
             let human = accounting::total_human_seconds(&acc.signals, idle);
             let active = accounting::active_seconds(&acc.activity, idle);
             sqlx::query(
@@ -2422,6 +2456,64 @@ mod tests {
             activity: None,
             note: None,
         }
+    }
+
+    /// Issue #74's residue: the writer prune only fires when a `SessionEnd`
+    /// arrives AND the registry still knows the session, so a crashed harness or
+    /// a daemon restart leaves phantom rows behind. Compaction is where those
+    /// finally land — and a rollup row outlives the events it summarises, so an
+    /// all-zero row would inflate the session count forever.
+    #[tokio::test]
+    async fn compact_never_writes_a_rollup_for_a_session_that_did_nothing() {
+        let store = Store::open_in_memory().await.unwrap();
+        let idle = time::Duration::minutes(5);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(30);
+        let old = now - time::Duration::days(20);
+
+        // A phantom: lifecycle events only, exactly what a launcher spawn leaves.
+        store
+            .append(&ev_at("01AAA0", "phantom", old, EventKind::SessionStart))
+            .await
+            .unwrap();
+        store
+            .append(&ev_at(
+                "01AAA1",
+                "phantom",
+                old + time::Duration::seconds(1),
+                EventKind::SessionEnd,
+            ))
+            .await
+            .unwrap();
+        // A real session in the same window, to prove the skip is narrow.
+        store
+            .append(&ev_at("01AAA2", "real", old, EventKind::UserPrompt))
+            .await
+            .unwrap();
+        store
+            .append(&ev_at(
+                "01AAA3",
+                "real",
+                old + time::Duration::seconds(60),
+                EventKind::UserPrompt,
+            ))
+            .await
+            .unwrap();
+
+        let deleted = store.compact(Some("01AAA9"), now, idle).await.unwrap();
+        assert_eq!(deleted, 4, "every eligible raw row is still pruned");
+
+        let rolled: Vec<String> = sqlx::query("SELECT session_id FROM session_rollup_daily")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("session_id"))
+            .collect();
+        assert_eq!(
+            rolled,
+            vec!["real".to_string()],
+            "the phantom leaves no permanent trace; the real session does"
+        );
     }
 
     #[tokio::test]

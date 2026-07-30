@@ -71,6 +71,8 @@ pub fn normalize(hook: &GrokHook) -> Option<Normalized> {
         // `dira_core::tokens::parse_grok_updates_usage` in the daemon's
         // token capture — see `cli/dirad/src/writer.rs::capture_tokens`.
         transcript_path: hook.transcript_path.clone(),
+        source: None,
+        reason: None,
     })
 }
 

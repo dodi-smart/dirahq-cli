@@ -410,10 +410,37 @@ function Invoke-GhApi {
         $headers['Authorization'] = "Bearer $Token"
     }
     try {
+        $script:LastGhApiStatus = 0
         return Invoke-RestMethod -Uri $uri -Headers $headers -UseBasicParsing
     } catch {
+        # Record the status code for the caller BEFORE throwing, so a 401 can be
+        # recovered from rather than parsed back out of an error string. 5.1 and
+        # 7+ expose the response differently, hence the two probes.
+        $script:LastGhApiStatus = Get-HttpStatusCode -ErrorRecord $_
+        if ($script:LastGhApiStatus -eq 401) {
+            # Deliberately not fatal here -- Invoke-Main retries anonymously. See
+            # the note there for why a rejected token must never be terminal.
+            throw "unauthorized"
+        }
         Write-Err "GitHub API request failed: $uri ($($_.Exception.Message))"
     }
+}
+
+# The HTTP status behind a failed Invoke-RestMethod/Invoke-WebRequest, or 0 if it
+# wasn't an HTTP error at all (DNS, TLS, connection refused). Windows PowerShell
+# 5.1 throws a WebException carrying an HttpWebResponse, while PowerShell 7+
+# throws HttpResponseException with a StatusCode on the record itself -- probe
+# both rather than assuming a host.
+function Get-HttpStatusCode {
+    param($ErrorRecord)
+    $response = $ErrorRecord.Exception.Response
+    if ($response -and $response.StatusCode) {
+        return [int]$response.StatusCode
+    }
+    if ($ErrorRecord.Exception.StatusCode) {
+        return [int]$ErrorRecord.Exception.StatusCode
+    }
+    return 0
 }
 
 # Save-Download <url> <out-file> -- unauthenticated download (public asset URLs).
@@ -871,9 +898,29 @@ function Invoke-Main {
     $tmp = Join-Path $env:TEMP "dira-install.$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     New-Item -ItemType Directory -Path $tmp -Force | Out-Null
     try {
-        # 7. version + asset resolution
+        # 7. version + asset resolution.
+        #
+        # A token is an optimization on a public repo, never a requirement: it
+        # only lifts GitHub's 60 req/hr anonymous per-IP limit. So a token the
+        # API rejects must not be fatal -- drop it and resolve anonymously,
+        # which is the path every normal user takes anyway. Without this, any
+        # developer with a stale or expired GITHUB_TOKEN/GH_TOKEN exported in
+        # their shell -- extremely common, and nothing to do with dira -- got a
+        # hard `401 (Unauthorized)` from `irm | iex` and could not install at
+        # all, on a repo that needs no credentials.
+        #
+        # Clearing $token (not just retrying the one call) is the point: it also
+        # switches the download below from Save-AssetById, which sends the same
+        # rejected bearer, to the plain public asset URLs.
         if ($token) {
-            $release = Resolve-ReleaseAuthenticated -VersionPin $Version -Channel $effectiveChannel -Repo $repo -ApiUrl $apiUrl -Token $token -Target $resolvedTarget
+            try {
+                $release = Resolve-ReleaseAuthenticated -VersionPin $Version -Channel $effectiveChannel -Repo $repo -ApiUrl $apiUrl -Token $token -Target $resolvedTarget
+            } catch {
+                if ($script:LastGhApiStatus -ne 401) { throw }
+                Write-Warn "GITHUB_TOKEN/GH_TOKEN was rejected by GitHub (401) -- ignoring it and continuing anonymously. Unset or replace that token to silence this."
+                $token = ''
+                $release = Resolve-ReleaseUnauthenticated -VersionPin $Version -Channel $effectiveChannel -Repo $repo -ApiUrl $apiUrl -DownloadUrl $downloadUrl -Target $resolvedTarget
+            }
         } else {
             $release = Resolve-ReleaseUnauthenticated -VersionPin $Version -Channel $effectiveChannel -Repo $repo -ApiUrl $apiUrl -DownloadUrl $downloadUrl -Target $resolvedTarget
         }

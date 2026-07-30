@@ -60,6 +60,10 @@ use std::sync::{Arc, Mutex};
 struct MockState {
     latest_body: Arc<Mutex<String>>,
     assets: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    /// When set, answer 401 to any request carrying an `Authorization` header
+    /// while still serving anonymous ones — GitHub's behaviour for a stale or
+    /// expired token.
+    reject_authorized: Arc<Mutex<bool>>,
 }
 
 struct MockGitHub {
@@ -76,10 +80,23 @@ impl MockGitHub {
         let router = Router::new()
             .route(
                 "/repos/{repo}/releases/latest",
-                get(move |AxPath(_repo): AxPath<String>| {
-                    let body = latest_state.latest_body.lock().unwrap().clone();
-                    async move { ([("content-type", "application/json")], body) }
-                }),
+                get(
+                    move |AxPath(_repo): AxPath<String>, headers: axum::http::HeaderMap| {
+                        // Stands in for a stale/expired credential: GitHub 401s
+                        // an request carrying a bad bearer while serving the
+                        // very same endpoint anonymously. See
+                        // `reject_authorized_requests`.
+                        let reject = *latest_state.reject_authorized.lock().unwrap();
+                        let authorized = headers.contains_key(axum::http::header::AUTHORIZATION);
+                        let body = latest_state.latest_body.lock().unwrap().clone();
+                        async move {
+                            if reject && authorized {
+                                return StatusCode::UNAUTHORIZED.into_response();
+                            }
+                            ([("content-type", "application/json")], body).into_response()
+                        }
+                    },
+                ),
             )
             .route(
                 "/assets/{filename}",
@@ -128,6 +145,11 @@ impl MockGitHub {
             "assets": []
         });
         *self.state.latest_body.lock().unwrap() = body.to_string();
+    }
+
+    /// Make every authenticated request 401 while anonymous ones keep working.
+    fn reject_authorized_requests(&self) {
+        *self.state.reject_authorized.lock().unwrap() = true;
     }
 
     fn put_asset(&self, name: &str, bytes: Vec<u8>) {
@@ -290,6 +312,57 @@ async fn successful_update_replaces_both_binaries_mode_0755_and_cleans_up_backup
     assert!(
         !bin_dir.join(".dirad.bak").exists(),
         "backup must be cleaned up on success"
+    );
+}
+
+/// A stale `GITHUB_TOKEN` in the environment must not break `dira update`.
+///
+/// Real-world report: an expired token exported in the user's shell — common,
+/// and nothing to do with dira — turned every release lookup into a hard 401
+/// against a repo that needs no credentials at all. A token only lifts GitHub's
+/// anonymous rate limit here, so a rejected one is dropped and resolution
+/// continues anonymously. Same fix as `install.sh` / `install.ps1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_token_falls_back_to_anonymous_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    seed_install(&bin_dir);
+
+    let mock = MockGitHub::start().await;
+    mock.set_latest_tag("v42.0.0");
+    mock.reject_authorized_requests();
+
+    let sock = bin_dir.join("isolated-never-created.sock");
+    let out = Command::new(bin_dir.join("dira"))
+        .arg("update")
+        .arg("--bin-dir")
+        .arg(&bin_dir)
+        .arg("--no-restart")
+        .arg("--check")
+        .env("DIRA_API_URL", mock.api_base())
+        .env("DIRA_DOWNLOAD_URL", mock.download_base())
+        .env("DIRA_REPO", "test-repo")
+        .env("DIRA_TARGET", TARGET)
+        .env("DIRA_SOCKET_PATH", &sock)
+        // The whole point: a credential the server rejects.
+        .env("GITHUB_TOKEN", "ghp_expiredAndNoLongerValid")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("spawn the copied dira binary");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a rejected token must not fail the check: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("42.0.0"),
+        "must still resolve the release anonymously: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("rejected by GitHub (401)"),
+        "must say why the token was ignored: stderr={stderr:?}"
     );
 }
 

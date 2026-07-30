@@ -397,6 +397,56 @@ fn parse_reported_version(out: &str) -> Option<&str> {
     (!version.is_empty()).then_some(version)
 }
 
+/// How long to keep re-attempting the `--version` probe while the kernel
+/// answers `ETXTBSY`. Deliberately a longer budget than [`retry_rename`]'s
+/// three tries: that one waits out a Windows file lock held by a process that
+/// is on its way out, whereas this waits out another process's fork→exec
+/// window, which is short but can recur under load.
+const EXEC_BUSY_ATTEMPTS: u32 = 10;
+const EXEC_BUSY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Run `<dira> --version`, retrying while the kernel refuses the exec with
+/// `ETXTBSY`. Any other error, and the final `ETXTBSY`, are returned as-is.
+///
+/// # The *other* `ETXTBSY` (unix)
+///
+/// This is not the trap documented on [`swap_in`] — that one is "never open the
+/// destination for writing", a rule this module already follows by only ever
+/// renaming onto it. This is the mirror image: Linux also refuses to **exec** a
+/// file while *any* process holds a write descriptor to that inode, and nothing
+/// about rename discipline prevents someone else from holding one.
+///
+/// The window is real and does not require a misbehaving program. Staging opens
+/// the new binary for writing ([`swap_in`] uses `fs::copy`), and a concurrent
+/// `Command::spawn` anywhere in the process — another thread, another `dira`
+/// invocation — forks a child that inherits every open descriptor. `O_CLOEXEC`
+/// only takes effect at *exec*, so between the child's fork and its exec that
+/// inherited write fd is live, and an exec of the same inode in that instant
+/// gets `ETXTBSY`. It is timing-dependent, which is exactly why it surfaced as
+/// an intermittent CI failure (#65) on a branch that changed no Rust at all,
+/// and never once on macOS.
+///
+/// `ErrorKind::ExecutableFileBusy` names it without a `libc` dependency
+/// (stable since Rust 1.83; this workspace's MSRV is 1.88). Retrying is safe
+/// because the condition is transient by construction — the holder is a child
+/// that is about to exec — and bounded so a genuinely stuck writer still
+/// surfaces as an error rather than a hang.
+fn run_version_probe(dira: &Path) -> std::io::Result<std::process::Output> {
+    let mut attempt = 0;
+    loop {
+        match std::process::Command::new(dira).arg("--version").output() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt + 1 < EXEC_BUSY_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(EXEC_BUSY_DELAY);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run `<bin_dir>/dira --version` and assert it reports EXACTLY
 /// `expected_version`. Catches a wrong-target download (or a corrupted swap)
 /// *before* the daemon is ever touched — see the module doc on why this must
@@ -411,10 +461,8 @@ pub fn verify_installed_version(bin_dir: &Path, expected_version: &str) -> Resul
     // rather than doing a PATH lookup, so it runs exactly the binary this
     // update just swapped in regardless of platform.
     let dira = bin_dir.join(dira_ipc::DIRA_BIN);
-    let output = std::process::Command::new(&dira)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("run `{} --version`", dira.display()))?;
+    let output =
+        run_version_probe(&dira).with_context(|| format!("run `{} --version`", dira.display()))?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -816,5 +864,74 @@ mod tests {
         )
         .unwrap();
         assert!(verify_installed_version(dir.path(), "9.9.9").is_err());
+    }
+
+    // --- the ETXTBSY retry (#65) --------------------------------------------
+    //
+    // Linux-only: it is the only platform in the matrix that refuses to exec a
+    // file while a write descriptor to that inode is open, which is the whole
+    // condition under test. Verified by hand in a container first — with a
+    // write fd held, exec fails "Text file busy"; close it and the same exec
+    // succeeds — so these two tests pin the retry against the real kernel
+    // behaviour rather than a mocked error.
+
+    #[cfg(target_os = "linux")]
+    fn busy_fixture(dir: &Path) -> std::fs::File {
+        let path = dir.join(dira_ipc::DIRA_BIN);
+        std::fs::write(&path, "#!/bin/sh\necho \"dira 0.9.9\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The held write handle is what makes the exec fail — the same shape a
+        // concurrent fork produces by inheriting one.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_installed_version_retries_past_a_transient_etxtbsy() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = busy_fixture(dir.path());
+
+        // Release the descriptor well inside the retry budget
+        // (10 x 50ms): the first attempt must fail ETXTBSY, a later one succeed.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(held);
+        });
+
+        verify_installed_version(dir.path(), "0.9.9")
+            .expect("must retry past a transient ETXTBSY, not fail the update");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_installed_version_gives_up_on_a_permanent_etxtbsy() {
+        let dir = tempfile::tempdir().unwrap();
+        // Never dropped for the duration of the call: the retry is bounded, so
+        // this must surface as an error rather than hang forever.
+        let _held = busy_fixture(dir.path());
+
+        let err = verify_installed_version(dir.path(), "0.9.9")
+            .expect_err("a permanently busy binary must error, not spin");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("--version"),
+            "error must name the probe it gave up on: {chain}"
+        );
+    }
+
+    #[test]
+    fn non_busy_spawn_errors_are_not_retried() {
+        // A missing binary is NotFound, not ExecutableFileBusy — it must fail
+        // immediately rather than burn the 500ms retry budget on an error that
+        // will never clear.
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let err = run_version_probe(&dir.path().join(dira_ipc::DIRA_BIN)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            started.elapsed() < EXEC_BUSY_DELAY,
+            "must not have slept: took {:?}",
+            started.elapsed()
+        );
     }
 }

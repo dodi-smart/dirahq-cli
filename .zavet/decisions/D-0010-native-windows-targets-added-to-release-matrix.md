@@ -1,7 +1,8 @@
 ---
 id: D-0010
 title: Native Windows targets are added to the release matrix and install.ps1 ships alongside install.sh
-status: active
+status: superseded
+superseded-by: D-0014
 supersedes: D-0002
 guards:
   - .github/workflows/build-release.yml

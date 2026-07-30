@@ -65,23 +65,12 @@ jobs:
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Stable releases only: skip prerelease tags (a SemVer suffix like
-          # v0.2.0-develop.1). Binaries ship for clean vX.Y.Z tags cut on main.
-          # A manual workflow_dispatch can still force a build for any tag —
-          # this is deliberate while the repo is private: it keeps prerelease
-          # builds off every develop merge (billed self-hosted runner
-          # minutes) while still letting us dogfood the pipeline on demand.
-          # TODO(public): remove this hard-skip once the repo is public and
-          # runner minutes are free — prereleases can build automatically too.
-          case "$tag" in
-            *-*)
-              if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-                echo "Tag $tag is a prerelease — binaries build for stable releases only, skipping."
-                echo "proceed=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              ;;
-          esac
+          # Prerelease tags build exactly like stable ones (D-0013). This used to
+          # hard-skip them on automatic runs to avoid billed runner minutes on a
+          # private repo; the repo is public, every leg is GitHub-hosted (D-0015),
+          # and GitHub-hosted minutes are free for public repositories.
+          # The idempotency check below is now the only guard against rebuilding
+          # a release that already has assets — keep it.
           # Only build for a tag that semantic-release actually published as a GitHub
           # Release. A bare tag with no Release object (e.g. the v0.1.0 baseline tag)
           # is not a real release — skip it so we never publish binaries prematurely.
@@ -102,60 +91,44 @@ jobs:
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
-  # Detect online/idle self-hosted runners labeled `self-hosted,build`; fall back
-  # to `ubuntu-latest`. Used for the heaviest native compile (x86_64 linux musl).
-  check-runners:
-    name: Pick runner
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [resolve]
-    if: needs.resolve.outputs.proceed == 'true'
-    outputs:
-      runner: ${{ steps.set-runner.outputs.use-runner }}
-    steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-      - name: Check runner availability
-        id: set-runner
-        uses: dodi-smart/runner-fallback-action@v2
-        with:
-          organization: ${{ github.repository_owner }}
-          primary-runner: "self-hosted,build"
-          fallback-runner: "ubuntu-latest"
-          github-token: ${{ steps.app-token.outputs.token }}
-          fallback-on-error: true
-
+  # NOTE: there is deliberately no `check-runners` job any more (D-0015). The
+  # org's Default runner group sets `allows_public_repositories: false`, so once
+  # this repo went public GitHub stopped scheduling anything that asks for
+  # `self-hosted,build` — the job queues forever rather than failing. The
+  # fallback action could not save us: it picks by whether runners are online and
+  # idle, which they are, and has no visibility into the group policy. Every leg
+  # now names a GitHub-hosted runner directly.
   # musl is statically linked, so the build host's glibc floor is irrelevant — one binary
-  # per Linux arch covers Alpine, containers, and old-glibc distros alike. The x86_64 leg
-  # matters most here since it runs on a self-hosted runner whose glibc version is unknown
-  # and can drift without notice. `universal-apple-darwin` is a lipo fat binary the upload
+  # per Linux arch covers Alpine, containers, and old-glibc distros alike. That mattered
+  # most while x86_64 built on a self-hosted runner of unknown, drifting glibc; it is a
+  # weaker argument now that every leg is a pinned GitHub-hosted image, but the property
+  # is what the artifact promises users, so it stands independent of the build host.
+  # `universal-apple-darwin` is a lipo fat binary the upload
   # action builds itself (both rustup targets + `lipo -create`), so Apple Silicon and Intel
-  # ship from one leg — no separate x86_64-apple-darwin leg needed. The two Windows legs
-  # (D-0010) both build on `windows-latest`: x86_64-pc-windows-msvc natively, and
-  # aarch64-pc-windows-msvc cross-compiled -- MSVC's linker can target a foreign
-  # architecture from an x86_64 host with nothing beyond `rustup target add` (no separate
-  # cross-linker/sysroot the way the musl legs need), and the native `windows-11-arm`
-  # runner label fails outright on private repos, which this one still is.
+  # ship from one leg — no separate x86_64-apple-darwin leg needed. Both Windows legs now
+  # build natively (D-0014): x86_64-pc-windows-msvc on `windows-latest`, and
+  # aarch64-pc-windows-msvc on `windows-11-arm`. The cross-compile that used to cover arm64
+  # worked fine — MSVC links a foreign arch from an x86_64 host with nothing beyond
+  # `rustup target add` — but you cannot *execute* an arm64 binary on an x64 runner, so
+  # arm64 shipped with no smoke coverage at all. Native building is what makes the arm64
+  # smoke leg possible; the label only resolves because the repo is public.
   build:
     name: Build ${{ matrix.target }}
-    needs: [resolve, check-runners]
+    needs: [resolve]
     if: needs.resolve.outputs.proceed == 'true'
     timeout-minutes: 45
-    # x86_64 linux musl (the heaviest) runs on the self-hosted runner when
-    # available; every other target builds natively on its matching
-    # GitHub-hosted runner.
-    runs-on: ${{ matrix.use_fallback && fromJson(needs.check-runners.outputs.runner) || matrix.runner }}
+    # Every leg names its runner directly — no self-hosted fallback (D-0015).
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Was the one leg routed to the self-hosted pool, as the heaviest
+          # compile. It is now plain `ubuntu-latest`: the org runner group
+          # refuses public repositories, so asking for `self-hosted,build`
+          # queues indefinitely instead of running (D-0015).
           - target: x86_64-unknown-linux-musl
-            use_fallback: true
+            runner: ubuntu-latest
             cross: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
@@ -166,11 +139,11 @@ jobs:
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             cross: false
-          # TODO(public): once this repo is public, move this leg to a native
-          # windows-11-arm runner (that label only works on public repos today) and give
-          # it its own native smoke leg instead of relying on the x86_64 Windows leg below.
+          # Native, not cross-compiled (D-0014) — `cross: false` here means the same
+          # thing it does for the x86_64 leg: build for the host arch. The smoke matrix
+          # has a matching windows-arm64 leg on the same runner label.
           - target: aarch64-pc-windows-msvc
-            runner: windows-latest
+            runner: windows-11-arm
             cross: false
     steps:
       - uses: actions/checkout@v7
@@ -205,11 +178,12 @@ jobs:
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: ${{ matrix.target }}
-      # Windows legs only: `rustup target add` is the entire cross-compile setup here
-      # (unlike the musl legs above, MSVC needs no separate cross-linker or sysroot to
-      # target a foreign architecture from an x86_64 host). x86_64-pc-windows-msvc is the
-      # runner's own host triple and typically already installed, so this is a harmless
-      # no-op for that leg; aarch64-pc-windows-msvc is the genuine cross-compile.
+      # Windows legs only. Since D-0014 both Windows targets build natively — x86_64 on
+      # `windows-latest`, aarch64 on `windows-11-arm` — so in each case this is the
+      # runner's own host triple and `rustup target add` is a harmless no-op. Kept
+      # anyway: it costs nothing, and it is what makes a future Windows cross leg work
+      # without anyone having to rediscover that MSVC needs no separate cross-linker or
+      # sysroot (unlike the musl legs above).
       - name: Add Windows rustup target
         if: contains(matrix.target, 'windows')
         shell: bash
@@ -226,6 +200,35 @@ jobs:
           checksum: sha256
           dry-run: ${{ inputs.dry_run == true }}
           token: ${{ secrets.GITHUB_TOKEN }}
+      # Regression guard for #60. The CRT is linked statically via
+      # .cargo/config.toml so the binaries run on a machine with no Visual C++
+      # Redistributable. Nothing else can catch a regression here: every GitHub
+      # Windows image ships the redistributable, so the smoke legs would stay
+      # green while shipping a binary that dies at process start on a clean box.
+      # Runs after the build step above, against the same compiled artifact it
+      # packaged (present under target/ even on a dry run).
+      - name: Windows binaries link the CRT statically
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+          foreach ($name in 'dira', 'dirad') {
+            $exe = "target/${{ matrix.target }}/release/$name.exe"
+            if (-not (Test-Path $exe)) { throw "expected $exe to exist after the build step" }
+            # Import scan without dumpbin, which needs a VS dev shell to be on
+            # PATH. Reading the PE as ASCII and looking for the import names is
+            # enough to catch the dynamic-CRT case this guards against.
+            $bytes = [IO.File]::ReadAllBytes($exe)
+            $text  = [Text.Encoding]::ASCII.GetString($bytes)
+            foreach ($dll in 'VCRUNTIME140', 'api-ms-win-crt-runtime') {
+              if ($text -match [regex]::Escape($dll)) { $bad += "$name.exe imports $dll" }
+            }
+          }
+          if ($bad) {
+            throw "dynamic CRT detected -- these binaries need the VC++ Redistributable: $($bad -join '; ')"
+          }
+          Write-Host "both binaries are free of VCRUNTIME140 / api-ms-win-crt-* imports"
 
   # Attach the contract artifacts (schema + signing fixture) and both installers to the
   # release so the cloud repo's `just contract-pull` and
@@ -309,13 +312,23 @@ jobs:
           # current GitHub-hosted Intel macOS image is macos-15-intel.
           - leg: macos-intel
             runner: macos-15-intel
-          # install.ps1, for real, against the just-built release. NOTE: this leg only
-          # goes green once the Rust-side Windows target support (landing in a parallel
-          # package) is in the released tag being smoked here -- acceptable because
-          # releases are manual-dispatch-only while the repo is private (D-0005), so
-          # nothing forces this leg to pass before that sibling work lands.
+          # install.ps1, for real, against the just-built release. The caveat that
+          # used to live here -- that this leg couldn't go green until the Rust-side
+          # Windows target support reached a released tag -- is spent: v0.1.0 ships
+          # it, and a diagnostic run on windows-latest confirmed install, both
+          # binaries, the named-pipe transport, and the full daemon lifecycle
+          # (start/status/update --check/restart/stop) all work. Treat a failure
+          # here as real.
           - leg: windows-x64
             runner: windows-latest
+          # arm64 Windows, natively (D-0014). Until this existed the arm64 zip shipped
+          # with no execution coverage whatsoever -- an x64 runner can build it but
+          # cannot run it. install.ps1 resolves the target from PROCESSOR_ARCHITECTURE
+          # (ARM64 -> aarch64-pc-windows-msvc), so this leg exercises the arm64 artifact
+          # without any leg-specific wiring; the Windows steps below key off
+          # `runner.os == 'Windows'` and apply to both legs unchanged.
+          - leg: windows-arm64
+            runner: windows-11-arm
     steps:
       - uses: actions/checkout@v7
         with:
@@ -375,9 +388,35 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           .\install.ps1
+          # install.ps1 reports failure by throwing, so a non-zero exit code from a run
+          # that did NOT throw means it leaked one from an ignored best-effort call. That
+          # is invisible without this assertion: GitHub ends the step with
+          # `exit $LASTEXITCODE`, so a leak fails the step at its very end with nothing in
+          # the log pointing at the cause. See the uninstall step below.
+          #
+          # `Test-Path variable:` first, exactly as GitHub's own wrapper does it, because
+          # `$null -ne 0` is TRUE in PowerShell: a script that ran no native command never
+          # creates $LASTEXITCODE, so the bare comparison throws on a perfectly successful
+          # install. This assertion shipped without the guard and did precisely that to
+          # both windows legs of v0.1.1-develop.2 -- the same null trap the #58 note below
+          # already warned about.
+          if ((Test-Path variable:\LASTEXITCODE) -and $LASTEXITCODE -ne 0) {
+            throw "install.ps1 leaked exit code $LASTEXITCODE"
+          }
           $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
-          $reported = ((dira --version | Select-Object -First 1) -split '\s+')[1]
-          if ($LASTEXITCODE -ne 0) { throw "dira --version failed" }
+          # Capture first, THEN assert. `dira --version` prints two lines, so
+          # piping it straight into `Select-Object -First 1` satisfies the cmdlet
+          # on line 1 and it stops the upstream pipeline. That terminates the
+          # native process, and PowerShell reports the stopped pipeline as
+          # $LASTEXITCODE = -1 -- so the old ordering threw even though the
+          # command had succeeded and the version had parsed correctly.
+          # Measured on windows-latest: reported=[0.1.0] with LASTEXITCODE=[-1].
+          # Assigning to a variable first runs the process to completion; the
+          # later Select-Object then operates on a plain string array, where
+          # early termination means nothing. See #58.
+          $versionOutput = & dira --version
+          if ($LASTEXITCODE -ne 0) { throw "dira --version failed (exit $LASTEXITCODE)" }
+          $reported = (($versionOutput | Select-Object -First 1) -split '\s+')[1]
           if ($reported -ne $env:DIRA_VERSION) { throw "dira --version reported '$reported', expected '$env:DIRA_VERSION'" }
           dirad --version
           if ($LASTEXITCODE -ne 0) { throw "dirad --version failed" }
@@ -427,6 +466,23 @@ jobs:
           $env:PATH = "$env:DIRA_BIN_DIR;$env:PATH"
           # Re-running over an identical install is a no-op.
           .\install.ps1
+          # `Test-Path variable:` first — see the note on the same assertion in the step
+          # above. The "already installed, nothing to do" path returns before running any
+          # native command, so this one hit the null trap too.
+          if ((Test-Path variable:\LASTEXITCODE) -and $LASTEXITCODE -ne 0) {
+            throw "install.ps1 (idempotent re-run) leaked exit code $LASTEXITCODE"
+          }
+          # Assert the exit code here rather than letting GitHub's trailing
+          # `exit $LASTEXITCODE` decide the step's fate. This uninstall did its whole job
+          # -- printed "removed dira and dirad", both Test-Path guards below stayed quiet --
+          # and the step still failed 1, because `dira daemon uninstall` runs schtasks/reg,
+          # whose "ERROR: nothing to remove" stderr tripped Windows PowerShell 5.1's
+          # redirected-native-stderr rule under $ErrorActionPreference='Stop' and left
+          # $LASTEXITCODE poisoned. Fixed in install.ps1's Invoke-BestEffort; asserted here
+          # so a regression names itself instead of pointing at the end of the step.
           .\install.ps1 -Uninstall -Force
+          if ((Test-Path variable:\LASTEXITCODE) -and $LASTEXITCODE -ne 0) {
+            throw "install.ps1 -Uninstall leaked exit code $LASTEXITCODE"
+          }
           if (Test-Path "$env:DIRA_BIN_DIR\dira.exe") { throw "dira.exe still present after -Uninstall" }
           if (Test-Path "$env:DIRA_BIN_DIR\dirad.exe") { throw "dirad.exe still present after -Uninstall" }

@@ -71,6 +71,24 @@ fn tag_semver(tag: &str) -> Option<semver::Version> {
     semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()
 }
 
+/// How `candidate` orders against `current` under SemVer 2.0 §11 — `Greater`
+/// means `candidate` is genuinely newer. `None` when either side doesn't parse,
+/// which callers must read as "make no claim", never as "different, therefore
+/// newer".
+///
+/// This exists because that exact conflation was a bug: [`pick_latest`] above
+/// has always ordered *releases against each other* correctly, but the two
+/// places that compared a resolved release against the **running** version
+/// (`update --check` and the passive notice) used `==` and treated any
+/// inequality as an upgrade. A `0.1.1-develop.1` build therefore announced
+/// stable `0.1.0` as "available" — a downgrade — because the strings differ.
+/// One comparator, three callers, so they cannot drift again.
+///
+/// Both arguments accept a bare version or a `v`-prefixed tag.
+pub fn compare_versions(candidate: &str, current: &str) -> Option<std::cmp::Ordering> {
+    Some(tag_semver(candidate)?.cmp(&tag_semver(current)?))
+}
+
 /// Pick the newest non-draft release for `channel`.
 ///
 /// Stable only considers non-prerelease releases (mirrors GitHub's own
@@ -119,6 +137,29 @@ fn user_agent() -> String {
     format!("dira/{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// GitHub answered 401 — the credential we sent was rejected.
+///
+/// A marker type rather than a formatted string so [`resolve`] can recognise
+/// this one failure and recover from it without pattern-matching an error
+/// message. Carried through `anyhow`'s context chain; use [`is_unauthorized`]
+/// to test for it.
+#[derive(Debug)]
+pub struct Unauthorized;
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GitHub rejected the token (401 Unauthorized)")
+    }
+}
+
+impl std::error::Error for Unauthorized {}
+
+/// True if `err` (or anything it wraps) is an [`Unauthorized`]. Walks the whole
+/// chain, so a `.context(...)` added on the way up doesn't hide it.
+pub fn is_unauthorized(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<Unauthorized>())
+}
+
 async fn gh_get(http: &reqwest::Client, ctx: &GhContext, path: &str) -> Result<String> {
     let url = format!("{}{path}", ctx.api_url.trim_end_matches('/'));
     let mut req = http
@@ -132,6 +173,15 @@ async fn gh_get(http: &reqwest::Client, ctx: &GhContext, path: &str) -> Result<S
     let resp = req.send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // Typed, so `resolve` can drop the token and retry anonymously. Only
+        // meaningful when we actually sent one: a 401 with no credential would
+        // be a genuine server-side problem, so leave that as a plain error.
+        if ctx.token.is_some() {
+            return Err(anyhow::Error::new(Unauthorized)
+                .context(format!("GitHub API request failed (401) for {url}")));
+        }
+    }
     if !status.is_success() {
         anyhow::bail!(
             "GitHub API request failed ({status}) for {url}: {}",
@@ -223,10 +273,37 @@ pub async fn resolve(
 ) -> Result<Resolved> {
     let ctx = GhContext::from_env();
 
-    if ctx.token.is_some() {
-        resolve_authenticated(http, &ctx, target, version_pin, channel).await
-    } else {
-        resolve_unauthenticated(http, &ctx, target, version_pin, channel).await
+    if ctx.token.is_none() {
+        return resolve_unauthenticated(http, &ctx, target, version_pin, channel).await;
+    }
+
+    match resolve_authenticated(http, &ctx, target, version_pin, channel).await {
+        Err(e) if is_unauthorized(&e) => {
+            // A token is an optimization on a public repo, never a requirement:
+            // it only lifts GitHub's 60 req/hr anonymous per-IP limit. So a
+            // token GitHub rejects must not be terminal — drop it and resolve
+            // anonymously, the path every normal user takes.
+            //
+            // This mirrors install.sh / install.ps1, which hit the same wall:
+            // an expired or wrong-account GITHUB_TOKEN/GH_TOKEN exported in the
+            // user's shell (common, and nothing to do with dira) turned a
+            // routine `dira update` into a hard 401 against a repo that needs
+            // no credentials.
+            //
+            // Anonymous resolution also yields plain public asset URLs rather
+            // than `AssetRef::ApiAsset`, so the download that follows stops
+            // carrying the rejected bearer too.
+            eprintln!(
+                "warning: GITHUB_TOKEN/GH_TOKEN was rejected by GitHub (401) -- ignoring it \
+                 and continuing anonymously. Unset or replace that token to silence this."
+            );
+            let anonymous = GhContext {
+                token: None,
+                ..ctx.clone()
+            };
+            resolve_unauthenticated(http, &anonymous, target, version_pin, channel).await
+        }
+        other => other,
     }
 }
 
@@ -504,6 +581,62 @@ mod tests {
         ];
         let picked = pick_latest(&releases, Channel::Stable).unwrap();
         assert_eq!(picked.tag_name, "v0.1.0");
+    }
+
+    // --- compare_versions (#63) --------------------------------------------
+
+    #[test]
+    fn compare_versions_orders_a_prerelease_below_its_own_release() {
+        use std::cmp::Ordering;
+        // SemVer §11, and the exact case that produced the bug: stable 0.1.0 is
+        // *older* than the 0.1.1-develop.1 prerelease, even though the strings
+        // merely differ.
+        assert_eq!(
+            compare_versions("0.1.0", "0.1.1-develop.1"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.1.1-develop.1", "0.1.0"),
+            Some(Ordering::Greater)
+        );
+        // A finished release outranks its own prerelease, and prerelease
+        // identifiers compare numerically rather than lexically.
+        assert_eq!(
+            compare_versions("0.2.0", "0.2.0-develop.10"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.2.0-develop.10", "0.2.0-develop.9"),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn compare_versions_is_equal_for_the_same_version() {
+        assert_eq!(
+            compare_versions("1.2.3", "1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn compare_versions_accepts_a_v_prefixed_tag_on_either_side() {
+        assert_eq!(
+            compare_versions("v1.2.3", "1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_versions("1.2.3", "v1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn compare_versions_makes_no_claim_when_either_side_is_unparseable() {
+        // `None` must mean "no claim". Callers treating it as "different,
+        // therefore newer" is the bug this comparator replaced.
+        assert!(compare_versions("not-a-version", "1.2.3").is_none());
+        assert!(compare_versions("1.2.3", "not-a-version").is_none());
     }
 
     // --- asset_names / archive_extension (D-0010) --------------------------

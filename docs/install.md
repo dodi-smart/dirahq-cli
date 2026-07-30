@@ -325,6 +325,13 @@ every 24h after a successful check (6h after a failed one). It's suppressed by:
 The first four only suppress *printing*; the config knob and a dev build also stop the
 background refresh itself.
 
+"Newer" means SemVer 2.0 §11 ordering, not simply "a different version string". So a
+prerelease build is never told to install the older stable head: `0.1.0` is *behind*
+`0.1.1-develop.1`, and `dira update --check` says so explicitly (`dira is up to date
+(0.1.1-develop.1 — ahead of the stable channel's 0.1.0)`) while the passive notice stays
+quiet. `dira update` refuses that downgrade for the same reason — pass `--version <v>` to
+move backwards deliberately, or `--channel prerelease` to keep following prereleases.
+
 ## What the installer does and does not touch
 
 `install.sh` and `dira update`:

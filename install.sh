@@ -352,6 +352,34 @@ _gh_get() {
   fi
 }
 
+# _gh_status <path> -- the HTTP status of a GET to ${api_url}<path> using the
+# current $token, or 000 when it can't be determined (no curl/wget, DNS failure,
+# TLS error -- anything that isn't an HTTP response). Callers must treat 000 as
+# "don't second-guess" and carry on with whatever they were going to do.
+#
+# Deliberately status-only, unlike _gh_get: `curl -f` collapses every HTTP error
+# into exit 22, and the resolve helpers below call `err`, which exits the script.
+# So a rejected token can't be recovered from after the fact -- it has to be
+# detected before we commit to the authenticated path.
+_gh_status() {
+  local path="$1" url
+  url="${api_url}${path}"
+  if command -v curl >/dev/null 2>&1; then
+    set -- curl -s -o /dev/null -w '%{http_code}' -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28"
+    case "$url" in https://*) set -- "$@" --proto '=https' --tlsv1.2 ;; esac
+    if [ -n "$token" ]; then set -- "$@" -H "Authorization: Bearer $token"; fi
+    set -- "$@" "$url"
+    "$@" 2>/dev/null || printf '000'
+  elif command -v wget >/dev/null 2>&1; then
+    set -- wget -q -O /dev/null --server-response --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28"
+    if [ -n "$token" ]; then set -- "$@" --header "Authorization: Bearer $token"; fi
+    set -- "$@" "$url"
+    "$@" 2>&1 | awk '/^  HTTP\// { code = $2 } END { print (code == "" ? "000" : code) }'
+  else
+    printf '000'
+  fi
+}
+
 # _dl <url> <out-file> -- unauthenticated download (public asset URLs).
 _dl() {
   local url="$1" out="$2"
@@ -808,6 +836,21 @@ main() {
   # 7. version + asset resolution
   version="" tag="" tarball_name="" sha_name=""
   tarball_url="" sha_url="" tarball_id="" sha_id="" assets_json=""
+  # A token is an optimization on a public repo, never a requirement: it only
+  # lifts GitHub's 60 req/hr anonymous per-IP limit. So a token the API rejects
+  # must not be fatal -- drop it and resolve anonymously, which is the path
+  # every normal user takes anyway. Without this, any developer with a stale or
+  # expired GITHUB_TOKEN/GH_TOKEN exported in their shell -- extremely common,
+  # and nothing to do with dira -- got a hard 401 and could not install at all,
+  # on a repo that needs no credentials.
+  #
+  # Clearing $token (rather than retrying one call) is the point: it also
+  # switches the download below off _dl_asset, which would send the same
+  # rejected bearer, and drops the jq requirement the authenticated path has.
+  if [ -n "$token" ] && [ "$(_gh_status "/repos/${repo}")" = "401" ]; then
+    warn "GITHUB_TOKEN/GH_TOKEN was rejected by GitHub (401) -- ignoring it and continuing anonymously. Unset or replace that token to silence this."
+    token=""
+  fi
   if [ -n "$token" ]; then
     need_cmd jq
     _resolve_authenticated

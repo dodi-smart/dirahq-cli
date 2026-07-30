@@ -11,7 +11,7 @@ pub mod ratelimit;
 
 pub use batch::{
     build_batch, build_batch_with_partials, build_chunked_batches, est_cost, ArtifactRow,
-    ChunkBatch, PartialSession, TokenRow, CHUNK_EVENTS,
+    ChunkBatch, PartialSession, TokenRow, CHUNK_ARTIFACTS, CHUNK_EVENTS, CHUNK_TOKENS,
 };
 pub use billing::{
     parse_billing_summary_response, BillingSummary, CachedBillingSummary, META_BILLING_SUMMARY,

@@ -428,7 +428,10 @@ async fn beat(
     // lock before any await. `engaged_seconds` / `agent_wall_seconds` come
     // straight off `LiveSession` — no SQLite scan.
     let (active, last_activity) = match state.sessions.lock() {
-        Ok(reg) => (reg.active(), reg.last_activity_at()),
+        Ok(reg) => (
+            reg.active(now, state.config.session_stale_after()),
+            reg.last_activity_at(),
+        ),
         Err(e) => {
             tracing::warn!("heartbeat: sessions lock poisoned: {e}");
             return BeatResult::Noop;
@@ -1107,6 +1110,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            had_signal: true,
             started_at: OffsetDateTime::UNIX_EPOCH,
             last_event_at,
             last_signal_at: Some(OffsetDateTime::UNIX_EPOCH),

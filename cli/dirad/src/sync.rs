@@ -20,7 +20,7 @@
 //! no-ops on it. Nothing is ever lost and nothing is double-counted.
 
 use crate::state::AppState;
-use dira_contract::{Envelope, IngestAck, IngestError, ServerMeta, SCHEMA_VERSION};
+use dira_contract::{Envelope, IngestError, ServerMeta, SCHEMA_VERSION};
 use dira_core::identity;
 use dira_core::signing::DeviceKey;
 use std::time::Duration as StdDuration;
@@ -281,6 +281,29 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
                 record_health(
                     &state,
                     Some("schema_skew"),
+                    consecutive_failures,
+                    backoff.as_secs(),
+                )
+                .await;
+                sleep(backoff).await;
+            }
+            Err(SyncError::PayloadTooLarge(body)) => {
+                backoff = next_backoff(backoff);
+                consecutive_failures += 1;
+                state.progress.mark_flush_failure();
+                // Named explicitly, because the generic "backing off" line was read
+                // as an ordinary transient failure for the whole of issue #71 while
+                // the batch was in fact unsendable. Artifacts are capped by
+                // construction now, so this points at one oversized record rather
+                // than at the backlog.
+                tracing::error!(
+                    "sync: cloud rejected the batch as too large (413) — a single \
+                     record exceeds the request ceiling and re-sending cannot help; \
+                     backing off {backoff:?}: {body}"
+                );
+                record_health(
+                    &state,
+                    Some("payload_too_large"),
                     consecutive_failures,
                     backoff.as_secs(),
                 )
@@ -581,6 +604,17 @@ enum SyncError {
     /// Re-sending the same batch can't help — pause with a clear message instead
     /// of hot-looping until the operator upgrades the daemon or cloud.
     SchemaSkew(String),
+    /// `413 Payload Too Large` — the request body exceeded the platform's ceiling.
+    ///
+    /// Its own variant rather than a generic [`Self::Fatal`] because the two need
+    /// different things from the operator, and conflating them is what made issue
+    /// #71 hard to read: a 413 surfaced as "sync: error, backing off", identical to
+    /// a local DB failure. Re-sending unchanged bytes cannot succeed, so the
+    /// message has to say what is oversized rather than imply a retry will fix it.
+    /// With [`dira_core::sync::CHUNK_ARTIFACTS`] bounding batches by construction,
+    /// reaching this now means a single pathological row — which no amount of
+    /// re-chunking would shrink.
+    PayloadTooLarge(String),
     /// Local error (DB, signing) — log and back off; not expected in steady state.
     Fatal(String),
 }
@@ -887,6 +921,9 @@ async fn flush(
         }
         // 4xx: unknown_device can arrive here (gateways map auth → 403); an
         // unsupported contract major is a skew we pause on rather than hot-loop.
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(SyncError::PayloadTooLarge(body));
+        }
         if is_unknown_device(&body) {
             return Err(SyncError::ReLinkRequired);
         }
@@ -897,9 +934,16 @@ async fn flush(
     }
 
     // 5. The advisory handshake (epoch + watermark) was already applied
-    //    per-chunk above (D12) — nothing left to do here but parse the last
+    //    per-chunk above (D12) — nothing left to do here but re-read the last
     //    chunk's ack for the summary log line below.
-    let ack = parse_ingest_ack(&last_body);
+    //
+    //    Deliberately the SAME parser the handshake uses, not a second typed ack
+    //    of our own: the previous code deserialized the real 202 body into an
+    //    all-default `IngestAck` (every field `#[serde(default)]`), so it always
+    //    logged `accepted=0 duplicates=0` — on flushes that demonstrably landed.
+    //    That read as "the cloud is silently dropping everything" and cost real
+    //    time during an unrelated outage (issue #72).
+    let ack = dira_core::sync::parse_ingest_response(&last_body);
     tracing::info!(
         events = events.len(),
         artifacts = artifact_rows.len(),
@@ -907,8 +951,12 @@ async fn flush(
         chunks = chunk_count,
         intervals = total_intervals,
         sessions = total_sessions,
-        accepted = ack.accepted,
-        duplicates = ack.duplicates,
+        status = %ack.status,
+        batch_id = %ack.batch_id,
+        // `-` when the cloud doesn't report a count. An unknown quantity must not
+        // be printed as a number, which is the entire bug being fixed here.
+        accepted = %count_or_unknown(ack.accepted),
+        duplicates = %count_or_unknown(ack.duplicates),
         cursor = until.as_deref().unwrap_or(""),
         "sync: flushed batch(es) to cloud"
     );
@@ -1065,15 +1113,15 @@ fn fmt_at(e: &dira_core::model::RawEvent) -> String {
         .unwrap_or_default()
 }
 
-/// Parse a 2xx ingest response body into a typed [`IngestAck`]. Tolerant by
-/// design: an empty body or a body the current schema can't fully read both
-/// degrade to a default ack (all zeros), so a successful flush is never
-/// downgraded to a failure over a logging detail.
-fn parse_ingest_ack(body: &str) -> IngestAck {
-    if body.trim().is_empty() {
-        return IngestAck::default();
-    }
-    serde_json::from_str(body).unwrap_or_default()
+/// Render an optional cloud-reported count for a log line: the number when the
+/// cloud reported one, `-` when it didn't.
+///
+/// The whole of issue #72 is this distinction. Printing an unreported counter as
+/// `0` is not a cosmetic defect — it states, in the daemon's own telemetry, that
+/// the cloud accepted nothing, which is the most alarming thing it could say
+/// about a flush that in fact succeeded.
+fn count_or_unknown(n: Option<u64>) -> String {
+    n.map_or_else(|| "-".to_string(), |n| n.to_string())
 }
 
 /// Whether a non-2xx ingest error body is the typed `unknown_device` signal that
@@ -1177,6 +1225,14 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use crate::test_support::{keychain_lock, use_mock_keychain, MockCloud, MockResp};
+
+    /// The body the live cloud actually returns on a successful ingest.
+    ///
+    /// Every mock here used to answer `{"accepted":1,"duplicates":0}` — a shape the
+    /// cloud has never sent. That fiction is exactly why the whole suite stayed
+    /// green while production logged `accepted=0 duplicates=0` on every flush
+    /// (issue #72). Mocks must speak the real wire, or they test nothing.
+    const OK_INGEST: &str = r#"{"status":"accepted","batchId":"01ACK","sync":{}}"#;
 
     /// A minimal single-event window for `flush` to have something to send.
     fn test_event(session: &str, at: time::OffsetDateTime) -> dira_core::model::RawEvent {
@@ -1309,10 +1365,7 @@ mod tests {
         std::env::set_var(dira_core::identity::ENV_DEVICE_SECRET, key.secret_base64());
 
         let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
 
         let store = dira_core::Store::open_in_memory().await.unwrap();
         dira_core::identity::set_device_id(&store, "01TESTDEVICE")
@@ -1436,13 +1489,17 @@ mod tests {
         // Chunk 1/3: acks with a NEW epoch ⇒ must blank the cursor right away.
         cloud.push(
             "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0,"sync":{"dataEpoch":"epoch-2"}}"#),
+            MockResp::ok(
+                r#"{"status":"accepted","batchId":"01ACK","sync":{"dataEpoch":"epoch-2"}}"#,
+            ),
         );
         // Chunk 2/3: succeeds under the (now-current) epoch — must NOT silently
         // re-advance the cursor past the blank chunk 1 just set.
         cloud.push(
             "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0,"sync":{"dataEpoch":"epoch-2"}}"#),
+            MockResp::ok(
+                r#"{"status":"accepted","batchId":"01ACK","sync":{"dataEpoch":"epoch-2"}}"#,
+            ),
         );
         // Chunk 3/3: fails outright.
         cloud.push("/api/v1/ingest", MockResp::status(500, "boom"));
@@ -1528,10 +1585,7 @@ mod tests {
     #[tokio::test]
     async fn flush_200_ack_advances_cursor_to_window_high_water() {
         let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let state = linked_state_with_one_event(&cloud).await;
         let until = state.store.max_event_id().await.unwrap();
         let key = DeviceKey::generate();
@@ -1543,6 +1597,42 @@ mod tests {
         assert_eq!(
             cursor, until,
             "a plain 2xx ack must advance the cursor to the window's high-water event id"
+        );
+    }
+
+    /// Issue #71: a 413 used to fall through to the untyped `Fatal` arm, so an
+    /// oversized batch and a local DB error produced the same "sync: error,
+    /// backing off" line. It needs its own variant so the operator is told the
+    /// batch is unsendable rather than left to assume a retry will clear it.
+    #[tokio::test]
+    async fn flush_413_is_typed_and_leaves_both_cursors_unchanged() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        cloud.push(
+            "/api/v1/ingest",
+            MockResp::status(413, "Request Entity Too Large"),
+        );
+        let state = linked_state_with_one_event(&cloud).await;
+        let key = DeviceKey::generate();
+        let cursor_before = state.store.meta_get(META_SYNC_CURSOR).await.unwrap();
+        let art_before = state.store.meta_get(META_ARTIFACTS_CURSOR).await.unwrap();
+
+        let err = flush(&state, &key, &state.http)
+            .await
+            .expect_err("a 413 must fail this flush");
+        assert!(
+            matches!(err, SyncError::PayloadTooLarge(_)),
+            "a 413 must be typed, not swept into Fatal, got {err:?}"
+        );
+
+        assert_eq!(
+            cursor_before,
+            state.store.meta_get(META_SYNC_CURSOR).await.unwrap(),
+            "a rejected batch must not advance the event cursor"
+        );
+        assert_eq!(
+            art_before,
+            state.store.meta_get(META_ARTIFACTS_CURSOR).await.unwrap(),
+            "nor the artifact cursor — the artifacts never landed"
         );
     }
 
@@ -1663,10 +1753,7 @@ mod tests {
 
         // Attempt 1: chunk 1 (the packed burst) acks 2xx; chunk 2 (the tail)
         // fails — simulating a crash/network drop mid-drain.
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         cloud.push("/api/v1/ingest", MockResp::status(500, "boom"));
         let err = flush(&state, &key, &state.http)
             .await
@@ -1690,10 +1777,7 @@ mod tests {
 
         // Attempt 2 (resumed): only the un-acked tail event remains in the
         // window — reconstructed as a single chunk from the new cursor.
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let outcome = flush(&state, &key, &state.http)
             .await
             .expect("resumed flush must now succeed");
@@ -1771,10 +1855,7 @@ mod tests {
         let key = DeviceKey::generate();
 
         // Flush window 1: L1, L2 — a plain, unseeded, single [L1,L2) interval.
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let outcome = flush(&state, &key, &state.http)
             .await
             .expect("window 1 flush");
@@ -1794,10 +1875,7 @@ mod tests {
 
         // Flush window 2: just M — but the LOOP must seed it from the store
         // before building the chunk.
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let outcome = flush(&state, &key, &state.http)
             .await
             .expect("window 2 flush");
@@ -1913,10 +1991,7 @@ mod tests {
         let key = DeviceKey::generate();
 
         // Flush #1: start + prompt + tool activity, no end yet — no rollup ships.
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let outcome = flush(&state, &key, &state.http).await.expect("flush 1 ok");
         assert!(matches!(outcome, FlushOutcome::Synced));
         let cursor = state.store.meta_get(META_SYNC_CURSOR).await.unwrap();
@@ -1945,10 +2020,7 @@ mod tests {
         );
         state.store.append(&end).await.unwrap();
 
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let outcome = flush(&state, &key, &state.http).await.expect("flush 2 ok");
         assert!(matches!(outcome, FlushOutcome::Synced));
 
@@ -2039,10 +2111,7 @@ mod tests {
         }
 
         let key = DeviceKey::generate();
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let outcome = flush(&state, &key, &state.http).await.expect("flush ok");
         assert!(matches!(outcome, FlushOutcome::Synced));
 
@@ -2192,10 +2261,7 @@ mod tests {
             MockResp::status(401, r#"{"error":"bad_signature"}"#),
         );
         // Retry (pending key): accepted.
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let state = linked_state_with_one_event(&cloud).await;
 
         // Seed the daemon's cached ACTIVE key directly (bypassing the
@@ -2325,10 +2391,7 @@ mod tests {
             MockResp::status(401, r#"{"error":"bad_signature"}"#),
         );
         // Retry (reloaded active key): accepted.
-        cloud.push(
-            "/api/v1/ingest",
-            MockResp::ok(r#"{"accepted":1,"duplicates":0}"#),
-        );
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
         let state = linked_state_with_one_event(&cloud).await;
 
         // The CLI completed a full rotation out-of-process: the new key is
@@ -2541,26 +2604,41 @@ mod tests {
         assert_eq!(transient_wait(None, MAX_BACKOFF), MAX_BACKOFF);
     }
 
+    /// Issue #72's regression guard, stated at the level the log line reads at: a
+    /// count the cloud never sent must render as `-`, and only a count it DID send
+    /// may render as a number — including a real zero.
     #[test]
-    fn ingest_ack_parses_counts() {
-        let ack = parse_ingest_ack(
-            r#"{"serverTime":"2026-06-29T10:00:00Z","accepted":7,"duplicates":2,"schemaVersion":"1.0.0"}"#,
+    fn an_unreported_count_logs_as_unknown_not_zero() {
+        let real_202 = dira_core::sync::parse_ingest_response(
+            r#"{"status":"accepted","batchId":"01ABC","sync":{"syncedEventId":"01XYZ"}}"#,
         );
-        assert_eq!(ack.accepted, 7);
-        assert_eq!(ack.duplicates, 2);
+        assert_eq!(
+            count_or_unknown(real_202.accepted),
+            "-",
+            "the live cloud's 202 carries no counters — saying 0 accepted is a lie"
+        );
+        assert_eq!(count_or_unknown(real_202.duplicates), "-");
+
+        let with_counts = dira_core::sync::parse_ingest_response(
+            r#"{"status":"accepted","accepted":7,"duplicates":2}"#,
+        );
+        assert_eq!(count_or_unknown(with_counts.accepted), "7");
+        assert_eq!(count_or_unknown(with_counts.duplicates), "2");
+
+        // A genuine zero is reported as zero — the point is to distinguish it from
+        // "unknown", not to stop printing zeros.
+        let genuine_zero = dira_core::sync::parse_ingest_response(r#"{"accepted":0}"#);
+        assert_eq!(count_or_unknown(genuine_zero.accepted), "0");
     }
 
+    /// A 2xx must never be downgraded over a logging detail, whatever the body.
     #[test]
-    fn ingest_ack_tolerates_empty_and_garbage_bodies() {
-        // Empty body (older cloud, 200 with no JSON) → default ack, not a panic.
-        assert_eq!(parse_ingest_ack("").accepted, 0);
-        assert_eq!(parse_ingest_ack("   ").accepted, 0);
-        // Non-JSON body → default ack rather than an error.
-        assert_eq!(parse_ingest_ack("ok").accepted, 0);
-        // Partial body → fields present are read, absent ones default.
-        let ack = parse_ingest_ack(r#"{"accepted":3}"#);
-        assert_eq!(ack.accepted, 3);
-        assert_eq!(ack.duplicates, 0);
+    fn ack_parsing_tolerates_empty_and_garbage_bodies() {
+        for body in ["", "   ", "ok", "<html>502</html>"] {
+            let ack = dira_core::sync::parse_ingest_response(body);
+            assert_eq!(ack.accepted, None, "body {body:?}");
+            assert_eq!(count_or_unknown(ack.accepted), "-");
+        }
     }
 
     #[test]

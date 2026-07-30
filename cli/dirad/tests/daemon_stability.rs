@@ -105,7 +105,7 @@ async fn slow_git_capture_does_not_stall_timer_accrual() {
     let mut active = 0u64;
     for _ in 0..100 {
         active = dirad::control::lock_recover(&state.sessions)
-            .active()
+            .all()
             .into_iter()
             .find(|s| s.session_id == "s1")
             .map(|s| s.active_seconds)
@@ -179,7 +179,7 @@ async fn panicking_message_is_caught_and_writer_keeps_accruing() {
     for _ in 0..200 {
         panics = state.progress.writer_panics();
         active = dirad::control::lock_recover(&state.sessions)
-            .active()
+            .all()
             .into_iter()
             .find(|s| s.session_id == "panic-1")
             .map(|s| s.active_seconds)

@@ -348,29 +348,6 @@ pub struct PresenceSession {
     pub idle: bool,
 }
 
-/// The cloud's typed response to a successful `POST /api/v1/ingest`.
-///
-/// Returned on a 2xx so the daemon can log what the cloud actually did with the
-/// batch (accepted vs. de-duplicated). All fields are tolerant: an older cloud
-/// that returns an empty/absent body still deserializes (every field defaults),
-/// keeping back-compat with the pre-typed-ack era.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct IngestAck {
-    /// RFC 3339 timestamp the cloud processed the batch. Empty when unknown.
-    #[serde(default)]
-    pub server_time: String,
-    /// Count of newly-accepted facts in this batch.
-    #[serde(default)]
-    pub accepted: u64,
-    /// Count of facts the cloud already had (idempotent duplicates).
-    #[serde(default)]
-    pub duplicates: u64,
-    /// The contract version the cloud processed under. Empty when unknown.
-    #[serde(default)]
-    pub schema_version: String,
-}
-
 /// A typed ingest error body, returned with a 4xx on `POST /api/v1/ingest`.
 ///
 /// Replaces the brittle substring match on the response text: `error ==
@@ -756,7 +733,12 @@ pub struct KnowledgeGuardEvent {
 pub struct KnowledgeRepoStats {
     /// Canonical repo ref.
     pub repo_canonical: String,
-    /// The rolling window the counts cover, in days (currently 90).
+    /// The **effective** rolling window the counts cover, in days.
+    ///
+    /// Capped at 90, but clamped down to the days since the repo adopted
+    /// `.zavet/`: counting commits from before the practice existed as "missed
+    /// capture" made the ratios read far too low on repos with long history
+    /// (issue #67). Consumers should render this value rather than assume 90.
     pub window_days: u32,
     /// Distinct paths touched by commits inside the window.
     pub active_paths: u64,
@@ -768,10 +750,18 @@ pub struct KnowledgeRepoStats {
     pub trailer_commits: u64,
     /// RFC 3339 timestamp the snapshot was computed.
     pub computed_at: String,
+    /// RFC 3339 author date of the commit that added `.zavet/` — when the repo
+    /// adopted the practice these counts measure. `None` when it can't be dated.
+    ///
+    /// Lets a consumer say *why* `window_days` is short ("coverage over the 34
+    /// days since zavet started") instead of a bare number that reads like a bug.
+    /// Optional and skipped when absent so older payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zavet_since: Option<String>,
 }
 
 /// The cloud's typed response to a successful `POST /api/v1/knowledge`.
-/// Tolerant like [`IngestAck`]: an empty body deserializes with defaults.
+/// Tolerant: an empty body deserializes with defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeAck {
@@ -859,33 +849,6 @@ mod tests {
         assert!(json.contains("\"presenceTtlSecs\":75"));
         let back: PresencePing = serde_json::from_str(&json).unwrap();
         assert_eq!(back.presence_ttl_secs, Some(75));
-    }
-
-    #[test]
-    fn ingest_ack_tolerates_empty_body() {
-        // An older cloud returning `{}` (or omitting fields) still deserializes,
-        // defaulting every field — preserving back-compat with the pre-typed-ack era.
-        let ack: IngestAck = serde_json::from_str("{}").unwrap();
-        assert_eq!(ack.accepted, 0);
-        assert_eq!(ack.duplicates, 0);
-        assert!(ack.server_time.is_empty());
-        assert!(ack.schema_version.is_empty());
-    }
-
-    #[test]
-    fn ingest_ack_roundtrips_camel_case() {
-        let ack = IngestAck {
-            server_time: "2026-06-29T10:00:00Z".into(),
-            accepted: 12,
-            duplicates: 3,
-            schema_version: SCHEMA_VERSION.into(),
-        };
-        let json = serde_json::to_string(&ack).unwrap();
-        assert!(json.contains("\"serverTime\""));
-        assert!(json.contains("\"schemaVersion\""));
-        let back: IngestAck = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.accepted, 12);
-        assert_eq!(back.duplicates, 3);
     }
 
     #[test]
@@ -1069,6 +1032,7 @@ mod tests {
                 nontrivial_commits: 40,
                 trailer_commits: 25,
                 computed_at: "t".into(),
+                zavet_since: Some("2026-06-01T00:00:00Z".into()),
             }],
         }
     }

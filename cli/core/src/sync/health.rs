@@ -31,8 +31,8 @@ pub struct SyncHealth {
     pub last_success_at: Option<String>,
     /// A stable, short code for the most recent failure kind (e.g.
     /// `"signature_rejected"`, `"unknown_device"`, `"transient"`,
-    /// `"schema_skew"`, `"fatal"`), or `None` right after a success / before
-    /// the first attempt.
+    /// `"schema_skew"`, `"payload_too_large"`, `"fatal"`), or `None` right after
+    /// a success / before the first attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_kind: Option<String>,
     /// Consecutive failed attempts since the last success (0 right after one).

@@ -1,10 +1,10 @@
 ---
 title: Harness sources and hook ingestion
-version: 1
+version: 2
 origin: session
 verified: false
 confidence: high
-date: 2026-07-25
+date: 2026-07-31
 paths:
   - cli/sources/src/
   - cli/dira/src/init.rs
@@ -53,8 +53,17 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 - `HarnessSource` trait: `harness()` (contract enum tag), `id()` (wire id),
   `normalize(payload) -> Option<Normalized>`. Registered in `registry()`.
 - `Normalized` carries only metadata: session_id, kind, cwd, tool name,
-  optional transcript path. Prompt text, tool arguments, and outputs are
-  never read (D-0001 posture extends to ingestion).
+  optional transcript path, and the optional lifecycle reasons `source` /
+  `reason`. Prompt text, tool arguments, and outputs are never read (D-0001
+  posture extends to ingestion).
+- `source` / `reason` are Claude Code's `SessionStart.source` (`startup`,
+  `resume`, `clear`, `compact`, `fork`) and `SessionEnd.reason` (`clear`,
+  `resume`, `logout`, `prompt_input_exit`, `bypass_permissions_disabled`,
+  `other`). Every other source sets both `None`. Nothing accounts on them —
+  they ride the writer's ingest debug line. They exist because dropping them
+  made a launcher spawn and a real session indistinguishable at the ingress,
+  which is what kept issue #74 invisible; the fix for that issue gates on
+  observed activity instead, so it stays harness-independent.
 - Adding a harness touches: contract `Harness` enum (+ `just contract`),
   the source module + `lib.rs` registry/aliases, `init.rs` writer,
   `main.rs` init dispatch/help, README table. The daemon needs no changes.

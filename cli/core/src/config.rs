@@ -196,6 +196,14 @@ pub struct Config {
     /// (see the cloud's presence-ack clamp), so no cloud-side change is needed to
     /// honor it.
     pub presence_ttl_deep_idle_secs: u64,
+    /// Seconds without an event of ANY kind before a session that never received a
+    /// `SessionEnd` stops being reported as live (issue #74).
+    ///
+    /// Not every session gets a terminal event — a crashed or force-quit harness
+    /// never sends one — and `ended` is not a latch, so without this bound such a
+    /// session is broadcast under "Right now" forever. See
+    /// [`Config::session_stale_after`] for the default and its clamp.
+    pub session_stale_after_secs: u64,
     /// Optional module toggles. Absent from older configs — defaults keep
     /// today's behavior (zavet in `auto`, dormant unless a repo carries
     /// `.zavet/`). Env override: `DIRA_MODULES__ZAVET=auto|on|off`.
@@ -283,6 +291,7 @@ impl Default for Config {
             report_local_day: false,
             deep_idle_after_secs: 900,
             presence_ttl_deep_idle_secs: 600,
+            session_stale_after_secs: 14_400,
             modules: Modules::default(),
             sync: SyncKnobs::default(),
             update: UpdateKnobs::default(),
@@ -415,6 +424,20 @@ impl Config {
     /// same pattern as [`Config::coalesce`] / [`Config::heartbeat_idle`].
     pub fn deep_idle_after(&self) -> time::Duration {
         time::Duration::seconds(self.deep_idle_after_secs.max(60) as i64)
+    }
+
+    /// How long a session may go without any event before it stops being reported
+    /// as live, floored at 15 minutes.
+    ///
+    /// The default (4h) is chosen to sit in the wide gap between the two things it
+    /// has to separate: the longest plausible pause *inside* a live session (a
+    /// meeting, lunch — tens of minutes) and the age of the leftovers this bound
+    /// exists to hide (observed at 10–31 hours). The floor matters because this
+    /// gates what the user sees as running: too small and a live session the user
+    /// stepped away from vanishes from their own dashboard. Clamped rather than
+    /// rejected, matching every other knob on this type.
+    pub fn session_stale_after(&self) -> time::Duration {
+        time::Duration::seconds(self.session_stale_after_secs.max(900) as i64)
     }
 
     /// The presence TTL advertised while deep idle, clamped to

@@ -151,6 +151,23 @@ async fn process_message(
         }
         _ => None,
     };
+    // Why the harness says this session began or ended, when it says at all:
+    // Claude Code's `SessionStart.source` and `SessionEnd.reason`. They are
+    // mutually exclusive — one per lifecycle kind — so they collapse to a single
+    // value. Nothing accounts on it; it exists because without it a launcher
+    // spawn and a real session are indistinguishable at the ingress, which is
+    // what kept issue #74 invisible.
+    //
+    // Extracted only for lifecycle events, so the high-volume tool-call path
+    // pays nothing for a field it can never carry.
+    let lifecycle_why = match &msg {
+        EventMsg::Hook { norm, .. }
+            if matches!(norm.kind, EventKind::SessionStart | EventKind::SessionEnd) =>
+        {
+            norm.source.clone().or_else(|| norm.reason.clone())
+        }
+        _ => None,
+    };
     let ev = match msg {
         EventMsg::Raw(ev) => *ev,
         EventMsg::Hook { norm, harness, at } => enrich(norm, harness, at, cache),
@@ -183,6 +200,38 @@ async fn process_message(
         watermark => watermark,
     };
 
+    // Issue #74: the desktop app spawns short-lived harness processes that each get
+    // a fresh session id, so a `SessionStart`/`SessionEnd` pair with nothing between
+    // it is the most common thing in the log — 113 of 126 sessions on one observed
+    // day, making the events table ~90% noise. The terminal event is the first
+    // moment we can be sure the session showed nothing, and the registry (a pure
+    // fold over this same log) is the cheapest place to ask.
+    //
+    // Guarded on the registry KNOWING the session: hydrate replays only the last
+    // day, so an unknown session is "no opinion", not "degenerate", and takes the
+    // normal path. `ManualStop` is deliberately not a trigger — a manual session is
+    // an explicit `dira start`, and `ManualStop` is itself a human signal, so it
+    // could never be degenerate anyway.
+    if ev.kind == EventKind::SessionEnd
+        && crate::control::lock_recover(&state.sessions).is_degenerate(&ev.session_id)
+    {
+        match state.store.delete_session_events(&ev.session_id).await {
+            Ok(deleted) => {
+                crate::control::lock_recover(&state.sessions).forget(&ev.session_id);
+                tracing::debug!(
+                    session_id = %ev.session_id,
+                    deleted,
+                    reason = lifecycle_why.as_deref().unwrap_or("-"),
+                    "ingest: pruned a session that never showed an activity signal"
+                );
+                return; // the pair is gone; storing this event would recreate it
+            }
+            // Best-effort: a failed delete must not lose the event, so fall through
+            // and store it the ordinary way.
+            Err(e) => tracing::warn!("prune of degenerate session failed: {e}"),
+        }
+    }
+
     if let Err(e) = state.store.append(&ev).await {
         tracing::warn!("append failed: {e}");
         return; // not stored — the watermark/registry stay untouched too
@@ -197,6 +246,20 @@ async fn process_message(
     // accounting-ordering invariant in this function's doc comment.
     apply_watermark(last_stored_activity, watermark);
     crate::control::lock_recover(&state.sessions).observe(&ev, idle);
+
+    // Surface the harness's own account of a lifecycle transition. This is the
+    // only place `SessionStart.source` is observable — the prune below runs on
+    // `SessionEnd`, where `source` is by definition absent — and telling a
+    // `startup` apart from a `resume`/`compact` is what makes a flood of
+    // short-lived launcher sessions legible in the log (issue #74).
+    if let Some(why) = lifecycle_why.as_deref() {
+        tracing::debug!(
+            session_id = %ev.session_id,
+            kind = ?ev.kind,
+            why,
+            "ingest: harness reported why a session started or ended"
+        );
+    }
 
     // Periodic ingest heartbeat (6d): one info line per 256 stored events keeps
     // the steady-state log quiet while still surfacing volume + the live
@@ -604,6 +667,103 @@ mod tests {
                 "{kind:?} is a lifecycle boundary — it must nudge sync and wake presence"
             );
         }
+    }
+
+    /// Drive `process_message` over a whole session and report what survived in
+    /// the log — the end-to-end shape issue #74 is actually about.
+    async fn stored_after(events: &[RawEvent]) -> usize {
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        let config = dira_core::Config::default();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
+        let mut cache = HashMap::new();
+        let mut last_stored = HashMap::new();
+        let (mut ingested, mut coalesced) = (0u64, 0u64);
+        let mut throttle = Throttle::default();
+        for ev in events {
+            process_message(
+                &state,
+                EventMsg::Raw(Box::new(ev.clone())),
+                &mut cache,
+                &mut last_stored,
+                Duration::ZERO,
+                Duration::minutes(5),
+                |_, _, _| {},
+                &mut throttle,
+                &mut ingested,
+                &mut coalesced,
+            )
+            .await;
+        }
+        let session = &events[0].session_id;
+        state
+            .store
+            .events_for_sessions(std::slice::from_ref(session), "\u{10FFFF}")
+            .await
+            .unwrap()
+            .len()
+    }
+
+    fn lifecycle(session: &str, at: OffsetDateTime, kind: EventKind) -> RawEvent {
+        RawEvent {
+            tool: None,
+            ..tool_ev(session, at, kind)
+        }
+    }
+
+    /// The reported case: a desktop-app spawn that starts and immediately quits.
+    /// Both rows must go — storing either one recreates the phantom session.
+    #[tokio::test]
+    async fn a_session_that_only_starts_and_ends_leaves_nothing_behind() {
+        let t = OffsetDateTime::UNIX_EPOCH;
+        let stored = stored_after(&[
+            lifecycle("phantom", t, EventKind::SessionStart),
+            lifecycle("phantom", t + Duration::seconds(1), EventKind::SessionEnd),
+        ])
+        .await;
+        assert_eq!(stored, 0, "a session with no signal leaves no rows");
+    }
+
+    /// The guard against over-deletion: one real signal anywhere in the session
+    /// keeps the WHOLE session, bookends included.
+    #[tokio::test]
+    async fn one_signal_anywhere_keeps_the_whole_session() {
+        let t = OffsetDateTime::UNIX_EPOCH;
+        let stored = stored_after(&[
+            lifecycle("real", t, EventKind::SessionStart),
+            tool_ev("real", t + Duration::seconds(1), EventKind::PreTool),
+            lifecycle("real", t + Duration::seconds(2), EventKind::SessionEnd),
+        ])
+        .await;
+        assert_eq!(stored, 3, "start + tool call + end all survive");
+    }
+
+    /// An agent-only session never submits a prompt. It must be retained in full:
+    /// "no human signal" is not "no work".
+    #[tokio::test]
+    async fn an_agent_only_session_is_retained_in_full() {
+        let t = OffsetDateTime::UNIX_EPOCH;
+        let stored = stored_after(&[
+            lifecycle("agent", t, EventKind::SessionStart),
+            tool_ev("agent", t + Duration::seconds(1), EventKind::PreTool),
+            tool_ev("agent", t + Duration::seconds(2), EventKind::PostTool),
+            lifecycle("agent", t + Duration::seconds(3), EventKind::SessionEnd),
+        ])
+        .await;
+        assert_eq!(stored, 4, "tool calls with no prompt are still real work");
+    }
+
+    /// A manual `dira start`/`dira stop` pair is an explicit user action and is
+    /// never a prune candidate, even though it is two lifecycle events.
+    #[tokio::test]
+    async fn a_manual_session_is_never_pruned() {
+        let t = OffsetDateTime::UNIX_EPOCH;
+        let stored = stored_after(&[
+            lifecycle("manual", t, EventKind::ManualStart),
+            lifecycle("manual", t + Duration::seconds(1), EventKind::ManualStop),
+        ])
+        .await;
+        assert_eq!(stored, 2, "manual sessions are deliberate, not noise");
     }
 
     #[test]

@@ -39,6 +39,8 @@ pub fn normalize(hook: &GenericHook) -> Option<Normalized> {
         cwd: hook.cwd.clone(),
         tool: hook.tool_name.clone(),
         transcript_path: hook.transcript_path.clone(),
+        source: None,
+        reason: None,
     })
 }
 

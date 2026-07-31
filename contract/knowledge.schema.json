@@ -294,10 +294,17 @@
           "minimum": 0
         },
         "windowDays": {
-          "description": "The rolling window the counts cover, in days (currently 90).",
+          "description": "The **effective** rolling window the counts cover, in days.\n\nCapped at 90, but clamped down to the days since the repo adopted\n`.zavet/`: counting commits from before the practice existed as \"missed\ncapture\" made the ratios read far too low on repos with long history\n(issue #67). Consumers should render this value rather than assume 90.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "zavetSince": {
+          "description": "RFC 3339 author date of the commit that added `.zavet/` — when the repo\nadopted the practice these counts measure. `None` when it can't be dated.\n\nLets a consumer say *why* `window_days` is short (\"coverage over the 34\ndays since zavet started\") instead of a bare number that reads like a bug.\nOptional and skipped when absent so older payloads stay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

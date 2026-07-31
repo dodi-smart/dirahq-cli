@@ -34,6 +34,22 @@ pub struct IngestResponse {
     pub batch_id: String,
     #[serde(default)]
     pub sync: SyncBlock,
+    /// Records the cloud newly wrote for this batch. `None` — not `0` — when the
+    /// cloud doesn't report it, and that distinction is the entire fix for issue
+    /// #72: the daemon used to deserialize the real 202 body into an all-zero
+    /// typed ack and log `accepted=0 duplicates=0` after every *successful*
+    /// flush, so its own telemetry claimed nothing had been accepted while sync
+    /// was perfectly healthy. An absent count must read as "unknown", never "zero".
+    #[serde(default)]
+    pub accepted: Option<u64>,
+    /// Records the cloud already had (idempotent duplicates). `None` when
+    /// unreported, for the same reason as [`Self::accepted`].
+    ///
+    /// The cloud also sends a per-table `records` breakdown and a `failures`
+    /// count; both are deliberately not modelled here until something reads
+    /// them — unknown fields are ignored, so adding them later costs nothing.
+    #[serde(default)]
+    pub duplicates: Option<u64>,
 }
 
 /// Parse an ingest response body into the typed handshake. Tolerant: a missing,
@@ -63,6 +79,32 @@ mod tests {
         let r = parse_ingest_response(r#"{"serverTime":"t","accepted":1,"duplicates":0}"#);
         assert!(r.sync.synced_event_id.is_none());
         assert!(r.sync.data_epoch.is_none());
+    }
+
+    /// Issue #72: a cloud that reports no counters must leave them `None`, so the
+    /// daemon can say "unknown" instead of the flatly false "accepted=0".
+    #[test]
+    fn absent_counters_are_unknown_not_zero() {
+        let r = parse_ingest_response(r#"{"status":"accepted","batchId":"01ABC","sync":{}}"#);
+        assert_eq!(r.status, "accepted");
+        assert_eq!(r.accepted, None, "absent must not collapse to 0");
+        assert_eq!(r.duplicates, None);
+    }
+
+    /// …and a cloud that does report them is read verbatim, including a genuine
+    /// zero, which is why the distinction has to live in the type.
+    #[test]
+    fn reported_counters_are_read_verbatim_including_zero() {
+        let r = parse_ingest_response(
+            r#"{"status":"accepted","batchId":"01ABC","accepted":0,"duplicates":7,
+                "records":{"intervals":0,"sessions":0,"tokens":3,"artifacts":4},"sync":{}}"#,
+        );
+        assert_eq!(
+            r.accepted,
+            Some(0),
+            "a reported 0 is a fact, not an absence"
+        );
+        assert_eq!(r.duplicates, Some(7));
     }
 
     #[test]

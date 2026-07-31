@@ -166,7 +166,11 @@ async fn fetch_once(
     let idle_check_at = OffsetDateTime::now_utc();
     let (active_count, last_activity) = {
         let reg = crate::control::lock_recover(&state.sessions);
-        (reg.active().len(), reg.last_activity_at())
+        (
+            reg.active(idle_check_at, state.config.session_stale_after())
+                .len(),
+            reg.last_activity_at(),
+        )
     };
     let idle_for = last_activity
         .map(|at| (idle_check_at - at).max(Duration::ZERO))

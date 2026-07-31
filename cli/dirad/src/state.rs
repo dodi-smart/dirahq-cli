@@ -402,6 +402,19 @@ pub struct LiveSession {
     /// fallback policy for ended rollups, whose terminal write overwrites this
     /// anyway (issue #40).
     pub branch: Option<String>,
+    /// Has this session ever shown a *real* signal — a human signal or agent
+    /// activity — as opposed to nothing but lifecycle noise (issue #74)?
+    ///
+    /// Sticky for the entry's lifetime: once a session has done something it stays
+    /// real, so Claude Code's mid-conversation compaction `SessionEnd` can never
+    /// make a working session look degenerate. False means the session is made of
+    /// `SessionStart`/`SessionEnd`/`CwdChanged` and nothing else — no observable
+    /// work by any measure the daemon has.
+    ///
+    /// Deliberately the UNION of `is_human_signal` and `is_agent_activity`, so an
+    /// agent-only session (tool calls, no prompt — e.g. a headless run) counts as
+    /// real on its very first tool call.
+    pub had_signal: bool,
 }
 
 impl LiveSession {
@@ -411,6 +424,22 @@ impl LiveSession {
             Some(t) => now - t > idle,
             None => true,
         }
+    }
+
+    /// A session is *stale* once no event of any kind has arrived for `after`.
+    ///
+    /// Distinct from [`Self::is_idle`], which is about human attention within a live
+    /// session. Staleness is about the harness process being gone: not every session
+    /// gets a `SessionEnd` (a crashed or force-quit harness never sends one), and
+    /// `ended` is not a latch, so without this bound such a session is reported as
+    /// live forever — observed in production as sessions idle for 10–31 hours still
+    /// listed under "Right now" (issue #74).
+    ///
+    /// This only gates *reporting*: the entry stays in the registry, so if events
+    /// resume, [`SessionRegistry::observe`] finds it again with `started_at` and every
+    /// counter intact.
+    pub fn is_stale(&self, now: OffsetDateTime, after: time::Duration) -> bool {
+        now - self.last_event_at > after
     }
 
     /// Short, user-facing handle (the ULID tail for manual sessions).
@@ -473,7 +502,14 @@ impl SessionRegistry {
                 last_partial_active_seconds: None,
                 prompts: 0,
                 branch: ev.branch.clone(),
+                had_signal: false,
             });
+
+        // Sticky, and set before anything else can early-return: the first real
+        // signal promotes the session out of "lifecycle noise" for good (issue #74).
+        if ev.kind.is_human_signal() || ev.kind.is_agent_activity() {
+            entry.had_signal = true;
+        }
 
         // Active gap (all events): add the gap from the previous event of any kind
         // when it is within (0, idle], exactly the active_seconds rule.
@@ -556,12 +592,36 @@ impl SessionRegistry {
         self.sessions.values().map(|s| s.last_event_at).max()
     }
 
-    /// All sessions that have not ended.
-    pub fn active(&self) -> Vec<LiveSession> {
+    /// The sessions that are genuinely live right now: not ended, not lifecycle
+    /// noise, and not stale.
+    ///
+    /// `!ended` alone is not enough (issue #74). Two things masquerade as live:
+    ///
+    /// - **Lifecycle noise** — a bare `SessionStart` with nothing after it. The
+    ///   desktop app spawns short-lived Claude Code processes that each get a fresh
+    ///   session id; on one observed day 113 of 126 sessions carried no signal at
+    ///   all. `had_signal` drops them. Agent-only sessions are unaffected: a tool
+    ///   call is a signal.
+    /// - **Stale sessions** — a session that did real work and never received a
+    ///   `SessionEnd` (crashed or force-quit harness). `ended` is not a latch, so
+    ///   these are otherwise reported as live indefinitely; four such sessions were
+    ///   found idle for 10–31 hours while still being broadcast to the cloud's
+    ///   "Right now" panel. [`LiveSession::is_stale`] bounds them.
+    ///
+    /// Neither filter removes anything: the entries stay in the registry, so a
+    /// session that resumes is reported again with its full history.
+    pub fn active(&self, now: OffsetDateTime, stale_after: time::Duration) -> Vec<LiveSession> {
+        self.snapshot(|s| !s.ended && s.had_signal && !s.is_stale(now, stale_after))
+    }
+
+    /// Sessions matching `keep`, oldest-started first — the shape every
+    /// live-session view returns. Private so the predicate stays the only thing
+    /// that differs between them.
+    fn snapshot(&self, keep: impl Fn(&LiveSession) -> bool) -> Vec<LiveSession> {
         let mut v: Vec<LiveSession> = self
             .sessions
             .values()
-            .filter(|s| !s.ended)
+            .filter(|s| keep(s))
             .cloned()
             .collect();
         v.sort_by_key(|s| s.started_at);
@@ -576,11 +636,40 @@ impl SessionRegistry {
     }
 
     /// Active manual sessions (for the idle ticker and `stop --auto`).
+    ///
+    /// Deliberately NOT routed through [`Self::active`]: a manual session is an
+    /// explicit `dira start` and must keep accruing while the user is away from the
+    /// keyboard, so neither the signal nor the staleness filter may touch it. (In
+    /// practice `ManualTick` keeps it fresh every 30s and `ManualStart` is itself a
+    /// human signal, so both filters would pass anyway — but the ticker is what
+    /// *produces* those ticks, and gating it on them would be a self-starving loop.)
     pub fn active_manual(&self) -> Vec<LiveSession> {
-        self.active()
-            .into_iter()
-            .filter(|s| s.kind == SessionKind::Manual)
-            .collect()
+        self.snapshot(|s| !s.ended && s.kind == SessionKind::Manual)
+    }
+
+    /// Whether this session is *known* to the registry and has never shown a real
+    /// signal — i.e. its whole life so far is lifecycle noise (issue #74).
+    ///
+    /// `false` for an unknown session on purpose: the registry hydrates from only
+    /// the last day of the log, so "not in the registry" means "no opinion", never
+    /// "degenerate". A caller acting on this must treat absence as a reason to leave
+    /// the session alone.
+    pub fn is_degenerate(&self, session_id: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|s| !s.had_signal)
+    }
+
+    /// Forget a session entirely — used when the writer prunes a degenerate
+    /// session's events from the log (issue #74), so the registry doesn't keep
+    /// reporting a session whose backing rows no longer exist.
+    pub fn forget(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+        if self.last_human_signal_session.as_deref() == Some(session_id) {
+            // The pruned session can't have opened a counted gap (it had no human
+            // signal, or it wouldn't be degenerate), but clear the attribution
+            // anyway so a later signal can't be credited to a session that's gone.
+            self.last_human_signal_session = None;
+            self.last_human_signal_at = None;
+        }
     }
 
     /// Snapshot of long-running, not-yet-ended sessions eligible for a *partial*
@@ -816,23 +905,123 @@ mod tests {
         assert_eq!(reg.session_for_repo("github.com/acme/other"), None);
     }
 
+    /// Test `now`, far enough past the fixture events that nothing is stale.
+    const NOW: OffsetDateTime = OffsetDateTime::UNIX_EPOCH;
+    /// Test staleness bound — generous, so only tests that *mean* to go stale do.
+    const STALE: Duration = Duration::hours(4);
+
+    /// `active()` at the fixture clock. Every test that predates the signal +
+    /// staleness filters (issue #74) reads through here.
+    fn live(reg: &SessionRegistry) -> Vec<LiveSession> {
+        reg.active(NOW, STALE)
+    }
+
     #[test]
     fn session_reactivates_after_end_when_activity_resumes() {
         let repo = "github.com/acme/api";
         let mut reg = SessionRegistry::default();
 
+        // A tool call makes the session real; without one it is lifecycle noise
+        // and `active` would (correctly, per issue #74) never report it at all.
         reg.observe(&ev("s1", EventKind::SessionStart, Some(repo)), IDLE);
+        reg.observe(&ev("s1", EventKind::PostTool, Some(repo)), IDLE);
         // SessionEnd (e.g. Claude Code compaction) ends it.
         reg.observe(&ev("s1", EventKind::SessionEnd, Some(repo)), IDLE);
-        assert!(reg.active().is_empty(), "ended session is not active");
+        assert!(live(&reg).is_empty(), "ended session is not active");
 
         // Activity resumes on the same id — it must come back as active.
         reg.observe(&ev("s1", EventKind::SessionStart, Some(repo)), IDLE);
-        assert_eq!(reg.active().len(), 1, "SessionStart reactivates");
+        assert_eq!(live(&reg).len(), 1, "SessionStart reactivates");
 
         reg.observe(&ev("s1", EventKind::SessionEnd, Some(repo)), IDLE);
         reg.observe(&ev("s1", EventKind::PostTool, Some(repo)), IDLE);
-        assert_eq!(reg.active().len(), 1, "a tool event after end reactivates");
+        assert_eq!(live(&reg).len(), 1, "a tool event after end reactivates");
+    }
+
+    /// Issue #74's core claim: a session whose whole life is lifecycle events did
+    /// no observable work and must not be reported as live.
+    #[test]
+    fn a_bare_session_start_is_never_reported_as_live() {
+        let mut reg = SessionRegistry::default();
+        reg.observe(&ev("phantom", EventKind::SessionStart, None), IDLE);
+
+        assert!(live(&reg).is_empty(), "a bare SessionStart is not live");
+        assert!(
+            reg.is_degenerate("phantom"),
+            "and the writer can recognise it as prunable"
+        );
+    }
+
+    /// The signal predicate is the UNION of human signal and agent activity, so a
+    /// headless run that never submits a prompt is still fully real. This is the
+    /// regression that would silently delete legitimate agent-only work.
+    #[test]
+    fn an_agent_only_session_is_live_from_its_first_tool_call() {
+        let mut reg = SessionRegistry::default();
+        reg.observe(&ev("agent", EventKind::SessionStart, None), IDLE);
+        reg.observe(&ev_at("agent", EventKind::PreTool, None, 1), IDLE);
+
+        assert_eq!(live(&reg).len(), 1, "a tool call alone makes it live");
+        assert!(
+            !reg.is_degenerate("agent"),
+            "and it must never be prunable — no prompt is not the same as no work"
+        );
+    }
+
+    /// An unknown session is "no opinion", not "degenerate": the hydrate replay
+    /// only covers the last day, so absence must never authorise a prune.
+    #[test]
+    fn an_unknown_session_is_not_degenerate() {
+        let reg = SessionRegistry::default();
+        assert!(!reg.is_degenerate("never-seen"));
+    }
+
+    /// A session that did real work but never received a `SessionEnd` (crashed or
+    /// force-quit harness) must stop being reported as live once it goes quiet —
+    /// four such sessions were found in production still broadcast as "Right now"
+    /// after 10–31 hours idle.
+    #[test]
+    fn a_real_session_that_never_ended_goes_quiet_once_stale() {
+        let mut reg = SessionRegistry::default();
+        reg.observe(&ev("zombie", EventKind::SessionStart, None), IDLE);
+        reg.observe(&ev_at("zombie", EventKind::Stop, None, 60), IDLE);
+
+        let last_event = OffsetDateTime::UNIX_EPOCH + Duration::seconds(60);
+        assert_eq!(
+            reg.active(last_event + Duration::hours(1), STALE).len(),
+            1,
+            "an hour of quiet is an ordinary pause, not a dead session"
+        );
+        assert!(
+            reg.active(last_event + Duration::hours(5), STALE)
+                .is_empty(),
+            "past the staleness bound it is no longer 'right now'"
+        );
+
+        // Nothing was evicted: if the harness comes back, so does the session,
+        // with its history intact.
+        reg.observe(&ev_at("zombie", EventKind::PostTool, None, 40_000), IDLE);
+        let resumed = reg.active(last_event + Duration::hours(12), STALE);
+        assert_eq!(resumed.len(), 1, "a resumed session is reported again");
+        assert_eq!(
+            resumed[0].started_at,
+            OffsetDateTime::UNIX_EPOCH,
+            "and keeps its original start, so accounting is unaffected"
+        );
+    }
+
+    /// A manual `dira start` must keep accruing while the user is away from the
+    /// keyboard, so the idle ticker's view is deliberately unfiltered.
+    #[test]
+    fn a_manual_session_is_never_hidden_by_the_staleness_bound() {
+        let mut reg = SessionRegistry::default();
+        reg.observe(&ev("manual", EventKind::ManualStart, None), IDLE);
+
+        assert_eq!(
+            reg.active_manual().len(),
+            1,
+            "the ticker still sees it — it is what keeps the session fresh"
+        );
     }
 
     /// Phase 6b: the incrementally-maintained `active_seconds` /

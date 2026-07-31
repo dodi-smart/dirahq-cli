@@ -561,15 +561,15 @@ pub async fn idle_ticker(state: AppState) {
         interval.tick().await;
         state.progress.mark_ticker();
 
+        let now = OffsetDateTime::now_utc();
         let (manual, active_count, last_activity) = {
             let reg = control::lock_recover(&state.sessions);
             (
                 reg.active_manual(),
-                reg.active().len(),
+                reg.active(now, state.config.session_stale_after()).len(),
                 reg.last_activity_at(),
             )
         };
-        let now = OffsetDateTime::now_utc();
         for s in manual {
             let ev = events::manual_event(
                 &s.session_id,

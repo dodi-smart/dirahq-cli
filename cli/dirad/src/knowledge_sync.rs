@@ -44,7 +44,10 @@ const DEBOUNCE: StdDuration = StdDuration::from_secs(3);
 const BACKSTOP: StdDuration = StdDuration::from_secs(120);
 /// HTTP timeout for a single knowledge chunk POST.
 const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
-/// Rolling window for the per-repo coverage/capture snapshot.
+/// Ceiling on the rolling window for the per-repo coverage/capture snapshot.
+///
+/// A ceiling, not a fixed window: the effective window is clamped to the period
+/// since the repo adopted `.zavet/` (see [`effective_window_days`]).
 const STATS_WINDOW_DAYS: u32 = 90;
 /// Minimum interval between recomputations of one repo's stats snapshot (the
 /// git pass walks 90 days of history — cheap, but not per-flush cheap).
@@ -479,10 +482,16 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
 
         let root2 = root.clone();
         let globs2 = globs.clone();
-        let Ok((activity, covered)) = tokio::task::spawn_blocking(move || {
-            let activity = project::knowledge_activity(&root2, STATS_WINDOW_DAYS);
-            let covered = project::paths_touched_since_days(&root2, STATS_WINDOW_DAYS, &globs2);
-            (activity, covered)
+        // One blocking git pass, now three commands: date the repo's adoption of
+        // `.zavet/` first, so both counts are gathered over the SAME clamped
+        // window rather than over 90 days of history that predates the practice
+        // being measured (issue #67).
+        let Ok((zavet_since, window, activity, covered)) = tokio::task::spawn_blocking(move || {
+            let zavet_since = project::first_commit_date(&root2, ".zavet");
+            let window = effective_window_days(zavet_since.as_deref(), now);
+            let activity = project::knowledge_activity(&root2, window);
+            let covered = project::paths_touched_since_days(&root2, window, &globs2);
+            (zavet_since, window, activity, covered)
         })
         .await
         else {
@@ -501,16 +510,46 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
             .count() as u64;
         out.push(KnowledgeRepoStats {
             repo_canonical: repo.clone(),
-            window_days: STATS_WINDOW_DAYS,
+            window_days: window,
             active_paths: activity.paths.len() as u64,
             covered_paths: covered.len() as u64,
             nontrivial_commits: activity.nontrivial_commits.len() as u64,
             trailer_commits,
             computed_at: now_str.clone(),
+            zavet_since,
         });
         let _ = state.store.meta_set(&key, &now_str).await;
     }
     out
+}
+
+/// The window the stats actually cover: `STATS_WINDOW_DAYS`, clamped down to the
+/// days since the repo adopted `.zavet/`.
+///
+/// Without the clamp the denominator answers a question nobody asked. On a repo
+/// where `.zavet/` was initialised 10 days ago, a fixed 90-day window counts ~80
+/// days of pre-zavet commits as "missed capture" and their paths as uncovered —
+/// so capture ratio and knowledge coverage read far too low, which is exactly the
+/// production report in issue #67. The arithmetic was never wrong; the window was.
+///
+/// Floored at 1 so a repo that adopted zavet today still divides by something, and
+/// falls back to the full ceiling when the date is missing or unparseable — an
+/// unknown adoption date must not silently shrink the window to nothing.
+fn effective_window_days(zavet_since: Option<&str>, now: time::OffsetDateTime) -> u32 {
+    let Some(since) = zavet_since
+        .and_then(|s| {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .filter(|since| *since <= now)
+    else {
+        return STATS_WINDOW_DAYS;
+    };
+    // One clamp, both bounds: floor at 1 so today's adoption still divides by
+    // something, ceiling at the window so the `u32` conversion cannot fail.
+    let days = (now - since)
+        .whole_days()
+        .clamp(1, i64::from(STATS_WINDOW_DAYS));
+    days as u32
 }
 
 /// The knowledge channel's [`HealthChannel`] keys: it reuses the attestation
@@ -546,6 +585,56 @@ mod tests {
     use super::*;
     use crate::test_support::{MockCloud, MockResp};
     use dira_core::store::{ZavetDecisionCapture, ZavetTrailer};
+
+    fn at(rfc3339: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(rfc3339, &time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    /// Issue #67: the ratios were reported as far too low on repos with long
+    /// history. The arithmetic was right; the window was answering a question
+    /// nobody asked — on a repo that adopted zavet 10 days ago, ~80 days of
+    /// pre-zavet commits counted as missed capture.
+    #[test]
+    fn the_window_is_clamped_to_the_days_since_zavet_was_adopted() {
+        let now = at("2026-07-30T12:00:00Z");
+        assert_eq!(
+            effective_window_days(Some("2026-07-20T12:00:00Z"), now),
+            10,
+            "a young zavet repo is measured over its own lifetime, not 90 days"
+        );
+        assert_eq!(
+            effective_window_days(Some("2026-01-01T00:00:00Z"), now),
+            STATS_WINDOW_DAYS,
+            "a long-adopted repo still caps at the 90-day ceiling"
+        );
+    }
+
+    /// An unknown or unusable adoption date must fall back to the full ceiling.
+    /// Shrinking the window on missing data would corrupt the ratios in the other
+    /// direction, which is worse than the bug being fixed.
+    #[test]
+    fn an_undatable_adoption_falls_back_to_the_ceiling() {
+        let now = at("2026-07-30T12:00:00Z");
+        assert_eq!(effective_window_days(None, now), STATS_WINDOW_DAYS);
+        assert_eq!(
+            effective_window_days(Some("not-a-date"), now),
+            STATS_WINDOW_DAYS
+        );
+        // A future date (clock skew between the committer and this machine) is
+        // not evidence of a zero-day window.
+        assert_eq!(
+            effective_window_days(Some("2027-01-01T00:00:00Z"), now),
+            STATS_WINDOW_DAYS
+        );
+    }
+
+    /// Adopted today: the window floors at 1 so the denominator is never zero.
+    #[test]
+    fn a_repo_that_adopted_zavet_today_still_has_a_one_day_window() {
+        let now = at("2026-07-30T12:00:00Z");
+        assert_eq!(effective_window_days(Some("2026-07-30T09:00:00Z"), now), 1);
+    }
 
     fn capture(id: &str) -> ZavetDecisionCapture {
         ZavetDecisionCapture {

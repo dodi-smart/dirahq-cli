@@ -68,6 +68,8 @@ pub fn normalize(hook: &CodexHook) -> Option<Normalized> {
         cwd: hook.cwd.clone(),
         tool: hook.tool_name.clone(),
         transcript_path: hook.transcript_path.clone(),
+        source: None,
+        reason: None,
     })
 }
 
@@ -122,6 +124,8 @@ impl HarnessSource for CodexSource {
             cwd: n.cwd,
             tool: None,
             transcript_path: None,
+            source: None,
+            reason: None,
         })
     }
 }

@@ -214,10 +214,20 @@ pub struct Config {
     /// wins) for this to be safe — see `sync::build_batch_with_partials`.
     pub partial_rollup_after_secs: u64,
     /// Compute report day boundaries (`Today` / `Week`) in the *system local*
-    /// timezone instead of UTC. Default `false` preserves the historical
-    /// UTC-midnight behavior (and keeps existing report tests deterministic). When
-    /// `true`, the daemon resolves the local UTC offset at request time; if that
-    /// resolution fails (it can in multithreaded contexts), it falls back to UTC.
+    /// timezone instead of UTC.
+    ///
+    /// Defaults to `true`: "today" should mean the user's today. With the old
+    /// UTC default, anyone east of UTC watched today's totals wipe partway
+    /// through their morning — 03:00 for UTC+3 — and work done between local
+    /// midnight and that point landed on the previous day. That reads as a bug,
+    /// because it is one.
+    ///
+    /// The offset is resolved once at daemon startup ([`crate::config`]'s caller
+    /// captures it before the runtime spawns threads, since
+    /// `UtcOffset::current_local_offset` refuses to run multithreaded) and falls
+    /// back to UTC if it was never resolved.
+    ///
+    /// Set `false` to keep UTC boundaries.
     #[serde(default)]
     pub report_local_day: bool,
     /// Seconds of zero-active-sessions quiet (no session ended/ticked and no
@@ -327,7 +337,7 @@ impl Default for Config {
             heartbeat_idle_secs: 90,
             presence_ttl_secs: 75,
             partial_rollup_after_secs: 3600,
-            report_local_day: false,
+            report_local_day: true,
             deep_idle_after_secs: 900,
             presence_ttl_deep_idle_secs: 600,
             session_stale_after_secs: 14_400,
@@ -810,10 +820,13 @@ mod tests {
         assert_eq!(p.max_span, p.idle);
     }
 
+    /// The default is local, not UTC. It was UTC to keep early report tests
+    /// deterministic — a test-stability argument that should not outlive the
+    /// tests it protected, and one that cost every non-UTC user a daily
+    /// mid-morning reset of their visible totals.
     #[test]
-    fn report_local_day_defaults_off() {
-        // The default MUST stay UTC so existing report behavior/tests are stable.
-        assert!(!Config::default().report_local_day);
+    fn report_local_day_defaults_on() {
+        assert!(Config::default().report_local_day);
     }
 
     #[test]

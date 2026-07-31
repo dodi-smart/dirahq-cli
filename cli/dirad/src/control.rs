@@ -624,13 +624,20 @@ pub(crate) fn session_agent_evidence(
 
 /// The start of "today" for report windows, as a UTC instant.
 ///
-/// By default this is UTC midnight (`config.report_local_day == false`), which
-/// preserves the original Phase 1 behavior. When `report_local_day` is enabled the
-/// boundary is computed in the system local timezone via
-/// [`dira_core::config::start_of_day`], using the offset captured at daemon startup
-/// ([`crate::local_offset`]) — resolving it per-request would fail in the
-/// multithreaded runtime. If no offset was captured we fall back to UTC so reporting
-/// never breaks.
+/// By default (`config.report_local_day == true`) this is **local** midnight, so
+/// "today" means the user's today rather than a boundary that lands mid-morning
+/// for anyone east of UTC. Set the knob `false` for UTC boundaries.
+///
+/// When local, the boundary is computed in the system local timezone via
+/// [`dira_core::config::start_of_day`], using the offset captured **once at daemon
+/// startup** ([`crate::local_offset`]) — `UtcOffset::current_local_offset` refuses
+/// to run once the runtime has spawned threads, so resolving it per request would
+/// always fail and silently fall back to UTC. If no offset was captured we fall
+/// back to UTC so reporting never breaks.
+///
+/// Known limitation: a daemon running across a DST transition (or a laptop that
+/// changes timezone) keeps its startup offset until restarted, so the boundary can
+/// be an hour off until then.
 fn start_of_today(state: &AppState) -> OffsetDateTime {
     let now = OffsetDateTime::now_utc();
     if !state.config.report_local_day {

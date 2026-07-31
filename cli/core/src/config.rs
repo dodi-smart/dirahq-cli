@@ -97,6 +97,29 @@ fn default_true() -> bool {
     true
 }
 
+/// 5 minutes — the same as `idle_seconds`, on purpose. It covers model inference
+/// between tool calls, and matching the human threshold means short gaps are
+/// credited exactly as they were before agent time got its own rules. The long
+/// spans that actually needed fixing are tool calls, and those are governed by
+/// `agent_max_span_seconds`. The knob is separate because the *meaning* is
+/// separate, not because the number has to differ.
+///
+/// Derived from [`crate::accounting::AgentPolicy::default`] so the config
+/// default and the accounting default cannot drift apart.
+fn default_agent_idle_seconds() -> u64 {
+    crate::accounting::AgentPolicy::default()
+        .idle
+        .whole_seconds() as u64
+}
+
+/// 8 hours. Clears any real build, test suite or long-running subagent, while
+/// still bounding a session abandoned with an unmatched `PreTool`.
+fn default_agent_max_span_seconds() -> u64 {
+    crate::accounting::AgentPolicy::default()
+        .max_span
+        .whole_seconds() as u64
+}
+
 /// Passive update-check knobs (`[update]` in `config.toml`).
 ///
 /// Governs only the cached, rate-limited "update available" notice printed
@@ -133,6 +156,20 @@ pub struct Config {
     pub db_path: PathBuf,
     /// Idle threshold in seconds; gaps wider than this are not counted as human time.
     pub idle_seconds: u64,
+    /// Idle threshold for *agent* wall-clock, in seconds. Separate from
+    /// `idle_seconds` on purpose: that one encodes human attention ("nobody has
+    /// typed for 5 minutes, so they stopped working"), an inference that is
+    /// simply false for an agent, which is most likely mid-build. A gap not
+    /// opened by a tool call is clamped to this rather than discarded.
+    #[serde(default = "default_agent_idle_seconds")]
+    pub agent_idle_seconds: u64,
+    /// Ceiling in seconds for a single tool call's contribution to agent
+    /// wall-clock. A gap opened by a `PreTool` is credited in full up to this —
+    /// a two-hour test suite is real work, not idleness. It is a sanity bound,
+    /// not a working limit: it exists so a laptop that sleeps mid-call, or a
+    /// session abandoned with an unmatched `PreTool`, cannot bank days.
+    #[serde(default = "default_agent_max_span_seconds")]
+    pub agent_max_span_seconds: u64,
     /// Capture-time coalescing window in seconds. A high-volume tool-activity
     /// event (PreTool/PostTool) is dropped at capture if the session's last
     /// *stored* activity event is younger than this. Human signals, lifecycle,
@@ -280,6 +317,8 @@ impl Default for Config {
                 .map(|d| d.data_dir().join("dira.db"))
                 .unwrap_or_else(|| std::env::temp_dir().join("dira.db")),
             idle_seconds: 300,
+            agent_idle_seconds: default_agent_idle_seconds(),
+            agent_max_span_seconds: default_agent_max_span_seconds(),
             coalesce_seconds: 45,
             retention_days: 14,
             cloud_url: Some(DEFAULT_CLOUD_URL.to_string()),
@@ -372,6 +411,16 @@ impl Config {
 
     pub fn idle(&self) -> time::Duration {
         time::Duration::seconds(self.idle_seconds as i64)
+    }
+
+    /// The agent wall-clock policy — the ceilings
+    /// [`crate::accounting::agent_active_seconds`] applies. `max_span` is
+    /// floored at `idle` so a misconfiguration can never make a tool call worth
+    /// *less* than an ordinary gap.
+    pub fn agent_policy(&self) -> crate::accounting::AgentPolicy {
+        let idle = time::Duration::seconds(self.agent_idle_seconds as i64);
+        let max_span = time::Duration::seconds(self.agent_max_span_seconds as i64).max(idle);
+        crate::accounting::AgentPolicy { idle, max_span }
     }
 
     /// The effective coalescing window, clamped to strictly less than the idle
@@ -735,6 +784,30 @@ mod tests {
             assert_eq!(c.sync.knowledge, KnowledgeSyncMode::Full);
             Ok(())
         });
+    }
+
+    /// The config knobs and the accounting defaults are one source of truth; if
+    /// they ever drift, the daemon would account differently from the batch path.
+    #[test]
+    fn agent_policy_matches_the_accounting_default() {
+        assert_eq!(
+            Config::default().agent_policy(),
+            crate::accounting::AgentPolicy::default()
+        );
+    }
+
+    /// A misconfiguration must never make a tool call worth *less* than an
+    /// ordinary quiet gap.
+    #[test]
+    fn agent_max_span_is_floored_at_agent_idle() {
+        let c = Config {
+            agent_idle_seconds: 600,
+            agent_max_span_seconds: 60,
+            ..Config::default()
+        };
+        let p = c.agent_policy();
+        assert_eq!(p.idle, time::Duration::seconds(600));
+        assert_eq!(p.max_span, p.idle);
     }
 
     #[test]

@@ -366,7 +366,7 @@ async fn status(state: &AppState) -> Response {
         .events_since(Some(since))
         .await
         .unwrap_or_default();
-    let today = report::build(&events, state.config.idle());
+    let today = report::build(&events, state.config.idle(), state.config.agent_policy());
     let active = build_session_views(state, &events, true);
     // Un-synced backlog: events past the confirmed sync cursor.
     let cursor = state
@@ -501,6 +501,7 @@ async fn report_cmd(state: &AppState, scope: ReportScope) -> Response {
     Response::Report(report::build_merged(
         &events,
         state.config.idle(),
+        state.config.agent_policy(),
         &rollups,
         rollup_sessions,
     ))
@@ -520,6 +521,7 @@ fn build_session_views(
         reg.all()
     };
     let idle = state.config.idle();
+    let agent_policy = state.config.agent_policy();
 
     // De-duplicated human time attributed **per session** by the opening-signal
     // policy — the exact global attribution `report::build` uses per project. The
@@ -538,7 +540,8 @@ fn build_session_views(
     live.into_iter()
         .map(|s| {
             let human = human_by_session.get(&s.session_id).copied().unwrap_or(0);
-            let agent = session_agent_seconds(events, &s.session_id, idle);
+            let (_has_agent_activity, agent) =
+                session_agent_evidence(events, &s.session_id, agent_policy);
             // Two independent notions of "recent": `idle` tracks the last *human*
             // signal (are you driving it?), `agent_active` tracks the last event of
             // any kind (is its agent working?). The activity basis mirrors the
@@ -579,28 +582,41 @@ fn fmt_ts(t: OffsetDateTime) -> String {
         .unwrap_or_default()
 }
 
-/// Per-session agent wall-clock seconds for display: the idle-trimmed active span
-/// over the session's own event timestamps ([`accounting::active_seconds`]) when it
-/// has any agent activity, else 0 — the same measure [`report::build`], the
-/// sync/rollup path, and the cloud use, so a session left open for hours between
-/// bursts of work reads as time actually worked, not its raw lifetime. Human time is
-/// deliberately *not* computed here: it is a global, de-duplicated measure
-/// attributed across all sessions (see [`accounting::per_key_seconds`] in
-/// [`build_session_views`]), which a single session viewed in isolation cannot
-/// reproduce.
-pub(crate) fn session_agent_seconds(events: &[RawEvent], session_id: &str, idle: Duration) -> i64 {
-    let mut times = Vec::new();
+/// Whether a session has any agent-activity evidence, and its agent wall-clock
+/// seconds — computed in **one** pass so the two can never disagree.
+///
+/// The pair matters: `SessionView.has_agent_activity` is what gates the `watch`
+/// dashboard's live tail, and if it could ever say "yes" while the seconds say
+/// "this session has no agent events", a manual session would grow phantom agent
+/// time again (the 30-second sawtooth).
+///
+/// The seconds use [`accounting::agent_active_seconds`] — the same measure
+/// [`report::build`], the sync/rollup path, and the cloud use, so a session left
+/// open for hours between bursts of work reads as time actually worked, not its
+/// raw lifetime. Human time is deliberately *not* computed here: it is a global,
+/// de-duplicated measure attributed across all sessions (see
+/// [`accounting::per_key_seconds`] in [`build_session_views`]), which a single
+/// session viewed in isolation cannot reproduce.
+pub(crate) fn session_agent_evidence(
+    events: &[RawEvent],
+    session_id: &str,
+    agent: accounting::AgentPolicy,
+) -> (bool, i64) {
+    let mut samples = Vec::new();
     let mut had_activity = false;
     for e in events.iter().filter(|e| e.session_id == session_id) {
-        times.push(e.at);
+        samples.push(accounting::AgentSample {
+            at: e.at,
+            opens_span: e.kind.opens_agent_span(),
+        });
         if e.kind.is_agent_activity() {
             had_activity = true;
         }
     }
     if had_activity {
-        accounting::active_seconds(&times, idle)
+        (true, accounting::agent_active_seconds(&samples, agent))
     } else {
-        0
+        (false, 0)
     }
 }
 

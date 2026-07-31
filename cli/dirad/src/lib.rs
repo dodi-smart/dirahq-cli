@@ -89,7 +89,9 @@ pub async fn build_state(
 )> {
     let bearer = resolve_bearer(&store).await?;
     let (tx, rx) = mpsc::channel::<EventMsg>(QUEUE_CAPACITY);
-    let sessions = Arc::new(Mutex::new(SessionRegistry::default()));
+    let sessions = Arc::new(Mutex::new(SessionRegistry::with_agent_policy(
+        config.agent_policy(),
+    )));
     let (sync_handle, sync_rx) = sync::channel();
     let (knowledge_handle, knowledge_rx) = knowledge_sync::channel();
 

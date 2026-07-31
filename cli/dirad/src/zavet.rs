@@ -756,7 +756,8 @@ async fn price_sessions(
     let mut lines = Vec::with_capacity(session_ids.len());
     for sid in session_ids {
         let raw_human = human_by_session.get(sid).copied().unwrap_or(0);
-        let raw_agent = crate::control::session_agent_seconds(&events, sid, idle);
+        let raw_agent =
+            crate::control::session_agent_evidence(&events, sid, state.config.agent_policy()).1;
         let hist = state
             .store
             .zavet_session_totals(sid)

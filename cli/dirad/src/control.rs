@@ -540,7 +540,7 @@ fn build_session_views(
     live.into_iter()
         .map(|s| {
             let human = human_by_session.get(&s.session_id).copied().unwrap_or(0);
-            let (_has_agent_activity, agent) =
+            let (has_agent_activity, agent) =
                 session_agent_evidence(events, &s.session_id, agent_policy);
             // Two independent notions of "recent": `idle` tracks the last *human*
             // signal (are you driving it?), `agent_active` tracks the last event of
@@ -552,8 +552,8 @@ fn build_session_views(
             SessionView {
                 handle: s.handle(),
                 session_id: s.session_id.clone(),
-                harness: format!("{:?}", s.harness),
-                kind: format!("{:?}", s.kind),
+                harness: s.harness,
+                kind: s.kind,
                 project: s.project.clone(),
                 label: s.label.clone(),
                 activity: s.activity.clone(),
@@ -570,6 +570,7 @@ fn build_session_views(
                 // `now - these` (clamped to idle) between polls.
                 last_activity_at: Some(fmt_ts(s.last_active_at.unwrap_or(s.last_event_at))),
                 last_human_at: s.last_human_signal_at.or(s.last_signal_at).map(fmt_ts),
+                has_agent_activity,
             }
         })
         .collect()

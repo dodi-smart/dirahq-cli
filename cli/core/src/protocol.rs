@@ -5,6 +5,7 @@
 //! many bytes of JSON. One request, one response, per connection.
 
 use crate::report::Report;
+use dira_contract::{Harness, SessionKind};
 use serde::{Deserialize, Serialize};
 
 /// A command from the CLI to the daemon.
@@ -224,8 +225,16 @@ pub struct SessionView {
     /// Short handle for manual sessions; harness id otherwise.
     pub handle: String,
     pub session_id: String,
-    pub harness: String,
-    pub kind: String,
+    /// Typed, not stringly. These were `String`s built with `format!("{:?}", …)`,
+    /// whose `Debug` form ignores the enums' `rename_all = "snake_case"` — so the
+    /// wire carried `"Manual"` while every consumer compared against `"manual"`.
+    /// Those comparisons silently never matched, which is what let a manual
+    /// session grow phantom agent time. Typing them makes the compiler reject the
+    /// whole class of mistake.
+    #[serde(deserialize_with = "compat::harness")]
+    pub harness: Harness,
+    #[serde(deserialize_with = "compat::session_kind")]
+    pub kind: SessionKind,
     pub project: Option<String>,
     pub label: Option<String>,
     /// Activity classification + free-text note for manual sessions (display).
@@ -260,6 +269,71 @@ pub struct SessionView {
     /// engagement tail for the human timer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_human_at: Option<String>,
+    /// `true` when this session has produced at least one agent-activity event
+    /// (`PreTool`/`PostTool`/`Stop`) inside the reported window — i.e. the daemon
+    /// has real wall-clock evidence for it.
+    ///
+    /// The **only** gate a renderer may use to grow a live agent tail.
+    /// Deliberately not `agent_seconds > 0`: a genuine agent session in its first
+    /// second has evidence but no settled seconds yet. Deliberately not `kind`
+    /// either — belt and braces, so a session mislabelled by some future path
+    /// still cannot accrue agent time it never earned.
+    ///
+    /// Defaulted (`false`) so an older daemon degrades to "no tail", never to a
+    /// phantom one.
+    #[serde(default)]
+    pub has_agent_activity: bool,
+}
+
+/// Lenient deserializers for the two typed enums above.
+///
+/// Every other field this protocol has gained is `#[serde(default)]`, so a newer
+/// `dira` against an older `dirad` degrades rather than fails. A bare typed field
+/// would break that: a pre-fix daemon still sends `"Manual"`/`"ClaudeCode"`, and
+/// strict parsing would make `dira status` and `dira watch` error outright
+/// against it. Accepting both spellings keeps the skew behaviour this protocol
+/// has always had.
+///
+/// The reverse direction needs nothing: an *older* CLI reads these as `String`,
+/// receives `"manual"`, and its `== "manual"` comparison — the one it always
+/// intended — starts working. The old binary is fixed by the daemon change.
+mod compat {
+    use super::{Harness, SessionKind};
+    use serde::{Deserialize, Deserializer};
+
+    /// `"ClaudeCode"` and `"claude_code"` both normalise to `claudecode`.
+    fn normalize(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    }
+
+    pub(super) fn harness<'de, D: Deserializer<'de>>(d: D) -> Result<Harness, D::Error> {
+        let raw = String::deserialize(d)?;
+        match normalize(&raw).as_str() {
+            "claudecode" | "claude" => Ok(Harness::ClaudeCode),
+            "codex" => Ok(Harness::Codex),
+            "gemini" => Ok(Harness::Gemini),
+            "cursor" => Ok(Harness::Cursor),
+            "opencode" => Ok(Harness::OpenCode),
+            "grok" => Ok(Harness::Grok),
+            "generic" => Ok(Harness::Generic),
+            "manual" => Ok(Harness::Manual),
+            _ => Err(serde::de::Error::custom(format!("unknown harness: {raw}"))),
+        }
+    }
+
+    pub(super) fn session_kind<'de, D: Deserializer<'de>>(d: D) -> Result<SessionKind, D::Error> {
+        let raw = String::deserialize(d)?;
+        match normalize(&raw).as_str() {
+            "agent" => Ok(SessionKind::Agent),
+            "manual" => Ok(SessionKind::Manual),
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown session kind: {raw}"
+            ))),
+        }
+    }
 }
 
 /// The live engagement state of a session for the STATE column, with precedence
@@ -276,6 +350,22 @@ pub enum LiveState {
 }
 
 impl SessionView {
+    /// A manual `dira start` session rather than a harness one.
+    pub fn is_manual(&self) -> bool {
+        matches!(self.kind, SessionKind::Manual)
+    }
+
+    /// The single gate for growing *displayed* agent time.
+    ///
+    /// Both conditions matter. `is_manual` is the intent ("a stopwatch a human
+    /// started is not agent work"); `has_agent_activity` is the evidence, computed
+    /// by the daemon from the same predicate that produces `agent_seconds`. A
+    /// renderer that consults either one alone can drift; this is the one place
+    /// that decides.
+    pub fn accrues_agent_time(&self) -> bool {
+        !self.is_manual() && self.has_agent_activity
+    }
+
     /// Fold [`SessionView::idle`] and [`SessionView::agent_active`] into the
     /// three-way [`LiveState`] the renderers display. Human engagement wins over
     /// agent activity, so a session you just prompted reads `Engaged` even while
@@ -691,8 +781,8 @@ mod tests {
         SessionView {
             handle: "h".into(),
             session_id: "s".into(),
-            harness: "claude".into(),
-            kind: "agent".into(),
+            harness: Harness::ClaudeCode,
+            kind: SessionKind::Agent,
             project: None,
             label: None,
             activity: None,
@@ -704,6 +794,7 @@ mod tests {
             agent_active,
             last_activity_at: None,
             last_human_at: None,
+            has_agent_activity: true,
         }
     }
 

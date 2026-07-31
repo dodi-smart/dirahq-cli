@@ -18,3 +18,7 @@ agent context at session start — keep it short and non-negotiable.
   two MSVC zip legs. Never add an arch branch on Darwin, a libc probe, or a
   Windows case to install.sh — Windows installs go through install.ps1.
   See D-0002/D-0010.
+- Never create the Windows control pipe without its explicit security descriptor
+  (user-only DACL + medium integrity label) — in `bind` **and** in the accept
+  loop, or connection #2 silently loses it. Never report `ERROR_ACCESS_DENIED`
+  as "daemon not running". See D-0016.

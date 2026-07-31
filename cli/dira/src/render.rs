@@ -6,8 +6,8 @@
 //! parse the plain output (and pipes, which fall back to 80) stay stable.
 
 use crate::format::{
-    bar as bar_cells, billing_line, hms, project_label, repo_short, tokens_compact, truncate,
-    usd_approx,
+    bar as bar_cells, billing_line, hms, kind_label, project_label, repo_short, tokens_compact,
+    truncate, usd_approx,
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{
@@ -1102,8 +1102,8 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout) {
         println!(
             "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
             truncate(&s.handle, 8),
-            truncate(&s.harness, 10),
-            truncate(&s.kind, 7),
+            truncate(dira_sources::harness_id(s.harness), 10),
+            truncate(kind_label(s.kind), 7),
             truncate(&project_label(&s.project), pw),
             hms(s.human_seconds),
             hms(s.agent_seconds),
@@ -1140,13 +1140,19 @@ fn print_session_meta(s: &SessionView) {
 /// so "one person supervising several agents" is visible at a glance, like the
 /// web's Right Now view.
 fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
-    if active.is_empty() {
+    // Only sessions with real agent evidence get a lane. A manual `dira start`
+    // stopwatch is not a parallel agent, and listing one both invented a lane and
+    // skewed the ×-today multiplier next to it. This filter was missing entirely
+    // here — the TUI had one, but mis-cased, so neither surface actually applied
+    // it (see `SessionView::accrues_agent_time`).
+    let agents: Vec<&SessionView> = active.iter().filter(|s| s.accrues_agent_time()).collect();
+    if agents.is_empty() {
         return;
     }
     let lw = layout.parallel_label;
     let bw = layout.bar_cells;
     let eng = today.total_human_seconds;
-    let max = active
+    let max = agents
         .iter()
         .map(|s| s.agent_seconds)
         .chain(std::iter::once(eng))
@@ -1165,17 +1171,24 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
     if eng > 0 {
         let parallel = today.total_agent_seconds as f64 / eng as f64;
         let mult = theme::paint(&format!("{parallel:.1}× today"), Role::Accent);
-        println!("{head}  ·  {} agent(s){you} · {mult}", active.len());
+        println!("{head}  ·  {} agent(s){you} · {mult}", agents.len());
     } else {
-        println!("{head}  ·  {} agent(s){you}", active.len());
+        println!("{head}  ·  {} agent(s){you}", agents.len());
     }
     println!();
     // `◆` marks an agent lane (purple), `●` the deduped human baseline (teal) —
     // the same shape/colour language as the cloud's "Right Now" view. Painting
     // only the glyph keeps the padded label column aligned.
     let agent_mark = theme::paint("◆", Role::Agent);
-    for s in active {
-        let label = truncate(&format!("{} · {}", s.harness, repo_short(&s.project)), lw);
+    for s in &agents {
+        let label = truncate(
+            &format!(
+                "{} · {}",
+                dira_sources::harness_id(s.harness),
+                repo_short(&s.project)
+            ),
+            lw,
+        );
         println!(
             "  {agent_mark} {label:<lw$}   {}   {:>8}",
             bar(s.agent_seconds as f64 / max as f64, bw),
@@ -1274,8 +1287,8 @@ mod tests {
         SessionView {
             handle: "h".into(),
             session_id: "s".into(),
-            harness: "claude".into(),
-            kind: "agent".into(),
+            harness: dira_contract::Harness::ClaudeCode,
+            kind: dira_contract::SessionKind::Agent,
             project: Some("github.com/acme/api".into()),
             label: None,
             activity: None,
@@ -1287,6 +1300,7 @@ mod tests {
             agent_active,
             last_activity_at: None,
             last_human_at: None,
+            has_agent_activity: true,
         }
     }
 

@@ -125,6 +125,24 @@ function Write-Info {
     [Console]::Error.WriteLine($Message)
 }
 
+# Is this PowerShell session running elevated (as Administrator)?
+#
+# A daemon inherits the elevation of whatever started it, and an elevated dirad
+# creates a control channel that ordinary `dira` commands and harness hooks
+# cannot open -- which is a silent, days-long capture outage, not a visible
+# error. `irm ... | iex` from an Administrator prompt is a completely normal
+# instinct, so the installer must not quietly hand the user that state.
+function Test-Elevated {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        # Fail open: never block an install on a failed probe.
+        return $false
+    }
+}
+
 function Write-Warn {
     param([string]$Message)
     [Console]::Error.WriteLine("warning: $Message")
@@ -991,7 +1009,19 @@ function Invoke-Main {
         # 14. daemon handling: default do nothing. If one was already running, always
         # restart it -- otherwise the user is left with a new CLI nagging about an old
         # daemon. -NoDaemon opts all the way out.
-        if (-not $NoDaemon) {
+        $elevated = Test-Elevated
+        if (-not $NoDaemon -and $elevated) {
+            # Deliberately skip auto-start rather than starting a daemon the user
+            # will not be able to reach. Installing the binaries is fine elevated;
+            # RUNNING the daemon elevated is what breaks capture.
+            Write-Warn "this installer is running as Administrator -- NOT starting dirad automatically."
+            Write-Warn "a daemon started from here would be elevated, and its control channel would"
+            Write-Warn "refuse the ordinary (non-elevated) processes that harness hooks run in --"
+            Write-Warn "capture would silently record nothing."
+            Write-Info "start it from a NORMAL terminal instead:"
+            Write-Info "  $installedDira daemon start"
+            Write-Info "  $installedDira daemon install   # logon task, runs unelevated"
+        } elseif (-not $NoDaemon) {
             if ($daemonWasRunning) {
                 Write-Info "restarting dirad..."
                 if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'restart')) -ne 0) {

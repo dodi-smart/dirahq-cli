@@ -125,9 +125,19 @@ pub fn build_batch(
     artifact_rows: &[ArtifactRow],
     device_id: &str,
     idle: Duration,
+    agent: crate::accounting::AgentPolicy,
     now: OffsetDateTime,
 ) -> AttestationBatch {
-    build_batch_with_partials(events, token_rows, artifact_rows, &[], device_id, idle, now)
+    build_batch_with_partials(
+        events,
+        token_rows,
+        artifact_rows,
+        &[],
+        device_id,
+        idle,
+        agent,
+        now,
+    )
 }
 
 /// Like [`build_batch`], but also emits a *partial* [`SessionRollup`]
@@ -138,6 +148,7 @@ pub fn build_batch(
 /// A partial is suppressed when an *ended* rollup for the same `session_id` is
 /// already in this batch (the session ended in this very window): the final
 /// rollup supersedes the partial, so shipping both would be redundant.
+#[allow(clippy::too_many_arguments)]
 pub fn build_batch_with_partials(
     events: &[RawEvent],
     token_rows: &[TokenRow],
@@ -145,6 +156,7 @@ pub fn build_batch_with_partials(
     partials: &[PartialSession],
     device_id: &str,
     idle: Duration,
+    agent: crate::accounting::AgentPolicy,
     now: OffsetDateTime,
 ) -> AttestationBatch {
     assemble_batch(
@@ -158,6 +170,7 @@ pub fn build_batch_with_partials(
         partials,
         device_id,
         idle,
+        agent,
         now,
     )
 }
@@ -184,6 +197,7 @@ fn assemble_batch(
     partials: &[PartialSession],
     device_id: &str,
     idle: Duration,
+    agent: crate::accounting::AgentPolicy,
     now: OffsetDateTime,
 ) -> AttestationBatch {
     let intervals = build_intervals_seeded(events, idle, seed);
@@ -192,7 +206,7 @@ fn assemble_batch(
     // interval's (start,end) split of the same minutes yields a DIFFERENT batch id so
     // the cloud re-unpacks it, while a byte-identical rebuild stays stable (issue #21).
     let batch_id = batch_id_for_chunk(events, artifact_rows, &intervals);
-    let mut sessions = build_sessions(events, history, idle);
+    let mut sessions = build_sessions(events, history, agent);
     // Drop degenerate sessions before shipping: no engaged time AND no agent
     // activity is empty noise (a bare SessionStart with nothing after it), so it
     // never reaches the cloud. Manual/agent sessions with real time are kept.
@@ -338,6 +352,7 @@ pub fn build_chunked_batches(
     partials: &[PartialSession],
     device_id: &str,
     idle: Duration,
+    agent: crate::accounting::AgentPolicy,
     now: OffsetDateTime,
     // Human signals at/before the flush cursor within one idle-window of the
     // boundary. Used only to recover the boundary-straddling gap in the FIRST chunk;
@@ -392,7 +407,7 @@ pub fn build_chunked_batches(
             // their sent-watermark advances with `is_last`.
             let parts: &[PartialSession] = if is_last { partials } else { &[] };
             let batch = assemble_batch(
-                chunk, chunk_seed, hist, toks, arts, parts, device_id, idle, now,
+                chunk, chunk_seed, hist, toks, arts, parts, device_id, idle, agent, now,
             );
             ChunkBatch {
                 batch,
@@ -616,7 +631,11 @@ fn interval_id(
 /// with slightly different content under the same `batch_id`; the cloud's
 /// batch-id dedup makes the FIRST accepted version stick, which is acceptable —
 /// it is still always a superset of the pre-#40 tail-only rollup.
-fn build_sessions(events: &[RawEvent], history: &[RawEvent], idle: Duration) -> Vec<SessionRollup> {
+fn build_sessions(
+    events: &[RawEvent],
+    history: &[RawEvent],
+    agent: crate::accounting::AgentPolicy,
+) -> Vec<SessionRollup> {
     // session_id -> accumulator. BTreeMap for deterministic output ordering.
     struct Acc {
         harness: Harness,
@@ -634,7 +653,7 @@ fn build_sessions(events: &[RawEvent], history: &[RawEvent], idle: Duration) -> 
         /// Frequency of each branch across the session's events (fallback).
         branch_counts: BTreeMap<String, u64>,
         /// Every event timestamp in the session, for idle-trimmed wall-clock.
-        event_times: Vec<OffsetDateTime>,
+        event_times: Vec<crate::accounting::AgentSample>,
         /// First non-null free-text note / operational label across the session's
         /// events (manual sessions; agent sessions leave these None).
         note: Option<String>,
@@ -690,7 +709,10 @@ fn build_sessions(events: &[RawEvent], history: &[RawEvent], idle: Duration) -> 
                 note: e.note.clone(),
                 label: e.label.clone(),
             });
-        entry.event_times.push(e.at);
+        entry.event_times.push(crate::accounting::AgentSample {
+            at: e.at,
+            opens_span: e.kind.opens_agent_span(),
+        });
         if let Some(b) = &e.branch {
             *entry.branch_counts.entry(b.clone()).or_insert(0) += 1;
         }
@@ -734,7 +756,7 @@ fn build_sessions(events: &[RawEvent], history: &[RawEvent], idle: Duration) -> 
             // whole event timeline when it had activity (not the raw last - first
             // span), so dead spans between bursts of work don't inflate it.
             let agent_wall = if a.had_activity {
-                crate::accounting::active_seconds(&a.event_times, idle).max(0) as u64
+                crate::accounting::agent_active_seconds(&a.event_times, agent).max(0) as u64
             } else {
                 0
             };
@@ -941,6 +963,18 @@ mod tests {
     }
 
     const IDLE: Duration = Duration::minutes(5);
+    /// The shipped agent ceilings, so these fixtures exercise the same policy a
+    /// real daemon runs with. `agent_const_matches_the_shipped_default` below
+    /// fails if this ever drifts from `AgentPolicy::default()`.
+    const AGENT: crate::accounting::AgentPolicy = crate::accounting::AgentPolicy {
+        idle: Duration::minutes(5),
+        max_span: Duration::hours(8),
+    };
+
+    #[test]
+    fn agent_const_matches_the_shipped_default() {
+        assert_eq!(AGENT, crate::accounting::AgentPolicy::default());
+    }
     const NOW: OffsetDateTime = OffsetDateTime::UNIX_EPOCH;
 
     #[test]
@@ -952,7 +986,7 @@ mod tests {
             ev("s1", 60, EventKind::UserPrompt, "p"),
             ev("s1", 90, EventKind::SessionEnd, "p"),
         ];
-        let batch = build_batch(&events, &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&events, &[], &[], "d", IDLE, AGENT, NOW);
         let s = batch
             .sessions
             .iter()
@@ -978,8 +1012,8 @@ mod tests {
             ev("s2", 90, EventKind::SessionEnd, "p"),
         ];
 
-        let report = report::build(&events, IDLE);
-        let batch = build_batch(&events, &[], &[], "01DEVICE", IDLE, NOW);
+        let report = report::build(&events, IDLE, crate::accounting::AgentPolicy::default());
+        let batch = build_batch(&events, &[], &[], "01DEVICE", IDLE, AGENT, NOW);
 
         let interval_seconds: u64 = batch.intervals.iter().map(|i| i.human_seconds).sum();
         assert_eq!(
@@ -1016,7 +1050,7 @@ mod tests {
             ev("s1", 30, EventKind::UserPrompt, "p"),
             ev("s1", 60, EventKind::UserPrompt, "p"),
         ];
-        let batch = build_batch(&events, &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&events, &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.intervals.len(), 2, "one interval per counted gap");
         assert_eq!(batch.intervals[0].human_seconds, 30);
         assert_eq!(batch.intervals[1].human_seconds, 30);
@@ -1216,7 +1250,7 @@ mod tests {
             ev("s1", 30 + 600, EventKind::UserPrompt, "p"),
             ev("s1", 30 + 600 + 30, EventKind::UserPrompt, "p"),
         ];
-        let batch = build_batch(&events, &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&events, &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.intervals.len(), 2);
         assert_eq!(batch.intervals[0].human_seconds, 30);
         assert_eq!(batch.intervals[1].human_seconds, 30);
@@ -1232,7 +1266,7 @@ mod tests {
             ev("s2", 0, EventKind::SessionStart, "p"),
             ev("s2", 15, EventKind::PreTool, "p"),
         ];
-        let batch = build_batch(&events, &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&events, &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.sessions.len(), 1);
         let s = &batch.sessions[0];
         assert_eq!(s.session_id, "s1");
@@ -1243,24 +1277,44 @@ mod tests {
 
     #[test]
     fn agent_wall_is_idle_trimmed_not_raw_span() {
-        // A session opened, a short burst of activity (0..30s), then a long idle
-        // gap (~1h), then a final end event. The raw span is ~3690s, but the
-        // idle-trimmed active time is only the 30s burst — the dead hour is not
-        // counted toward agent wall-clock.
+        // A session opened, a short burst of activity (0..30s), then a long quiet
+        // hour that is NOT a tool call, then a final end event. What this test
+        // protects is that the raw ~3690s span is never what gets shipped.
         let events = vec![
             ev("s1", 0, EventKind::SessionStart, "p"),
             ev("s1", 10, EventKind::PreTool, "p"),
             ev("s1", 30, EventKind::PostTool, "p"),
             ev("s1", 30 + 3600, EventKind::SessionEnd, "p"),
         ];
-        let batch = build_batch(&events, &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&events, &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.sessions.len(), 1);
         let s = &batch.sessions[0];
         // started_at / ended_at remain first / last as before.
         assert_eq!(s.started_at, fmt(OffsetDateTime::UNIX_EPOCH));
         assert!(s.ended_at.is_some());
-        // active = 0..10 + 10..30 = 30s; the >5min gap to the end is trimmed.
-        assert_eq!(s.agent_wall_seconds, 30);
+        // 10 (start→pre) + 20 (the tool call) + 300 (the quiet hour, clamped to
+        // the agent idle ceiling rather than discarded, so the live dashboard can
+        // predict this value instead of showing time it later revokes).
+        assert_eq!(s.agent_wall_seconds, 330);
+        assert!(s.agent_wall_seconds < 3690 / 10);
+    }
+
+    /// The regression the agent policy exists for: the gap after a `PreTool` is
+    /// the tool call itself, and the rollup shipped to the cloud must bank it.
+    /// Under the old shared-idle rule this session reported zero agent seconds.
+    #[test]
+    fn a_long_tool_call_reaches_the_cloud_rollup() {
+        let two_hours = 2 * 60 * 60;
+        let events = vec![
+            ev("s1", 0, EventKind::SessionStart, "p"),
+            ev("s1", 1, EventKind::PreTool, "p"),
+            ev("s1", 1 + two_hours, EventKind::PostTool, "p"),
+            ev("s1", 2 + two_hours, EventKind::SessionEnd, "p"),
+        ];
+        let batch = build_batch(&events, &[], &[], "d", IDLE, AGENT, NOW);
+        let s = &batch.sessions[0];
+        // 1 (start→pre) + 7200 (the build) + 1 (post→end).
+        assert_eq!(s.agent_wall_seconds, (two_hours + 2) as u64);
     }
 
     #[test]
@@ -1269,7 +1323,7 @@ mod tests {
         start.harness = Harness::Manual;
         let mut stop = ev("m1", 60, EventKind::ManualStop, "p");
         stop.harness = Harness::Manual;
-        let batch = build_batch(&[start, stop], &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&[start, stop], &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.sessions.len(), 1);
         assert_eq!(batch.sessions[0].kind, SessionKind::Manual);
         assert_eq!(batch.sessions[0].harness, Harness::Manual);
@@ -1289,7 +1343,7 @@ mod tests {
             est_cost_usd: Some(0.5),
             at: "2026-06-27T10:00:00Z".into(),
         }];
-        let batch = build_batch(&[], &rows, &[], "d", IDLE, NOW);
+        let batch = build_batch(&[], &rows, &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.token_usage.len(), 1);
         let t = &batch.token_usage[0];
         assert_eq!(t.id, "t1");
@@ -1337,7 +1391,8 @@ mod tests {
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
-        let chunks = build_chunked_batches(&events, &[], &rows, &[], "d", IDLE, NOW, &[], &[]);
+        let chunks =
+            build_chunked_batches(&events, &[], &rows, &[], "d", IDLE, AGENT, NOW, &[], &[]);
 
         let (shipped, per_chunk) = shipped_artifacts(&chunks);
         assert!(
@@ -1361,7 +1416,8 @@ mod tests {
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
-        let chunks = build_chunked_batches(&events, &[], &rows, &[], "d", IDLE, NOW, &[], &[]);
+        let chunks =
+            build_chunked_batches(&events, &[], &rows, &[], "d", IDLE, AGENT, NOW, &[], &[]);
 
         assert_eq!(
             chunks.len(),
@@ -1388,7 +1444,7 @@ mod tests {
             .map(|i| art(&format!("sha-{i:04}")))
             .collect();
 
-        let chunks = build_chunked_batches(&[], &[], &rows, &[], "d", IDLE, NOW, &[], &[]);
+        let chunks = build_chunked_batches(&[], &[], &rows, &[], "d", IDLE, AGENT, NOW, &[], &[]);
 
         let (shipped, per_chunk) = shipped_artifacts(&chunks);
         assert_eq!(per_chunk, vec![CHUNK_ARTIFACTS, CHUNK_ARTIFACTS, 1]);
@@ -1424,7 +1480,8 @@ mod tests {
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
-        let chunks = build_chunked_batches(&events, &rows, &[], &[], "d", IDLE, NOW, &[], &[]);
+        let chunks =
+            build_chunked_batches(&events, &rows, &[], &[], "d", IDLE, AGENT, NOW, &[], &[]);
 
         let per_chunk: Vec<usize> = chunks.iter().map(|c| c.batch.token_usage.len()).collect();
         assert_eq!(per_chunk, vec![CHUNK_TOKENS, CHUNK_TOKENS, 5]);
@@ -1444,7 +1501,7 @@ mod tests {
             ev("s1", 0, EventKind::UserPrompt, "p"),
             ev("s1", 10, EventKind::PreTool, "p"),
         ];
-        let chunks = build_chunked_batches(&events, &[], &[], &[], "d", IDLE, NOW, &[], &[]);
+        let chunks = build_chunked_batches(&events, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &[]);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].is_last);
         assert!(chunks[0].cursor_event_id.is_some());
@@ -1469,7 +1526,7 @@ mod tests {
                 blob: "blob-a".into(),
             }]),
         }];
-        let batch = build_batch(&[], &[], &rows, "d", IDLE, NOW);
+        let batch = build_batch(&[], &[], &rows, "d", IDLE, AGENT, NOW);
         assert_eq!(batch.artifacts.len(), 1);
         let a = &batch.artifacts[0];
         // id == sha keeps cloud ingest idempotent on re-ship.
@@ -1502,7 +1559,7 @@ mod tests {
         work.branch = Some("feat/y".into());
         let mut end = ev("s1", 20, EventKind::SessionEnd, "p");
         end.branch = Some("feat/y".into());
-        let batch = build_batch(&[start, work, end], &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&[start, work, end], &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.sessions.len(), 1);
         assert_eq!(batch.sessions[0].branch.as_deref(), Some("feat/x"));
     }
@@ -1517,7 +1574,7 @@ mod tests {
         w2.branch = Some("feat/x".into());
         let mut end = ev("s1", 30, EventKind::SessionEnd, "p");
         end.branch = Some("feat/y".into());
-        let batch = build_batch(&[start, w1, w2, end], &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&[start, w1, w2, end], &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.sessions.len(), 1);
         assert_eq!(batch.sessions[0].branch.as_deref(), Some("feat/x"));
     }
@@ -1528,20 +1585,20 @@ mod tests {
             ev("s1", 0, EventKind::UserPrompt, "p"),
             ev("s1", 30, EventKind::UserPrompt, "p"),
         ];
-        let a = build_batch(&events, &[], &[], "d", IDLE, NOW);
-        let b = build_batch(&events, &[], &[], "d", IDLE, NOW);
+        let a = build_batch(&events, &[], &[], "d", IDLE, AGENT, NOW);
+        let b = build_batch(&events, &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(a.batch_id, b.batch_id, "same window ⇒ same batch id");
 
         // A different window ⇒ a different id.
         let mut more = events.clone();
         more.push(ev("s1", 60, EventKind::UserPrompt, "p"));
-        let c = build_batch(&more, &[], &[], "d", IDLE, NOW);
+        let c = build_batch(&more, &[], &[], "d", IDLE, AGENT, NOW);
         assert_ne!(a.batch_id, c.batch_id);
     }
 
     #[test]
     fn empty_window_is_an_empty_batch() {
-        let batch = build_batch(&[], &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&[], &[], &[], "d", IDLE, AGENT, NOW);
         assert!(batch.intervals.is_empty());
         assert!(batch.sessions.is_empty());
         assert!(batch.token_usage.is_empty());
@@ -1571,7 +1628,7 @@ mod tests {
             note: None,
             label: None,
         }];
-        let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, NOW);
+        let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, AGENT, NOW);
         let s = batch
             .sessions
             .iter()
@@ -1609,7 +1666,7 @@ mod tests {
             note: None,
             label: None,
         }];
-        let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, NOW);
+        let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, AGENT, NOW);
         let rollups: Vec<_> = batch
             .sessions
             .iter()
@@ -1637,7 +1694,7 @@ mod tests {
             note: None,
             label: None,
         }];
-        let batch = build_batch_with_partials(&[], &[], &[], &partials, "d", IDLE, NOW);
+        let batch = build_batch_with_partials(&[], &[], &[], &partials, "d", IDLE, AGENT, NOW);
         assert!(
             batch.sessions.is_empty(),
             "no active time ⇒ nothing to settle"
@@ -1729,7 +1786,7 @@ mod tests {
         start.label = Some("standup".into());
         start.activity = Some("meeting".into());
         let stop = ev("m", 60, EventKind::ManualStop, "p");
-        let batch = build_batch(&[start, stop], &[], &[], "d", IDLE, NOW);
+        let batch = build_batch(&[start, stop], &[], &[], "d", IDLE, AGENT, NOW);
 
         let sess = batch
             .sessions
@@ -1749,7 +1806,7 @@ mod tests {
         // An agent session carries none of them.
         let a = ev("a", 0, EventKind::UserPrompt, "p");
         let b = ev("a", 30, EventKind::SessionEnd, "p");
-        let abatch = build_batch(&[a, b], &[], &[], "d", IDLE, NOW);
+        let abatch = build_batch(&[a, b], &[], &[], "d", IDLE, AGENT, NOW);
         if let Some(asess) = abatch.sessions.iter().find(|s| s.session_id == "a") {
             assert!(asess.note.is_none() && asess.label.is_none());
         }
@@ -1776,7 +1833,8 @@ mod tests {
         // pre-fix, a window slice that's just a bare SessionEnd has no agent
         // activity and no interval-engaged time of its own, so the old (window-
         // only) rollup would have been silently dropped by that filter.
-        let chunks = build_chunked_batches(&window, &[], &[], &[], "d", IDLE, NOW, &[], &history);
+        let chunks =
+            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &history);
         assert_eq!(chunks.len(), 1);
         let sessions = &chunks[0].batch.sessions;
         assert_eq!(
@@ -1811,7 +1869,7 @@ mod tests {
             ev("s1", 110, EventKind::PreTool, "p"),
         ];
         let history = vec![ev("s1", 50, EventKind::SessionEnd, "p")];
-        let sessions = build_sessions(&window, &history, IDLE);
+        let sessions = build_sessions(&window, &history, AGENT);
         assert!(
             sessions.iter().all(|s| s.session_id != "s1"),
             "a SessionEnd sitting only in history must never terminate a live session"
@@ -1833,7 +1891,7 @@ mod tests {
             window[0].clone(),
             window[1].clone(),
         ];
-        let sessions = build_sessions(&window, &history, IDLE);
+        let sessions = build_sessions(&window, &history, AGENT);
         let s = sessions
             .iter()
             .find(|s| s.session_id == "s1")
@@ -1862,9 +1920,9 @@ mod tests {
         window.push(ev("s1", 1305, EventKind::SessionEnd, "p"));
 
         let with_history =
-            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, NOW, &[], &window);
+            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &window);
         let without_history =
-            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, NOW, &[], &[]);
+            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &[]);
 
         assert_eq!(
             with_history.len(),
@@ -1938,7 +1996,7 @@ mod tests {
             ev("s1", 100, EventKind::SessionEnd, "p"), // stale compaction end
         ];
         let window = vec![ev("s1", 500, EventKind::SessionEnd, "p")]; // the real end
-        let sessions = build_sessions(&window, &history, IDLE);
+        let sessions = build_sessions(&window, &history, AGENT);
         let s = sessions
             .iter()
             .find(|s| s.session_id == "s1")

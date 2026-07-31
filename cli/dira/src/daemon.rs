@@ -70,6 +70,49 @@ fn locate_dirad() -> PathBuf {
     PathBuf::from(dira_ipc::DIRAD_BIN)
 }
 
+/// A truncating file for the spawned daemon's stdout/stderr, or `None` when no
+/// log location resolves (in which case the caller nulls them, as before).
+///
+/// Deliberately truncating and separate from the daemon's own rolling log: this
+/// only ever holds one process's pre-`tracing` output, so it cannot grow, and a
+/// crash loop leaves the *latest* failure rather than an unbounded pile.
+fn spawn_log(config: &Config) -> Option<std::fs::File> {
+    let dir = match std::env::var("DIRA_LOG_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ if cfg!(windows) => config.runtime_dir().join("logs"),
+        _ => return None,
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::File::create(dir.join("dirad.spawn.log")).ok()
+}
+
+/// Record a started daemon's pid, warning rather than failing.
+///
+/// A running daemon with a missing pidfile is strictly better than aborting an
+/// otherwise-successful start: the pidfile is a convenience for `stop`/`restart`,
+/// not a correctness requirement (`detect_supervision` also probes the socket).
+/// But the failure is no longer swallowed with `.ok()` — silence here is how a
+/// stale pid survives unnoticed.
+fn write_pidfile(pf: &Path, pid: u32) {
+    if let Some(dir) = pf.parent() {
+        // `runtime_dir()` isn't guaranteed to exist yet — on unix it's the
+        // socket's own parent (already created when the daemon binds), but on
+        // windows it's the project data dir, which may never have been touched
+        // before this first `dira daemon start`.
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("warning: could not create {} ({e})", dir.display());
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(pf, pid.to_string()) {
+        eprintln!(
+            "warning: could not write the pidfile at {} ({e}) — `dira daemon stop` \
+             will fall back to a process-name kill",
+            pf.display()
+        );
+    }
+}
+
 /// Is a daemon answering `Ping` on this exact socket?
 pub async fn answers(sock: &Path) -> bool {
     matches!(client::send(sock, &Request::Ping).await, Ok(Response::Pong))
@@ -80,17 +123,57 @@ pub async fn is_up(config: &Config) -> bool {
     answers(&config.socket_path).await
 }
 
+/// Tri-state liveness: `Up`, `Down`, or *refusing us*.
+///
+/// [`is_up`] answers "can I talk to it", which is the right question for most
+/// callers and is left alone. This answers "is one there at all", which is a
+/// different question whenever the endpoint is permission-gated — and collapsing
+/// the two is what let a running-but-unreachable daemon be reported as `down`,
+/// with advice that made it worse.
+pub async fn reach(config: &Config) -> client::Reach {
+    match dira_ipc::connect(&config.socket_path).await {
+        Ok(_) => client::Reach::Up,
+        Err(e) => client::classify(&e),
+    }
+}
+
 pub async fn start(config: &Config) -> Result<()> {
     if is_up(config).await {
         println!("dirad already running");
         return Ok(());
     }
+    // A daemon that refuses us is still a daemon. Spawning a second one cannot
+    // help: it fails `first_pipe_instance` against the live one and exits — after
+    // this function has already overwritten the real daemon's pidfile, leaving
+    // `stop`/`restart`/`status` pointing at a dead pid. Refuse before spawning.
+    if reach(config).await == client::Reach::Denied {
+        anyhow::bail!(
+            "{}",
+            dira_ipc::elevation::access_denied_advice(dira_ipc::elevation::is_elevated())
+        );
+    }
     let bin = locate_dirad();
     println!("starting {} ...", bin.display());
     let mut cmd = Command::new(&bin);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null());
+    // A daemon that dies *before* `tracing` initialises — a config parse error, a
+    // missing DLL, a panic in startup — writes to stderr and nothing else. Nulling
+    // it meant those failures left no trace on any platform. Truncate per start so
+    // this stays bounded to one process's output.
+    match spawn_log(config) {
+        Some(f) => {
+            let dup = f.try_clone().ok();
+            cmd.stderr(std::process::Stdio::from(f));
+            match dup {
+                Some(d) => cmd.stdout(std::process::Stdio::from(d)),
+                None => cmd.stdout(std::process::Stdio::null()),
+            };
+        }
+        None => {
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
 
     #[cfg(windows)]
     {
@@ -112,15 +195,12 @@ pub async fn start(config: &Config) -> Result<()> {
         .spawn()
         .with_context(|| format!("failed to spawn {}", bin.display()))?;
 
+    // The pidfile is written only once the child has proven itself (below), never
+    // here. Writing it up front meant a start that failed — the common case when
+    // an already-running daemon refuses us — clobbered the live daemon's pidfile
+    // on its way out, so `stop`/`restart`/`status` all lost track of the real
+    // process. Cross-platform.
     let pf = pidfile(config);
-    if let Some(dir) = pf.parent() {
-        // `runtime_dir()` isn't guaranteed to exist yet — on unix it's the
-        // socket's own parent (already created when the daemon binds), but on
-        // windows it's the project data dir, which may never have been touched
-        // before this first `dira daemon start`.
-        std::fs::create_dir_all(dir).ok();
-    }
-    std::fs::write(&pf, child.id().to_string()).ok();
 
     // Poll for readiness. Startup can be slow on first run — a keychain unlock
     // prompt (for the device key) or a large event-log hydration both delay the
@@ -130,6 +210,7 @@ pub async fn start(config: &Config) -> Result<()> {
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if is_up(config).await {
+            write_pidfile(&pf, child.id());
             println!("dirad up (pid {})", child.id());
             return Ok(());
         }
@@ -141,7 +222,9 @@ pub async fn start(config: &Config) -> Result<()> {
     }
 
     // Still alive but not answering yet — almost certainly waiting on a keychain
-    // prompt. It will come up on its own, so report that rather than fail.
+    // prompt. It will come up on its own, so record the pid and report that
+    // rather than fail; this branch DID produce a live daemon.
+    write_pidfile(&pf, child.id());
     println!(
         "dirad starting (pid {}) but not answering yet — it may be waiting on a \
          keychain prompt. Check `dira daemon status`.",
@@ -1173,6 +1256,7 @@ mod tests {
             pid,
             uptime_seconds: 1,
             http_ingress_error: None,
+            control_channel_warning: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let _ = dira_ipc::write_frame(&mut stream, &bytes).await;

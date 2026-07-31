@@ -6,6 +6,7 @@
 
 use crate::sync::SyncHandle;
 use dira_contract::{Harness, SessionKind};
+use dira_core::accounting;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::signing::DeviceKey;
 use dira_core::sync::CachedBillingSummary;
@@ -115,6 +116,12 @@ pub struct AppState {
     /// `dira daemon status` can say so instead of the daemon silently
     /// capturing nothing. Never hold this lock across an await. See D-0009.
     pub http_ingress_error: Arc<Mutex<Option<String>>>,
+    /// Why the control channel is not in its intended state (windows: the pipe's
+    /// security descriptor fell back a rung, and/or dirad is running elevated),
+    /// or `None`. Reported on `DaemonInfo` for the same reason as
+    /// `http_ingress_error` — D-0009: a daemon that cannot do its job must never
+    /// look plainly healthy.
+    pub control_channel_warning: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -390,6 +397,11 @@ pub struct LiveSession {
     /// Distinct from `last_event_at` only in intent; kept separate so the gap math
     /// reads from a field the partial-rollup / observe logic never repurposes.
     pub last_active_at: Option<OffsetDateTime>,
+    /// Did the event at `last_active_at` open an agent span (a `PreTool`)? The
+    /// registry sums gaps incrementally, so it has to remember what opened the
+    /// currently-open one to know whether the next gap is a tool call in flight
+    /// (credited in full) or an ordinary quiet stretch (clamped).
+    pub last_opens_span: bool,
     /// `active_seconds` as of the last partial rollup we emitted for this session,
     /// or `None` if none yet. Used to decide "new activity since the last partial"
     /// (6c) without re-scanning.
@@ -464,9 +476,24 @@ pub struct SessionRegistry {
     /// total instead of each counting its own signals in isolation.
     last_human_signal_at: Option<OffsetDateTime>,
     last_human_signal_session: Option<String>,
+    /// Ceilings for agent wall-clock. Held on the registry rather than passed per
+    /// event because it is configuration, not a property of an event — and
+    /// because `observe` is called from a dozen places that would otherwise all
+    /// have to thread it through. `Default` matches `Config`'s defaults, so a
+    /// registry built without one still behaves exactly like a shipped daemon.
+    agent: accounting::AgentPolicy,
 }
 
 impl SessionRegistry {
+    /// A registry using `agent` for wall-clock ceilings. `build_state` passes
+    /// `Config::agent_policy()`; `Default` is for tests.
+    pub fn with_agent_policy(agent: accounting::AgentPolicy) -> Self {
+        Self {
+            agent,
+            ..Self::default()
+        }
+    }
+
     /// Fold an appended event into the live registry, maintaining the rolling
     /// `engaged_seconds` / `active_seconds` counters with `idle` as the gap
     /// threshold (Phase 6b). Pass the same `idle` the accounting core uses
@@ -499,6 +526,7 @@ impl SessionRegistry {
                 active_seconds: 0,
                 last_human_signal_at: None,
                 last_active_at: None,
+                last_opens_span: false,
                 last_partial_active_seconds: None,
                 prompts: 0,
                 branch: ev.branch.clone(),
@@ -511,15 +539,19 @@ impl SessionRegistry {
             entry.had_signal = true;
         }
 
-        // Active gap (all events): add the gap from the previous event of any kind
-        // when it is within (0, idle], exactly the active_seconds rule.
+        // Agent wall-clock gap (all events): credit the gap from the previous
+        // event under exactly the rule `accounting::agent_active_seconds` applies
+        // in one shot, so the incremental sum here and the batch scan agree.
+        // A gap opened by a `PreTool` is a tool call in flight and is credited in
+        // full; any other gap is clamped. Neither is discarded — dropping
+        // over-idle gaps is what used to zero a whole two-hour build.
         if let Some(prev) = entry.last_active_at {
-            let gap = ev.at - prev;
-            if gap > Duration::ZERO && gap <= idle {
-                entry.active_seconds += gap.whole_seconds() as u64;
-            }
+            entry.active_seconds +=
+                accounting::agent_gap_seconds(ev.at - prev, entry.last_opens_span, self.agent)
+                    as u64;
         }
         entry.last_active_at = Some(ev.at);
+        entry.last_opens_span = ev.kind.opens_agent_span();
 
         entry.last_event_at = ev.at;
         if entry.project.is_none() && ev.project.is_some() {
@@ -1037,15 +1069,21 @@ mod tests {
         }
         let s = reg.sessions.get("s1").expect("session present in registry");
 
-        // active_seconds over *all* event timestamps.
-        let all_times: Vec<OffsetDateTime> = seq
+        // Agent wall-clock over *all* events, under the same policy the registry
+        // used. This is the guard that keeps the registry's incremental sum and
+        // the one-shot batch scan from ever disagreeing — the two numbers a user
+        // sees as "live" and "reported".
+        let all_samples: Vec<accounting::AgentSample> = seq
             .iter()
-            .map(|(_, secs)| OffsetDateTime::UNIX_EPOCH + Duration::seconds(*secs))
+            .map(|(kind, secs)| accounting::AgentSample {
+                at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(*secs),
+                opens_span: kind.opens_agent_span(),
+            })
             .collect();
-        let expect_active = accounting::active_seconds(&all_times, IDLE).max(0) as u64;
+        let expect_active = accounting::agent_active_seconds(&all_samples, reg.agent).max(0) as u64;
         assert_eq!(
             s.active_seconds, expect_active,
-            "incremental active_seconds must equal accounting::active_seconds for {seq:?}"
+            "incremental active_seconds must equal accounting::agent_active_seconds for {seq:?}"
         );
 
         // engaged_seconds over human signals only.

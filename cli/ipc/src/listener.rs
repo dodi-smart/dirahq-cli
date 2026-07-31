@@ -12,7 +12,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOpti
 #[cfg(windows)]
 use tokio::time::Instant;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY};
 
 /// A bound IPC endpoint, accepting one connection at a time.
 #[derive(Debug)]
@@ -31,7 +31,62 @@ pub enum Listener {
         name: String,
         next: NamedPipeServer,
         endpoint: PathBuf,
+        /// The descriptor every instance of this pipe is created with — built
+        /// once at bind, because each Claude event spawns a fresh `dira.exe` and
+        /// a token query + SDDL parse per accepted connection would be pure
+        /// waste. `None` on the `Default` rung.
+        security: Option<crate::security::SecurityDescriptor>,
+        /// Which rung of the ladder we actually got, and why, for `DaemonInfo`.
+        level: crate::security::SecurityLevel,
+        level_detail: Option<String>,
     },
+}
+
+/// Does this `create` error mean another daemon already owns the pipe name?
+///
+/// `first_pipe_instance(true)` reports a live owner as ACCESS_DENIED, which is
+/// otherwise indistinguishable from a descriptor problem — and must NOT degrade
+/// down the ladder, because a second daemon on one database is exactly what the
+/// single-instance guard exists to prevent (D-0009).
+#[cfg(windows)]
+fn is_name_taken(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(x) if x == ERROR_ACCESS_DENIED as i32 || x == ERROR_PIPE_BUSY as i32
+    )
+}
+
+/// Create one instance of `name`, applying `sec` when present.
+///
+/// Used by BOTH [`Listener::bind`] and [`Listener::accept`]. Forgetting the
+/// accept-loop call site is the easiest mistake in this module and the failure is
+/// invisible: connection #1 works, and every connection after it silently gets
+/// the process token's default DACL.
+#[cfg(windows)]
+fn create_pipe_instance(
+    name: &str,
+    first_instance: bool,
+    sec: Option<&crate::security::SecurityDescriptor>,
+) -> io::Result<NamedPipeServer> {
+    let mut opts = ServerOptions::new();
+    if first_instance {
+        opts.first_pipe_instance(true);
+    }
+    match sec {
+        None => opts.create(name),
+        Some(s) => {
+            let mut attrs = s.attributes();
+            // SAFETY: `attrs` points at a descriptor owned by `s`, which the
+            // caller keeps alive across this call; tokio passes the pointer
+            // straight through to `CreateNamedPipeW`'s `lpSecurityAttributes`.
+            unsafe {
+                opts.create_with_security_attributes_raw(
+                    name,
+                    (&mut attrs as *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES).cast(),
+                )
+            }
+        }
+    }
 }
 
 impl Listener {
@@ -70,15 +125,69 @@ impl Listener {
         }
         #[cfg(windows)]
         {
+            use crate::security::{SecurityDescriptor, SecurityLevel};
             let name = pipe_name(endpoint)?;
-            let next = ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(&name)?;
+
+            // Walk down the ladder: labeled → DACL-only → default. A descriptor
+            // failure must never turn a working daemon into one that will not
+            // start (D-0009), but it must never be silent either — the rung we
+            // land on is reported on `DaemonInfo`.
+            //
+            // ERROR_ACCESS_DENIED / ERROR_PIPE_BUSY from `create` mean another
+            // daemon already holds this name (`first_pipe_instance`), which is a
+            // real bind failure and must propagate rather than degrade.
+            let mut detail: Option<String> = None;
+            for (level, with_label) in [
+                (SecurityLevel::UserOnlyLabeled, true),
+                (SecurityLevel::UserOnly, false),
+            ] {
+                let sec = match SecurityDescriptor::for_current_user(with_label) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        detail = Some(e.to_string());
+                        continue;
+                    }
+                };
+                match create_pipe_instance(&name, true, Some(&sec)) {
+                    Ok(next) => {
+                        return Ok(Listener::Pipe {
+                            name,
+                            next,
+                            endpoint: endpoint.to_path_buf(),
+                            security: Some(sec),
+                            level,
+                            level_detail: None,
+                        })
+                    }
+                    Err(e) if is_name_taken(&e) => return Err(e),
+                    Err(e) => detail = Some(e.to_string()),
+                }
+            }
+
+            let next = create_pipe_instance(&name, true, None)?;
             Ok(Listener::Pipe {
                 name,
                 next,
                 endpoint: endpoint.to_path_buf(),
+                security: None,
+                level: SecurityLevel::Default,
+                level_detail: detail,
             })
+        }
+    }
+
+    /// Why the control channel is not in its intended state, or `None` when it
+    /// is. Always `None` on unix, where the `0600` chmod is unconditional.
+    pub fn security_degradation(&self) -> Option<String> {
+        match self {
+            #[cfg(unix)]
+            Listener::Unix { .. } => None,
+            #[cfg(windows)]
+            Listener::Pipe {
+                level,
+                level_detail,
+                ..
+            } => level.degradation(level_detail.as_deref()),
         }
     }
 
@@ -91,12 +200,22 @@ impl Listener {
                 Ok(Stream::Unix(stream))
             }
             #[cfg(windows)]
-            Listener::Pipe { name, next, .. } => {
+            Listener::Pipe {
+                name,
+                next,
+                security,
+                ..
+            } => {
                 next.connect().await?;
                 // Create the next waiting instance BEFORE handing back the connected
                 // one: this ordering is what guarantees a second client dialing in
                 // immediately after always finds an instance to connect to.
-                let fresh = ServerOptions::new().create(name.as_str())?;
+                //
+                // The SAME descriptor goes on every instance. Omitting it here
+                // would leave connection #1 protected and everything after it on
+                // the token's default DACL — a bug that reproduces only on the
+                // second command a user runs.
+                let fresh = create_pipe_instance(name.as_str(), false, security.as_ref())?;
                 let connected = std::mem::replace(next, fresh);
                 Ok(Stream::PipeServer(connected))
             }
@@ -114,8 +233,33 @@ impl Listener {
     }
 }
 
+/// How long [`connect`] retries a busy pipe before giving up.
+#[cfg(windows)]
+pub const DEFAULT_BUSY_BUDGET: Duration = Duration::from_secs(2);
+/// Unix has no busy state to retry; the constant exists so callers compile
+/// unchanged on both platforms.
+#[cfg(not(windows))]
+pub const DEFAULT_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Connect to a listener at `endpoint` as a client.
 pub async fn connect(endpoint: &Path) -> io::Result<Stream> {
+    connect_with_budget(endpoint, DEFAULT_BUSY_BUDGET).await
+}
+
+/// [`connect`] with an explicit busy-retry budget.
+///
+/// Exists because the hook shim wraps its send in a short outer timeout, and a
+/// retry budget longer than that timeout is dead code — the outer deadline always
+/// fires first, so on windows every `ERROR_PIPE_BUSY` was silently dropped rather
+/// than retried. Callers with their own deadline pass a budget strictly inside it.
+///
+/// On unix the budget is unused: a UDS `connect` to a live listener has no
+/// equivalent busy state, and a stall would be on read, which the caller's own
+/// timeout already covers.
+pub async fn connect_with_budget(
+    endpoint: &Path,
+    #[cfg_attr(unix, allow(unused_variables))] busy_budget: std::time::Duration,
+) -> io::Result<Stream> {
     #[cfg(unix)]
     {
         let stream = tokio::net::UnixStream::connect(endpoint).await?;
@@ -130,8 +274,7 @@ pub async fn connect(endpoint: &Path) -> io::Result<Stream> {
         // outright, bounded to ~2s total so a genuinely dead/wedged daemon still fails
         // fast instead of hanging the caller.
         const RETRY_INTERVAL: Duration = Duration::from_millis(50);
-        const RETRY_BUDGET: Duration = Duration::from_secs(2);
-        let deadline = Instant::now() + RETRY_BUDGET;
+        let deadline = Instant::now() + busy_budget;
         loop {
             match ClientOptions::new().open(&name) {
                 Ok(client) => return Ok(Stream::PipeClient(client)),

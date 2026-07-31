@@ -202,7 +202,11 @@ own **double consent gate**:
   slugs, titles, status, guard globs, spec paths, trailer keys + decision
   refs, guard events, shas (`recordSha` = the git blob oid), and per-repo
   coverage/capture counts — enough for dashboards to show structure, cost,
-  and guard telemetry without any prose. `full` adds the consent-gated
+  and guard telemetry without any prose. The coverage surface is active
+  decisions' guard globs ∪ **every** spec's paths: `verified` records a human
+  review of whether a spec matches the code, which is a different question
+  from whether the code is documented, and decisions have always counted
+  while unverified (D-0016). `full` adds the consent-gated
   content fields (`bodyMd`, trailer `value`), which are pinned by an explicit
   path allowlist in the contract's no-content invariant.
 - **Workspace tier** (cloud-side) — the dashboard's ZAVET · KNOWLEDGE SYNC

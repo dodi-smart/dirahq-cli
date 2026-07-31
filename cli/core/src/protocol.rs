@@ -571,6 +571,26 @@ pub struct ZavetDecisionView {
     /// hypothesis, never as fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<bool>,
+    /// A later decision that corrects one claim in this one. The record stays
+    /// `active` and keeps its body — this is the pointer that makes an
+    /// append-only record safe to leave standing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrected_by: Option<String>,
+    /// How this record's invariants are verified. Empty means nobody has said
+    /// — which is a finding, not a pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<ZavetCheckView>,
+}
+
+/// One verification binding as shown by `why` / `wiki`.
+///
+/// The command is displayed, never run: dira only reports what a record claims
+/// about its own verification. Executing it is `zavet verify`'s job, which a
+/// human invokes explicitly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetCheckView {
+    pub label: String,
+    pub command: String,
 }
 
 /// One ranked hit for a free-text `why`/`wiki` query.
@@ -625,6 +645,9 @@ pub struct ZavetSpecView {
     /// Linked decision ids (spec-side links; decisions stay append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decisions: Vec<String>,
+    /// Feature-level scenarios proving this spec's behavior still holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<ZavetCheckView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -723,6 +746,10 @@ pub struct ZavetWhyView {
     /// The decision that replaced this one, if any (reverse `supersedes` link).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Records THIS decision corrects (reverse `corrected-by` link) — the
+    /// forward direction lives on `decision.corrected_by`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corrects: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commits: Vec<ZavetCommitView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

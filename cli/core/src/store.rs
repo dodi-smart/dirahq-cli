@@ -864,8 +864,9 @@ impl Store {
             "INSERT INTO zavet_decisions
                 (repo, id, slug, title, status, path, supersedes, body_md,
                  first_commit, last_commit, created_at, updated_at,
-                 source_session, content_hash, origin, verified, touched_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?10, ?11, ?12, ?13, ?14,
+                 source_session, content_hash, origin, verified, corrected_by,
+                 touched_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15,
                      (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_decisions))
              ON CONFLICT(repo, id) DO UPDATE SET
                 slug = excluded.slug,
@@ -879,6 +880,7 @@ impl Store {
                 content_hash = excluded.content_hash,
                 origin = excluded.origin,
                 verified = excluded.verified,
+                corrected_by = excluded.corrected_by,
                 touched_seq = (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_decisions)",
         )
         .bind(repo)
@@ -895,6 +897,7 @@ impl Store {
         .bind(&cap.content_hash)
         .bind(&cap.origin)
         .bind(cap.verified)
+        .bind(&cap.corrected_by)
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM zavet_guards WHERE repo = ?1 AND decision_id = ?2")
@@ -912,6 +915,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        replace_checks(&mut tx, repo, "decision", &cap.id, &cap.checks).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -979,7 +983,7 @@ impl Store {
         let row = sqlx::query(
             "SELECT repo, id, slug, title, status, path, supersedes, body_md,
                     first_commit, last_commit, created_at, updated_at,
-                    source_session, content_hash, origin, verified
+                    source_session, content_hash, origin, verified, corrected_by
              FROM zavet_decisions WHERE repo = ?1 AND id = ?2",
         )
         .bind(repo)
@@ -989,6 +993,7 @@ impl Store {
         let Some(row) = row else { return Ok(None) };
         let mut decision = row_to_zavet_decision(&row);
         decision.guards = self.zavet_guards_for(repo, id).await?;
+        decision.checks = self.zavet_checks_for(repo, "decision", id).await?;
         Ok(Some(decision))
     }
 
@@ -998,7 +1003,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT repo, id, slug, title, status, path, supersedes, body_md,
                     first_commit, last_commit, created_at, updated_at,
-                    source_session, content_hash, origin, verified
+                    source_session, content_hash, origin, verified, corrected_by
              FROM zavet_decisions WHERE repo = ?1 ORDER BY id ASC",
         )
         .bind(repo)
@@ -1018,12 +1023,32 @@ impl Store {
                 .or_default()
                 .push(r.get("glob"));
         }
+        let check_rows = sqlx::query(
+            "SELECT subject_key, label, command FROM zavet_checks
+             WHERE repo = ?1 AND subject_kind = 'decision' ORDER BY subject_key, seq",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut checks: HashMap<String, Vec<ZavetCheck>> = HashMap::new();
+        for r in &check_rows {
+            checks
+                .entry(r.get("subject_key"))
+                .or_default()
+                .push(ZavetCheck {
+                    label: r.get("label"),
+                    command: r.get("command"),
+                });
+        }
         Ok(rows
             .iter()
             .map(|row| {
                 let mut d = row_to_zavet_decision(row);
                 if let Some(g) = guards.remove(&d.id) {
                     d.guards = g;
+                }
+                if let Some(c) = checks.remove(&d.id) {
+                    d.checks = c;
                 }
                 d
             })
@@ -1043,7 +1068,8 @@ impl Store {
         let rows = sqlx::query(
             "SELECT repo, id, slug, title, status, path, supersedes, body_md,
                     first_commit, last_commit, created_at, updated_at,
-                    source_session, content_hash, origin, verified, touched_seq
+                    source_session, content_hash, origin, verified, corrected_by,
+                    touched_seq
              FROM zavet_decisions WHERE touched_seq > ?1
              ORDER BY touched_seq ASC LIMIT ?2",
         )
@@ -1072,12 +1098,38 @@ impl Store {
                 .or_default()
                 .push(r.get("glob"));
         }
+        let check_rows = sqlx::query(
+            "SELECT c.repo, c.subject_key, c.label, c.command
+             FROM zavet_checks c
+             JOIN (SELECT repo, id FROM zavet_decisions
+                   WHERE touched_seq > ?1 ORDER BY touched_seq ASC LIMIT ?2) w
+               ON w.repo = c.repo AND w.id = c.subject_key
+             WHERE c.subject_kind = 'decision'
+             ORDER BY c.repo, c.subject_key, c.seq",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut checks: HashMap<(String, String), Vec<ZavetCheck>> = HashMap::new();
+        for r in &check_rows {
+            checks
+                .entry((r.get("repo"), r.get("subject_key")))
+                .or_default()
+                .push(ZavetCheck {
+                    label: r.get("label"),
+                    command: r.get("command"),
+                });
+        }
         Ok(rows
             .iter()
             .map(|row| {
                 let mut d = row_to_zavet_decision(row);
                 if let Some(g) = guards.remove(&(d.repo.clone(), d.id.clone())) {
                     d.guards = g;
+                }
+                if let Some(c) = checks.remove(&(d.repo.clone(), d.id.clone())) {
+                    d.checks = c;
                 }
                 (row.get::<i64, _>("touched_seq"), d)
             })
@@ -1142,6 +1194,29 @@ impl Store {
                 .or_default()
                 .push(r.get("decision_id"));
         }
+        let check_rows = sqlx::query(
+            "SELECT c.repo, c.subject_key, c.label, c.command
+             FROM zavet_checks c
+             JOIN (SELECT repo, slug FROM zavet_specs
+                   WHERE touched_seq > ?1 ORDER BY touched_seq ASC LIMIT ?2) w
+               ON w.repo = c.repo AND w.slug = c.subject_key
+             WHERE c.subject_kind = 'spec'
+             ORDER BY c.repo, c.subject_key, c.seq",
+        )
+        .bind(seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut checks: HashMap<(String, String), Vec<ZavetCheck>> = HashMap::new();
+        for r in &check_rows {
+            checks
+                .entry((r.get("repo"), r.get("subject_key")))
+                .or_default()
+                .push(ZavetCheck {
+                    label: r.get("label"),
+                    command: r.get("command"),
+                });
+        }
         Ok(rows
             .iter()
             .map(|row| {
@@ -1152,6 +1227,9 @@ impl Store {
                 }
                 if let Some(d) = links.remove(&key) {
                     s.decisions = d;
+                }
+                if let Some(c) = checks.remove(&key) {
+                    s.checks = c;
                 }
                 (row.get::<i64, _>("touched_seq"), s)
             })
@@ -1228,6 +1306,20 @@ impl Store {
         Ok(rows.iter().map(|r| r.get("sha")).collect())
     }
 
+    /// The decisions `id` corrects — the reverse of `corrected_by`, so a
+    /// record can say what it fixes without either side editing the other.
+    /// Ordered by id; a record may correct more than one.
+    pub async fn zavet_corrects(&self, repo: &str, id: &str) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT id FROM zavet_decisions WHERE repo = ?1 AND corrected_by = ?2 ORDER BY id",
+        )
+        .bind(repo)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
     /// The decision that superseded `id` (the reverse of a record's own
     /// `supersedes` link), if captured.
     pub async fn zavet_superseded_by(&self, repo: &str, id: &str) -> Result<Option<String>, Error> {
@@ -1239,6 +1331,31 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.get("id")))
+    }
+
+    /// Checks bound to one decision or spec, in declaration order.
+    async fn zavet_checks_for(
+        &self,
+        repo: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Vec<ZavetCheck>, Error> {
+        let rows = sqlx::query(
+            "SELECT label, command FROM zavet_checks
+             WHERE repo = ?1 AND subject_kind = ?2 AND subject_key = ?3 ORDER BY seq",
+        )
+        .bind(repo)
+        .bind(kind)
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ZavetCheck {
+                label: r.get("label"),
+                command: r.get("command"),
+            })
+            .collect())
     }
 
     async fn zavet_guards_for(&self, repo: &str, decision_id: &str) -> Result<Vec<String>, Error> {
@@ -1526,6 +1643,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        replace_checks(&mut tx, repo, "spec", &cap.slug, &cap.checks).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1568,6 +1686,7 @@ impl Store {
             .iter()
             .map(|r| r.get::<String, _>("decision_id"))
             .collect();
+        spec.checks = self.zavet_checks_for(repo, "spec", slug).await?;
         Ok(Some(spec))
     }
 
@@ -1608,6 +1727,23 @@ impl Store {
                 .or_default()
                 .push(r.get("decision_id"));
         }
+        let check_rows = sqlx::query(
+            "SELECT subject_key, label, command FROM zavet_checks
+             WHERE repo = ?1 AND subject_kind = 'spec' ORDER BY subject_key, seq",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut checks: HashMap<String, Vec<ZavetCheck>> = HashMap::new();
+        for r in &check_rows {
+            checks
+                .entry(r.get("subject_key"))
+                .or_default()
+                .push(ZavetCheck {
+                    label: r.get("label"),
+                    command: r.get("command"),
+                });
+        }
         Ok(rows
             .iter()
             .map(|row| {
@@ -1617,6 +1753,9 @@ impl Store {
                 }
                 if let Some(d) = links.remove(&s.slug) {
                     s.decisions = d;
+                }
+                if let Some(c) = checks.remove(&s.slug) {
+                    s.checks = c;
                 }
                 s
             })
@@ -1814,6 +1953,27 @@ pub struct ZavetDecisionCapture {
     pub origin: Option<String>,
     /// Frontmatter `verified`; reverse-engineered records start `false`.
     pub verified: Option<bool>,
+    /// Frontmatter `checks:` — how this record's invariants are verified.
+    pub checks: Vec<ZavetCheck>,
+    /// Frontmatter `corrected-by`: a later decision that corrects one claim in
+    /// this one. Unlike `supersedes` (which replaces a record wholesale) the
+    /// record stays `active` and keeps its body — recall paths just lead with
+    /// the correction. Canonical `D-NNNN`, possibly dangling.
+    pub corrected_by: Option<String>,
+}
+
+/// One verification binding: a human label and the command that proves it.
+///
+/// The command is opaque and framework-agnostic by construction — dira never
+/// parses, infers or special-cases a runner, and never executes it. Running
+/// checks is `zavet verify`'s job, deliberately: a command read out of a repo
+/// must only ever run when a human explicitly asks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetCheck {
+    /// Human-readable name; falls back to the command when unlabeled.
+    pub label: String,
+    /// Shell command. Exit 0 is pass — no output format is implied.
+    pub command: String,
 }
 
 /// A living spec as parsed from a `.zavet/specs/*.md` blob at capture time —
@@ -1838,6 +1998,9 @@ pub struct ZavetSpecCapture {
     pub paths: Vec<String>,
     /// Linked decision ids: frontmatter `decisions:` ∪ body D-refs, canonical.
     pub decisions: Vec<String>,
+    /// Frontmatter `checks:` — feature-level scenarios proving this spec's
+    /// behavior still holds.
+    pub checks: Vec<ZavetCheck>,
     /// Repo-relative file path.
     pub path: String,
     /// Full spec body — local by default; never rides `AttestationBatch`
@@ -1867,7 +2030,9 @@ pub struct ZavetDecisionRow {
     pub content_hash: Option<String>,
     pub origin: Option<String>,
     pub verified: Option<bool>,
+    pub corrected_by: Option<String>,
     pub guards: Vec<String>,
+    pub checks: Vec<ZavetCheck>,
 }
 
 /// One parsed commit trailer (`key` normalized to lowercase; `decision_id` is
@@ -1961,6 +2126,7 @@ pub struct ZavetSpecRow {
     pub source_session: Option<String>,
     pub paths: Vec<String>,
     pub decisions: Vec<String>,
+    pub checks: Vec<ZavetCheck>,
 }
 
 fn row_to_zavet_spec(row: &sqlx::sqlite::SqliteRow) -> ZavetSpecRow {
@@ -1983,7 +2149,45 @@ fn row_to_zavet_spec(row: &sqlx::sqlite::SqliteRow) -> ZavetSpecRow {
         source_session: row.get("source_session"),
         paths: Vec::new(),
         decisions: Vec::new(),
+        checks: Vec::new(),
     }
+}
+
+/// Replace a record's checks wholesale, mirroring how guards and spec paths
+/// are handled: the frontmatter is the sole source of truth, so a removed
+/// check must disappear rather than linger. `seq` is the declaration order —
+/// the only ordering the author actually expressed.
+async fn replace_checks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    repo: &str,
+    kind: &str,
+    key: &str,
+    checks: &[ZavetCheck],
+) -> Result<(), Error> {
+    sqlx::query(
+        "DELETE FROM zavet_checks WHERE repo = ?1 AND subject_kind = ?2 AND subject_key = ?3",
+    )
+    .bind(repo)
+    .bind(kind)
+    .bind(key)
+    .execute(&mut **tx)
+    .await?;
+    for (seq, check) in checks.iter().enumerate() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO zavet_checks
+                (repo, subject_kind, subject_key, seq, label, command)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(repo)
+        .bind(kind)
+        .bind(key)
+        .bind(seq as i64)
+        .bind(&check.label)
+        .bind(&check.command)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 fn row_to_zavet_commit_ref(row: &sqlx::sqlite::SqliteRow) -> ZavetCommitRef {
@@ -2013,7 +2217,9 @@ fn row_to_zavet_decision(row: &sqlx::sqlite::SqliteRow) -> ZavetDecisionRow {
         content_hash: row.get("content_hash"),
         origin: row.get("origin"),
         verified: row.get("verified"),
+        corrected_by: row.get("corrected_by"),
         guards: Vec::new(),
+        checks: Vec::new(),
     }
 }
 
@@ -2727,6 +2933,11 @@ mod tests {
             content_hash: Some("blob1".into()),
             origin: Some("recorded".into()),
             verified: Some(true),
+            checks: vec![ZavetCheck {
+                label: "poll survives a rewritten branch".into(),
+                command: "run-the-capture-suite".into(),
+            }],
+            corrected_by: None,
         }
     }
 
@@ -2866,6 +3077,10 @@ mod tests {
             path: format!(".zavet/specs/{slug}.md"),
             body_md: Some("## Overview\nsweeps".into()),
             content_hash: Some("blobS1".into()),
+            checks: vec![ZavetCheck {
+                label: "sweep covers every route".into(),
+                command: "run-the-sweep".into(),
+            }],
         }
     }
 

@@ -5,3 +5,4 @@ defaults-apply	lib/defaults/**
 happy-spec	cli/dirad/src/capture.rs
 happy-spec	cli/core/src/zavet.rs
 no-title-spec	lib/untitled/**
+spec-checks	src/ui/**

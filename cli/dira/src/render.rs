@@ -11,7 +11,7 @@ use crate::format::{
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{
-    any_engaged, LiveState, Response, SessionView, StatusView, ZavetDecisionView,
+    any_engaged, LiveState, Response, SessionView, StatusView, ZavetCheckView, ZavetDecisionView,
     ZavetGuardStatView, ZavetStatusView, ZavetWhyView,
 };
 use dira_core::report::Report;
@@ -273,6 +273,29 @@ fn spec_badges(
     parts.join(&theme::paint(" · ", Role::Muted))
 }
 
+/// The CHECKS panel: how a record says its invariants are verified.
+///
+/// Reported, never run — dira only shows what the record claims about itself;
+/// `zavet verify` is what executes a check, and only when a human asks. An
+/// unlabeled check has label == command, so print the command once.
+fn print_zavet_checks(checks: &[ZavetCheckView]) {
+    if checks.is_empty() {
+        return;
+    }
+    println!("\n{}", theme::paint("CHECKS", Role::Muted));
+    for c in checks {
+        if c.label == c.command {
+            println!("  {}", theme::paint(&c.command, Role::Ink));
+        } else {
+            println!(
+                "  {}\n    {}",
+                theme::paint(&c.label, Role::Ink),
+                theme::paint(&c.command, Role::Faint),
+            );
+        }
+    }
+}
+
 /// A record body: `## ` headings in the knowledge rose, everything else
 /// indented plain. Shared by the decision and spec why views.
 fn print_zavet_body(body: &str) {
@@ -443,12 +466,30 @@ fn print_zavet_why(v: &ZavetWhyView) {
     if let Some(s) = &d.supersedes {
         println!("{}", theme::paint(&format!("supersedes {s}"), Role::Muted));
     }
+    if !v.corrects.is_empty() {
+        println!(
+            "{}",
+            theme::paint(&format!("corrects {}", v.corrects.join(" · ")), Role::Muted)
+        );
+    }
     if let Some(s) = &v.superseded_by {
         println!(
             "{}",
             theme::paint(
                 &format!("superseded by {s} — read that instead"),
                 Role::Negative
+            )
+        );
+    }
+    // Amber and ABOVE the body: the record still stands (it was not
+    // superseded), but one claim inside it is wrong, and a reader who stops
+    // before the correction leaves with the wrong answer.
+    if let Some(s) = &d.corrected_by {
+        println!(
+            "{}",
+            theme::paint(
+                &format!("⚠ corrected by {s} — one claim below is wrong; read that too"),
+                Role::Compute
             )
         );
     }
@@ -486,6 +527,8 @@ fn print_zavet_why(v: &ZavetWhyView) {
             theme::paint(&guard_stats_line(&v.guard_stats), Role::Ink)
         );
     }
+
+    print_zavet_checks(&d.checks);
 
     let unattributed = (v.unattributed_commits > 0 || v.unattributed_guard_events > 0).then(|| {
         format!(
@@ -606,6 +649,8 @@ fn print_zavet_spec_why(v: &dira_core::protocol::ZavetSpecWhyView) {
     }
 
     print_zavet_commits(&v.commits);
+
+    print_zavet_checks(&s.checks);
 
     let unattributed = (v.unattributed_commits > 0).then(|| {
         format!(

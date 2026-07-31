@@ -266,6 +266,7 @@ async fn zavet_why_resolves_specs_and_links_both_ways() {
         path: ".zavet/specs/capture-pipeline.md".into(),
         body_md: Some("## Overview\nThe sweep batches trailer parsing.".into()),
         content_hash: None,
+        checks: Vec::new(),
     };
     state
         .store

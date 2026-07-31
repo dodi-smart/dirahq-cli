@@ -13,8 +13,10 @@ Both sides execute the same inputs and must produce these exact tables:
 |---|---|---|
 | `expected/decisions-meta.tsv` | `zavet list` | `parse_decision` → `id \t status(default active) \t title(or empty)` |
 | `expected/decisions-guards.tsv` | `zavet guards` | one row per guard, **active decisions only** |
+| `expected/decision-checks.tsv` | `zavet checks` | one row per check, `id \t label \t command`, **every status** |
 | `expected/specs-meta.tsv` | `zavet specs` | `parse_spec` → `slug \t origin \t confidence \t date(or empty) \t title(or empty)` |
 | `expected/spec-paths.tsv` | `zavet spec-paths` | one row per path |
+| `expected/spec-checks.tsv` | `zavet spec-checks` | one row per check, `slug \t label \t command` |
 
 Row order = filename sort order (the sh glob and the Rust walker both sort).
 
@@ -33,6 +35,16 @@ Row order = filename sort order (the sh glob and the Rust walker both sort).
 - superseded decisions keep their meta row and lose their guard rows
 - dot-prefixed spec files (`.hidden-template.md` here) are templates,
   excluded by FILENAME on both sides — not a parser rule
+- `checks:` items split on the FIRST ` :: ` into label and command; an item
+  with no separator IS the command and doubles as its own label; an item with
+  a label and no command verifies nothing and DROPS; a command keeps any
+  later `::`; quoting is the escape hatch for a command containing ` #`,
+  which the shared decomment rule would otherwise truncate
+- checks emit for every status, unlike guards — a check is a claim about how a
+  record was verified, not an enforcement surface
+- `corrected-by:` is the errata pointer: the record stays `active` and keeps
+  its body, and a pointer at a record that does not exist still parses
+  (danglingness is a store-side finding, not a parse error)
 
 ## Deliberately out of scope (documented divergences)
 
@@ -44,6 +56,9 @@ Row order = filename sort order (the sh glob and the Rust walker both sort).
 - `version:` and `decisions:` keys are parsed by Rust only; the sh
   projections simply never show them (fixtures include them to prove both
   sides tolerate their presence).
+- **Id canonicalization of `corrected-by`** is likewise Rust-only: `D-7`
+  becomes `D-0007` on the Rust side, while the sh projection reports the
+  frontmatter verbatim. `D-0015` pins that both sides tolerate the short form.
 - Body `D-NNNN` auto-linking is capture-side behavior, not frontmatter.
 
 Editing anything here means regenerating goldens on BOTH sides, updating

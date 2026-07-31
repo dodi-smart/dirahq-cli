@@ -744,6 +744,12 @@ async fn main() -> Result<()> {
     // `status` renders with a client-side flag (summary vs detailed), so it
     // sends + renders here instead of the generic print path below.
     if let Command::Status { detailed } = &cli.command {
+        // BEFORE the send, deliberately. The case this breadcrumb exists for is a
+        // daemon that is running but refusing hooks — where `status` itself fails
+        // with the same access-denied error, so anything printed after the send
+        // never runs. Warning first means the one command a confused user reaches
+        // for always says why capture is dead.
+        hook_health::maybe_warn();
         let resp = client::send(&config.socket_path, &Request::Status).await?;
         match resp {
             Response::Status(s) => render::print_status(&s, *detailed),
@@ -753,7 +759,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        hook_health::maybe_warn();
         update::notice::maybe_print(&config);
         return Ok(());
     }

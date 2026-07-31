@@ -127,6 +127,7 @@ pub async fn build_state(
         presence_wake: Arc::new(tokio::sync::Notify::new()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         http_ingress_error: Arc::new(Mutex::new(None)),
+        control_channel_warning: Arc::new(Mutex::new(None)),
     };
     Ok((state, rx, sync_rx, knowledge_rx))
 }
@@ -366,6 +367,23 @@ pub async fn run() -> anyhow::Result<()> {
     let sock = state.config.socket_path.clone();
     let (listener, _socket_lock) = bind_control_socket(&sock).await?;
     tracing::info!(sock = %sock.display(), "control socket ready");
+
+    // Report anything that makes this control channel less reachable than
+    // intended. Precedence is deliberate: a failed security descriptor *plus*
+    // elevation is the genuinely-broken combination, so the descriptor message
+    // wins — it is the one that explains why hooks will be refused.
+    //
+    // Elevation alone is a warning, never a refusal (see
+    // `dira_ipc::elevation::daemon_elevation_warning`): with the descriptor
+    // applied an elevated daemon works, and exiting here would recreate D-0009's
+    // respawn-loop shape with every client reporting "down".
+    let control_warning = listener.security_degradation().or_else(|| {
+        dira_ipc::elevation::daemon_elevation_warning(dira_ipc::elevation::is_elevated())
+    });
+    if let Some(w) = &control_warning {
+        tracing::warn!("{w}");
+    }
+    *control::lock_recover(&state.control_channel_warning) = control_warning;
 
     // HTTP ingress (loopback only). Survivable: a conflict leaves the daemon up
     // and degraded, retrying in the background.

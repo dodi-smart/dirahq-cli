@@ -116,6 +116,12 @@ pub struct AppState {
     /// `dira daemon status` can say so instead of the daemon silently
     /// capturing nothing. Never hold this lock across an await. See D-0009.
     pub http_ingress_error: Arc<Mutex<Option<String>>>,
+    /// Why the control channel is not in its intended state (windows: the pipe's
+    /// security descriptor fell back a rung, and/or dirad is running elevated),
+    /// or `None`. Reported on `DaemonInfo` for the same reason as
+    /// `http_ingress_error` — D-0009: a daemon that cannot do its job must never
+    /// look plainly healthy.
+    pub control_channel_warning: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {

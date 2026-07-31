@@ -186,6 +186,15 @@ pub enum Response {
         /// older daemon's reply during a partial update.
         #[serde(default)]
         http_ingress_error: Option<String>,
+        /// Why the *control channel itself* is not in its intended state, or
+        /// `None`. Covers the windows pipe's security descriptor falling back to
+        /// a weaker rung, and/or the daemon running elevated.
+        ///
+        /// Same rationale as `http_ingress_error` (D-0009: a daemon that cannot
+        /// do its job must never report as plainly healthy) — and the same skew
+        /// posture: `default` so a newer `dira` can still read an older daemon.
+        #[serde(default)]
+        control_channel_warning: Option<String>,
     },
     /// `ZavetStatus`. Boxed like `Status` to keep small arms small.
     ZavetStatus(Box<ZavetStatusView>),

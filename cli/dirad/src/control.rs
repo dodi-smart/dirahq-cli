@@ -162,6 +162,7 @@ fn daemon_info(state: &AppState) -> Response {
         pid: std::process::id(),
         uptime_seconds: state.started_at.elapsed().as_secs(),
         http_ingress_error: state.http_ingress_error.lock().unwrap().clone(),
+        control_channel_warning: lock_recover(&state.control_channel_warning).clone(),
     }
 }
 

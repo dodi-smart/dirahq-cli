@@ -46,6 +46,9 @@ dunce.workspace = true
 # bounded; the updater only reads archives our own release workflow produced.
 [target.'cfg(windows)'.dependencies]
 zip = { version = "8", default-features = false, features = ["deflate"] }
+# `client::classify` matches ERROR_PIPE_BUSY by raw code so a busy pipe is never
+# reported as a dead daemon. Feature flag only; already a workspace dependency.
+windows-sys = { workspace = true, features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 # `config_cmd`'s round-trip test re-layers a written config.toml the same way

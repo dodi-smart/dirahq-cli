@@ -7,6 +7,7 @@ mod daemon;
 mod device;
 mod duration;
 mod format;
+mod hook_health;
 mod init;
 mod render;
 #[cfg(test)]
@@ -661,6 +662,7 @@ async fn main() -> Result<()> {
                 DaemonAction::Status => {
                     let running = daemon::status(&config).await?;
                     print_supervision(&config).await;
+                    hook_health::maybe_warn();
                     update::notice::maybe_print(&config);
                     if !running {
                         std::process::exit(1);
@@ -700,6 +702,7 @@ async fn main() -> Result<()> {
         Command::Nuke { yes } => return nuke(&config, *yes).await,
         Command::Version => {
             print_version(&config).await?;
+            hook_health::maybe_warn();
             update::notice::maybe_print(&config);
             return Ok(());
         }
@@ -741,6 +744,12 @@ async fn main() -> Result<()> {
     // `status` renders with a client-side flag (summary vs detailed), so it
     // sends + renders here instead of the generic print path below.
     if let Command::Status { detailed } = &cli.command {
+        // BEFORE the send, deliberately. The case this breadcrumb exists for is a
+        // daemon that is running but refusing hooks — where `status` itself fails
+        // with the same access-denied error, so anything printed after the send
+        // never runs. Warning first means the one command a confused user reaches
+        // for always says why capture is dead.
+        hook_health::maybe_warn();
         let resp = client::send(&config.socket_path, &Request::Status).await?;
         match resp {
             Response::Status(s) => render::print_status(&s, *detailed),
@@ -891,36 +900,79 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Total wall-clock a hook shim may spend talking to the daemon.
+///
+/// Must stay strictly greater than [`HOOK_CONNECT_BUDGET`], or the transport's
+/// busy-retry loop is unreachable. It previously was: a 500 ms outer timeout
+/// against a 2 s retry budget meant every `ERROR_PIPE_BUSY` on windows was
+/// dropped rather than retried, and each of Claude Code's eight event types
+/// spawns a fresh `dira.exe` contending for one pending pipe instance.
+const HOOK_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the connect itself may retry a busy endpoint — strictly inside
+/// [`HOOK_TOTAL_BUDGET`]. Only the *busy* case waits: a daemon that is simply not
+/// running answers `NotFound` immediately, so the "no daemon" path stays as fast
+/// as it ever was.
+const HOOK_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Forward a JSON payload from stdin to the daemon, wrapped into a request by
-/// `wrap`. Hook shims are fire-and-forget and must never break the agent loop:
-/// any failure (daemon down, bad JSON, old daemon) exits 0 silently, and the
-/// send is bounded so a wedged daemon can't stall the caller.
+/// `wrap`.
+///
+/// Hook shims are fire-and-forget and must never break the agent loop: this still
+/// exits 0 on every path and writes nothing to stdout. What changed is that a
+/// *transport* failure is no longer invisible — it leaves a breadcrumb
+/// (`hook_health`) that `dira status` surfaces, because "never tell the harness"
+/// had been implemented as "never tell anyone", and a dead capture channel was
+/// indistinguishable from a healthy one for days.
+///
+/// `DIRA_HOOK_DEBUG=1` additionally prints the failure to stderr, which harnesses
+/// capture into their own logs — the switch that turns a support conversation
+/// into one line.
 async fn forward_stdin(
     config: &Config,
+    label: &str,
     wrap: impl FnOnce(serde_json::Value) -> Request,
 ) -> Result<()> {
     let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() {
+    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        note_hook_failure(label, &format!("could not read the hook payload: {e}"));
         return Ok(());
     }
     let payload: serde_json::Value = match serde_json::from_str(&buf) {
         Ok(v) => v,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            note_hook_failure(label, &format!("hook payload was not JSON: {e}"));
+            return Ok(());
+        }
     };
     let req = wrap(payload);
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        client::send(&config.socket_path, &req),
+    match tokio::time::timeout(
+        HOOK_TOTAL_BUDGET,
+        client::send_with_budget(&config.socket_path, &req, HOOK_CONNECT_BUDGET),
     )
-    .await;
+    .await
+    {
+        // A `Response::Error` is the daemon answering — an unknown harness or an
+        // unaccounted event kind is a *semantic* non-result, not a transport
+        // failure, and stays silent by design.
+        Ok(Ok(_)) => hook_health::record_success(),
+        Ok(Err(e)) => note_hook_failure(label, &e.to_string()),
+        Err(_) => note_hook_failure(label, "timed out reaching dirad"),
+    }
     Ok(())
+}
+
+fn note_hook_failure(label: &str, reason: &str) {
+    hook_health::record_failure(label, reason);
+    if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
+        eprintln!("dira hook {label}: {reason}");
+    }
 }
 
 /// Forward a harness hook payload from stdin to the daemon.
 async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
-    let harness = harness.to_string();
-    forward_stdin(config, move |payload| Request::IngestHook {
-        harness,
+    let owned = harness.to_string();
+    forward_stdin(config, harness, move |payload| Request::IngestHook {
+        harness: owned,
         payload,
     })
     .await
@@ -928,7 +980,7 @@ async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
 
 /// Forward a zavet guard event from stdin to the daemon.
 async fn forward_zavet_event(config: &Config) -> Result<()> {
-    forward_stdin(config, |payload| Request::IngestZavet { payload }).await
+    forward_stdin(config, "zavet", |payload| Request::IngestZavet { payload }).await
 }
 
 /// Print the CLI version (and wire schema), then best-effort query the running
@@ -945,6 +997,7 @@ async fn print_version(config: &Config) -> Result<()> {
             pid,
             uptime_seconds,
             http_ingress_error,
+            control_channel_warning,
         }) => {
             println!(
                 "dirad   {version}  (schema {schema_version}, pid {pid}, up {})",
@@ -952,6 +1005,12 @@ async fn print_version(config: &Config) -> Result<()> {
             );
             if let Some(reason) = http_ingress_error {
                 println!("warning: daemon is DEGRADED — {reason}");
+            }
+            // Distinct from DEGRADED on purpose: an elevated-but-reachable daemon
+            // captures fine, so it gets an advisory rather than the word reserved
+            // for "captures nothing".
+            if let Some(reason) = control_channel_warning {
+                println!("note: {reason}");
             }
             if version != cli {
                 println!(

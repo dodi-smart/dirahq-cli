@@ -26,6 +26,7 @@ pub mod heartbeat;
 pub mod http;
 pub mod jitter;
 pub mod knowledge_sync;
+pub mod logfile;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
@@ -89,7 +90,9 @@ pub async fn build_state(
 )> {
     let bearer = resolve_bearer(&store).await?;
     let (tx, rx) = mpsc::channel::<EventMsg>(QUEUE_CAPACITY);
-    let sessions = Arc::new(Mutex::new(SessionRegistry::default()));
+    let sessions = Arc::new(Mutex::new(SessionRegistry::with_agent_policy(
+        config.agent_policy(),
+    )));
     let (sync_handle, sync_rx) = sync::channel();
     let (knowledge_handle, knowledge_rx) = knowledge_sync::channel();
 
@@ -125,6 +128,7 @@ pub async fn build_state(
         presence_wake: Arc::new(tokio::sync::Notify::new()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         http_ingress_error: Arc::new(Mutex::new(None)),
+        control_channel_warning: Arc::new(Mutex::new(None)),
     };
     Ok((state, rx, sync_rx, knowledge_rx))
 }
@@ -365,6 +369,23 @@ pub async fn run() -> anyhow::Result<()> {
     let (listener, _socket_lock) = bind_control_socket(&sock).await?;
     tracing::info!(sock = %sock.display(), "control socket ready");
 
+    // Report anything that makes this control channel less reachable than
+    // intended. Precedence is deliberate: a failed security descriptor *plus*
+    // elevation is the genuinely-broken combination, so the descriptor message
+    // wins — it is the one that explains why hooks will be refused.
+    //
+    // Elevation alone is a warning, never a refusal (see
+    // `dira_ipc::elevation::daemon_elevation_warning`): with the descriptor
+    // applied an elevated daemon works, and exiting here would recreate D-0009's
+    // respawn-loop shape with every client reporting "down".
+    let control_warning = listener.security_degradation().or_else(|| {
+        dira_ipc::elevation::daemon_elevation_warning(dira_ipc::elevation::is_elevated())
+    });
+    if let Some(w) = &control_warning {
+        tracing::warn!("{w}");
+    }
+    *control::lock_recover(&state.control_channel_warning) = control_warning;
+
     // HTTP ingress (loopback only). Survivable: a conflict leaves the daemon up
     // and degraded, retrying in the background.
     let http_addr = format!("127.0.0.1:{}", state.config.http_port);
@@ -416,6 +437,23 @@ pub async fn run() -> anyhow::Result<()> {
     // best-effort empty-sessions beat (short timeout, errors ignored) so it
     // doesn't wait out the presence TTL.
     heartbeat::send_offline_beat(&state).await;
+
+    // Fold the WAL back into the main database on the way out, so a daemon that
+    // is stopped (or self-restarted by `dira update`) leaves a tidy file rather
+    // than one that only shrinks on the next hourly sweep.
+    //
+    // Time-boxed: a busy checkpoint must never hang `dira daemon stop`. This
+    // matters most on windows, where `Request::Shutdown` is the *only* orderly
+    // exit — there is no SIGTERM to fall back on.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.store.wal_checkpoint_truncate(),
+    )
+    .await
+    .is_err()
+    {
+        tracing::debug!("wal checkpoint timed out on shutdown; continuing");
+    }
 
     // Nothing to clean up on windows — a named pipe isn't a filesystem object,
     // so there's no stale file for the next `run()` to trip over the way a
@@ -630,41 +668,89 @@ const VACUUM_EVERY_N_SWEEPS: u64 = 24;
 pub async fn maintenance(state: AppState) {
     let base = std::time::Duration::from_secs(MAINTENANCE_INTERVAL_SECS);
     let mut sweeps: u64 = 0;
+    let mut dirty_since_vacuum = false;
     loop {
         // Jittered ±10% so many daemons don't all compact on the same wall-clock
         // cadence; purely cosmetic here (this task never hits the network) but
         // kept consistent with the other background timers.
         tokio::time::sleep(jitter::jittered(base, jitter::DEFAULT_FRAC)).await;
         sweeps += 1;
+        maintenance_sweep(&state, sweeps, &mut dirty_since_vacuum).await;
+    }
+}
 
-        let cursor = state.store.sync_cursor().await.ok().flatten();
-        let cutoff = OffsetDateTime::now_utc() - state.config.retention();
-        match state
-            .store
-            .compact(cursor.as_deref(), cutoff, state.config.idle())
-            .await
-        {
-            Ok(0) => continue, // nothing eligible — skip the heavier compaction
-            Ok(deleted) => {
-                tracing::info!(deleted, "compacted old synced events into daily rollup");
-            }
-            Err(e) => {
-                tracing::warn!("compaction failed: {e}");
-                continue;
-            }
-        }
+/// What one [`maintenance_sweep`] actually did.
+///
+/// Returned rather than only logged so a test can assert the ordering without
+/// waiting out the hourly timer — in particular that the checkpoint runs even
+/// when compaction deleted nothing, which is the case that regressed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepOutcome {
+    pub deleted: u64,
+    pub compaction_failed: bool,
+    pub checkpointed: bool,
+    pub vacuumed: bool,
+}
 
-        // Fold the deletes' WAL back into the main file every sweep; VACUUM only
-        // periodically (it rewrites the whole file).
-        if let Err(e) = state.store.wal_checkpoint_truncate().await {
-            tracing::debug!("wal checkpoint failed: {e}");
+/// One maintenance pass: compact, then always fold the WAL back, then VACUUM if
+/// enough has changed.
+///
+/// The checkpoint is deliberately **not** conditional on compaction having
+/// deleted anything. It used to be — an early `continue` on `Ok(0)` returned
+/// before it — which meant an install younger than the retention window never
+/// truncated its WAL at all, because nothing is eligible for compaction yet.
+/// SQLite's default `wal_autocheckpoint` is passive: it recycles the WAL's write
+/// pointer but never shrinks the file, so it settles at its high-water mark
+/// (1000 pages ≈ 4 MiB) and stays there. The WAL grows from ordinary appends,
+/// not just from compaction deletes, so the checkpoint belongs on every sweep.
+///
+/// **This is housekeeping and it zeroes no counter** — worth saying plainly so a
+/// large `-wal` is never mistaken for the cause of a missing-time report.
+pub async fn maintenance_sweep(
+    state: &AppState,
+    sweeps: u64,
+    dirty_since_vacuum: &mut bool,
+) -> SweepOutcome {
+    let mut outcome = SweepOutcome::default();
+
+    let cursor = state.store.sync_cursor().await.ok().flatten();
+    let cutoff = OffsetDateTime::now_utc() - state.config.retention();
+    match state
+        .store
+        .compact(cursor.as_deref(), cutoff, state.config.idle())
+        .await
+    {
+        Ok(0) => {}
+        Ok(deleted) => {
+            tracing::info!(deleted, "compacted old synced events into daily rollup");
+            outcome.deleted = deleted;
+            *dirty_since_vacuum = true;
         }
-        if sweeps.is_multiple_of(VACUUM_EVERY_N_SWEEPS) {
-            if let Err(e) = state.store.vacuum().await {
-                tracing::debug!("vacuum failed: {e}");
-            }
+        Err(e) => {
+            tracing::warn!("compaction failed: {e}");
+            outcome.compaction_failed = true;
         }
     }
+
+    match state.store.wal_checkpoint_truncate().await {
+        Ok(()) => outcome.checkpointed = true,
+        Err(e) => tracing::debug!("wal checkpoint failed: {e}"),
+    }
+
+    // VACUUM rewrites the whole file, so it stays gated on there having been
+    // deletes since the last one — otherwise a young install would rewrite its
+    // database daily for nothing.
+    if *dirty_since_vacuum && sweeps.is_multiple_of(VACUUM_EVERY_N_SWEEPS) {
+        match state.store.vacuum().await {
+            Ok(()) => {
+                outcome.vacuumed = true;
+                *dirty_since_vacuum = false;
+            }
+            Err(e) => tracing::debug!("vacuum failed: {e}"),
+        }
+    }
+
+    outcome
 }
 
 /// Rebuild the in-memory registry from today's event log.

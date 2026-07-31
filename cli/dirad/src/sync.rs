@@ -713,6 +713,7 @@ async fn flush(
     let partials = partial_rollups(state, now);
     let partial_ids: Vec<String> = partials.iter().map(|p| p.session_id.clone()).collect();
     let idle = state.config.idle();
+    let agent_policy = state.config.agent_policy();
     // Seed the first chunk's interval build with the already-synced human signals that
     // neighbour the window's human-signal `at`-span (padded by one idle on each side),
     // so a counted gap that straddles the flush boundary — including one re-split by a
@@ -765,6 +766,7 @@ async fn flush(
         &partials,
         &device_id,
         idle,
+        agent_policy,
         now,
         &seed,
         &history,
@@ -1921,6 +1923,7 @@ mod tests {
             &[],
             "01TESTDEVICE",
             idle,
+            state.config.agent_policy(),
             time::OffsetDateTime::now_utc(),
             &[], // no seed
             &[], // no history

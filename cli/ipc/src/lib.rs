@@ -20,12 +20,15 @@
 //! Entry points: [`Listener::bind`] + [`Listener::accept`] (server side), [`connect`]
 //! (client side), and the platform-erased [`Stream`] both sides read/write through.
 
+pub mod elevation;
 mod framing;
 mod listener;
+pub mod security;
 mod stream;
 
 pub use framing::{read_frame, write_frame};
-pub use listener::{connect, Listener};
+pub use listener::{connect, connect_with_budget, Listener, DEFAULT_BUSY_BUDGET};
+pub use security::SecurityLevel;
 pub use stream::Stream;
 
 /// The CLI binary's file name, platform-appropriate for locating it on `PATH` or

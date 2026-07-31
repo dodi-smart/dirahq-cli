@@ -97,6 +97,29 @@ fn default_true() -> bool {
     true
 }
 
+/// 5 minutes — the same as `idle_seconds`, on purpose. It covers model inference
+/// between tool calls, and matching the human threshold means short gaps are
+/// credited exactly as they were before agent time got its own rules. The long
+/// spans that actually needed fixing are tool calls, and those are governed by
+/// `agent_max_span_seconds`. The knob is separate because the *meaning* is
+/// separate, not because the number has to differ.
+///
+/// Derived from [`crate::accounting::AgentPolicy::default`] so the config
+/// default and the accounting default cannot drift apart.
+fn default_agent_idle_seconds() -> u64 {
+    crate::accounting::AgentPolicy::default()
+        .idle
+        .whole_seconds() as u64
+}
+
+/// 8 hours. Clears any real build, test suite or long-running subagent, while
+/// still bounding a session abandoned with an unmatched `PreTool`.
+fn default_agent_max_span_seconds() -> u64 {
+    crate::accounting::AgentPolicy::default()
+        .max_span
+        .whole_seconds() as u64
+}
+
 /// Passive update-check knobs (`[update]` in `config.toml`).
 ///
 /// Governs only the cached, rate-limited "update available" notice printed
@@ -133,6 +156,20 @@ pub struct Config {
     pub db_path: PathBuf,
     /// Idle threshold in seconds; gaps wider than this are not counted as human time.
     pub idle_seconds: u64,
+    /// Idle threshold for *agent* wall-clock, in seconds. Separate from
+    /// `idle_seconds` on purpose: that one encodes human attention ("nobody has
+    /// typed for 5 minutes, so they stopped working"), an inference that is
+    /// simply false for an agent, which is most likely mid-build. A gap not
+    /// opened by a tool call is clamped to this rather than discarded.
+    #[serde(default = "default_agent_idle_seconds")]
+    pub agent_idle_seconds: u64,
+    /// Ceiling in seconds for a single tool call's contribution to agent
+    /// wall-clock. A gap opened by a `PreTool` is credited in full up to this —
+    /// a two-hour test suite is real work, not idleness. It is a sanity bound,
+    /// not a working limit: it exists so a laptop that sleeps mid-call, or a
+    /// session abandoned with an unmatched `PreTool`, cannot bank days.
+    #[serde(default = "default_agent_max_span_seconds")]
+    pub agent_max_span_seconds: u64,
     /// Capture-time coalescing window in seconds. A high-volume tool-activity
     /// event (PreTool/PostTool) is dropped at capture if the session's last
     /// *stored* activity event is younger than this. Human signals, lifecycle,
@@ -177,10 +214,20 @@ pub struct Config {
     /// wins) for this to be safe — see `sync::build_batch_with_partials`.
     pub partial_rollup_after_secs: u64,
     /// Compute report day boundaries (`Today` / `Week`) in the *system local*
-    /// timezone instead of UTC. Default `false` preserves the historical
-    /// UTC-midnight behavior (and keeps existing report tests deterministic). When
-    /// `true`, the daemon resolves the local UTC offset at request time; if that
-    /// resolution fails (it can in multithreaded contexts), it falls back to UTC.
+    /// timezone instead of UTC.
+    ///
+    /// Defaults to `true`: "today" should mean the user's today. With the old
+    /// UTC default, anyone east of UTC watched today's totals wipe partway
+    /// through their morning — 03:00 for UTC+3 — and work done between local
+    /// midnight and that point landed on the previous day. That reads as a bug,
+    /// because it is one.
+    ///
+    /// The offset is resolved once at daemon startup ([`crate::config`]'s caller
+    /// captures it before the runtime spawns threads, since
+    /// `UtcOffset::current_local_offset` refuses to run multithreaded) and falls
+    /// back to UTC if it was never resolved.
+    ///
+    /// Set `false` to keep UTC boundaries.
     #[serde(default)]
     pub report_local_day: bool,
     /// Seconds of zero-active-sessions quiet (no session ended/ticked and no
@@ -280,6 +327,8 @@ impl Default for Config {
                 .map(|d| d.data_dir().join("dira.db"))
                 .unwrap_or_else(|| std::env::temp_dir().join("dira.db")),
             idle_seconds: 300,
+            agent_idle_seconds: default_agent_idle_seconds(),
+            agent_max_span_seconds: default_agent_max_span_seconds(),
             coalesce_seconds: 45,
             retention_days: 14,
             cloud_url: Some(DEFAULT_CLOUD_URL.to_string()),
@@ -288,7 +337,7 @@ impl Default for Config {
             heartbeat_idle_secs: 90,
             presence_ttl_secs: 75,
             partial_rollup_after_secs: 3600,
-            report_local_day: false,
+            report_local_day: true,
             deep_idle_after_secs: 900,
             presence_ttl_deep_idle_secs: 600,
             session_stale_after_secs: 14_400,
@@ -372,6 +421,16 @@ impl Config {
 
     pub fn idle(&self) -> time::Duration {
         time::Duration::seconds(self.idle_seconds as i64)
+    }
+
+    /// The agent wall-clock policy — the ceilings
+    /// [`crate::accounting::agent_active_seconds`] applies. `max_span` is
+    /// floored at `idle` so a misconfiguration can never make a tool call worth
+    /// *less* than an ordinary gap.
+    pub fn agent_policy(&self) -> crate::accounting::AgentPolicy {
+        let idle = time::Duration::seconds(self.agent_idle_seconds as i64);
+        let max_span = time::Duration::seconds(self.agent_max_span_seconds as i64).max(idle);
+        crate::accounting::AgentPolicy { idle, max_span }
     }
 
     /// The effective coalescing window, clamped to strictly less than the idle
@@ -737,10 +796,37 @@ mod tests {
         });
     }
 
+    /// The config knobs and the accounting defaults are one source of truth; if
+    /// they ever drift, the daemon would account differently from the batch path.
     #[test]
-    fn report_local_day_defaults_off() {
-        // The default MUST stay UTC so existing report behavior/tests are stable.
-        assert!(!Config::default().report_local_day);
+    fn agent_policy_matches_the_accounting_default() {
+        assert_eq!(
+            Config::default().agent_policy(),
+            crate::accounting::AgentPolicy::default()
+        );
+    }
+
+    /// A misconfiguration must never make a tool call worth *less* than an
+    /// ordinary quiet gap.
+    #[test]
+    fn agent_max_span_is_floored_at_agent_idle() {
+        let c = Config {
+            agent_idle_seconds: 600,
+            agent_max_span_seconds: 60,
+            ..Config::default()
+        };
+        let p = c.agent_policy();
+        assert_eq!(p.idle, time::Duration::seconds(600));
+        assert_eq!(p.max_span, p.idle);
+    }
+
+    /// The default is local, not UTC. It was UTC to keep early report tests
+    /// deterministic — a test-stability argument that should not outlive the
+    /// tests it protected, and one that cost every non-UTC user a daily
+    /// mid-morning reset of their visible totals.
+    #[test]
+    fn report_local_day_defaults_on() {
+        assert!(Config::default().report_local_day);
     }
 
     #[test]

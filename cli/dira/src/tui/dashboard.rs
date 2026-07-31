@@ -80,7 +80,7 @@ pub fn lanes(s: &StatusView) -> Vec<Lane> {
     }];
     for sess in &s.active {
         // An agent lane is only interesting once it has accrued wall time.
-        if sess.kind == "manual" || sess.agent_seconds <= 0 {
+        if !sess.accrues_agent_time() || sess.agent_seconds <= 0 {
             continue;
         }
         lanes.push(Lane {
@@ -128,7 +128,14 @@ pub fn tick(s: &StatusView, now: time::OffsetDateTime, idle: i64) -> StatusView 
     for sess in &mut s.active {
         let state = sess.live_state();
         if state == LiveState::Idle {
-            continue; // nothing recent — freeze both timers
+            // Nothing recent — freeze both timers at their settled values. This
+            // is a `continue`, not a reset: the daemon's `human_seconds` /
+            // `agent_seconds` are already in `s`, so skipping the tail leaves the
+            // displayed number exactly where it was. (It previously *read* as a
+            // reset for a different reason — a tail that had been growing on time
+            // the accountant then discarded. Clamping in `agent_active_seconds`
+            // is what fixed that; this branch was always correct.)
+            continue;
         }
         // The human tail grows only while *you* are engaged; an agent working on
         // its own (active, not engaged) accrues no human time, keeping the
@@ -144,7 +151,7 @@ pub fn tick(s: &StatusView, now: time::OffsetDateTime, idle: i64) -> StatusView 
         // The agent tail grows whenever the session is live — engaged *or* active —
         // so a busy agent's lane keeps ticking even when you last prompted it long
         // ago (previously it froze the moment the session went human-idle).
-        if sess.kind != "manual" {
+        if sess.accrues_agent_time() {
             let a = live_tail(now, parse_ts(sess.last_activity_at.as_deref()), idle);
             sess.agent_seconds += a;
             *agent_inc.entry(sess.project.clone()).or_insert(0) += a;
@@ -360,7 +367,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
         let (state, style) = state_label_style(sess);
         Row::new([
             Cell::from(truncate(&sess.handle, 10)),
-            Cell::from(truncate(&sess.harness, 10)),
+            Cell::from(truncate(dira_sources::harness_id(sess.harness), 10)),
             Cell::from(truncate(&project_label(&sess.project), project_w)),
             Cell::from(hms(sess.human_seconds)),
             Cell::from(hms(sess.agent_seconds)),
@@ -523,8 +530,8 @@ mod tests {
         SessionView {
             handle: handle.to_string(),
             session_id: format!("id-{handle}"),
-            harness: "claude".to_string(),
-            kind: "agent".to_string(),
+            harness: dira_contract::Harness::ClaudeCode,
+            kind: dira_contract::SessionKind::Agent,
             project: project.map(|p| p.to_string()),
             label: None,
             activity: None,
@@ -538,6 +545,21 @@ mod tests {
             agent_active: false,
             last_activity_at: None,
             last_human_at: None,
+            // An agent fixture must carry agent evidence, or it would silently
+            // stop growing a tail and these tests would assert nothing.
+            has_agent_activity: true,
+        }
+    }
+
+    /// A manual `dira start` session, exactly as the daemon reports one: kind
+    /// `Manual` and **no** agent evidence, because a manual timeline only ever
+    /// emits `ManualStart`/`ManualTick`/`ManualStop`.
+    fn manual_sess(handle: &str, project: Option<&str>, agent: i64) -> SessionView {
+        SessionView {
+            kind: dira_contract::SessionKind::Manual,
+            harness: dira_contract::Harness::Manual,
+            has_agent_activity: false,
+            ..sess(handle, project, agent, false)
         }
     }
 
@@ -578,11 +600,7 @@ mod tests {
             active: vec![
                 sess("a1", Some("acme/api"), 1200, false),
                 sess("a2", Some("acme/web"), 0, false), // no agent wall → dropped
-                {
-                    let mut m = sess("m1", Some("acme/api"), 999, false);
-                    m.kind = "manual".to_string(); // manual → dropped from lanes
-                    m
-                },
+                manual_sess("m1", Some("acme/api"), 999), // manual → dropped from lanes
             ],
             today: report(600, 1200, vec![]),
             sync_pending: 0,
@@ -599,6 +617,95 @@ mod tests {
         assert_eq!(lanes[1].label, "a1 · api");
         assert_eq!(lanes[1].seconds, 1200);
         assert!(!lanes[1].is_human);
+    }
+
+    /// **The reported bug.** A manual `dira start` session must never grow agent
+    /// time, at any elapsed time.
+    ///
+    /// It used to: the daemon put `kind` on the wire as `format!("{:?}", …)`, so
+    /// it read `"Manual"`, while this module compared against `"manual"`. The
+    /// guard never fired, so a manual session got an agent tail on top of a
+    /// settled value that is structurally always 0 — and the idle ticker's
+    /// `ManualTick` every 30s reset `last_activity_at`, making the AGENT column
+    /// ramp 0→30s and snap back, forever.
+    ///
+    /// 45s is deliberately past one 30s tick.
+    #[test]
+    fn a_manual_session_never_grows_agent_time() {
+        let m = manual_sess("m1", Some("acme/api"), 0);
+        let last = "2026-06-27T10:00:00Z";
+        let mut m = SessionView {
+            last_activity_at: Some(last.into()),
+            last_human_at: Some(last.into()),
+            ..m
+        };
+        m.idle = false; // engaged: a manual session ticks, so it is never idle
+        let s = StatusView {
+            active: vec![m],
+            today: report(600, 0, vec![]),
+            sync_pending: 0,
+            hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
+        };
+
+        let ticked = tick(&s, time::macros::datetime!(2026-06-27 10:00:45 UTC), 300);
+        assert_eq!(
+            ticked.active[0].agent_seconds, 0,
+            "a manual session must never accrue displayed agent time"
+        );
+        assert_eq!(
+            ticked.today.total_agent_seconds, 0,
+            "and it must not inflate the today total either"
+        );
+        // Its human time still ticks — that is the whole point of a manual timer.
+        assert!(ticked.active[0].human_seconds > 0);
+    }
+
+    /// Belt and braces: the evidence flag alone stops a tail, even for a session
+    /// whose `kind` says `Agent`. Guards against a future path mislabelling a
+    /// session and reintroducing the sawtooth through a different door.
+    #[test]
+    fn an_agent_session_without_evidence_grows_no_tail() {
+        let mut a = sess("a1", Some("acme/api"), 0, false);
+        a.has_agent_activity = false;
+        a.last_activity_at = Some("2026-06-27T10:00:00Z".into());
+        let s = StatusView {
+            active: vec![a],
+            today: report(0, 0, vec![]),
+            sync_pending: 0,
+            hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
+        };
+        let ticked = tick(&s, time::macros::datetime!(2026-06-27 10:00:45 UTC), 300);
+        assert_eq!(ticked.active[0].agent_seconds, 0);
+    }
+
+    /// The converse, which is why the flag exists instead of `agent_seconds > 0`:
+    /// a real agent session in its first second has evidence but no settled
+    /// seconds yet, and must still tick.
+    #[test]
+    fn an_agent_session_with_evidence_but_no_settled_seconds_still_ticks() {
+        let mut a = sess("a1", Some("acme/api"), 0, false);
+        a.has_agent_activity = true;
+        a.last_activity_at = Some("2026-06-27T10:00:00Z".into());
+        let s = StatusView {
+            active: vec![a],
+            today: report(0, 0, vec![]),
+            sync_pending: 0,
+            hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
+        };
+        let ticked = tick(&s, time::macros::datetime!(2026-06-27 10:00:45 UTC), 300);
+        assert_eq!(ticked.active[0].agent_seconds, 45);
     }
 
     #[test]

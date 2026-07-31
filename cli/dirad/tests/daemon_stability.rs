@@ -309,6 +309,7 @@ async fn daemon_info_reports_version_schema_and_pid() {
             version,
             schema_version,
             pid,
+            control_channel_warning: _,
             uptime_seconds: _,
             http_ingress_error: _,
         } => {

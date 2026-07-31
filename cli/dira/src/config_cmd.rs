@@ -78,7 +78,7 @@ const KNOBS: &[Knob] = &[
     Knob {
         key: "report_local_day",
         kind: Kind::U64, // accepts 0/1 or true/false; parsed in set()
-        help: "compute report day boundaries in local time (0/1); default 0 (UTC)",
+        help: "compute report day boundaries in local time (0/1); default 1 (local)",
     },
     Knob {
         key: "deep_idle_after_secs",

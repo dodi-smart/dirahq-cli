@@ -89,6 +89,29 @@ pub fn canonical_harness_id(id: &str) -> Option<&'static str> {
     })
 }
 
+/// The canonical wire id for a [`Harness`], and the label rendered in the
+/// HARNESS column.
+///
+/// These are the same ids `dira init <harness>`, [`canonical_harness_id`] and the
+/// `/hooks/{harness}` route already use, so what a user reads in `dira status` is
+/// exactly what they would type. Previously the column printed the Rust `Debug`
+/// form (`ClaudeCode`), which no command accepted.
+///
+/// The match is exhaustive with no `_` arm on purpose: adding a harness fails to
+/// compile until it is spelled here.
+pub fn harness_id(h: Harness) -> &'static str {
+    match h {
+        Harness::ClaudeCode => "claude",
+        Harness::Codex => "codex",
+        Harness::Gemini => "gemini",
+        Harness::Cursor => "cursor",
+        Harness::OpenCode => "opencode",
+        Harness::Grok => "grok",
+        Harness::Generic => "generic",
+        Harness::Manual => "manual",
+    }
+}
+
 /// Resolve a harness id (with a few friendly aliases) to its source.
 fn source_for(id: &str) -> Option<Box<dyn HarnessSource>> {
     let canonical = canonical_harness_id(id)?;

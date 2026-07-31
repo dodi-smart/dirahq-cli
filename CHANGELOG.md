@@ -1,3 +1,9 @@
+## [0.1.2](https://github.com/dodi-smart/dirahq-cli/compare/v0.1.1...v0.1.2) (2026-07-31)
+
+### 🐛 Bug Fixes
+
+* **cli:** session hygiene, sync batching, ack telemetry and the knowledge window ([1320fcf](https://github.com/dodi-smart/dirahq-cli/commit/1320fcf5984a20e36a066ab78546f861fdaec683)), closes [#74](https://github.com/dodi-smart/dirahq-cli/issues/74) [#72](https://github.com/dodi-smart/dirahq-cli/issues/72) [#71](https://github.com/dodi-smart/dirahq-cli/issues/71) [#67](https://github.com/dodi-smart/dirahq-cli/issues/67) [#74](https://github.com/dodi-smart/dirahq-cli/issues/74) [#72](https://github.com/dodi-smart/dirahq-cli/issues/72) [#71](https://github.com/dodi-smart/dirahq-cli/issues/71) [#67](https://github.com/dodi-smart/dirahq-cli/issues/67) [#24](https://github.com/dodi-smart/dirahq-cli/issues/24) [#74](https://github.com/dodi-smart/dirahq-cli/issues/74) [#72](https://github.com/dodi-smart/dirahq-cli/issues/72) [#71](https://github.com/dodi-smart/dirahq-cli/issues/71) [#67](https://github.com/dodi-smart/dirahq-cli/issues/67) [#24](https://github.com/dodi-smart/dirahq-cli/issues/24)
+
 ## [0.1.1](https://github.com/dodi-smart/dirahq-cli/compare/v0.1.0...v0.1.1) (2026-07-30)
 
 ### 🐛 Bug Fixes

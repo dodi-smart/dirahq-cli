@@ -197,14 +197,15 @@ fn build_fixture_archive(workdir: &Path, version: &str) -> (Vec<u8>, String, Vec
 
     let tarball_name = format!("dira-{version}-{TARGET}.tar.gz");
     let tarball_path = workdir.join(&tarball_name);
-    let status = Command::new("tar")
-        .arg("-czf")
-        .arg(&tarball_path)
-        .arg("-C")
-        .arg(&root)
-        .args(["dira", "dirad"])
-        .status()
-        .expect("spawn tar to build the fixture archive");
+    let status = status_staged(
+        Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball_path)
+            .arg("-C")
+            .arg(&root)
+            .args(["dira", "dirad"]),
+    )
+    .expect("spawn tar to build the fixture archive");
     assert!(
         status.success(),
         "building the fixture archive with tar failed"
@@ -230,19 +231,79 @@ fn build_fixture_archive(workdir: &Path, version: &str) -> (Vec<u8>, String, Vec
 fn seed_install(bin_dir: &Path) -> (Vec<u8>, Vec<u8>) {
     std::fs::create_dir_all(bin_dir).unwrap();
     let dira_src = std::fs::read(env!("CARGO_BIN_EXE_dira")).unwrap();
-    std::fs::write(bin_dir.join("dira"), &dira_src).unwrap();
-    std::fs::set_permissions(bin_dir.join("dira"), std::fs::Permissions::from_mode(0o755)).unwrap();
-
     let dirad_src =
         b"#!/bin/sh\necho \"dirad (placeholder, never executed by this test)\"\n".to_vec();
-    std::fs::write(bin_dir.join("dirad"), &dirad_src).unwrap();
-    std::fs::set_permissions(
-        bin_dir.join("dirad"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+
+    // Held across BOTH writes so no other test thread can fork while a write fd
+    // to a staged executable is open. See `EXEC_STAGING`.
+    let _staging = lock_staging();
+    for (name, bytes) in [("dira", &dira_src), ("dirad", &dirad_src)] {
+        let path = bin_dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     (dira_src, dirad_src)
+}
+
+/// Serialises *writing* an executable against *forking* a subprocess.
+///
+/// `execve` returns `ETXTBSY` when any process holds the target open for
+/// writing — and that check is per **inode**, not per path. `cargo test` runs
+/// these tests on several threads, so:
+///
+///   1. thread A opens `A/bin/dira` to stage it (`i_writecount` > 0);
+///   2. thread B forks for its own subprocess and the child inherits A's fd —
+///      `O_CLOEXEC` does not save us, because it is only applied on a
+///      *successful* exec;
+///   3. B's child keeps that inode pinned for as long as it lives;
+///   4. thread A execs its freshly-staged binary → `ETXTBSY`.
+///
+/// Each test has its own tempdir, so this is not path contention — it is fd
+/// inheritance across a fork inside one process. Go hit the identical race in
+/// golang/go#22315.
+///
+/// Note this is also why write-then-rename would **not** be enough on its own,
+/// which is what issue #80 originally proposed: the inherited fd refers to the
+/// inode, and renaming merely gives that inode another name. The window has to
+/// be closed on the fork side, which is what this lock does.
+///
+/// Only the `spawn` is serialised, never the wait, so tests still overlap while
+/// their subprocesses run.
+static EXEC_STAGING: Mutex<()> = Mutex::new(());
+
+fn lock_staging() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking test elsewhere must not cascade into "all subsequent spawns
+    // panic on a poisoned lock" — the guarded data is `()`, so there is no
+    // invariant left to protect.
+    EXEC_STAGING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`Command::output`] with the fork serialised against binary staging.
+///
+/// Mirrors `output()`'s own stdio setup (stdin null, stdout/stderr piped); the
+/// only difference is that the `spawn` happens under [`EXEC_STAGING`].
+fn output_staged(cmd: &mut Command) -> std::io::Result<Output> {
+    let child = {
+        let _staging = lock_staging();
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?
+    };
+    child.wait_with_output()
+}
+
+/// [`Command::status`] with the same serialisation. Inherits stdio, as
+/// `status()` does.
+fn status_staged(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = {
+        let _staging = lock_staging();
+        cmd.spawn()?
+    };
+    child.wait()
 }
 
 /// Run `<bin_dir>/dira update <extra_args...>` with the mock GitHub wired up
@@ -261,7 +322,7 @@ fn run_update(bin_dir: &Path, download_base: &str, extra_args: &[&str]) -> Outpu
         .env("DIRA_SOCKET_PATH", &sock)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN");
-    cmd.output().expect("spawn the copied dira binary")
+    output_staged(&mut cmd).expect("spawn the copied dira binary")
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -333,22 +394,23 @@ async fn a_rejected_token_falls_back_to_anonymous_resolution() {
     mock.reject_authorized_requests();
 
     let sock = bin_dir.join("isolated-never-created.sock");
-    let out = Command::new(bin_dir.join("dira"))
-        .arg("update")
-        .arg("--bin-dir")
-        .arg(&bin_dir)
-        .arg("--no-restart")
-        .arg("--check")
-        .env("DIRA_API_URL", mock.api_base())
-        .env("DIRA_DOWNLOAD_URL", mock.download_base())
-        .env("DIRA_REPO", "test-repo")
-        .env("DIRA_TARGET", TARGET)
-        .env("DIRA_SOCKET_PATH", &sock)
-        // The whole point: a credential the server rejects.
-        .env("GITHUB_TOKEN", "ghp_expiredAndNoLongerValid")
-        .env_remove("GH_TOKEN")
-        .output()
-        .expect("spawn the copied dira binary");
+    let out = output_staged(
+        Command::new(bin_dir.join("dira"))
+            .arg("update")
+            .arg("--bin-dir")
+            .arg(&bin_dir)
+            .arg("--no-restart")
+            .arg("--check")
+            .env("DIRA_API_URL", mock.api_base())
+            .env("DIRA_DOWNLOAD_URL", mock.download_base())
+            .env("DIRA_REPO", "test-repo")
+            .env("DIRA_TARGET", TARGET)
+            .env("DIRA_SOCKET_PATH", &sock)
+            // The whole point: a credential the server rejects.
+            .env("GITHUB_TOKEN", "ghp_expiredAndNoLongerValid")
+            .env_remove("GH_TOKEN"),
+    )
+    .expect("spawn the copied dira binary");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -377,23 +439,24 @@ async fn check_resolves_against_the_latest_endpoint_and_mutates_nothing() {
     // Deliberately never register any asset — `--check` must never download.
 
     let sock = bin_dir.join("isolated-never-created.sock");
-    let out = Command::new(bin_dir.join("dira"))
-        .arg("update")
-        .arg("--bin-dir")
-        .arg(&bin_dir)
-        .arg("--no-restart")
-        .arg("--check")
-        .env("DIRA_API_URL", mock.api_base())
-        .env("DIRA_DOWNLOAD_URL", mock.download_base())
-        // The mock's `/repos/{repo}/releases/latest` route captures a single
-        // path segment; the real default (`dodi-smart/dirahq-cli`) is two.
-        .env("DIRA_REPO", "test-repo")
-        .env("DIRA_TARGET", TARGET)
-        .env("DIRA_SOCKET_PATH", &sock)
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .output()
-        .expect("spawn the copied dira binary");
+    let out = output_staged(
+        Command::new(bin_dir.join("dira"))
+            .arg("update")
+            .arg("--bin-dir")
+            .arg(&bin_dir)
+            .arg("--no-restart")
+            .arg("--check")
+            .env("DIRA_API_URL", mock.api_base())
+            .env("DIRA_DOWNLOAD_URL", mock.download_base())
+            // The mock's `/repos/{repo}/releases/latest` route captures a single
+            // path segment; the real default (`dodi-smart/dirahq-cli`) is two.
+            .env("DIRA_REPO", "test-repo")
+            .env("DIRA_TARGET", TARGET)
+            .env("DIRA_SOCKET_PATH", &sock)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN"),
+    )
+    .expect("spawn the copied dira binary");
     assert!(
         out.status.success(),
         "--check must exit 0: stdout={}\nstderr={}",
@@ -430,19 +493,20 @@ async fn check_exits_zero_even_when_the_asset_host_is_unreachable() {
     seed_install(&bin_dir);
 
     let sock = bin_dir.join("isolated-never-created.sock");
-    let out = Command::new(bin_dir.join("dira"))
-        .arg("update")
-        .arg("--bin-dir")
-        .arg(&bin_dir)
-        .arg("--no-restart")
-        .arg("--check")
-        .env("DIRA_API_URL", "http://127.0.0.1:1") // nothing listens on port 1
-        .env("DIRA_TARGET", TARGET)
-        .env("DIRA_SOCKET_PATH", &sock)
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .output()
-        .expect("spawn the copied dira binary");
+    let out = output_staged(
+        Command::new(bin_dir.join("dira"))
+            .arg("update")
+            .arg("--bin-dir")
+            .arg(&bin_dir)
+            .arg("--no-restart")
+            .arg("--check")
+            .env("DIRA_API_URL", "http://127.0.0.1:1") // nothing listens on port 1
+            .env("DIRA_TARGET", TARGET)
+            .env("DIRA_SOCKET_PATH", &sock)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN"),
+    )
+    .expect("spawn the copied dira binary");
 
     assert!(
         out.status.success(),

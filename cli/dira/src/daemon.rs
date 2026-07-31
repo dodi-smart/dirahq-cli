@@ -70,6 +70,22 @@ fn locate_dirad() -> PathBuf {
     PathBuf::from(dira_ipc::DIRAD_BIN)
 }
 
+/// A truncating file for the spawned daemon's stdout/stderr, or `None` when no
+/// log location resolves (in which case the caller nulls them, as before).
+///
+/// Deliberately truncating and separate from the daemon's own rolling log: this
+/// only ever holds one process's pre-`tracing` output, so it cannot grow, and a
+/// crash loop leaves the *latest* failure rather than an unbounded pile.
+fn spawn_log(config: &Config) -> Option<std::fs::File> {
+    let dir = match std::env::var("DIRA_LOG_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ if cfg!(windows) => config.runtime_dir().join("logs"),
+        _ => return None,
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::File::create(dir.join("dirad.spawn.log")).ok()
+}
+
 /// Record a started daemon's pid, warning rather than failing.
 ///
 /// A running daemon with a missing pidfile is strictly better than aborting an
@@ -139,9 +155,25 @@ pub async fn start(config: &Config) -> Result<()> {
     let bin = locate_dirad();
     println!("starting {} ...", bin.display());
     let mut cmd = Command::new(&bin);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null());
+    // A daemon that dies *before* `tracing` initialises — a config parse error, a
+    // missing DLL, a panic in startup — writes to stderr and nothing else. Nulling
+    // it meant those failures left no trace on any platform. Truncate per start so
+    // this stays bounded to one process's output.
+    match spawn_log(config) {
+        Some(f) => {
+            let dup = f.try_clone().ok();
+            cmd.stderr(std::process::Stdio::from(f));
+            match dup {
+                Some(d) => cmd.stdout(std::process::Stdio::from(d)),
+                None => cmd.stdout(std::process::Stdio::null()),
+            };
+        }
+        None => {
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
 
     #[cfg(windows)]
     {

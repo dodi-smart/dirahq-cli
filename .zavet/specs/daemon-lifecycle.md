@@ -1,16 +1,16 @@
 ---
 title: Daemon startup and ingress lifecycle
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-07-22
+date: 2026-07-31
 paths:
   - cli/dirad/src/lib.rs
   - cli/dirad/src/control.rs
   - cli/dira/src/daemon.rs
   - cli/ipc/**
-decisions: [D-0008, D-0009, D-0010]
+decisions: [D-0008, D-0009, D-0010, D-0016]
 ---
 
 ## Overview
@@ -24,6 +24,14 @@ on unix, a named pipe on windows (D-0010). Everything below about socket
 files, `flock`, and stale-path reclaim is the unix arm; on windows the pipe's
 `first_pipe_instance` bind is atomically the single-instance guard, and no
 filesystem state exists to go stale.
+
+Both arms are **explicitly** permission-gated, and the gate is never inherited:
+unix chmods the socket to `0600`, windows creates every pipe instance with a
+user-only DACL plus a medium integrity label (D-0016). The channel carries
+`Nuke`/`Shutdown`/`IngestHook` with no auth of its own, so that gate is the
+whole of its access control. Windows previously passed a NULL descriptor and
+inherited the creating token's default, which for an elevated daemon excluded
+the interactive user entirely — a silent, total capture outage.
 
 ## Behavior
 
@@ -58,11 +66,18 @@ filesystem state exists to go stale.
 
 ## Interfaces & data
 
-- `bind_control_socket(&Path) -> Result<(UnixListener, SocketLock)>` and
+- `bind_control_socket(&Path) -> Result<(dira_ipc::Listener, SocketLock)>` and
   `serve_http_ingress(AppState, String, Duration)` are both public so the
   integration tests in `cli/dirad/tests/startup_binding.rs` drive the real
   code paths rather than a copy. Callers hold the `SocketLock` as long as the
   listener serves; `run()` keeps it as a local until shutdown.
+- `Listener::security_degradation() -> Option<String>` reports which rung of
+  the descriptor ladder the windows bind landed on (labeled → DACL-only →
+  default); always `None` on unix. `run()` folds it together with the
+  elevation advisory into
+  `Response::DaemonInfo.control_channel_warning: Option<String>`. `DEGRADED`
+  stays reserved for "captures nothing" — an elevated but reachable daemon is
+  an advisory `note:`, not a degradation.
 - `Response::DaemonInfo.http_ingress_error: Option<String>` carries the
   degradation to clients. It is `#[serde(default)]`, so a newer `dira` reading
   an older daemon's reply during a partial update sees `None` instead of a
@@ -80,6 +95,10 @@ filesystem state exists to go stale.
 - The socket path itself is a fixed per-user location, never `$TMPDIR`
   (D-0008), so client and daemon agree without coordination.
 - A daemon that cannot do its job never reports as plainly healthy.
+- The control channel is permission-gated on every platform, and the gate is
+  explicit, never inherited from a process token (D-0016).
+- A descriptor failure degrades and is surfaced; it never fails the bind, and
+  it is never silent.
 
 ## Open Questions
 

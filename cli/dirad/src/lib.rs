@@ -26,6 +26,7 @@ pub mod heartbeat;
 pub mod http;
 pub mod jitter;
 pub mod knowledge_sync;
+pub mod logfile;
 pub mod state;
 pub mod supervisor;
 pub mod sync;

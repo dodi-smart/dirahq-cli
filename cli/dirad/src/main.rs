@@ -19,12 +19,22 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "dirad=info,warn".into()),
-        )
-        .init();
+    // On windows the daemon is spawned with all three stdio handles nulled and
+    // no console, so anything written to stdout goes nowhere — which is why a
+    // days-long capture outage left nothing to diagnose. Log to a size-capped
+    // file there (and anywhere `DIRA_LOG_DIR` asks). macOS keeps stdout because
+    // the launchd plist already redirects it; Linux keeps it for journald.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "dirad=info,warn".into());
+    match dirad::logfile::log_dir().and_then(|d| dirad::logfile::RollingLog::open(&d).ok()) {
+        Some(log) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            // No SGR escapes in a file nobody is going to `cat` with a pager.
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(log))
+            .init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
 
     // Resolve the system local UTC offset while the process is still single-threaded
     // — before building the multithreaded tokio runtime. `current_local_offset()`

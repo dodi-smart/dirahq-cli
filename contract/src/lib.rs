@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.2.0";
+pub const SCHEMA_VERSION: &str = "1.3.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -550,9 +550,15 @@ impl KnowledgeBatch {
     pub fn strip_content(&mut self) {
         for d in &mut self.decisions {
             d.body_md = None;
+            for c in &mut d.checks {
+                c.command = None;
+            }
         }
         for s in &mut self.specs {
             s.body_md = None;
+            for c in &mut s.checks {
+                c.command = None;
+            }
         }
         for t in &mut self.trailer_refs {
             t.value = None;
@@ -614,10 +620,42 @@ pub struct KnowledgeDecision {
     /// Guard globs (active enforcement surface).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guards: Vec<String>,
+    /// A later decision that corrects one claim in this one. The record stays
+    /// `active` — this is lineage, like `supersedes`, not a status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrected_by: Option<String>,
+    /// How this record's invariants are verified — see [`KnowledgeCheck`] for
+    /// why only half of a check crosses at the metadata tier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<KnowledgeCheck>,
     /// CONTENT (consent-gated): the record body markdown. `None` unless the
     /// batch is full-tier. Allowlisted in the no-content-fields invariant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
+}
+
+/// One verification binding on a decision or spec.
+///
+/// The split is deliberate, and follows D-0001's rule that content needs its
+/// own opt-in. A `label` names an invariant the way a `title` names a record —
+/// metadata. A `command` is a line of the repo's own build configuration: it
+/// can name internal tooling, hosts and paths nobody agreed to publish by
+/// turning knowledge sync on. So the label rides at every tier and the command
+/// is consent-gated exactly like `bodyMd`.
+///
+/// An unlabeled check has `label == command` at the source, so the metadata
+/// tier degrades to a label that reads like a command. That is not a leak: it
+/// is the name its author chose, in the same position `title` already
+/// occupies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeCheck {
+    /// Human label for the invariant. Metadata.
+    pub label: String,
+    /// CONTENT (consent-gated): the command that verifies it. `None` unless
+    /// the batch is full-tier. Allowlisted in the no-content-fields invariant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// One living spec, metadata-first. Same tiering rules as [`KnowledgeDecision`].
@@ -666,6 +704,10 @@ pub struct KnowledgeSpec {
     /// Linked decision ids (frontmatter ∪ body refs, canonical, deduplicated).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decisions: Vec<String>,
+    /// Feature-level scenarios proving this spec's behavior still holds. Same
+    /// label/command tiering as a decision's — see [`KnowledgeCheck`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<KnowledgeCheck>,
     /// CONTENT (consent-gated): the spec body markdown. `None` unless the
     /// batch is full-tier. Allowlisted in the no-content-fields invariant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -914,7 +956,12 @@ mod tests {
     /// stored only by a workspace that separately opted in (see D-0001 and
     /// docs/zavet.md). Anything content-shaped outside this list still fails
     /// the invariant.
-    const CONTENT_ALLOWLIST: &[&str] = &["payload.decisions[].bodyMd", "payload.specs[].bodyMd"];
+    const CONTENT_ALLOWLIST: &[&str] = &[
+        "payload.decisions[].bodyMd",
+        "payload.specs[].bodyMd",
+        "payload.decisions[].checks[].command",
+        "payload.specs[].checks[].command",
+    ];
 
     // Split a field name (snake_case on disk, camelCase on the wire) into its
     // lowercase word tokens.
@@ -985,6 +1032,11 @@ mod tests {
                 origin: Some("recorded".into()),
                 verified: Some(true),
                 guards: vec!["contract/**".into()],
+                corrected_by: Some("D-0002".into()),
+                checks: vec![KnowledgeCheck {
+                    label: "wire carries no content fields".into(),
+                    command: Some("full-tier command".into()),
+                }],
                 body_md: Some("## Decision\nfull-tier prose".into()),
             }],
             specs: vec![KnowledgeSpec {
@@ -1005,6 +1057,10 @@ mod tests {
                 source_session: Some("s1".into()),
                 paths: vec!["cli/dirad/src/capture.rs".into()],
                 decisions: vec!["D-0001".into()],
+                checks: vec![KnowledgeCheck {
+                    label: "capture survives a rewritten branch".into(),
+                    command: Some("full-tier command".into()),
+                }],
                 body_md: Some("## Overview\nfull-tier prose".into()),
             }],
             trailer_refs: vec![KnowledgeTrailerRef {

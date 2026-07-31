@@ -133,8 +133,9 @@ budget:
   `Why: Rejected: Constraint: Refs: Supersedes: Spec:` (case-insensitive),
   first `D-NNNN` reference extracted; idempotent by `(sha, seq)`.
 - **Decision records** — `.zavet/decisions/*.md` files added/modified by each
-  walked commit: frontmatter (`id`, `title`, `status`, `guards`, `supersedes`)
-  plus body, upserted by `(repo, id)` with first-sight provenance (the
+  walked commit: frontmatter (`id`, `title`, `status`, `guards`, `supersedes`,
+  `checks`, `corrected-by`) plus body, upserted by `(repo, id)` with
+  first-sight provenance (the
   introducing commit, its author date, and its attributed session are
   preserved forever); `content_hash` is the git blob oid.
 - **Living specs** — `.zavet/specs/<slug>.md` files (flat, dot-prefixed
@@ -144,9 +145,24 @@ budget:
   `title`, `version`, `origin` (`designed` | `session` | `reverse-engineered`),
   `verified` (true only after a human confirms spec matches code),
   `confidence` (`low` | `med` | `high`), `date`, `paths` (git pathspecs the
-  spec covers), `decisions` (optional links). Decision links are derived as
-  the frontmatter list ∪ every `D-NNNN` reference in the body, canonicalized —
-  links live on the spec side only, decisions stay append-only.
+  spec covers), `decisions` (optional links), `checks`. Decision links are
+  derived as the frontmatter list ∪ every `D-NNNN` reference in the body,
+  canonicalized — links live on the spec side only, decisions stay
+  append-only.
+
+**Checks** (`checks:` on either record type) bind an invariant to the command
+that proves it, as `label :: command` — an item with no separator IS the
+command. dira displays them and never runs them: a command read out of a repo
+must only execute when a human explicitly asks, which is `zavet verify`'s job
+in the plugin. Nothing here detects, infers or special-cases a test framework;
+the command is opaque, and exit 0 is the whole contract.
+
+**Corrections** (`corrected-by:` on a decision) are the light sibling of
+`supersedes`. Supersession replaces a record wholesale, which is too heavy when
+one claim inside it turns out wrong; a corrected record stays `active` and
+keeps its body, and every recall path leads with the correction instead. The
+pointer may dangle — that is a finding for the plugin's `zavet check`, never a
+parse error.
 
 **Staleness** is never materialized: no table stores per-commit paths, so it
 is computed at query time — `git log <last_commit>..HEAD -- :(glob)<path>…`
@@ -200,15 +216,19 @@ own **double consent gate**:
   `config.toml` (or `DIRA_SYNC__KNOWLEDGE`). Default **off**: zavet works
   fully on the machine, nothing leaves it. `metadata` ships decision ids,
   slugs, titles, status, guard globs, spec paths, trailer keys + decision
-  refs, guard events, shas (`recordSha` = the git blob oid), and per-repo
-  coverage/capture counts — enough for dashboards to show structure, cost,
-  and guard telemetry without any prose. The coverage surface is active
-  decisions' guard globs ∪ **every** spec's paths: `verified` records a human
-  review of whether a spec matches the code, which is a different question
-  from whether the code is documented, and decisions have always counted
-  while unverified (D-0016). `full` adds the consent-gated
-  content fields (`bodyMd`, trailer `value`), which are pinned by an explicit
-  path allowlist in the contract's no-content invariant.
+  refs, guard events, shas (`recordSha` = the git blob oid), check LABELS,
+  `correctedBy`, and per-repo coverage/capture counts — enough for dashboards
+  to show structure, cost, and guard telemetry without any prose. The coverage
+  surface is active decisions' guard globs ∪ **every** spec's paths:
+  `verified` records a human review of whether a spec matches the code, which
+  is a different question from whether the code is documented, and decisions
+  have always counted while unverified (D-0017). `full` adds the consent-gated
+  content fields (`bodyMd`, trailer `value`, and a check's `command`), which
+  are pinned by an explicit path allowlist in the contract's no-content
+  invariant. A check splits across that boundary deliberately: the label names
+  an invariant the way a title names a record, while the command is a line of
+  the repo's own build configuration and can name internal tooling, hosts and
+  paths nobody agreed to publish by turning sync on.
 - **Workspace tier** (cloud-side) — the dashboard's ZAVET · KNOWLEDGE SYNC
   setting: `off` refuses the channel (`knowledge_disabled`), `metadata`
   refuses content (`content_not_allowed` — the daemon downgrades the window

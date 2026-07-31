@@ -111,6 +111,43 @@ fn specs_meta_matches_golden() {
 }
 
 #[test]
+fn decision_checks_matches_golden() {
+    let mut out = String::new();
+    for f in md_files("decisions") {
+        let text = std::fs::read_to_string(&f).unwrap();
+        let rel = format!(
+            ".zavet/decisions/{}",
+            f.file_name().unwrap().to_str().unwrap()
+        );
+        let Some(cap) = parse_decision(&text, &rel) else {
+            continue;
+        };
+        // Unlike guards, checks emit for superseded records too: a check is a
+        // claim about how the record was verified, not an enforcement surface.
+        for c in &cap.checks {
+            out.push_str(&format!("{}\t{}\t{}\n", cap.id, c.label, c.command));
+        }
+    }
+    assert_matches_golden("decision-checks.tsv", &out);
+}
+
+#[test]
+fn spec_checks_matches_golden() {
+    let mut out = String::new();
+    for f in md_files("specs") {
+        let text = std::fs::read_to_string(&f).unwrap();
+        let rel = format!(".zavet/specs/{}", f.file_name().unwrap().to_str().unwrap());
+        let Some(cap) = parse_spec(&text, &rel) else {
+            continue;
+        };
+        for c in &cap.checks {
+            out.push_str(&format!("{}\t{}\t{}\n", cap.slug, c.label, c.command));
+        }
+    }
+    assert_matches_golden("spec-checks.tsv", &out);
+}
+
+#[test]
 fn spec_paths_matches_golden() {
     let mut out = String::new();
     for f in md_files("specs") {

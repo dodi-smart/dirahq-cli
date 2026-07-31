@@ -87,12 +87,46 @@
         "tier"
       ]
     },
+    "KnowledgeCheck": {
+      "description": "One verification binding on a decision or spec.\n\nThe split is deliberate, and follows D-0001's rule that content needs its\nown opt-in. A `label` names an invariant the way a `title` names a record —\nmetadata. A `command` is a line of the repo's own build configuration: it\ncan name internal tooling, hosts and paths nobody agreed to publish by\nturning knowledge sync on. So the label rides at every tier and the command\nis consent-gated exactly like `bodyMd`.\n\nAn unlabeled check has `label == command` at the source, so the metadata\ntier degrades to a label that reads like a command. That is not a leak: it\nis the name its author chose, in the same position `title` already\noccupies.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "CONTENT (consent-gated): the command that verifies it. `None` unless\nthe batch is full-tier. Allowlisted in the no-content-fields invariant.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "Human label for the invariant. Metadata.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ]
+    },
     "KnowledgeDecision": {
       "description": "One zavet decision record, metadata-first.\n\n`recordSha` is the git blob oid of the record file (a content-identity\npointer like [`BlobRef::blob`], never the file's bytes). `bodyMd` is the\nconsent-gated content field — `None` at the metadata tier.",
       "type": "object",
       "properties": {
         "bodyMd": {
           "description": "CONTENT (consent-gated): the record body markdown. `None` unless the\nbatch is full-tier. Allowlisted in the no-content-fields invariant.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checks": {
+          "description": "How this record's invariants are verified — see [`KnowledgeCheck`] for\nwhy only half of a check crosses at the metadata tier.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KnowledgeCheck"
+          }
+        },
+        "correctedBy": {
+          "description": "A later decision that corrects one claim in this one. The record stays\n`active` — this is lineage, like `supersedes`, not a status.",
           "type": [
             "string",
             "null"
@@ -327,6 +361,13 @@
             "string",
             "null"
           ]
+        },
+        "checks": {
+          "description": "Feature-level scenarios proving this spec's behavior still holds. Same\nlabel/command tiering as a decision's — see [`KnowledgeCheck`].",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KnowledgeCheck"
+          }
         },
         "confidence": {
           "description": "`low` | `med` | `high`.",

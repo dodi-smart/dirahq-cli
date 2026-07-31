@@ -3,7 +3,7 @@
 //! capture path feeds this from `git show`/`git log` output, and a future CI
 //! mode reuses it verbatim.
 
-use crate::store::{ZavetDecisionCapture, ZavetSpecCapture, ZavetTrailer};
+use crate::store::{ZavetCheck, ZavetDecisionCapture, ZavetSpecCapture, ZavetTrailer};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -263,6 +263,15 @@ pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
             ("origin", FmValue::Scalar(v)) => cap.origin = non_empty(unquote(decomment(v))),
             ("verified", FmValue::Scalar(v)) => cap.verified = parse_bool(v),
             ("guards", FmValue::List(items)) => cap.guards.extend(clean_list(items)),
+            ("checks", FmValue::List(items)) => cap.checks.extend(clean_checks(items)),
+            // The errata pointer. A record stays `active` and keeps its body
+            // (append-only); this is how ONE claim inside it is marked wrong
+            // without superseding the whole record. Uncanonicalizable values
+            // drop rather than reject the document — a typo'd pointer must not
+            // cost the record itself.
+            ("corrected-by", FmValue::Scalar(v)) => {
+                cap.corrected_by = canonical_decision_id(unquote(decomment(v)))
+            }
             _ => {} // unknown keys (tags, …) are fine
         }
     }
@@ -317,6 +326,7 @@ pub fn parse_spec(text: &str, path: &str) -> Option<ZavetSpecCapture> {
             }
             ("date", FmValue::Scalar(v)) => cap.date = non_empty(unquote(decomment(v))),
             ("paths", FmValue::List(items)) => cap.paths.extend(clean_list(items)),
+            ("checks", FmValue::List(items)) => cap.checks.extend(clean_checks(items)),
             ("decisions", FmValue::List(items)) => {
                 for id in clean_list(items).filter_map(|d| canonical_decision_id(&d)) {
                     if !decisions.contains(&id) {
@@ -351,6 +361,43 @@ fn clean_list<'a>(items: &'a [String]) -> impl Iterator<Item = String> + 'a {
         .iter()
         .map(|i| unquote(decomment(i)).to_string())
         .filter(|i| !i.is_empty())
+}
+
+/// The separator between a check's human label and the command that verifies
+/// it. A convention, not YAML: the dialect's list grammar only carries
+/// scalars, and a nested mapping would be a real grammar change the plugin's
+/// awk parser could not follow.
+const CHECK_SEP: &str = "::";
+
+/// Split a `label :: command` item. With no separator the whole item IS the
+/// command and doubles as its own label, so the cheapest possible check —
+/// a bare command — stays legal. Only the FIRST separator splits, so a
+/// command may contain `::` (Rust paths, `--grep 'A::b'`) unquoted.
+fn split_check(item: &str) -> Option<ZavetCheck> {
+    let (label, command) = match item.split_once(CHECK_SEP) {
+        Some((l, c)) => (l.trim(), c.trim()),
+        None => (item.trim(), item.trim()),
+    };
+    // A label with no command verifies nothing; a command is what makes it a
+    // check, so an item that is all label drops.
+    (!command.is_empty()).then(|| ZavetCheck {
+        label: if label.is_empty() { command } else { label }.to_string(),
+        command: command.to_string(),
+    })
+}
+
+/// Clean raw `checks:` items into label/command pairs.
+///
+/// Items go through the same comment/quote stripping as every other
+/// structured list, which means an UNQUOTED command containing ` #` is
+/// truncated there — quote the item to keep it (`- "lint :: sh -c 'x # y'"`).
+/// The command is otherwise opaque: no framework is detected, inferred or
+/// special-cased anywhere in this crate.
+fn clean_checks<'a>(items: &'a [String]) -> impl Iterator<Item = ZavetCheck> + 'a {
+    items
+        .iter()
+        .map(|i| unquote(decomment(i)).to_string())
+        .filter_map(|i| split_check(&i))
 }
 
 fn parse_bool(v: &str) -> Option<bool> {
@@ -565,6 +612,69 @@ mod tests {
         let body = cap.body_md.unwrap();
         assert!(body.starts_with("## Decision"));
         assert!(body.contains("Watchers add failure modes."));
+    }
+
+    #[test]
+    fn parses_checks_splitting_label_from_command() {
+        let doc = "---\nid: D-0001\nchecks:\n  - pg suite forbids mocks :: run-the-pg-suite\n  - run-the-lint-suite\n---\nbody";
+        let cap = parse_decision(doc, ".zavet/decisions/D-0001.md").unwrap();
+        assert_eq!(cap.checks.len(), 2);
+        assert_eq!(cap.checks[0].label, "pg suite forbids mocks");
+        assert_eq!(cap.checks[0].command, "run-the-pg-suite");
+        // Unlabeled: the command IS the label, so the cheapest check is legal.
+        assert_eq!(cap.checks[1].label, "run-the-lint-suite");
+        assert_eq!(cap.checks[1].command, "run-the-lint-suite");
+    }
+
+    #[test]
+    fn check_keeps_later_separators_and_drops_a_commandless_item() {
+        let doc = "---\nid: D-0001\nchecks:\n  - keeps later :: runner --grep 'A::b'\n  - label-only ::\n---\nbody";
+        let cap = parse_decision(doc, ".zavet/decisions/D-0001.md").unwrap();
+        assert_eq!(
+            cap.checks.len(),
+            1,
+            "a label with no command is not a check"
+        );
+        assert_eq!(cap.checks[0].command, "runner --grep 'A::b'");
+    }
+
+    #[test]
+    fn quoting_protects_a_hash_inside_a_check_command() {
+        // Unquoted, the shared decomment rule truncates at ` #` — same as
+        // every other structured list item. Quoting is the escape hatch.
+        let bare = "---\nid: D-0001\nchecks:\n  - t :: runner -c 'a # b'\n---\nbody";
+        let cap = parse_decision(bare, ".zavet/decisions/D-0001.md").unwrap();
+        assert_eq!(cap.checks[0].command, "runner -c 'a");
+
+        let quoted = "---\nid: D-0001\nchecks:\n  - \"t :: runner -c 'a # b'\"\n---\nbody";
+        let cap = parse_decision(quoted, ".zavet/decisions/D-0001.md").unwrap();
+        assert_eq!(cap.checks[0].command, "runner -c 'a # b'");
+    }
+
+    #[test]
+    fn corrected_by_canonicalizes_and_never_rejects_the_record() {
+        let doc = "---\nid: D-0014\ncorrected-by: D-7\n---\nbody";
+        let cap = parse_decision(doc, ".zavet/decisions/D-0014.md").unwrap();
+        assert_eq!(cap.corrected_by.as_deref(), Some("D-0007"));
+        // A record stays ACTIVE when corrected — that is the whole point:
+        // supersession replaces, correction annotates.
+        assert_eq!(cap.status.as_deref(), Some("active"));
+
+        // A malformed pointer drops the pointer, never the record.
+        let bad = "---\nid: D-0014\ncorrected-by: nonsense\n---\nbody";
+        let cap = parse_decision(bad, ".zavet/decisions/D-0014.md").unwrap();
+        assert_eq!(cap.corrected_by, None);
+        assert_eq!(cap.id, "D-0014");
+    }
+
+    #[test]
+    fn specs_parse_checks_with_the_same_rule_as_decisions() {
+        let doc =
+            "---\ntitle: T\nchecks:\n  - no overflow :: run-the-sweep\nchecks2: []\n---\nbody";
+        let cap = parse_spec(doc, ".zavet/specs/mobile.md").unwrap();
+        assert_eq!(cap.checks.len(), 1);
+        assert_eq!(cap.checks[0].label, "no overflow");
+        assert_eq!(cap.checks[0].command, "run-the-sweep");
     }
 
     #[test]

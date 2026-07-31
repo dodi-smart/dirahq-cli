@@ -10,10 +10,12 @@
 //! `dira device resync` — wipe-and-resync reproduces cloud state because the
 //! cloud is idempotent by natural keys.
 
-use crate::store::{ZavetDecisionRow, ZavetGuardEventSyncRow, ZavetSpecRow, ZavetTrailerSyncRow};
+use crate::store::{
+    ZavetCheck, ZavetDecisionRow, ZavetGuardEventSyncRow, ZavetSpecRow, ZavetTrailerSyncRow,
+};
 use dira_contract::{
-    KnowledgeBatch, KnowledgeDecision, KnowledgeGuardEvent, KnowledgeRepoStats, KnowledgeSpec,
-    KnowledgeTrailerRef,
+    KnowledgeBatch, KnowledgeCheck, KnowledgeDecision, KnowledgeGuardEvent, KnowledgeRepoStats,
+    KnowledgeSpec, KnowledgeTrailerRef,
 };
 use serde::Deserialize;
 
@@ -86,6 +88,8 @@ fn decision_to_wire(row: &ZavetDecisionRow, tier: KnowledgeTier) -> KnowledgeDec
         origin: row.origin.clone(),
         verified: row.verified,
         guards: row.guards.clone(),
+        corrected_by: row.corrected_by.clone(),
+        checks: checks_to_wire(&row.checks, tier),
         // Content flows only at the full tier — the metadata arm never even
         // reads the column's value into the wire struct.
         body_md: match tier {
@@ -93,6 +97,23 @@ fn decision_to_wire(row: &ZavetDecisionRow, tier: KnowledgeTier) -> KnowledgeDec
             KnowledgeTier::Metadata => None,
         },
     }
+}
+
+/// Map checks to the wire, splitting them across the tier boundary: the label
+/// is metadata and always rides, the command is content and rides only at the
+/// full tier. Same arm shape as `body_md` — the metadata arm never reads the
+/// command into the wire struct at all.
+fn checks_to_wire(checks: &[ZavetCheck], tier: KnowledgeTier) -> Vec<KnowledgeCheck> {
+    checks
+        .iter()
+        .map(|c| KnowledgeCheck {
+            label: c.label.clone(),
+            command: match tier {
+                KnowledgeTier::Full => Some(c.command.clone()),
+                KnowledgeTier::Metadata => None,
+            },
+        })
+        .collect()
 }
 
 fn spec_to_wire(row: &ZavetSpecRow, tier: KnowledgeTier) -> KnowledgeSpec {
@@ -114,6 +135,7 @@ fn spec_to_wire(row: &ZavetSpecRow, tier: KnowledgeTier) -> KnowledgeSpec {
         source_session: row.source_session.clone(),
         paths: row.paths.clone(),
         decisions: row.decisions.clone(),
+        checks: checks_to_wire(&row.checks, tier),
         body_md: match tier {
             KnowledgeTier::Full => row.body_md.clone(),
             KnowledgeTier::Metadata => None,

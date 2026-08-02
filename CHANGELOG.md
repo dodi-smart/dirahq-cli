@@ -1,3 +1,19 @@
+## [0.2.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.1.2...v0.2.0) (2026-08-02)
+
+### ✨ Features
+
+* **cli:** capture how a record is verified, and let one correct another ([891606f](https://github.com/dodi-smart/dirahq-cli/commit/891606fd787399f71fd472aea2dc9e571d7e2e63))
+* **cli:** fix agent time accounting and the windows control channel ([8ae49e1](https://github.com/dodi-smart/dirahq-cli/commit/8ae49e156b6570a40e7d8d5d8fd5a95cec2fb8d7)), closes [#1](https://github.com/dodi-smart/dirahq-cli/issues/1)
+
+### 🐛 Bug Fixes
+
+* **daemon:** count every spec toward coverage, not only verified ones ([81cb1ed](https://github.com/dodi-smart/dirahq-cli/commit/81cb1ed6328ec1a19da95af3b3c79ed953b527b8))
+
+### ✅ Tests
+
+* **cli:** pin that why leads with a correction and lists checks ([1ec2946](https://github.com/dodi-smart/dirahq-cli/commit/1ec29462f170bd6f3645ec8691fd4763b489b9a5))
+* **cli:** serialise executable staging against subprocess forks ([6d29a12](https://github.com/dodi-smart/dirahq-cli/commit/6d29a1280dd259f818791e2a6326168f61151744)), closes [#80](https://github.com/dodi-smart/dirahq-cli/issues/80)
+
 ## [0.1.2](https://github.com/dodi-smart/dirahq-cli/compare/v0.1.1...v0.1.2) (2026-07-31)
 
 ### 🐛 Bug Fixes

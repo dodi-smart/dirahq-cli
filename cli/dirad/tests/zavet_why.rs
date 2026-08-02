@@ -6,7 +6,7 @@
 use dira_contract::Harness;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::protocol::{Request, Response};
-use dira_core::store::{ZavetDecisionCapture, ZavetTrailer};
+use dira_core::store::{ZavetCheck, ZavetDecisionCapture, ZavetTrailer};
 use dira_core::{accounting, Config, Store};
 use dirad::state::AppState;
 use time::{Duration, OffsetDateTime};
@@ -237,6 +237,80 @@ async fn short_trailer_refs_join_zero_padded_decisions() {
 }
 
 #[tokio::test]
+async fn zavet_why_leads_with_a_correction_and_lists_checks() {
+    let state = test_state().await;
+    // The real shape this exists for: a record that is still ACTIVE and still
+    // right about most things, with one claim inside it corrected later.
+    let corrected = ZavetDecisionCapture {
+        id: "D-0007".into(),
+        title: Some("Capture is routed per repo".into()),
+        status: Some("active".into()),
+        path: ".zavet/decisions/D-0007-routing.md".into(),
+        body_md: Some("## Decision\nA claim, one part of which is wrong.".into()),
+        corrected_by: Some("D-0014".into()),
+        checks: vec![ZavetCheck {
+            label: "routing never migrates a filed repo".into(),
+            command: "run-the-routing-suite".into(),
+        }],
+        ..Default::default()
+    };
+    let corrector = ZavetDecisionCapture {
+        id: "D-0014".into(),
+        title: Some("Routing consent is per person and per repo".into()),
+        status: Some("active".into()),
+        path: ".zavet/decisions/D-0014-consent.md".into(),
+        ..Default::default()
+    };
+    for cap in [&corrected, &corrector] {
+        state
+            .store
+            .zavet_upsert_decision(REPO, cap, "sha1", None, None)
+            .await
+            .unwrap();
+    }
+
+    let why = |q: &str| {
+        let state = &state;
+        let q = q.to_string();
+        async move {
+            match dirad::control::dispatch(
+                state,
+                Request::ZavetWhy {
+                    query: q,
+                    cwd: None,
+                    repo: Some(REPO.into()),
+                },
+            )
+            .await
+            {
+                Response::ZavetWhy(v) => v,
+                other => panic!("expected ZavetWhy, got {other:?}"),
+            }
+        }
+    };
+
+    // Forward: the corrected record carries the pointer, keeps its status,
+    // and keeps its body. Correction annotates; supersession replaces.
+    let v = why("D-0007").await;
+    assert_eq!(v.decision.corrected_by.as_deref(), Some("D-0014"));
+    assert_eq!(v.decision.status.as_deref(), Some("active"));
+    assert!(
+        v.superseded_by.is_none(),
+        "a correction is not a supersession"
+    );
+    assert!(v.body_md.is_some(), "the corrected record keeps its body");
+    assert_eq!(v.decision.checks.len(), 1);
+    assert_eq!(v.decision.checks[0].command, "run-the-routing-suite");
+
+    // Reverse: the corrector says what it fixes, without either side editing
+    // the other.
+    let v = why("D-0014").await;
+    assert_eq!(v.corrects, vec!["D-0007".to_string()]);
+    assert!(v.decision.corrected_by.is_none());
+    assert!(v.decision.checks.is_empty());
+}
+
+#[tokio::test]
 async fn zavet_why_resolves_specs_and_links_both_ways() {
     let state = test_state().await;
     // A decision plus the living spec that links it.
@@ -266,6 +340,7 @@ async fn zavet_why_resolves_specs_and_links_both_ways() {
         path: ".zavet/specs/capture-pipeline.md".into(),
         body_md: Some("## Overview\nThe sweep batches trailer parsing.".into()),
         content_hash: None,
+        checks: Vec::new(),
     };
     state
         .store

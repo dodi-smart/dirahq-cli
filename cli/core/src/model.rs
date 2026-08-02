@@ -105,4 +105,19 @@ impl EventKind {
             EventKind::PreTool | EventKind::PostTool | EventKind::Stop
         )
     }
+
+    /// Does this event open a span in which the agent is *definitionally* busy?
+    ///
+    /// A `PreTool` is emitted immediately before a tool call runs, and no harness
+    /// emits anything else until it returns — so the gap following a `PreTool`
+    /// **is** the tool call, however long it takes. That is what lets agent
+    /// wall-clock credit a two-hour build instead of discarding it as idle
+    /// (see [`crate::accounting::agent_active_seconds`]).
+    ///
+    /// Deliberately keyed on the *opening* event rather than on a matched
+    /// `PreTool`/`PostTool` pair: a `PostToolUse` hook lost in transit must not
+    /// zero the work it was closing.
+    pub fn opens_agent_span(self) -> bool {
+        matches!(self, EventKind::PreTool)
+    }
 }

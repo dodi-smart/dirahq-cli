@@ -42,6 +42,18 @@ pub fn repo_short(project: &Option<String>) -> String {
     }
 }
 
+/// The KIND column label for a session.
+///
+/// Explicit rather than the enum's `Debug`, which is what previously leaked
+/// `"Manual"` onto the wire and broke every consumer comparing against
+/// `"manual"`. Matches the serde wire spelling.
+pub fn kind_label(k: dira_contract::SessionKind) -> &'static str {
+    match k {
+        dira_contract::SessionKind::Agent => "agent",
+        dira_contract::SessionKind::Manual => "manual",
+    }
+}
+
 /// Truncate `s` to at most `max` display columns, appending `…` when clipped.
 /// `max == 0` yields an empty string; `max == 1` yields just the ellipsis when
 /// the input is longer. Operates on `char`s (good enough for ASCII-ish labels).

@@ -11,9 +11,21 @@ description = "Cross-platform IPC transport for dira <-> dirad: Unix domain sock
 tokio.workspace = true
 
 # `ClientOptions::open`'s `ERROR_PIPE_BUSY` retry loop (see src/listener.rs) needs the
-# raw Win32 error code. `Win32_Foundation` only — no other Win32 surface is touched.
+# raw Win32 error code; the control pipe's security descriptor (src/security.rs) and
+# the elevation self-check (src/elevation.rs) need the token + SDDL surfaces. Feature
+# flags only — `windows-sys` is already a workspace dependency and tokio pulls the
+# same major, so this adds no crates.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation"] }
+windows-sys = { workspace = true, features = [
+    # ERROR_PIPE_BUSY, LocalFree, CloseHandle, HANDLE
+    "Win32_Foundation",
+    # SECURITY_ATTRIBUTES, TOKEN_USER, TOKEN_ELEVATION, GetTokenInformation
+    "Win32_Security",
+    # ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertSidToStringSidW
+    "Win32_Security_Authorization",
+    # OpenProcessToken, GetCurrentProcess
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

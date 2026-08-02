@@ -10,8 +10,8 @@ use crate::control::lock_recover;
 use crate::state::AppState;
 use dira_core::config::ZavetMode;
 use dira_core::protocol::{
-    Response, ZavetDecisionView, ZavetGuardStatView, ZavetSpecView, ZavetSpecWhyView,
-    ZavetStatusView, ZavetWhyView,
+    Response, ZavetCheckView, ZavetDecisionView, ZavetGuardStatView, ZavetSpecView,
+    ZavetSpecWhyView, ZavetStatusView, ZavetWhyView,
 };
 use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
 pub use dira_core::zavet::{parse_guard_event, GuardEventV1, ZAVET_DIR};
@@ -142,6 +142,7 @@ fn spec_view(s: &ZavetSpecRow, stale_commits: Option<u64>) -> ZavetSpecView {
         path: s.path.clone(),
         paths: s.paths.clone(),
         decisions: s.decisions.clone(),
+        checks: s.checks.iter().map(check_view).collect(),
         first_commit: s.first_commit.clone(),
         last_commit: s.last_commit.clone(),
         created_at: s.created_at.clone(),
@@ -195,6 +196,13 @@ async fn spec_staleness(
     .unwrap_or_else(|_| vec![None; n])
 }
 
+fn check_view(c: &dira_core::store::ZavetCheck) -> ZavetCheckView {
+    ZavetCheckView {
+        label: c.label.clone(),
+        command: c.command.clone(),
+    }
+}
+
 fn decision_view(d: &ZavetDecisionRow) -> ZavetDecisionView {
     ZavetDecisionView {
         id: d.id.clone(),
@@ -208,6 +216,8 @@ fn decision_view(d: &ZavetDecisionRow) -> ZavetDecisionView {
         source_session: d.source_session.clone(),
         origin: d.origin.clone(),
         verified: d.verified,
+        corrected_by: d.corrected_by.clone(),
+        checks: d.checks.iter().map(check_view).collect(),
     }
 }
 
@@ -618,6 +628,13 @@ async fn decision_why(
         .zavet_superseded_by(repo, &decision_id)
         .await
         .unwrap_or(None);
+    // Reverse errata link: the records THIS one corrects. The forward
+    // direction rides on the record itself (`corrected_by`).
+    let corrects = state
+        .store
+        .zavet_corrects(repo, &decision_id)
+        .await
+        .unwrap_or_default();
     let commits = state
         .store
         .zavet_commits_for_decision(repo, &decision_id)
@@ -657,6 +674,7 @@ async fn decision_why(
         body_md: decision.body_md.clone(),
         decision: decision_view(&decision),
         superseded_by,
+        corrects,
         commits: commit_views(commits),
         guard_stats: guard_stat_views(stats),
         total_human_seconds,
@@ -756,7 +774,8 @@ async fn price_sessions(
     let mut lines = Vec::with_capacity(session_ids.len());
     for sid in session_ids {
         let raw_human = human_by_session.get(sid).copied().unwrap_or(0);
-        let raw_agent = crate::control::session_agent_seconds(&events, sid, idle);
+        let raw_agent =
+            crate::control::session_agent_evidence(&events, sid, state.config.agent_policy()).1;
         let hist = state
             .store
             .zavet_session_totals(sid)

@@ -25,6 +25,7 @@ use crate::sync::{
 use dira_contract::{KnowledgeEnvelope, KnowledgeRepoStats, SCHEMA_VERSION};
 use dira_core::identity;
 use dira_core::signing::DeviceKey;
+use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
 use dira_core::sync::knowledge::{
     build_knowledge_batches, knowledge_batch_id, parse_knowledge_response, KnowledgeChunk,
     KnowledgeTier, KNOWLEDGE_CHUNK_ITEMS, META_KNOWLEDGE_DECISION_CURSOR,
@@ -432,6 +433,36 @@ async fn meta_put(state: &AppState, key: &str, value: &str) -> Result<(), KError
 /// Per-repo coverage/capture snapshot for every zavet-active repo the daemon
 /// has a working directory for, throttled to once per [`STATS_TTL`] per repo.
 /// Best-effort: a repo that fails to compute is simply omitted this round.
+/// The paths that recorded knowledge claims to cover: active decisions' guard
+/// globs ∪ EVERY spec's paths.
+///
+/// Specs are deliberately not filtered on `verified`. That flag records a
+/// human review of whether a spec matches the code; it is not a statement
+/// about whether the code is documented, and in practice nobody flips it —
+/// across two repos using this daily, every spec sits at `verified: false`,
+/// so gating on it made specs contribute exactly nothing and the metric read
+/// as "guards only" while being labelled coverage.
+///
+/// It was also inconsistent: decisions are counted whenever they are `active`,
+/// regardless of `origin`/`verified`, so an unverified reverse-engineered
+/// decision already counts. Holding specs to a stricter standard than
+/// decisions was an accident of implementation, not a rule anyone stated.
+///
+/// Superseded decisions drop out because a superseded guard enforces nothing —
+/// that IS a statement about the code's current surface, unlike `verified`.
+fn coverage_globs(decisions: &[ZavetDecisionRow], specs: &[ZavetSpecRow]) -> Vec<String> {
+    let mut globs: Vec<String> = Vec::new();
+    for d in decisions {
+        if d.status.as_deref().unwrap_or("active") == "active" {
+            globs.extend(d.guards.iter().cloned());
+        }
+    }
+    for s in specs {
+        globs.extend(s.paths.iter().cloned());
+    }
+    globs
+}
+
 async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
     let dirs: Vec<(String, String)> = match state.repo_dirs.lock() {
         Ok(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -456,22 +487,18 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
                 }
             }
         }
-        // Coverage surface: active guard globs ∪ verified specs' paths.
-        let mut globs: Vec<String> = Vec::new();
-        if let Ok(decisions) = state.store.zavet_decisions_list(&repo).await {
-            for d in decisions {
-                if d.status.as_deref().unwrap_or("active") == "active" {
-                    globs.extend(d.guards);
-                }
-            }
-        }
-        if let Ok(specs) = state.store.zavet_specs_list(&repo).await {
-            for s in specs {
-                if s.verified == Some(true) {
-                    globs.extend(s.paths);
-                }
-            }
-        }
+        // Coverage surface: active guard globs ∪ every spec's paths.
+        let decisions = state
+            .store
+            .zavet_decisions_list(&repo)
+            .await
+            .unwrap_or_default();
+        let specs = state
+            .store
+            .zavet_specs_list(&repo)
+            .await
+            .unwrap_or_default();
+        let globs = coverage_globs(&decisions, &specs);
         let trailer_shas: HashSet<String> = state
             .store
             .zavet_trailer_shas(&repo)
@@ -634,6 +661,65 @@ mod tests {
     fn a_repo_that_adopted_zavet_today_still_has_a_one_day_window() {
         let now = at("2026-07-30T12:00:00Z");
         assert_eq!(effective_window_days(Some("2026-07-30T09:00:00Z"), now), 1);
+    }
+
+    fn decision_row(id: &str, status: &str, guards: &[&str]) -> ZavetDecisionRow {
+        ZavetDecisionRow {
+            id: id.into(),
+            status: Some(status.into()),
+            guards: guards.iter().map(|g| g.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn spec_row(slug: &str, verified: Option<bool>, paths: &[&str]) -> ZavetSpecRow {
+        ZavetSpecRow {
+            slug: slug.into(),
+            verified,
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A spec covers code whether or not a human has reviewed it. `verified`
+    /// records that review, not whether the code is documented — and since
+    /// nobody flips it (every spec in the repos using this sits at `false`),
+    /// gating on it made specs contribute nothing at all while the number was
+    /// still labelled coverage.
+    #[test]
+    fn every_spec_counts_toward_coverage_verified_or_not() {
+        let specs = vec![
+            spec_row("reviewed", Some(true), &["src/a/**"]),
+            spec_row("unreviewed", Some(false), &["src/b/**"]),
+            spec_row("unstated", None, &["src/c/**"]),
+        ];
+        let globs = coverage_globs(&[], &specs);
+        assert_eq!(globs, vec!["src/a/**", "src/b/**", "src/c/**"]);
+    }
+
+    /// The asymmetry that made the old rule wrong: an unverified decision has
+    /// always counted, so holding specs to a stricter bar was an accident.
+    #[test]
+    fn decisions_and_specs_are_held_to_the_same_bar() {
+        let decisions = vec![decision_row("D-0001", "active", &["src/d/**"])];
+        let specs = vec![spec_row("s", Some(false), &["src/s/**"])];
+        assert_eq!(
+            coverage_globs(&decisions, &[]).len(),
+            coverage_globs(&[], &specs).len(),
+            "an unverified spec must contribute exactly what an unverified \
+             decision does"
+        );
+    }
+
+    /// Supersession IS a statement about the current surface, so it still
+    /// filters — a superseded guard enforces nothing.
+    #[test]
+    fn superseded_decisions_drop_out_of_the_coverage_surface() {
+        let decisions = vec![
+            decision_row("D-0001", "active", &["src/live/**"]),
+            decision_row("D-0002", "superseded", &["src/dead/**"]),
+        ];
+        assert_eq!(coverage_globs(&decisions, &[]), vec!["src/live/**"]);
     }
 
     fn capture(id: &str) -> ZavetDecisionCapture {

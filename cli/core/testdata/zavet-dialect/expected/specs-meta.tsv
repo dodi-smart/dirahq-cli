@@ -3,3 +3,4 @@ comment-only-origin	reverse-engineered	med	2026-01-01	Comment-only origin defaul
 defaults-apply	reverse-engineered	low		Only title and paths
 happy-spec	session	high	2026-07-16	Capture pipeline
 no-title-spec	session	med		
+spec-checks	designed	high	2026-08-01	Spec checks are scenarios

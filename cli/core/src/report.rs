@@ -26,7 +26,11 @@ pub struct Report {
 }
 
 /// Build a report from events, de-duplicating human time across all sessions.
-pub fn build(events: &[RawEvent], idle: Duration) -> Report {
+///
+/// `idle` governs human time; `agent` governs agent wall-clock. They are separate
+/// because a gap that means "the human walked away" means "the agent is running a
+/// build" — see [`accounting::AgentPolicy`].
+pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy) -> Report {
     // --- human time: dedup across the whole concurrent set ---
     let signals: Vec<Signal> = events
         .iter()
@@ -46,13 +50,16 @@ pub fn build(events: &[RawEvent], idle: Duration) -> Report {
     // measure the sync/rollup path (`sync::batch`) and the cloud already use, so the
     // local report, the historical rollups folded in by [`build_merged`], and the
     // synced totals all agree.
-    let mut sessions: BTreeMap<&str, (Option<String>, Vec<time::OffsetDateTime>, bool)> =
+    let mut sessions: BTreeMap<&str, (Option<String>, Vec<accounting::AgentSample>, bool)> =
         BTreeMap::new();
     for e in events {
         let entry = sessions
             .entry(e.session_id.as_str())
             .or_insert_with(|| (e.project.clone(), Vec::new(), false));
-        entry.1.push(e.at);
+        entry.1.push(accounting::AgentSample {
+            at: e.at,
+            opens_span: e.kind.opens_agent_span(),
+        });
         if e.kind.is_agent_activity() {
             entry.2 = true;
         }
@@ -62,10 +69,10 @@ pub fn build(events: &[RawEvent], idle: Duration) -> Report {
     }
 
     let mut agent_by_project: BTreeMap<Option<String>, i64> = BTreeMap::new();
-    for (project, times, had_activity) in sessions.values() {
+    for (project, samples, had_activity) in sessions.values() {
         if *had_activity {
             *agent_by_project.entry(project.clone()).or_insert(0) +=
-                accounting::active_seconds(times, idle);
+                accounting::agent_active_seconds(samples, agent);
         }
     }
 
@@ -113,10 +120,11 @@ pub fn build(events: &[RawEvent], idle: Duration) -> Report {
 pub fn build_merged(
     events: &[RawEvent],
     idle: Duration,
+    agent: accounting::AgentPolicy,
     rollups: &[RollupLine],
     rollup_sessions: usize,
 ) -> Report {
-    let mut report = build(events, idle);
+    let mut report = build(events, idle, agent);
     if rollups.is_empty() {
         return report;
     }
@@ -183,7 +191,11 @@ mod tests {
             ev("s2", 40, EventKind::PreTool, "p"),
             ev("s1", 60, EventKind::UserPrompt, "p"),
         ];
-        let r = build(&events, Duration::minutes(5));
+        let r = build(
+            &events,
+            Duration::minutes(5),
+            accounting::AgentPolicy::default(),
+        );
         // Human: gaps 10-20, 20-60 -> 50s, deduped across both sessions.
         assert_eq!(r.total_human_seconds, 50);
         // Agent wall: all gaps are within idle, so idle-trimmed active == the span:
@@ -194,19 +206,47 @@ mod tests {
 
     #[test]
     fn agent_wall_is_idle_trimmed_not_raw_span() {
-        // One session: a burst of activity, a long idle gap (>5min), then a final
-        // burst. The raw last-first span is ~1h, but the wall-clock must count only
-        // the two active bursts — the dead gap is trimmed.
+        // One session: a burst of activity, a long quiet gap (>5min) that is NOT a
+        // tool call, then a final burst. The point being protected is that the raw
+        // last-first span (~1h) is never what gets counted.
         let events = vec![
             ev("s", 0, EventKind::SessionStart, "p"),
             ev("s", 10, EventKind::PreTool, "p"),
             ev("s", 20, EventKind::PostTool, "p"), // burst 1: 0..20 = 20s
-            ev("s", 3600, EventKind::PreTool, "p"), // +1h idle gap (trimmed)
+            ev("s", 3600, EventKind::PreTool, "p"), // +1h quiet, opened by PostTool
             ev("s", 3630, EventKind::PostTool, "p"), // burst 2: 3600..3630 = 30s
         ];
-        let r = build(&events, Duration::minutes(5));
-        // Idle-trimmed active = 20 + 30 = 50s, NOT the ~3630s raw span.
-        assert_eq!(r.total_agent_seconds, 50);
+        let policy = accounting::AgentPolicy::default();
+        let r = build(&events, Duration::minutes(5), policy);
+
+        // 10 (start→pre) + 10 (the tool call) + 300 (the hour of quiet, CLAMPED to
+        // the agent idle ceiling) + 30 (the second tool call) = 350s.
+        //
+        // The quiet gap is clamped rather than discarded so the `watch` dashboard's
+        // live tail can predict this number instead of displaying time that is
+        // later revoked — the clamp-vs-discard asymmetry was the reset users saw.
+        // It is still nothing like the ~3630s raw span, which is what this test
+        // has always existed to rule out.
+        assert_eq!(r.total_agent_seconds, 350);
+        assert!(r.total_agent_seconds < 3630 / 10);
+    }
+
+    /// The regression that motivated the agent policy: a harness emits nothing
+    /// while a tool runs, so the gap after a `PreTool` IS the tool call. Under the
+    /// old shared-idle rule a two-hour build banked zero.
+    #[test]
+    fn a_long_tool_call_is_credited_not_discarded() {
+        let two_hours = 2 * 60 * 60;
+        let events = vec![
+            ev("s", 0, EventKind::PreTool, "p"),
+            ev("s", two_hours, EventKind::PostTool, "p"),
+        ];
+        let r = build(
+            &events,
+            Duration::minutes(5),
+            accounting::AgentPolicy::default(),
+        );
+        assert_eq!(r.total_agent_seconds, two_hours);
     }
 
     /// Compaction is lossless for reports: the full raw report equals the merged
@@ -258,7 +298,7 @@ mod tests {
         for e in &all {
             store.append(e).await.unwrap();
         }
-        let raw_report = build(&all, idle);
+        let raw_report = build(&all, idle, accounting::AgentPolicy::default());
 
         // Compact the old, synced portion, then merge rollups with the survivors.
         store
@@ -268,7 +308,13 @@ mod tests {
         let survivors = store.events_since(None).await.unwrap();
         let rollups = store.rollup_totals_since(None).await.unwrap();
         let rollup_sessions = store.rollup_session_count(None).await.unwrap();
-        let merged = build_merged(&survivors, idle, &rollups, rollup_sessions);
+        let merged = build_merged(
+            &survivors,
+            idle,
+            accounting::AgentPolicy::default(),
+            &rollups,
+            rollup_sessions,
+        );
 
         assert_eq!(merged.total_human_seconds, raw_report.total_human_seconds);
         assert_eq!(merged.total_agent_seconds, raw_report.total_agent_seconds);

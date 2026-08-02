@@ -115,11 +115,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
-      - name: contract schema is up to date
+      # Diff EVERY schema emit-schema writes, not just attestation. The cloud
+      # generates its Zod/TS from these files, so a stale one ships a wrong
+      # boundary downstream while this job stays green — which is exactly the
+      # hole knowledge.schema.json sat in: a KnowledgeDecision/KnowledgeSpec
+      # field addition leaves attestation.schema.json byte-identical.
+      - name: contract schemas are up to date
         run: |
           cargo run -q -p dira-contract --bin emit-schema
-          git diff --exit-code contract/attestation.schema.json \
-            || (echo "contract/attestation.schema.json is stale — run 'just contract-schema'"; exit 1)
+          git diff --exit-code contract/*.schema.json \
+            || (echo "a contract schema is stale — run 'just contract-schema'"; exit 1)
       - name: signing vector fixture is up to date
         run: |
           cargo run -q -p dira-core --bin sign_vector > contract/testdata/signing-vector.json

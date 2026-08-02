@@ -73,6 +73,13 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 - Only metadata crosses ingestion; hook payload content fields are ignored.
 - Every unknown event/payload is a silent ack — never an error to the
   harness, never a retry loop.
+- `dira hook <id>` always exits 0 and writes nothing to stdout. That is the
+  *harness* contract, and it is unchanged. A **transport** failure (the daemon
+  could not be reached, or refused the connection) additionally leaves a durable
+  local breadcrumb that `dira status` surfaces — "never tell the harness" had
+  been implemented as "never tell anyone", so a dead capture channel was
+  indistinguishable from a healthy one for days. A **semantic** non-result
+  (unknown harness, unaccounted event kind) stays silent everywhere. See D-0016.
 - The contract `Harness` enum is the wire's source of truth; schema artifacts
   are regenerated, never hand-edited.
 

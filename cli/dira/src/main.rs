@@ -75,6 +75,16 @@ Getting started:
 Run `dira help <command>` for details and examples of each command."
 )]
 struct Cli {
+    /// Print the daemon's raw JSON response instead of the human table.
+    ///
+    /// This is the machine-readable surface: the daemon's `Response` verbatim,
+    /// one JSON object on stdout. GUIs and scripts consume it by running `dira`
+    /// rather than reimplementing the control protocol — so socket discovery,
+    /// the busy budget, and version-skew handling all stay in one place instead
+    /// of being duplicated (and drifting) in every client.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -965,6 +975,9 @@ async fn main() -> Result<()> {
     };
 
     let resp = client::send(&config.socket_path, &req).await?;
+    if cli.json {
+        return emit_json(&resp);
+    }
     let ok = render::print(&resp);
     if is_zavet_status {
         if let Some(line) = zavet_install::status_line() {
@@ -1034,6 +1047,19 @@ async fn forward_stdin(
         Ok(Ok(_)) => hook_health::record_success(),
         Ok(Err(e)) => note_hook_failure(label, &e.to_string()),
         Err(_) => note_hook_failure(label, "timed out reaching dirad"),
+    }
+    Ok(())
+}
+
+/// Print a daemon response as one JSON object on stdout (`--json`).
+///
+/// Exits non-zero on `Response::Error` exactly as the human renderer does, so a
+/// caller can branch on the exit status without parsing — but the error message
+/// is still in the JSON, so it can also report it properly.
+fn emit_json(resp: &Response) -> Result<()> {
+    println!("{}", serde_json::to_string(resp)?);
+    if matches!(resp, Response::Error { .. }) {
+        std::process::exit(1);
     }
     Ok(())
 }

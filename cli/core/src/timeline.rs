@@ -325,10 +325,24 @@ pub fn page(units: Vec<WorkUnit>, floor_ms: i64, ceiling_ms: i64) -> Vec<WorkUni
         .collect()
 }
 
-/// `project \0 branch \0 identity` — the grouping key, missing parts as `-`.
+/// Field separator inside [`WorkUnit::key`] and the grouping key.
+///
+/// ASCII Unit Separator, deliberately NOT the cloud's `\0`. The cloud's key never
+/// leaves the process that built it; this one is serialized to JSON and parsed by
+/// other languages, and a NUL inside a string is a live hazard for any C-adjacent
+/// consumer (the desktop app's Zig core among them). US is equally impossible in
+/// a repo ref, branch name or email, and survives a round trip through JSON,
+/// logs, and a debugger intact.
+///
+/// The separator is an encoding detail, not part of the cross-language contract:
+/// the grouping vector pins which sessions land in which unit, never how the key
+/// spells itself. See D-0018.
+const KEY_SEP: char = '\u{1f}';
+
+/// `project ␟ branch ␟ identity` — the grouping key, missing parts as `-`.
 fn group_key(s: &SessionSummary) -> String {
     format!(
-        "{}\0{}\0{}",
+        "{}{KEY_SEP}{}{KEY_SEP}{}",
         s.project.as_deref().unwrap_or("-"),
         s.branch.as_deref().unwrap_or("-"),
         s.identity.to_lowercase(),
@@ -344,7 +358,7 @@ fn build_unit(members: &[SessionSummary]) -> WorkUnit {
 
     WorkUnit {
         key: format!(
-            "{}\0{}\0{}\0{}",
+            "{}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}",
             head.project.as_deref().unwrap_or("-"),
             head.branch.as_deref().unwrap_or("-"),
             head.identity.to_lowercase(),

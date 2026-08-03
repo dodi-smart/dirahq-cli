@@ -21,6 +21,13 @@ rule, the group sort and the page-boundary filter all mirror
 languages assert the same fixture — Rust in `timeline::tests`, TypeScript in the
 cloud's `session-grouping-vector.test.ts` (vendored by `just contract-pull`).
 
+**One deliberate divergence**: the key's field separator is ASCII Unit Separator
+(`\u{1f}`), not the cloud's `\0`. The cloud's key never leaves the process that
+built it; this one is serialized to JSON and parsed by other languages, and a NUL
+inside a string is a hazard for any C-adjacent consumer — the desktop app's Zig
+core included. What is pinned across languages is which sessions land in which
+unit, never how the key spells itself, so this changes nothing the fixture tests.
+
 ## Why
 
 The desktop app reads the daemon; the dashboard reads the cloud. Both show "your

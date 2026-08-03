@@ -3,6 +3,7 @@
 //! - [`model`]: the normalized event model (the source of truth).
 //! - [`accounting`]: de-duplicated, idle-trimmed human-time math (property-tested).
 //! - [`report`]: on-demand local reports computed from the event log.
+//! - [`timeline`]: work-unit assembly + paging, ported from the cloud (D-0019).
 //! - [`store`]: the append-only SQLite store.
 //! - [`project`]: working-dir → canonical repo + identity resolution.
 //! - [`config`]: layered configuration.
@@ -17,6 +18,7 @@ pub mod report;
 pub mod signing;
 pub mod store;
 pub mod sync;
+pub mod timeline;
 pub mod tokens;
 pub mod zavet;
 

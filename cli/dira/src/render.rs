@@ -11,10 +11,11 @@ use crate::format::{
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{
-    any_engaged, LiveState, Response, SessionView, StatusView, ZavetCheckView, ZavetDecisionView,
-    ZavetGuardStatView, ZavetStatusView, ZavetWhyView,
+    any_engaged, AnalyticsBreakdown, LiveState, Response, SessionView, StatusView, ZavetCheckView,
+    ZavetDecisionView, ZavetGuardStatView, ZavetStatusView, ZavetWhyView,
 };
-use dira_core::report::Report;
+use dira_core::report::{ProjectReport, Report};
+use dira_core::timeline::WorkUnit;
 use time::OffsetDateTime;
 
 /// The width the layout was originally hand-tuned for. Used as the fallback when
@@ -129,6 +130,27 @@ pub fn print(resp: &Response) -> bool {
         }
         Response::Report(r) => {
             print_report(r, &Layout::for_width(terminal_cols()));
+            true
+        }
+        Response::Timeline {
+            units,
+            cursor,
+            earlier_sessions,
+        } => {
+            print_timeline(
+                units,
+                cursor.as_deref(),
+                *earlier_sessions,
+                &Layout::for_width(terminal_cols()),
+            );
+            true
+        }
+        Response::Analytics(a) => {
+            print_analytics(a, &Layout::for_width(terminal_cols()));
+            true
+        }
+        Response::Projects { projects } => {
+            print_projects(projects, &Layout::for_width(terminal_cols()));
             true
         }
         Response::Nuked { events, tokens } => {
@@ -1274,6 +1296,120 @@ fn print_report(r: &Report, layout: &Layout) {
     );
     println!("{}", theme::paint(&total, Role::Ink));
     println!("  ({} session(s))", r.session_count);
+}
+
+/// One page of the Sessions timeline: work-units newest first, each showing how
+/// many sessions it collapses.
+fn print_timeline(units: &[WorkUnit], cursor: Option<&str>, earlier: u64, layout: &Layout) {
+    if units.is_empty() {
+        // Not the same as "no history": a page can be legitimately empty and still
+        // have older work behind it, which is exactly why the cursor is the stop
+        // signal rather than an empty page.
+        println!("  {}", theme::paint("no work in this window", Role::Faint));
+    } else {
+        let pw = layout.report_project;
+        let header = format!(
+            "  {:<16} {:<pw$} {:>6} {:>10} {:>10}",
+            "WHEN", "PROJECT", "N", "HUMAN", "AGENT"
+        );
+        println!("{}", theme::paint(&header, Role::Muted));
+        for u in units {
+            let when = u.started_at.get(0..16).unwrap_or(&u.started_at);
+            let label = match &u.branch {
+                Some(b) => format!("{} @{b}", project_label(&u.project)),
+                None => project_label(&u.project),
+            };
+            println!(
+                "  {:<16} {:<pw$} {:>6} {:>10} {:>10}",
+                when,
+                truncate(&label, pw),
+                u.count,
+                hms(u.human_seconds),
+                hms(u.agent_seconds),
+            );
+        }
+    }
+    if cursor.is_some() {
+        println!(
+            "  {}",
+            theme::paint(
+                &format!("{earlier} earlier session(s) — pass --before to walk back"),
+                Role::Faint,
+            )
+        );
+    }
+}
+
+/// An analytics breakdown. The cost column is always labelled estimated — the
+/// daemon's bundled pricing table is an approximation, and the response says so
+/// (`cost_is_estimated`) precisely so this renderer cannot quietly imply otherwise.
+fn print_analytics(a: &AnalyticsBreakdown, layout: &Layout) {
+    if a.buckets.is_empty() {
+        println!("  {}", theme::paint("no activity in this window", Role::Faint));
+        return;
+    }
+    let pw = layout.report_project;
+    let header = format!(
+        "  {:<pw$} {:>10} {:>10} {:>12} {:>10}",
+        "BUCKET", "HUMAN", "AGENT", "TOKENS", "COST~"
+    );
+    println!("{}", theme::paint(&header, Role::Muted));
+    for b in &a.buckets {
+        let tokens = b.input_tokens + b.output_tokens + b.cache_read_tokens + b.cache_create_tokens;
+        println!(
+            "  {:<pw$} {:>10} {:>10} {:>12} {:>10}",
+            truncate(&project_label(&b.key), pw),
+            hms(b.human_seconds),
+            hms(b.agent_wall_seconds),
+            tokens,
+            format!("${:.2}", b.est_cost_usd),
+        );
+    }
+    let total = format!(
+        "  {:<pw$} {:>10} {:>10} {:>12} {:>10}",
+        "— total —",
+        hms(a.total_human_seconds),
+        hms(a.total_agent_wall_seconds),
+        "",
+        format!("${:.2}", a.total_est_cost_usd),
+    );
+    println!("{}", theme::paint(&total, Role::Ink));
+    if a.cost_is_estimated {
+        println!(
+            "  {}",
+            theme::paint(
+                "~ cost is estimated from a bundled pricing table, not billed usage",
+                Role::Faint,
+            )
+        );
+    }
+}
+
+/// Per-project rollups over a caller-chosen window — `print_report`'s table
+/// without the session count, which this request does not carry.
+fn print_projects(projects: &[ProjectReport], layout: &Layout) {
+    if projects.is_empty() {
+        println!("  {}", theme::paint("no time tracked", Role::Faint));
+        return;
+    }
+    let pw = layout.report_project;
+    let header = format!("  {:<pw$} {:>10} {:>10}", "PROJECT", "HUMAN", "AGENT");
+    println!("{}", theme::paint(&header, Role::Muted));
+    for p in projects {
+        println!(
+            "  {:<pw$} {:>10} {:>10}",
+            truncate(&project_label(&p.project), pw),
+            hms(p.human_seconds),
+            hms(p.agent_wall_seconds),
+        );
+    }
+    let total = format!(
+        "  {:<pw$} {:>10} {:>10}",
+        "— total —",
+        hms(projects.iter().map(|p| p.human_seconds).sum()),
+        hms(projects.iter().map(|p| p.agent_wall_seconds).sum()),
+    );
+    println!("{}", theme::paint(&total, Role::Ink));
 }
 
 #[cfg(test)]

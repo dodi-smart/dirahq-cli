@@ -125,6 +125,44 @@ impl Store {
         rows.iter().map(row_to_event).collect()
     }
 
+    /// Load events in the half-open wall-clock window `[from, to)`, ordered by
+    /// time. Both bounds are RFC3339 strings, compared as text — the stored `at`
+    /// column is always UTC RFC3339, so lexicographic order is chronological.
+    ///
+    /// Distinct from [`Self::events_between`], which windows by event *id* for the
+    /// sync cursor. The timeline is a wall-clock surface: a page is "this week",
+    /// not "these ULIDs", and it needs the half-open `[from, to)` shape the paging
+    /// boundary rule is defined in terms of.
+    pub async fn events_in_window(&self, from: &str, to: &str) -> Result<Vec<RawEvent>, Error> {
+        let rows = sqlx::query("SELECT * FROM events WHERE at >= ?1 AND at < ?2 ORDER BY at ASC")
+            .bind(from)
+            .bind(to)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_event).collect()
+    }
+
+    /// How many distinct retained sessions started strictly before `before`.
+    ///
+    /// Counts SESSIONS, not work-units, and deliberately so: a unit count would
+    /// require clustering, which would require loading the very rows this number
+    /// exists to let a caller avoid loading.
+    ///
+    /// Bounded by retention like everything else here — a compacted session is
+    /// gone from `events`, so this is "how much retained history is left", which
+    /// is exactly what a "load more" affordance should be gated on.
+    pub async fn count_sessions_before(&self, before: &str) -> Result<u64, Error> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM (\
+               SELECT session_id FROM events GROUP BY session_id HAVING MIN(at) < ?1\
+             )",
+        )
+        .bind(before)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("n") as u64)
+    }
+
     /// Load events whose id is strictly greater than `since` and ≤ `until`,
     /// ordered by id. Both bounds are event ids (ULIDs, lexicographically
     /// monotonic), so this is the sync window `(cursor, until]`. `since = None`
@@ -313,6 +351,30 @@ impl Store {
                 .await?
             }
         };
+        rows.iter().map(row_to_token_row).collect()
+    }
+
+    /// Load per-row token usage in the half-open window `[from, to)`.
+    ///
+    /// Deliberately a different shape from [`Self::token_usage_between`], which is
+    /// `(since, until]` because it follows the sync cursor. Analytics buckets time
+    /// and tokens together, so both halves must agree about which side of a bound
+    /// is inclusive — otherwise a row exactly on the boundary is counted by one
+    /// half and not the other, and the totals disagree with each other by one turn.
+    pub async fn token_usage_in_window(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<TokenRow>, Error> {
+        let rows = sqlx::query(
+            "SELECT id, session_id, project, model, input, output, \
+             cache_read, cache_create, est_cost, at \
+             FROM token_usage WHERE at >= ?1 AND at < ?2 ORDER BY at ASC",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(row_to_token_row).collect()
     }
 

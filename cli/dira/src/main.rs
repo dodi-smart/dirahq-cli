@@ -19,7 +19,7 @@ mod zavet_install;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
-use dira_core::protocol::{ReportScope, Request, Response, StopSelector};
+use dira_core::protocol::{AnalyticsGrouping, ReportScope, Request, Response, StopSelector};
 use dira_core::Config;
 use std::io::Read;
 use std::path::PathBuf;
@@ -248,6 +248,65 @@ Examples:
         /// Only this repo/project (any scope).
         #[arg(long, value_name = "REPO")]
         project: Option<String>,
+    },
+    /// Walk the work timeline: sessions clustered into work-units, newest first.
+    #[command(
+        long_about = "\
+One page of the work timeline. Sessions on the same repo, branch and identity
+are clustered into work-units when they happen within 4h of each other, so a
+burst of short sessions reads as one piece of work instead of twenty rows.
+
+Pages are keyset-paginated on session start: each page reports how many earlier
+sessions remain, and `--before` walks back using the previous page's floor. How
+far back you can walk is bounded by local retention — an unlinked daemon never
+compacts, so an offline-only install keeps its whole history.",
+        after_help = "\
+Examples:
+  dira timeline                              the last 7 days
+  dira timeline --days 1                     today
+  dira timeline --before 2026-01-05T00:00:00Z   the week before that"
+    )]
+    Timeline {
+        /// Page width in days (default 7).
+        #[arg(long, value_name = "N")]
+        days: Option<i64>,
+        /// Walk back: the previous page's floor, as RFC3339.
+        #[arg(long, value_name = "RFC3339")]
+        before: Option<String>,
+    },
+    /// Time + token-cost rollups over a window.
+    #[command(
+        long_about = "\
+Bucket a window of work by day, project, model, or harness. Cost is ESTIMATED
+from a pricing table bundled with the daemon — it is a useful signal, not an
+invoice, and never leaves this machine.
+
+Note that a model bucket carries tokens and cost but no time: a model does not
+spend human minutes, only token turns, so time is reported under the other
+groupings.",
+        after_help = "\
+Examples:
+  dira analytics --days 7                    the last week, by day
+  dira analytics --days 30 --by project      last 30 days, per repo
+  dira analytics --days 7 --by model         what each model cost"
+    )]
+    Analytics {
+        /// Window width in days, counting back from now (default 7).
+        #[arg(long, value_name = "N")]
+        days: Option<i64>,
+        /// Bucket by: `day` (default), `project`, `model`, or `harness`.
+        #[arg(long = "by", value_name = "FIELD")]
+        by: Option<String>,
+    },
+    /// Per-project time rollups over a window.
+    #[command(after_help = "\
+Examples:
+  dira projects              the last 7 days
+  dira projects --days 30    the last 30 days")]
+    Projects {
+        /// Window width in days, counting back from now (default 7).
+        #[arg(long, value_name = "N")]
+        days: Option<i64>,
     },
     /// Wire a harness's hooks to report to the daemon (default: claude).
     #[command(
@@ -841,6 +900,24 @@ async fn main() -> Result<()> {
             };
             Request::Report { scope }
         }
+        Command::Timeline { days, before } => Request::Timeline { before, days },
+        Command::Analytics { days, by } => {
+            let (from, to) = window_back(days.unwrap_or(7));
+            let group_by = match by.as_deref() {
+                Some("project") => AnalyticsGrouping::Project,
+                Some("model") => AnalyticsGrouping::Model,
+                Some("harness") => AnalyticsGrouping::Harness,
+                // Anything else (including `day` and nothing) buckets by day. The
+                // daemon is the one place that validates a window, so an unknown
+                // `--by` degrades to the default rather than failing the call.
+                _ => AnalyticsGrouping::Day,
+            };
+            Request::Analytics { from, to, group_by }
+        }
+        Command::Projects { days } => {
+            let (from, to) = window_back(days.unwrap_or(7));
+            Request::Projects { from, to }
+        }
         Command::Zavet { action } => match action {
             ZavetAction::Status { project } => Request::ZavetStatus { cwd, repo: project },
             ZavetAction::Why { query, project } => Request::ZavetWhy {
@@ -959,6 +1036,22 @@ async fn forward_stdin(
         Err(_) => note_hook_failure(label, "timed out reaching dirad"),
     }
     Ok(())
+}
+
+/// A `[from, to)` window of `days` ending now, as RFC3339 — the shape the
+/// `analytics`/`projects` requests take.
+///
+/// Deliberately a rolling window from this instant, not calendar-aligned: the
+/// daemon owns the day boundary (it knows the reporting timezone) and applies it
+/// when bucketing, so the CLI must not impose a second, possibly different one.
+fn window_back(days: i64) -> (String, String) {
+    let fmt = &time::format_description::well_known::Rfc3339;
+    let to = time::OffsetDateTime::now_utc();
+    let from = to - time::Duration::days(days.max(1));
+    (
+        from.format(fmt).unwrap_or_default(),
+        to.format(fmt).unwrap_or_default(),
+    )
 }
 
 fn note_hook_failure(label: &str, reason: &str) {

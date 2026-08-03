@@ -1,0 +1,156 @@
+{
+  "$comment": "Cross-language parity fixture for Sessions-timeline work-unit assembly (cloud D-0019). Asserted by cli/core/src/timeline.rs (Rust, the offline daemon) and by the cloud's sessions.pagination test (TypeScript, the hosted dashboard). Both must produce the same units for the same sessions — if they diverge, the desktop app and the web dashboard report different totals for the same week and neither is identifiably wrong. Every field here is metadata that already rides the attestation wire (repoCanonical, branch, identityEmail, prompts, timestamps); nothing content-bearing appears, per D-0001. Vendored into dirahq-cloud by `just contract-pull`.",
+  "clusterGapHours": 4,
+  "sessionLookbackHours": 12,
+  "sessions": [
+    {
+      "id": "s1",
+      "project": "github.com/acme/api",
+      "branch": "main",
+      "identity": "u1@example.com",
+      "startedAt": "2026-01-05T09:00:00Z",
+      "engagedSeconds": 600,
+      "$comment": "start of a chain"
+    },
+    {
+      "id": "s2",
+      "project": "github.com/acme/api",
+      "branch": "main",
+      "identity": "u1@example.com",
+      "startedAt": "2026-01-05T10:00:00Z",
+      "engagedSeconds": 900,
+      "$comment": "1h after s1 — same cluster"
+    },
+    {
+      "id": "s3",
+      "project": "github.com/acme/api",
+      "branch": "main",
+      "identity": "u1@example.com",
+      "startedAt": "2026-01-05T14:00:00Z",
+      "engagedSeconds": 1200,
+      "$comment": "EXACTLY 4h after s2. The gap comparison is inclusive, so this is still the same cluster — and it is measured against the previous member, not the chain head. An off-by-one in either rule flips this row."
+    },
+    {
+      "id": "s4",
+      "project": "github.com/acme/api",
+      "branch": "main",
+      "identity": "u1@example.com",
+      "startedAt": "2026-01-05T19:00:00Z",
+      "engagedSeconds": 300,
+      "$comment": "5h after s3 — exceeds the gap, so a new cluster"
+    },
+    {
+      "id": "s5",
+      "project": "github.com/acme/api",
+      "branch": "feat/x",
+      "identity": "u1@example.com",
+      "startedAt": "2026-01-05T09:30:00Z",
+      "engagedSeconds": 100,
+      "$comment": "same repo + identity, different branch — never joins s1's unit"
+    },
+    {
+      "id": "s6",
+      "project": "github.com/acme/api",
+      "branch": "main",
+      "identity": "u2@example.com",
+      "startedAt": "2026-01-05T09:15:00Z",
+      "engagedSeconds": 200,
+      "$comment": "same repo + branch, different identity — separate unit"
+    },
+    {
+      "id": "s7",
+      "project": "github.com/acme/api",
+      "branch": null,
+      "identity": "u1@example.com",
+      "startedAt": "2026-01-05T09:45:00Z",
+      "engagedSeconds": 300,
+      "$comment": "branchless (detached HEAD) — keys on '-', so it does not merge into main"
+    },
+    {
+      "id": "s8",
+      "project": null,
+      "branch": "main",
+      "identity": "u1@example.com",
+      "startedAt": "2026-01-05T11:00:00Z",
+      "engagedSeconds": 400,
+      "$comment": "unresolved project — keys on '-', groups with unresolved work only"
+    }
+  ],
+  "expectedUnits": [
+    {
+      "headStartedAt": "2026-01-05T19:00:00Z",
+      "project": "github.com/acme/api",
+      "branch": "main",
+      "identity": "u1@example.com",
+      "count": 1,
+      "engagedSeconds": 300,
+      "members": ["s4"]
+    },
+    {
+      "headStartedAt": "2026-01-05T14:00:00Z",
+      "project": "github.com/acme/api",
+      "branch": "main",
+      "identity": "u1@example.com",
+      "count": 3,
+      "engagedSeconds": 2700,
+      "members": ["s3", "s2", "s1"],
+      "$comment": "members newest-first; the head is s3, NOT the oldest member"
+    },
+    {
+      "headStartedAt": "2026-01-05T11:00:00Z",
+      "project": null,
+      "branch": "main",
+      "identity": "u1@example.com",
+      "count": 1,
+      "engagedSeconds": 400,
+      "members": ["s8"]
+    },
+    {
+      "headStartedAt": "2026-01-05T09:45:00Z",
+      "project": "github.com/acme/api",
+      "branch": null,
+      "identity": "u1@example.com",
+      "count": 1,
+      "engagedSeconds": 300,
+      "members": ["s7"]
+    },
+    {
+      "headStartedAt": "2026-01-05T09:30:00Z",
+      "project": "github.com/acme/api",
+      "branch": "feat/x",
+      "identity": "u1@example.com",
+      "count": 1,
+      "engagedSeconds": 100,
+      "members": ["s5"]
+    },
+    {
+      "headStartedAt": "2026-01-05T09:15:00Z",
+      "project": "github.com/acme/api",
+      "branch": "main",
+      "identity": "u2@example.com",
+      "count": 1,
+      "engagedSeconds": 200,
+      "members": ["s6"]
+    }
+  ],
+  "pages": [
+    {
+      "name": "newer",
+      "floor": "2026-01-05T12:00:00Z",
+      "ceiling": "2026-01-06T00:00:00Z",
+      "expectedHeads": ["2026-01-05T19:00:00Z", "2026-01-05T14:00:00Z"]
+    },
+    {
+      "name": "older",
+      "floor": "2026-01-05T00:00:00Z",
+      "ceiling": "2026-01-05T12:00:00Z",
+      "expectedHeads": [
+        "2026-01-05T11:00:00Z",
+        "2026-01-05T09:45:00Z",
+        "2026-01-05T09:30:00Z",
+        "2026-01-05T09:15:00Z"
+      ],
+      "$comment": "The s1+s2+s3 unit has two members (09:00, 10:00) inside this tile, but its head is at 14:00 — so the newer page owns it and this page must emit NOTHING for it. Emitting a 2-session fragment here is exactly the double-count D-0019 exists to prevent."
+    }
+  ]
+}

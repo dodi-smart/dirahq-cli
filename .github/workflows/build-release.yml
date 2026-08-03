@@ -252,6 +252,7 @@ jobs:
           gh release upload "${{ needs.resolve.outputs.tag }}" \
             contract/attestation.schema.json \
             contract/testdata/signing-vector.json \
+            contract/testdata/session-grouping-vector.json \
             install.sh \
             install.ps1 \
             --clobber

@@ -12,10 +12,11 @@ use dira_core::accounting;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::project;
 use dira_core::protocol::{
-    BillingView, ComputeView, ReportScope, Request, Response, SessionView, StatusView,
-    StopSelector, SyncHealthView, WriterHealthView,
+    AnalyticsBreakdown, AnalyticsBucket, AnalyticsGrouping, BillingView, ComputeView, ReportScope,
+    Request, Response, SessionView, StatusView, StopSelector, SyncHealthView, WriterHealthView,
 };
 use dira_core::report;
+use dira_core::timeline;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use time::{Duration, OffsetDateTime};
@@ -96,6 +97,9 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             cwd,
         } => log(state, duration_secs, project, note, activity, label, cwd).await,
         Request::Report { scope } => report_cmd(state, scope).await,
+        Request::Timeline { before, days } => timeline_cmd(state, before, days).await,
+        Request::Analytics { from, to, group_by } => analytics_cmd(state, from, to, group_by).await,
+        Request::Projects { from, to } => projects_cmd(state, from, to).await,
         Request::IngestHook { harness, payload } => ingest_hook(state, harness, payload).await,
         Request::Nuke => nuke(state).await,
         Request::DaemonInfo => daemon_info(state),
@@ -506,6 +510,236 @@ async fn report_cmd(state: &AppState, scope: ReportScope) -> Response {
         &rollups,
         rollup_sessions,
     ))
+}
+
+/// RFC3339, the one format every timestamp on this protocol uses.
+fn rfc3339(t: OffsetDateTime) -> String {
+    t.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+fn parse_rfc3339(s: &str) -> Result<OffsetDateTime, String> {
+    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .map_err(|e| format!("not an RFC3339 timestamp: {s} ({e})"))
+}
+
+/// One page of the Sessions timeline (see [`timeline`] and the cloud's D-0019).
+///
+/// `before` is the previous page's cursor; without it the page ends at now.
+/// Consecutive pages tile with no gap (`ceiling(N+1) == floor(N)`), which is what
+/// makes the head-in-`[floor, ceiling)` filter claim every unit exactly once.
+async fn timeline_cmd(state: &AppState, before: Option<String>, days: Option<i64>) -> Response {
+    let ceiling = match before.as_deref() {
+        Some(s) => match parse_rfc3339(s) {
+            Ok(t) => t,
+            Err(message) => return Response::Error { message },
+        },
+        None => OffsetDateTime::now_utc(),
+    };
+    let days = days.unwrap_or(timeline::PAGE_DAYS).max(1);
+    let floor = ceiling - Duration::days(days);
+
+    // Padded on BOTH ends: a unit straddling either boundary must be visible
+    // whole, so the page that owns its head assembles it complete and the
+    // neighbouring page can defer instead of re-clustering a fragment.
+    let events = state
+        .store
+        .events_in_window(
+            &rfc3339(floor - timeline::SESSION_LOOKBACK),
+            &rfc3339(ceiling + timeline::SESSION_LOOKBACK),
+        )
+        .await
+        .unwrap_or_default();
+
+    let sessions =
+        timeline::summarize_sessions(&events, state.config.idle(), state.config.agent_policy());
+    let units = timeline::page(
+        timeline::assemble_work_units(&sessions),
+        timeline::epoch_ms(floor),
+        timeline::epoch_ms(ceiling),
+    );
+
+    let earlier_sessions = state
+        .store
+        .count_sessions_before(&rfc3339(floor))
+        .await
+        .unwrap_or(0);
+
+    Response::Timeline {
+        units,
+        // Advance on the COUNT, never on whether this page happened to be empty:
+        // a quiet week is still a page, and stopping there would silently truncate
+        // history at the first gap.
+        cursor: (earlier_sessions > 0).then(|| rfc3339(floor)),
+        earlier_sessions,
+    }
+}
+
+/// Time + token-cost rollups over an explicit window.
+async fn analytics_cmd(
+    state: &AppState,
+    from: String,
+    to: String,
+    group_by: AnalyticsGrouping,
+) -> Response {
+    let (from_t, to_t) = match (parse_rfc3339(&from), parse_rfc3339(&to)) {
+        (Ok(f), Ok(t)) => (f, t),
+        (Err(message), _) | (_, Err(message)) => return Response::Error { message },
+    };
+    if to_t <= from_t {
+        return Response::Error {
+            message: format!("empty window: `to` ({to}) is not after `from` ({from})"),
+        };
+    }
+    let (from_s, to_s) = (rfc3339(from_t), rfc3339(to_t));
+
+    let events = state
+        .store
+        .events_in_window(&from_s, &to_s)
+        .await
+        .unwrap_or_default();
+    let tokens = state
+        .store
+        .token_usage_in_window(&from_s, &to_s)
+        .await
+        .unwrap_or_default();
+
+    let sessions =
+        timeline::summarize_sessions(&events, state.config.idle(), state.config.agent_policy());
+
+    // Session id → its bucket key, so a token row (which knows only its session)
+    // lands in the same bucket as the time that produced it.
+    let day_offset = if state.config.report_local_day {
+        crate::local_offset().unwrap_or(time::UtcOffset::UTC)
+    } else {
+        time::UtcOffset::UTC
+    };
+
+    let mut buckets: std::collections::BTreeMap<Option<String>, AnalyticsBucket> =
+        std::collections::BTreeMap::new();
+    let mut key_of_session: std::collections::HashMap<&str, Option<String>> =
+        std::collections::HashMap::new();
+
+    for s in &sessions {
+        let key = match group_by {
+            AnalyticsGrouping::Day => Some(day_key(&s.started_at, day_offset)),
+            AnalyticsGrouping::Project => s.project.clone(),
+            AnalyticsGrouping::Harness => Some(harness_key(s.harness)),
+            // A model does not do human time — only token turns carry a model, so
+            // model buckets are populated entirely from the token side below.
+            AnalyticsGrouping::Model => None,
+        };
+        key_of_session.insert(s.session_id.as_str(), key.clone());
+        if group_by == AnalyticsGrouping::Model {
+            continue;
+        }
+        let b = buckets.entry(key.clone()).or_insert_with(|| new_bucket(key));
+        b.human_seconds += s.human_seconds;
+        b.agent_wall_seconds += s.agent_seconds;
+    }
+
+    for t in &tokens {
+        let key = match group_by {
+            AnalyticsGrouping::Day => Some(day_key(&t.at, day_offset)),
+            AnalyticsGrouping::Model => Some(t.model.clone()),
+            // Prefer the token row's own project, but fall back to its session's:
+            // a turn captured before the repo resolved still belongs to the work
+            // that produced it.
+            AnalyticsGrouping::Project => t.project.clone().or_else(|| {
+                key_of_session
+                    .get(t.session_id.as_str())
+                    .cloned()
+                    .flatten()
+            }),
+            AnalyticsGrouping::Harness => key_of_session
+                .get(t.session_id.as_str())
+                .cloned()
+                .flatten(),
+        };
+        let b = buckets.entry(key.clone()).or_insert_with(|| new_bucket(key));
+        b.input_tokens += t.input;
+        b.output_tokens += t.output;
+        b.cache_read_tokens += t.cache_read;
+        b.cache_create_tokens += t.cache_create;
+        b.est_cost_usd += t.est_cost_usd.unwrap_or(0.0);
+    }
+
+    let buckets: Vec<AnalyticsBucket> = buckets.into_values().collect();
+    Response::Analytics(AnalyticsBreakdown {
+        group_by,
+        from: from_s,
+        to: to_s,
+        total_human_seconds: buckets.iter().map(|b| b.human_seconds).sum(),
+        total_agent_wall_seconds: buckets.iter().map(|b| b.agent_wall_seconds).sum(),
+        total_est_cost_usd: buckets.iter().map(|b| b.est_cost_usd).sum(),
+        buckets,
+        // The bundled per-family table is an approximation, not the cloud's
+        // maintained one. Say so on the wire so no renderer can imply otherwise.
+        cost_is_estimated: true,
+    })
+}
+
+fn new_bucket(key: Option<String>) -> AnalyticsBucket {
+    AnalyticsBucket {
+        key,
+        human_seconds: 0,
+        agent_wall_seconds: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_create_tokens: 0,
+        est_cost_usd: 0.0,
+    }
+}
+
+/// `YYYY-MM-DD` in the reporting timezone — the same day boundary `report` and
+/// `status` use, so a day bucket and "today" can never disagree.
+fn day_key(rfc: &str, offset: time::UtcOffset) -> String {
+    match parse_rfc3339(rfc) {
+        Ok(t) => {
+            let local = t.to_offset(offset);
+            format!(
+                "{:04}-{:02}-{:02}",
+                local.year(),
+                local.month() as u8,
+                local.day()
+            )
+        }
+        Err(_) => "unknown".into(),
+    }
+}
+
+fn harness_key(h: dira_contract::Harness) -> String {
+    serde_json::to_value(h)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Per-project time rollups over an explicit window.
+async fn projects_cmd(state: &AppState, from: String, to: String) -> Response {
+    let (from_t, to_t) = match (parse_rfc3339(&from), parse_rfc3339(&to)) {
+        (Ok(f), Ok(t)) => (f, t),
+        (Err(message), _) | (_, Err(message)) => return Response::Error { message },
+    };
+    if to_t <= from_t {
+        return Response::Error {
+            message: format!("empty window: `to` ({to}) is not after `from` ({from})"),
+        };
+    }
+
+    let events = state
+        .store
+        .events_in_window(&rfc3339(from_t), &rfc3339(to_t))
+        .await
+        .unwrap_or_default();
+
+    // Same builder `Report` uses, so a windowed project rollup and a scoped one
+    // can never disagree about how time is counted.
+    let built = report::build(&events, state.config.idle(), state.config.agent_policy());
+    Response::Projects {
+        projects: built.projects,
+    }
 }
 
 /// Build session views, optionally only active ones.

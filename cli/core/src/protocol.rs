@@ -43,6 +43,28 @@ pub enum Request {
     },
     /// Local report for a scope.
     Report { scope: ReportScope },
+    /// One page of the Sessions timeline, keyset-paginated on session start.
+    ///
+    /// `before` is the previous page's `cursor` (RFC3339); omit it for the first
+    /// page, which ends at "now". `days` overrides the page width, defaulting to
+    /// [`crate::timeline::PAGE_DAYS`].
+    ///
+    /// Reads the retained event log, so history reaches back as far as retention
+    /// allows. An unlinked (never-synced) daemon compacts nothing, so a purely
+    /// offline install keeps its whole timeline.
+    Timeline {
+        before: Option<String>,
+        days: Option<i64>,
+    },
+    /// Time + token-cost rollups over an explicit RFC3339 window.
+    Analytics {
+        from: String,
+        to: String,
+        group_by: AnalyticsGrouping,
+    },
+    /// Per-project time rollups over an explicit RFC3339 window — `Report`'s
+    /// project breakdown with a caller-chosen window instead of a fixed scope.
+    Projects { from: String, to: String },
     /// Forward a raw harness hook payload (from the `dira hook <harness>` shim)
     /// for normalization + accounting. Permission-gated by the socket itself, so
     /// no bearer is needed on this path.
@@ -135,6 +157,62 @@ pub enum ReportScope {
     Project { project: String },
 }
 
+/// How [`Request::Analytics`] buckets its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticsGrouping {
+    /// One bucket per calendar day, in the daemon's configured timezone.
+    Day,
+    /// One bucket per canonical repo ref.
+    Project,
+    /// One bucket per model id seen in token usage.
+    Model,
+    /// One bucket per harness.
+    Harness,
+}
+
+/// One bucket of an analytics rollup.
+///
+/// Time and cost are reported together because that is the question being asked
+/// ("what did this week cost me, in hours and in tokens?"), but they come from
+/// different sources: seconds from the accounting engine, dollars from the
+/// bundled estimator. See [`AnalyticsBreakdown::cost_is_estimated`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsBucket {
+    /// Bucket label — an ISO date, repo ref, model id, or harness name.
+    /// `None` is the unresolved bucket (work with no project, say).
+    pub key: Option<String>,
+    pub human_seconds: i64,
+    pub agent_wall_seconds: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_create_tokens: u64,
+    /// Estimated USD under the bundled pricing table — never an invoice.
+    pub est_cost_usd: f64,
+}
+
+/// An analytics rollup plus the honesty flag that must travel with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsBreakdown {
+    pub group_by: AnalyticsGrouping,
+    /// Echoed window bounds (RFC3339), so a renderer never has to trust that its
+    /// own request survived the round trip unchanged.
+    pub from: String,
+    pub to: String,
+    pub buckets: Vec<AnalyticsBucket>,
+    pub total_human_seconds: i64,
+    pub total_agent_wall_seconds: i64,
+    pub total_est_cost_usd: f64,
+    /// Always `true` offline, and on the wire rather than only in the UI.
+    ///
+    /// The cost here comes from [`crate::tokens`]'s bundled per-family table, not
+    /// from the cloud's maintained `pricing/models.json`. A renderer that showed
+    /// it unqualified would imply a precision this number does not have — so the
+    /// flag ships with the data and a client is expected to label it.
+    pub cost_is_estimated: bool,
+}
+
 /// The daemon's reply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -164,6 +242,28 @@ pub enum Response {
     Logged { handle: String },
     /// `Report`.
     Report(Report),
+    /// `Timeline`: one page of work-units, newest first.
+    Timeline {
+        units: Vec<crate::timeline::WorkUnit>,
+        /// Feed back as the next request's `before` to walk further back; `None`
+        /// means the retained log holds nothing older.
+        ///
+        /// This is the ONLY stop signal a walker may trust. `earlier_sessions` is
+        /// a display number and can lag a write — and a quiet week is still a
+        /// page, so a client that stops on an empty `units` truncates history the
+        /// moment it crosses a gap.
+        cursor: Option<String>,
+        /// Retained sessions starting strictly before this page's floor. Counted
+        /// in SESSIONS, not work-units: counting units would mean clustering the
+        /// very rows this number exists to avoid loading.
+        earlier_sessions: u64,
+    },
+    /// `Analytics`.
+    Analytics(AnalyticsBreakdown),
+    /// `Projects`: per-project time rollups over the requested window.
+    Projects {
+        projects: Vec<crate::report::ProjectReport>,
+    },
     /// `Nuke`: how many rows were wiped from each stats table.
     Nuked { events: u64, tokens: u64 },
     /// `ResyncCursor`: the cursor was rewound and a flush was triggered; `pending`

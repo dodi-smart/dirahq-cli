@@ -55,6 +55,16 @@ pub enum Request {
     Timeline {
         before: Option<String>,
         days: Option<i64>,
+        /// Include each unit's member sessions. Off by default: a unit's rollup
+        /// is what a timeline row draws, and the member list is what makes the
+        /// response unbounded — one real fortnight is ~260 KB with it and ~20 KB
+        /// without. A caller that renders an expanded unit asks for it; a caller
+        /// that draws a list must not pay for it.
+        ///
+        /// `#[serde(default)]` so an older client that omits the field keeps
+        /// working, and gets the cheaper answer.
+        #[serde(default)]
+        include_sessions: bool,
     },
     /// Time + token-cost rollups over an explicit RFC3339 window.
     Analytics {

@@ -97,7 +97,11 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             cwd,
         } => log(state, duration_secs, project, note, activity, label, cwd).await,
         Request::Report { scope } => report_cmd(state, scope).await,
-        Request::Timeline { before, days } => timeline_cmd(state, before, days).await,
+        Request::Timeline {
+            before,
+            days,
+            include_sessions,
+        } => timeline_cmd(state, before, days, include_sessions).await,
         Request::Analytics { from, to, group_by } => analytics_cmd(state, from, to, group_by).await,
         Request::Projects { from, to } => projects_cmd(state, from, to).await,
         Request::IngestHook { harness, payload } => ingest_hook(state, harness, payload).await,
@@ -528,7 +532,12 @@ fn parse_rfc3339(s: &str) -> Result<OffsetDateTime, String> {
 /// `before` is the previous page's cursor; without it the page ends at now.
 /// Consecutive pages tile with no gap (`ceiling(N+1) == floor(N)`), which is what
 /// makes the head-in-`[floor, ceiling)` filter claim every unit exactly once.
-async fn timeline_cmd(state: &AppState, before: Option<String>, days: Option<i64>) -> Response {
+async fn timeline_cmd(
+    state: &AppState,
+    before: Option<String>,
+    days: Option<i64>,
+    include_sessions: bool,
+) -> Response {
     let ceiling = match before.as_deref() {
         Some(s) => match parse_rfc3339(s) {
             Ok(t) => t,
@@ -553,11 +562,17 @@ async fn timeline_cmd(state: &AppState, before: Option<String>, days: Option<i64
 
     let sessions =
         timeline::summarize_sessions(&events, state.config.idle(), state.config.agent_policy());
-    let units = timeline::page(
+    let mut units = timeline::page(
         timeline::assemble_work_units(&sessions),
         timeline::epoch_ms(floor),
         timeline::epoch_ms(ceiling),
     );
+    // Strip AFTER assembly and paging: the rollups a row draws are computed from
+    // the members, so the members have to exist to get here — they just do not
+    // have to be transmitted.
+    if !include_sessions {
+        timeline::strip_sessions(&mut units);
+    }
 
     let earlier_sessions = state
         .store

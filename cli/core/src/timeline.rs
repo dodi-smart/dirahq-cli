@@ -106,8 +106,23 @@ pub struct WorkUnit {
     pub prompts: i64,
     pub human_seconds: i64,
     pub agent_seconds: i64,
-    /// Members, newest first.
+    /// Members, newest first — empty unless the caller asked for them (see
+    /// [`strip_sessions`] and `Request::Timeline.include_sessions`). Omitted from
+    /// the wire entirely when empty, so a list-drawing client never carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<SessionSummary>,
+}
+
+/// Drop every unit's member list.
+///
+/// The rollup a row draws (`count`, the summed seconds) is computed before this
+/// runs, so stripping changes what is transmitted and nothing that is displayed.
+/// This is the difference between a response that grows with a person's whole
+/// history and one that grows with the number of units on a page.
+pub fn strip_sessions(units: &mut [WorkUnit]) {
+    for unit in units.iter_mut() {
+        unit.sessions.clear();
+    }
 }
 
 /// Reconstruct per-session summaries from a window of raw events.

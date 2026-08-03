@@ -283,6 +283,13 @@ Examples:
         /// Walk back: the previous page's floor, as RFC3339.
         #[arg(long, value_name = "RFC3339")]
         before: Option<String>,
+        /// Include each unit's member sessions (only useful with `--json`).
+        ///
+        /// Off by default because it is what makes the response unbounded: a
+        /// fortnight of real work is ~260 KB with the member lists and ~20 KB
+        /// without, and the table below draws none of it.
+        #[arg(long)]
+        sessions: bool,
     },
     /// Time + token-cost rollups over a window.
     #[command(
@@ -910,7 +917,15 @@ async fn main() -> Result<()> {
             };
             Request::Report { scope }
         }
-        Command::Timeline { days, before } => Request::Timeline { before, days },
+        Command::Timeline {
+            days,
+            before,
+            sessions,
+        } => Request::Timeline {
+            before,
+            days,
+            include_sessions: sessions,
+        },
         Command::Analytics { days, by } => {
             let (from, to) = window_back(days.unwrap_or(7));
             let group_by = match by.as_deref() {

@@ -998,6 +998,8 @@ async fn print_version(config: &Config) -> Result<()> {
             uptime_seconds,
             http_ingress_error,
             control_channel_warning,
+            db_path,
+            storage_warning,
         }) => {
             println!(
                 "dirad   {version}  (schema {schema_version}, pid {pid}, up {})",
@@ -1011,6 +1013,13 @@ async fn print_version(config: &Config) -> Result<()> {
             // for "captures nothing".
             if let Some(reason) = control_channel_warning {
                 println!("note: {reason}");
+            }
+            if let Some(reason) = storage_warning {
+                println!("warning: {reason}");
+            }
+            // Only the comparison can see this — see `store_divergence_line`.
+            if let Some(line) = daemon::store_divergence_line(&config.db_path, db_path.as_deref()) {
+                println!("{line}");
             }
             if version != cli {
                 println!(

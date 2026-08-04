@@ -906,13 +906,20 @@ pub fn print_status(s: &StatusView, detailed: bool) {
         print_report(&s.today, &layout);
     }
 
-    if s.sync_pending > 0 {
+    // Two independent backlogs on two independent cursors, so both are reported
+    // and either can be non-zero alone. A compute backlog with zero pending events
+    // is the exact shape of the bug that made this line necessary.
+    if s.sync_pending > 0 || s.tokens_pending > 0 {
+        let mut parts = Vec::new();
+        if s.sync_pending > 0 {
+            parts.push(format!("{} event(s)", s.sync_pending));
+        }
+        if s.tokens_pending > 0 {
+            parts.push(format!("{} token row(s)", s.tokens_pending));
+        }
         println!(
             "\n{}",
-            theme::paint(
-                &format!("{} event(s) pending sync", s.sync_pending),
-                Role::Compute,
-            )
+            theme::paint(&format!("{} pending sync", parts.join(", ")), Role::Compute,)
         );
     }
 
@@ -1359,6 +1366,7 @@ mod tests {
                 session_count: 1,
             },
             sync_pending: 0,
+            tokens_pending: 0,
             hydrating: false,
             tokens: None,
             billing: None,

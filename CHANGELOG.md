@@ -1,3 +1,9 @@
+## [0.2.2](https://github.com/dodi-smart/dirahq-cli/compare/v0.2.1...v0.2.2) (2026-08-04)
+
+### 🐛 Bug Fixes
+
+* **daemon:** advance sync watermarks per acked chunk and pace long drains ([44b7ac3](https://github.com/dodi-smart/dirahq-cli/commit/44b7ac3ef74248d0d1fd8cbb027d3ddf5e567c75)), closes [#88](https://github.com/dodi-smart/dirahq-cli/issues/88)
+
 ## [0.2.1](https://github.com/dodi-smart/dirahq-cli/compare/v0.2.0...v0.2.1) (2026-08-04)
 
 ### 🐛 Bug Fixes

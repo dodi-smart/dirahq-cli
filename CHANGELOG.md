@@ -1,3 +1,12 @@
+## [0.2.1](https://github.com/dodi-smart/dirahq-cli/compare/v0.2.0...v0.2.1) (2026-08-04)
+
+### 🐛 Bug Fixes
+
+* **cli:** confirm process exit before starting a replacement daemon ([d7443b7](https://github.com/dodi-smart/dirahq-cli/commit/d7443b765f96e16cda5a93748b6e96080432125e))
+* **cli:** price models from a generated table, refreshed monthly ([7c700b5](https://github.com/dodi-smart/dirahq-cli/commit/7c700b5234e03b9762c7b5f6f83153bdad3a8d50))
+* **daemon:** capture subagent transcripts and stop coalescing the span opener ([1d14064](https://github.com/dodi-smart/dirahq-cli/commit/1d1406404cd4a863760c929dfc6a755f41717460))
+* **daemon:** give token usage its own sync cursor ([c3fd5f5](https://github.com/dodi-smart/dirahq-cli/commit/c3fd5f5c95491b3bb696d2ea7041760fde18c304))
+
 ## [0.2.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.1.2...v0.2.0) (2026-08-02)
 
 ### ✨ Features

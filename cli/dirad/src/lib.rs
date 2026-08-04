@@ -344,10 +344,38 @@ pub async fn run() -> anyhow::Result<()> {
     let config = Config::load().map_err(|e| anyhow::anyhow!("config: {e}"))?;
     tracing::info!(db = %config.db_path.display(), sock = %config.socket_path.display(), port = config.http_port, "starting dirad");
 
+    // Signals FIRST, before any readiness surface exists. `tokio::signal`
+    // installs the handler when the stream is created, so anything bound before
+    // this point can be observed by a supervisor that then SIGTERMs us into the
+    // DEFAULT disposition — hard-killed, no offline beat, no WAL checkpoint.
+    let mut shutdown_signals = ShutdownSignals::install();
+
+    // Control channel FIRST — before the store (D-0009: "any new startup surface
+    // that can fail must either bind after the control socket or be survivable;
+    // the control socket must stay the first thing up"). `Store::open` runs
+    // `sqlx::migrate!` and can both fail and block, and it used to run 20-odd
+    // lines BEFORE the single-instance guard — so a duplicate daemon opened and
+    // migrated the database, and contended for it, before the guard got a chance
+    // to refuse. That is the window in which two processes genuinely hold one
+    // database. Binding first makes the refusal the cheapest and earliest thing
+    // a duplicate hits, and side-effect-free.
+    //
+    // The lock lives until `run` returns — i.e. for the daemon's whole life — so
+    // no duplicate can race the endpoint meanwhile. `bind_control_socket` owns
+    // the guard + bind on both platforms (flock+probe on unix, the pipe's
+    // first-instance bind on windows), including the owner-only socket perms.
+    //
+    // Nothing accepts on the listener until `serve_control` below; that gap
+    // already existed (the HTTP bind and hydrate spawn sit inside it) and is
+    // only extended here by the store open.
+    let sock = config.socket_path.clone();
+    let (listener, _socket_lock) = bind_control_socket(&sock).await?;
+    tracing::info!(sock = %sock.display(), "control socket ready");
+
     let store = Store::open(&config.db_path).await?;
     let (state, rx, sync_rx, knowledge_rx) = build_state(store, config).await?;
 
-    // --- Bind the ingress surfaces FIRST (Commit 2) ---------------------------
+    // --- Bind the remaining ingress surfaces ----------------------------------
     // Bind the control socket and HTTP *before* hydration so the daemon answers
     // `Ping`/`Status` the instant it's up. Hydration then runs on a background
     // task; a status during warm-up reports `hydrating: true` rather than hanging
@@ -359,15 +387,6 @@ pub async fn run() -> anyhow::Result<()> {
     // was ever introspectable. Ordering the UDS first is only safe because
     // `bind_control_socket` refuses to take the path from a live daemon; it used
     // to unlink unconditionally, and the HTTP bind was the accidental guard.
-
-    // Control channel (UDS on unix, a named pipe on windows — see `dira_ipc`).
-    // The lock lives until `run` returns — i.e. for the daemon's whole life —
-    // so no duplicate can race the endpoint meanwhile. `bind_control_socket`
-    // owns the guard + bind on both platforms (flock+probe on unix, the pipe's
-    // first-instance bind on windows), including the owner-only socket perms.
-    let sock = state.config.socket_path.clone();
-    let (listener, _socket_lock) = bind_control_socket(&sock).await?;
-    tracing::info!(sock = %sock.display(), "control socket ready");
 
     // Report anything that makes this control channel less reachable than
     // intended. Precedence is deliberate: a failed security descriptor *plus*
@@ -431,12 +450,21 @@ pub async fn run() -> anyhow::Result<()> {
     serve_control(state.clone(), listener);
 
     // Block until shutdown. The accept loop runs detached in `serve_control`.
-    wait_for_shutdown_signal(&state).await;
+    wait_for_shutdown_signal(&state, &mut shutdown_signals).await;
+    // Teardown is timed and its completion is logged. The control listener is a
+    // detached accept loop that nothing cancels, so the pipe/socket keeps
+    // answering `Ping` for this whole window — "still answering" therefore says
+    // nothing about whether the process is still here. Without a completion line
+    // no log could tell "mid-checkpoint" from "gone", which is what made the
+    // restart overlap unreadable after the fact.
+    let teardown_started = std::time::Instant::now();
     tracing::info!("shutting down");
     // Graceful offline: tell the cloud this device is going offline with one
     // best-effort empty-sessions beat (short timeout, errors ignored) so it
     // doesn't wait out the presence TTL.
+    let beat_started = std::time::Instant::now();
     heartbeat::send_offline_beat(&state).await;
+    let beat_ms = beat_started.elapsed().as_millis();
 
     // Fold the WAL back into the main database on the way out, so a daemon that
     // is stopped (or self-restarted by `dira update`) leaves a tidy file rather
@@ -445,6 +473,7 @@ pub async fn run() -> anyhow::Result<()> {
     // Time-boxed: a busy checkpoint must never hang `dira daemon stop`. This
     // matters most on windows, where `Request::Shutdown` is the *only* orderly
     // exit — there is no SIGTERM to fall back on.
+    let checkpoint_started = std::time::Instant::now();
     if tokio::time::timeout(
         std::time::Duration::from_secs(5),
         state.store.wal_checkpoint_truncate(),
@@ -454,12 +483,25 @@ pub async fn run() -> anyhow::Result<()> {
     {
         tracing::debug!("wal checkpoint timed out on shutdown; continuing");
     }
+    let checkpoint_ms = checkpoint_started.elapsed().as_millis();
 
     // Nothing to clean up on windows — a named pipe isn't a filesystem object,
     // so there's no stale file for the next `run()` to trip over the way a
     // leftover UDS path would.
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
+
+    // The last line the process writes. Its absence in a log is itself the
+    // signal: the daemon was killed before it finished, or is still going. The
+    // two component timings are the overlap window a restart has to outwait, so
+    // they are exactly what needs measuring.
+    tracing::info!(
+        pid = std::process::id(),
+        took_ms = teardown_started.elapsed().as_millis() as u64,
+        offline_beat_ms = beat_ms as u64,
+        wal_checkpoint_ms = checkpoint_ms as u64,
+        "stopped"
+    );
     Ok(())
 }
 
@@ -477,27 +519,49 @@ pub async fn run() -> anyhow::Result<()> {
 /// update` performs) killing the process via the default signal disposition:
 /// no log line, no offline beat, no chance to flush.
 #[cfg(unix)]
-async fn wait_for_shutdown_signal(state: &AppState) {
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(s) => s,
-        Err(e) => {
+pub struct ShutdownSignals {
+    sigterm: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    /// Register the shutdown signals. Must be called BEFORE any readiness
+    /// surface is bound.
+    ///
+    /// `tokio::signal` installs the handler when the stream is *created*, so a
+    /// SIGTERM arriving before this call takes the default disposition and hard-
+    /// kills the process — skipping the offline beat and the WAL checkpoint.
+    /// Creating it at the point of `select!` (the end of `run`) left the whole
+    /// of startup exposed, and moving the control-socket bind ahead of
+    /// `Store::open` widened that window from "after the store opens" to "before
+    /// it", which is long enough that a supervisor watching for the socket
+    /// reliably lost the race.
+    pub fn install() -> Self {
+        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             // Registration only fails on resource exhaustion; fall back to
             // Ctrl-C + the in-band notify rather than panicking a running
             // daemon over it.
-            tracing::warn!(
-                "failed to install SIGTERM handler: {e}; SIGTERM will use the default disposition"
-            );
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = state.shutdown.notified() => {}
-            }
-            return;
-        }
-    };
+            .inspect_err(|e| {
+                tracing::warn!(
+                    "failed to install SIGTERM handler: {e}; \
+                     SIGTERM will use the default disposition"
+                )
+            })
+            .ok();
+        Self { sigterm }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal(state: &AppState, signals: &mut ShutdownSignals) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
+        _ = async {
+            match signals.sigterm.as_mut() {
+                Some(s) => { s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
         _ = state.shutdown.notified() => {}
     }
 }
@@ -517,36 +581,56 @@ async fn wait_for_shutdown_signal(state: &AppState) {
 /// single short-timeout best-effort HTTP call with no new blocking work added
 /// here, so it comfortably fits inside that budget.
 #[cfg(windows)]
-async fn wait_for_shutdown_signal(state: &AppState) {
-    // Each registration only fails on resource exhaustion; on failure that
-    // branch below simply never fires (`std::future::pending`) instead of
-    // panicking a running daemon over it — the remaining triggers still cover
-    // shutdown.
-    let mut ctrl_c = tokio::signal::windows::ctrl_c()
-        .inspect_err(|e| tracing::warn!("failed to install Ctrl-C handler: {e}"))
-        .ok();
-    let mut ctrl_close = tokio::signal::windows::ctrl_close()
-        .inspect_err(|e| tracing::warn!("failed to install Ctrl-Close handler: {e}"))
-        .ok();
-    let mut ctrl_shutdown = tokio::signal::windows::ctrl_shutdown()
-        .inspect_err(|e| tracing::warn!("failed to install Ctrl-Shutdown handler: {e}"))
-        .ok();
+pub struct ShutdownSignals {
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    ctrl_close: Option<tokio::signal::windows::CtrlClose>,
+    ctrl_shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
 
+#[cfg(windows)]
+impl ShutdownSignals {
+    /// Register the console-control handlers. Must be called BEFORE any
+    /// readiness surface is bound — see the unix arm for why.
+    ///
+    /// Ctrl-Close matters most here: Windows gives the process only ~5s before
+    /// hard-killing it, so the handler has to already exist when the event
+    /// arrives.
+    pub fn install() -> Self {
+        // Each registration only fails on resource exhaustion; on failure that
+        // branch simply never fires (`std::future::pending`) instead of
+        // panicking a running daemon over it — the remaining triggers still
+        // cover shutdown.
+        Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()
+                .inspect_err(|e| tracing::warn!("failed to install Ctrl-C handler: {e}"))
+                .ok(),
+            ctrl_close: tokio::signal::windows::ctrl_close()
+                .inspect_err(|e| tracing::warn!("failed to install Ctrl-Close handler: {e}"))
+                .ok(),
+            ctrl_shutdown: tokio::signal::windows::ctrl_shutdown()
+                .inspect_err(|e| tracing::warn!("failed to install Ctrl-Shutdown handler: {e}"))
+                .ok(),
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal(state: &AppState, signals: &mut ShutdownSignals) {
     tokio::select! {
         _ = async {
-            match ctrl_c.as_mut() {
+            match signals.ctrl_c.as_mut() {
                 Some(s) => { s.recv().await; }
                 None => std::future::pending::<()>().await,
             }
         } => {}
         _ = async {
-            match ctrl_close.as_mut() {
+            match signals.ctrl_close.as_mut() {
                 Some(s) => { s.recv().await; }
                 None => std::future::pending::<()>().await,
             }
         } => {}
         _ = async {
-            match ctrl_shutdown.as_mut() {
+            match signals.ctrl_shutdown.as_mut() {
                 Some(s) => { s.recv().await; }
                 None => std::future::pending::<()>().await,
             }

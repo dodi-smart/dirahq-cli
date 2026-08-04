@@ -331,19 +331,20 @@ fn chunk_ranges(events: &[RawEvent], idle: Duration, min_chunk: usize) -> Vec<(u
 
 /// Build deterministic, capped sub-batches for a window. Each chunk derives its own
 /// intervals/sessions from its events (lossless thanks to [`chunk_ranges`]); the
-/// final chunk additionally carries the token rows and partial rollups (the cloud
-/// dedups tokens by id and sessions by id), so their cursors advance only once the
-/// whole window has drained.
+/// final chunk additionally carries the partial rollups (the cloud dedups sessions
+/// by id), so their watermark advances only once the whole window has drained.
 ///
-/// **Artifacts are spread across the chunks**, at most [`CHUNK_ARTIFACTS`] per
-/// chunk, rather than all riding the final one (issue #71). Spreading rather than
-/// capping the store read is what keeps the artifact cursor honest: it still
-/// advances exactly once, on the true final chunk, to the same snapshot bound the
-/// caller read — so there is never a window in which the cursor has moved past a
-/// row that was never sent. A backlog larger than the event chunks can carry gets
-/// extra artifact-only chunks appended after the last event chunk, so the whole
-/// backlog still drains within ONE flush instead of one cap-sized slice per
-/// backstop tick.
+/// **Artifacts and token rows are both spread across the chunks**, at most
+/// [`CHUNK_ARTIFACTS`] / [`CHUNK_TOKENS`] per chunk, rather than all riding the
+/// final one (issue #71). Spreading rather than capping the store read is what
+/// keeps their cursors honest: each still advances exactly once, on the true final
+/// chunk, to the same snapshot bound the caller read — so there is never a window
+/// in which a cursor has moved past a row that was never sent. A backlog larger
+/// than the event chunks can carry gets extra artifact-/token-only chunks appended
+/// after the last event chunk, so the whole backlog still drains within ONE flush
+/// instead of one cap-sized slice per backstop tick. That matters most right after
+/// an upgrade, when the token cursor is unset and the entire local history is
+/// outstanding.
 #[allow(clippy::too_many_arguments)]
 pub fn build_chunked_batches(
     events: &[RawEvent],

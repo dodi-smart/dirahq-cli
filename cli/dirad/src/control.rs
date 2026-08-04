@@ -123,18 +123,24 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
 /// re-send); `Some(id)` to that event id. Safe — the cloud dedups attestations by
 /// id and intervals by content, so a re-send never double-counts.
 async fn resync_cursor(state: &AppState, from: Option<String>) -> Response {
-    use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR};
+    use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR, META_TOKEN_CURSOR};
     let new_cursor = from.clone().unwrap_or_default();
     if let Err(e) = state.store.meta_set(META_SYNC_CURSOR, &new_cursor).await {
         return Response::Error {
             message: format!("resync failed (set cursor): {e}"),
         };
     }
-    // A full rewind also re-sends artifacts (they ride their own rowid cursor).
+    // A full rewind also re-sends artifacts and token usage (both ride their own
+    // rowid cursors, so rewinding the event cursor alone would leave them put).
     if from.is_none() {
         if let Err(e) = state.store.meta_set(META_ARTIFACTS_CURSOR, "").await {
             return Response::Error {
                 message: format!("resync failed (reset artifacts cursor): {e}"),
+            };
+        }
+        if let Err(e) = state.store.meta_set(META_TOKEN_CURSOR, "").await {
+            return Response::Error {
+                message: format!("resync failed (reset token cursor): {e}"),
             };
         }
     }
@@ -382,6 +388,21 @@ async fn status(state: &AppState) -> Response {
         .count_events_after(cursor.as_deref())
         .await
         .unwrap_or(0);
+    // Un-synced compute backlog: token rows past the confirmed token cursor. Its
+    // own cursor, so it can be non-zero while `sync_pending` is 0 — which is the
+    // state that used to be completely invisible.
+    let tok_cursor = state
+        .store
+        .meta_get(crate::sync::META_TOKEN_CURSOR)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok());
+    let tokens_pending = state
+        .store
+        .count_token_usage_after(tok_cursor)
+        .await
+        .unwrap_or(0);
     // Today's compute totals for the summary row. Best-effort: a read failure
     // (or an all-zero day) renders as "no compute row", never a failed status.
     let tokens = state
@@ -446,6 +467,7 @@ async fn status(state: &AppState) -> Response {
         active,
         today,
         sync_pending,
+        tokens_pending,
         hydrating: !state.hydrated.load(std::sync::atomic::Ordering::Relaxed),
         tokens,
         billing,

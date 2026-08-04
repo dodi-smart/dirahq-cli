@@ -1,0 +1,81 @@
+name: Pricing Sync
+
+# Refresh the bundled model-price table (cli/core/pricing/models.json) from
+# models.dev and open a PR when prices changed. Runs monthly; run it by hand
+# (workflow_dispatch) after a model launch or a price change.
+#
+# The commit is `fix(cli)`, which releases a patch — the table is compiled into
+# the binaries, so a refresh only reaches users when they update. That release
+# is the point of the job.
+#
+# This mirrors the cloud's own monthly pricing-sync. The two tables are
+# deliberately allowed to drift: the cloud is authoritative for cost and
+# re-prices historical rows, while this copy exists so `dira status` /
+# `dira report` have a number to show offline. `est_cost_usd` on the wire is
+# contract-documented as a label, never a billing base, so a stale table here
+# never moves an invoice.
+#
+# models.dev being down just fails the run (no PR); retry manually or wait for
+# next month — pricing freshness is never critical.
+
+on:
+  schedule:
+    - cron: "0 6 1 * *" # monthly, 1st at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Refresh model pricing
+    # GitHub-hosted only, per D-0012/D-0015.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: develop
+      # Same toolchain setup as ci.yml's contract job — mise's `rust = "stable"`
+      # is a silent no-op on runners without rustup, and `just` is not installed
+      # on the hosted images, so the recipe is inlined rather than invoked.
+      - name: Set up Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: refresh the table from models.dev
+        shell: bash
+        # Mirrors `just pricing-sync`. Writes via a temp file so a failed fetch
+        # or a rejected payload can never truncate the vendored table.
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          curl -fsSL https://models.dev/api.json \
+            | cargo run -q -p dira-core --bin pricing_sync > "$tmp"
+          mv "$tmp" cli/core/pricing/models.json
+      - name: validate the refreshed table
+        # The pricing tests assert the table parses, covers every harness
+        # family, and still splits generations correctly — so a bad refresh
+        # fails here rather than shipping.
+        run: cargo test -p dira-core --lib pricing tokens
+      - name: open PR
+        uses: peter-evans/create-pull-request@v8
+        with:
+          base: develop
+          branch: chore/pricing-sync
+          title: "fix(cli): refresh model pricing from models.dev"
+          commit-message: "fix(cli): refresh model pricing from models.dev"
+          body: |
+            Automated refresh of `cli/core/pricing/models.json` from
+            https://models.dev/api.json — review the diff for price changes and
+            check the job log for reseller price collisions.
+
+            The table is compiled into `dira`/`dirad`, so merging releases a
+            patch to actually ship the new prices. Local cost figures are
+            estimates only; the cloud keeps its own copy, is authoritative, and
+            re-prices historical rows.

@@ -10,7 +10,7 @@ paths:
   - cli/core/src/store.rs
   - cli/dirad/src/sync.rs
   - cli/dirad/src/state.rs
-decisions: [D-0001, D-0006, D-0018]
+decisions: [D-0001, D-0006, D-0018, D-0020]
 ---
 
 ## Overview
@@ -26,8 +26,9 @@ single flush window (issue #40).
 - A flush reads events in `(META_SYNC_CURSOR, until]`, splits the window into
   chunks only at > idle breaks (never inside a billable interval), POSTs each
   chunk, and advances the cursor per 2xx ack. The final chunk carries the
-  partial rollups; its ack also marks partials sent and advances the artifact
-  and token cursors.
+  partial rollups; its ack marks partials sent. Row cursors do NOT ride that
+  flag — each chunk advances the artifact and token watermarks it carried, on
+  its own 2xx (D-0020).
 - Token rows ride `META_TOKEN_CURSOR`, a `token_usage.rowid` watermark, on
   exactly the artifact cursor's discipline. They are NOT selected by the
   `at`-span of the window's events, and they participate in the flush gate, so
@@ -43,9 +44,15 @@ single flush window (issue #40).
   `CHUNK_ARTIFACTS` / `CHUNK_TOKENS` each,
   with extra artifact-/token-only chunks appended when the backlog outlasts the
   event chunks. Spreading rather than capping the store read is what keeps
-  those cursors honest — each still advances exactly once, on the true
-  final chunk, to the same snapshot bound the caller read, so the cursor can
-  never move past a row that was not sent. Artifacts are the fat rows
+  those cursors honest — each chunk advances its stream's watermark only to the
+  high rowid IT carried, so the cursor can never move past a row that was not
+  sent, and a drain that dies part-way keeps everything the cloud accepted.
+  Gating those cursors on the final chunk instead made progress depend on an
+  unbounded run of consecutive successes: 48,601 token rows is 49 chunks
+  against the cloud's 30/min ingest budget, so the drain was throttled at
+  chunk 31, recorded nothing, and restarted at row 1 forever (issue #88,
+  D-0020). A long drain now paces its POSTs to stay inside that budget.
+  Artifacts are the fat rows
   (`touched_paths`, `blobs`); unbounded, a `dira device resync` built one
   body out of the whole backlog and was rejected `413` (issue #71). The
   ceiling is the platform's request-body limit, not a cloud policy, so

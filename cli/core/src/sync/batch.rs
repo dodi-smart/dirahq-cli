@@ -32,6 +32,10 @@ use ulid::Ulid;
 /// 1:1 (the summing `TokenTotals` collapses them, so we need a per-row form).
 #[derive(Debug, Clone)]
 pub struct TokenRow {
+    /// SQLite `rowid`. Carried per row so each chunk can report the watermark it
+    /// actually covered — a flush-wide bound would claim rows a throttled drain
+    /// never sent. See D-0020.
+    pub rowid: i64,
     pub id: String,
     pub session_id: String,
     pub project: Option<String>,
@@ -49,6 +53,9 @@ pub struct TokenRow {
 /// captured columns the batch builder needs to emit an [`ArtifactRef`].
 #[derive(Debug, Clone)]
 pub struct ArtifactRow {
+    /// SQLite `rowid` — the per-chunk artifact watermark, same discipline as
+    /// [`TokenRow::rowid`]. See D-0020.
+    pub rowid: i64,
     /// Commit SHA; doubles as the wire `ArtifactRef.id` for idempotent ingest.
     pub sha: String,
     /// Canonical repo ref, e.g. `github.com/acme/api`.
@@ -295,8 +302,16 @@ pub struct ChunkBatch {
     /// 2xx. `None` for an artifact/partial-only chunk (no events), where only the
     /// artifact cursor moves.
     pub cursor_event_id: Option<String>,
-    /// The final chunk carries the artifacts + partial rollups, so its ack also
-    /// advances the artifact cursor and marks partials sent.
+    /// The highest `token_usage.rowid` **this chunk carries** — advance
+    /// `META_TOKEN_CURSOR` to it on this chunk's own 2xx. `None` when the chunk
+    /// carries no token rows. Never the flush-wide snapshot bound: a drain that
+    /// dies at chunk 31 of 49 must keep exactly the 30 chunks the cloud took, and
+    /// claim nothing beyond them. See D-0020.
+    pub token_rowid_high: Option<i64>,
+    /// The highest `artifacts.rowid` this chunk carries — same discipline.
+    pub artifact_rowid_high: Option<i64>,
+    /// The final chunk carries the partial rollups, so its ack marks partials sent.
+    /// Row cursors do **not** ride this flag — see the two fields above.
     pub is_last: bool,
 }
 
@@ -415,6 +430,10 @@ pub fn build_chunked_batches(
                 // `None` on an artifact-only chunk past the last event range —
                 // there is no event high-water for it to advance.
                 cursor_event_id: chunk.last().map(|ev| ev.id.clone()),
+                // Rows arrive ordered by rowid ASC and are sliced in order, so the
+                // last row of the slice IS this chunk's high-water mark.
+                token_rowid_high: toks.last().map(|t| t.rowid),
+                artifact_rowid_high: arts.last().map(|a| a.rowid),
                 is_last,
             }
         })
@@ -1333,6 +1352,7 @@ mod tests {
     #[test]
     fn token_rows_map_to_contract() {
         let rows = vec![TokenRow {
+            rowid: 1,
             id: "t1".into(),
             session_id: "s1".into(),
             project: Some("p".into()),
@@ -1353,9 +1373,10 @@ mod tests {
         assert_eq!(t.est_cost_usd, Some(0.5));
     }
 
-    /// A minimal artifact row — only `sha` matters to the chunking tests.
-    fn art(sha: &str) -> ArtifactRow {
+    /// A minimal artifact row — `sha` and `rowid` are what the chunking tests read.
+    fn art(rowid: i64, sha: &str) -> ArtifactRow {
         ArtifactRow {
+            rowid,
             sha: sha.into(),
             repo: Some("github.com/acme/api".into()),
             git_ref: None,
@@ -1388,7 +1409,7 @@ mod tests {
     #[test]
     fn artifacts_are_spread_across_chunks_losslessly() {
         let rows: Vec<ArtifactRow> = (0..CHUNK_ARTIFACTS * 2 + 7)
-            .map(|i| art(&format!("sha-{i:04}")))
+            .map(|i| art(i as i64 + 1, &format!("sha-{i:04}")))
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
@@ -1413,7 +1434,7 @@ mod tests {
     #[test]
     fn only_the_final_chunk_is_last_when_artifacts_outnumber_event_chunks() {
         let rows: Vec<ArtifactRow> = (0..CHUNK_ARTIFACTS * 3)
-            .map(|i| art(&format!("sha-{i:04}")))
+            .map(|i| art(i as i64 + 1, &format!("sha-{i:04}")))
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
@@ -1442,7 +1463,7 @@ mod tests {
     #[test]
     fn an_artifact_only_flush_is_bounded_too() {
         let rows: Vec<ArtifactRow> = (0..CHUNK_ARTIFACTS * 2 + 1)
-            .map(|i| art(&format!("sha-{i:04}")))
+            .map(|i| art(i as i64 + 1, &format!("sha-{i:04}")))
             .collect();
 
         let chunks = build_chunked_batches(&[], &[], &rows, &[], "d", IDLE, AGENT, NOW, &[], &[]);
@@ -1455,8 +1476,9 @@ mod tests {
         assert_eq!(chunks.iter().filter(|c| c.is_last).count(), 1);
     }
 
-    fn tok(id: &str) -> TokenRow {
+    fn tok(rowid: i64, id: &str) -> TokenRow {
         TokenRow {
+            rowid,
             id: id.into(),
             session_id: "s1".into(),
             project: Some("p".into()),
@@ -1477,7 +1499,7 @@ mod tests {
     #[test]
     fn token_rows_are_spread_across_chunks_losslessly() {
         let rows: Vec<TokenRow> = (0..CHUNK_TOKENS * 2 + 5)
-            .map(|i| tok(&format!("t-{i:05}")))
+            .map(|i| tok(i as i64 + 1, &format!("t-{i:05}")))
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
@@ -1493,6 +1515,45 @@ mod tests {
         let expected: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
         assert_eq!(shipped, expected, "every token row ships exactly once");
         assert_eq!(chunks.iter().filter(|c| c.is_last).count(), 1);
+    }
+
+    /// Each chunk reports the high rowid IT carries, so a drain that dies part-way
+    /// records exactly what the cloud took — never the flush-wide bound, which
+    /// would claim rows that never left the machine. See D-0020.
+    #[test]
+    fn each_chunk_reports_only_the_rowids_it_carries() {
+        let rows: Vec<TokenRow> = (0..CHUNK_TOKENS * 2 + 5)
+            .map(|i| tok(i as i64 + 1, &format!("t-{i:05}")))
+            .collect();
+        let arts: Vec<ArtifactRow> = (0..CHUNK_ARTIFACTS + 3)
+            .map(|i| art(i as i64 + 1, &format!("sha-{i:04}")))
+            .collect();
+        let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
+
+        let chunks =
+            build_chunked_batches(&events, &rows, &arts, &[], "d", IDLE, AGENT, NOW, &[], &[]);
+
+        let toks: Vec<Option<i64>> = chunks.iter().map(|c| c.token_rowid_high).collect();
+        assert_eq!(
+            toks,
+            vec![
+                Some(CHUNK_TOKENS as i64),
+                Some(CHUNK_TOKENS as i64 * 2),
+                Some(CHUNK_TOKENS as i64 * 2 + 5),
+            ],
+            "each chunk's token watermark is its own last row"
+        );
+
+        let a: Vec<Option<i64>> = chunks.iter().map(|c| c.artifact_rowid_high).collect();
+        assert_eq!(
+            a,
+            vec![
+                Some(CHUNK_ARTIFACTS as i64),
+                Some(CHUNK_ARTIFACTS as i64 + 3),
+                None
+            ],
+            "a chunk carrying no artifacts must claim no artifact watermark"
+        );
     }
 
     /// Spreading must not disturb the no-artifact path, which is the common case.
@@ -1511,6 +1572,7 @@ mod tests {
     #[test]
     fn artifacts_map_to_contract_with_sha_as_id() {
         let rows = vec![ArtifactRow {
+            rowid: 1,
             sha: "abc123".into(),
             repo: Some("github.com/acme/api".into()),
             git_ref: Some("main".into()),

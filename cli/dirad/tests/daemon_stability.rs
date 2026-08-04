@@ -309,13 +309,24 @@ async fn daemon_info_reports_version_schema_and_pid() {
             version,
             schema_version,
             pid,
+            db_path,
             control_channel_warning: _,
             uptime_seconds: _,
             http_ingress_error: _,
+            storage_warning: _,
         } => {
             assert_eq!(version, env!("CARGO_PKG_VERSION"));
             assert_eq!(schema_version, dira_contract::SCHEMA_VERSION);
             assert_eq!(pid, std::process::id());
+            // The store the daemon actually opened. `dira` compares this against
+            // its OWN resolution to catch the elevated/service-account case,
+            // which neither side can detect alone — so it must never be absent
+            // from a daemon new enough to know about it.
+            assert_eq!(
+                db_path.as_deref(),
+                Some(state.config.db_path.display().to_string().as_str()),
+                "DaemonInfo must report the store it opened"
+            );
         }
         other => panic!("expected DaemonInfo, got {other:?}"),
     }

@@ -1,6 +1,6 @@
 ---
 title: Daemon startup and ingress lifecycle
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
@@ -9,6 +9,7 @@ paths:
   - cli/dirad/src/lib.rs
   - cli/dirad/src/control.rs
   - cli/dira/src/daemon.rs
+  - cli/core/src/config.rs
   - cli/ipc/**
 decisions: [D-0008, D-0009, D-0010, D-0016, D-0019]
 ---
@@ -35,6 +36,16 @@ the interactive user entirely — a silent, total capture outage.
 
 ## Behavior
 
+- Startup reports the store it opened. `DaemonInfo` carries `db_path` plus a
+  `storage_warning` when `project_dirs()` did not resolve and the store fell
+  through to `$TMPDIR` — a whole capture history somewhere the OS may clear on
+  reboot. `dira` compares the reported path against its OWN resolution
+  (`store_divergence_line`) because the elevated / service-account case is
+  invisible to either process alone: `project_dirs()` succeeds on both sides and
+  simply lands in two profiles. Neither condition is fatal — the log sink
+  resolves through the same `project_dirs()` and windows nulls stdio, so a bail
+  is invisible exactly where it would fire, and an exiting daemon respawn-loops
+  (D-0009). Both fields are `#[serde(default)]` for skew.
 - `run()` loads config, then binds the control channel **before opening the
   store**, then opens the store, builds state, and binds the loopback HTTP hook
   ingress. Both binds precede hydration, so `Ping`/`Status` answer immediately

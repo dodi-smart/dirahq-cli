@@ -343,6 +343,19 @@ pub fn serve_control(state: AppState, mut listener: dira_ipc::Listener) {
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::load().map_err(|e| anyhow::anyhow!("config: {e}"))?;
     tracing::info!(db = %config.db_path.display(), sock = %config.socket_path.display(), port = config.http_port, "starting dirad");
+    // An unanchored store is a whole capture history sitting somewhere the OS may
+    // clear on reboot. Logged loudly and surfaced on `DaemonInfo` (D-0009: a
+    // daemon that cannot do its job must not read as plainly healthy) rather than
+    // made fatal — this daemon's own log sink resolves through the same
+    // `project_dirs()`, and on windows all three stdio handles are nulled, so a
+    // bail would be invisible on the one platform that hits this; and an exiting
+    // daemon just respawn-loops under a supervisor.
+    if let Some(w) = dira_core::config::unanchored_store_warning(
+        &config.db_path,
+        dira_core::config::project_dirs().is_some(),
+    ) {
+        tracing::error!("storage: {w}");
+    }
 
     // Signals FIRST, before any readiness surface exists. `tokio::signal`
     // installs the handler when the stream is created, so anything bound before

@@ -195,6 +195,22 @@ pub enum Response {
         /// posture: `default` so a newer `dira` can still read an older daemon.
         #[serde(default)]
         control_channel_warning: Option<String>,
+        /// The store the daemon actually opened.
+        ///
+        /// Reported because the CLI cannot otherwise tell that it and the daemon
+        /// resolved DIFFERENT databases — the elevated/service-account case,
+        /// where `project_dirs()` succeeds on both sides but lands in two
+        /// profiles. No amount of work inside the daemon can detect that; only
+        /// comparing the two answers can. `default` for skew: an older daemon
+        /// omits it and the CLI simply says nothing.
+        #[serde(default)]
+        db_path: Option<String>,
+        /// Why the store is not anchored to a durable per-user location, or
+        /// `None`. Same D-0009 posture as the two warnings above: a daemon
+        /// writing a whole capture history into `$TMPDIR` must not report as
+        /// plainly healthy.
+        #[serde(default)]
+        storage_warning: Option<String>,
     },
     /// `ZavetStatus`. Boxed like `Status` to keep small arms small.
     ZavetStatus(Box<ZavetStatusView>),

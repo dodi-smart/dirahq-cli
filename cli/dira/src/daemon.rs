@@ -417,6 +417,31 @@ pub(crate) async fn legacy_daemon_socket_default(config: &Config) -> Option<Path
 /// The `dirad: up` line. A daemon whose hook ingress failed to bind answers
 /// every control request but captures nothing, so it is reported as **degraded**
 /// with the reason rather than as a healthy "up" (D-0009).
+/// A warning when `dira` and `dirad` resolved DIFFERENT capture stores.
+///
+/// Neither process can see this alone. `project_dirs()` succeeds on both sides;
+/// they just land in two profiles — a daemon started from an elevated shell, a
+/// service account, or `runas`. The daemon reports itself healthy, `dira status`
+/// reads an empty database, and the user concludes their history is gone. The
+/// only signal is the comparison, which is why the daemon publishes `db_path`.
+///
+/// `None` when they agree, and `None` when the daemon is too old to say — an
+/// unknown is not a divergence, and inventing a warning from a missing field
+/// would be worse than silence.
+pub(crate) fn store_divergence_line(cli_db: &Path, daemon_db: Option<&str>) -> Option<String> {
+    let daemon_db = daemon_db?;
+    if Path::new(daemon_db) == cli_db {
+        return None;
+    }
+    Some(format!(
+        "note: the daemon's capture store is {daemon_db}\n      \
+         but this CLI resolves {}\n      \
+         the daemon is most likely running as a different user or elevated, so \
+         it is writing a history you are not reading",
+        cli_db.display(),
+    ))
+}
+
 fn up_message(sock: &std::path::Path, ingress_error: Option<&str>) -> String {
     match ingress_error {
         None => format!("dirad: up  (socket {})", sock.display()),
@@ -1496,6 +1521,8 @@ mod tests {
             uptime_seconds: 1,
             http_ingress_error: None,
             control_channel_warning: None,
+            db_path: None,
+            storage_warning: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let _ = dira_ipc::write_frame(&mut stream, &bytes).await;
@@ -1516,6 +1543,54 @@ mod tests {
     }
 
     // -- the "up" line, incl. the degraded-ingress flag ----------------------
+
+    // -- the store-divergence line -------------------------------------------
+    //
+    // The elevated / service-account case: `project_dirs()` resolves on BOTH
+    // sides, so neither process can detect it alone — the daemon is happily
+    // writing into one profile's AppData while `dira` reads another's and finds
+    // an empty database. Comparing the two answers is the only way to see it.
+
+    #[test]
+    fn store_divergence_is_quiet_when_the_paths_agree() {
+        assert!(
+            store_divergence_line(
+                Path::new("/home/u/.local/share/dira/dira.db"),
+                Some("/home/u/.local/share/dira/dira.db")
+            )
+            .is_none(),
+            "the normal case must not nag"
+        );
+    }
+
+    #[test]
+    fn store_divergence_names_both_paths_when_they_differ() {
+        let line = store_divergence_line(
+            Path::new("/Users/me/Library/Application Support/dira/dira.db"),
+            Some("C:\\Windows\\system32\\config\\systemprofile\\AppData\\dira.db"),
+        )
+        .expect("a divergence must be reported");
+        assert!(
+            line.contains("/Users/me/Library/Application Support/dira/dira.db"),
+            "must name the CLI's store, got: {line}"
+        );
+        assert!(
+            line.contains("systemprofile"),
+            "must name the DAEMON's store, got: {line}"
+        );
+        assert!(
+            line.to_lowercase().contains("elevated")
+                || line.to_lowercase().contains("different user"),
+            "must name the likely cause, got: {line}"
+        );
+    }
+
+    #[test]
+    fn store_divergence_is_quiet_against_an_older_daemon() {
+        // A pre-upgrade daemon omits `db_path`. Unknown is not divergent, and
+        // inventing a warning from a missing field would be worse than silence.
+        assert!(store_divergence_line(Path::new("/x/dira.db"), None).is_none());
+    }
 
     #[test]
     fn up_message_is_plain_when_the_daemon_is_healthy() {

@@ -1,16 +1,16 @@
 ---
 title: Daemon startup and ingress lifecycle
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
-date: 2026-07-31
+date: 2026-08-04
 paths:
   - cli/dirad/src/lib.rs
   - cli/dirad/src/control.rs
   - cli/dira/src/daemon.rs
   - cli/ipc/**
-decisions: [D-0008, D-0009, D-0010, D-0016]
+decisions: [D-0008, D-0009, D-0010, D-0016, D-0019]
 ---
 
 ## Overview
@@ -35,10 +35,21 @@ the interactive user entirely — a silent, total capture outage.
 
 ## Behavior
 
-- `run()` loads config, opens the store, builds state, then binds — in order —
-  the control channel, then the loopback HTTP hook ingress. Both bind before
-  hydration, so `Ping`/`Status` answer immediately and a status during warm-up
-  reports `hydrating: true`.
+- `run()` loads config, then binds the control channel **before opening the
+  store**, then opens the store, builds state, and binds the loopback HTTP hook
+  ingress. Both binds precede hydration, so `Ping`/`Status` answer immediately
+  and a status during warm-up reports `hydrating: true`.
+- Control-channel-before-store is load-bearing (D-0019). `Store::open` runs
+  `sqlx::migrate!` and can both fail and block, and it used to run *before* the
+  single-instance guard — so a duplicate daemon opened and migrated the
+  database, and contended for it, before the guard could refuse. That is the
+  window in which two processes genuinely hold one database. Binding first
+  makes the refusal the earliest, cheapest and only side-effect-free thing a
+  duplicate hits, and satisfies D-0009's directive that any startup surface
+  which can fail must bind after the control socket.
+- Nothing accepts on the listener until `serve_control`; that gap already
+  existed (the HTTP bind and the hydrate spawn sit inside it) and is only
+  extended by the store open.
 - `bind_control_socket` creates the parent directory, takes an exclusive
   non-blocking `flock(2)` on `<sock>.lock` (held for the daemon's lifetime via
   `SocketLock`), then probes an existing socket file by `connect`. A held lock
@@ -59,6 +70,21 @@ the interactive user entirely — a silent, total capture outage.
   socket and pidfile, and starts a fresh daemon on the fixed path. If its pid
   cannot be determined, restart errors with manual instructions instead of
   starting a second daemon beside it.
+- **No replacement daemon is started until the previous PROCESS is confirmed
+  exited** (D-0019), on every windows restart path — bare and scheduled-task
+  alike. The sequence is `Shutdown` → wait for process exit → `taskkill /F` →
+  wait again → only then start. Failure to confirm exit is a hard error naming
+  the surviving pid and the manual command, never a silent extra daemon.
+- Exit is decided by the process probe (`tasklist`), never by whether the
+  control channel answers. `serve_control` is a detached accept loop nothing
+  cancels and the shutdown notify fires only after the response is written, so
+  the pipe answers `Ping` for the whole of teardown — "stopped answering" and
+  "exited" are different questions, and the grace budget (15 s) must exceed the
+  worst-case teardown (3 s offline beat + 5 s WAL checkpoint) or an orderly
+  shutdown gets force-killed mid-checkpoint.
+- Teardown logs a final `stopped` line with its total, offline-beat and
+  WAL-checkpoint durations. Its absence in a log is itself the signal: the
+  daemon was killed before finishing, or is still going.
 - `dira daemon status` exits 0 when any daemon is running (healthy, degraded,
   or legacy) and 1 when none is; install.sh keys its restart-after-upgrade
   decision off this. `dira version` and `dira daemon status` both point at a

@@ -532,6 +532,37 @@ fn is_subagent_transcript(path: &std::path::Path) -> bool {
 /// The session's own transcript keeps the legacy key so existing watermarks stay
 /// valid and no install re-reads a multi-megabyte transcript on upgrade; only
 /// sidecars get the qualified form.
+/// The `meta` key holding the prologue fingerprint that says WHICH file
+/// [`offset_key_for`]'s byte offset belongs to. Sibling of the offset key, same
+/// suffix, so `nuke` clears both with one `LIKE` each and a sidecar keeps its
+/// own.
+fn fp_key_for(session_id: &str, transcript_path: &str) -> String {
+    let offset = offset_key_for(session_id, transcript_path);
+    format!(
+        "token_fp:{}",
+        offset.strip_prefix("token_offset:").unwrap_or(session_id)
+    )
+}
+
+/// Hash of the file's first `<=FP_PROLOGUE` bytes.
+///
+/// A transcript is append-only in practice, so its prologue is stable for the
+/// life of the file and changes exactly when the file is replaced — which is the
+/// one thing a length comparison cannot see. Returns `None` when the prologue
+/// cannot be read, and a `None` never invalidates a stored offset: an unreadable
+/// prologue must not trigger a multi-megabyte re-read.
+async fn transcript_fingerprint(file: &mut tokio::fs::File, len: u64) -> Option<u64> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+    const FP_PROLOGUE: usize = 4096;
+    if len == 0 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(0)).await.ok()?;
+    let mut buf = vec![0u8; FP_PROLOGUE.min(len as usize)];
+    file.read_exact(&mut buf).await.ok()?;
+    Some(dira_core::sync::fnv1a_bytes(&buf, 0xcbf29ce484222325))
+}
+
 fn offset_key_for(session_id: &str, transcript_path: &str) -> String {
     let path = std::path::Path::new(transcript_path);
     if is_subagent_transcript(path) {
@@ -582,12 +613,23 @@ async fn capture_tokens(
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
     let offset_key = offset_key_for(session_id, transcript_path);
+    let fp_key = fp_key_for(session_id, transcript_path);
     let stored_offset: u64 = match state.store.meta_get(&offset_key).await {
         Ok(Some(s)) => s.parse().unwrap_or(0),
         Ok(None) => 0,
         Err(e) => {
-            tracing::debug!("token offset read failed ({session_id}): {e}");
+            // `warn`, not `debug`: a watermark we cannot read means this session
+            // re-imports its whole transcript on every turn boundary, and the
+            // default filter (`dirad=info,warn`) hides `debug` entirely.
+            tracing::warn!("token offset read failed ({session_id}): {e}");
             0
+        }
+    };
+    let stored_fp: Option<u64> = match state.store.meta_get(&fp_key).await {
+        Ok(v) => v.and_then(|s| s.parse().ok()),
+        Err(e) => {
+            tracing::warn!("token fingerprint read failed ({session_id}): {e}");
+            None
         }
     };
 
@@ -606,27 +648,51 @@ async fn capture_tokens(
         }
     };
 
+    // The file's prologue identifies WHICH file this offset belongs to. Length
+    // alone cannot: a transcript replaced by a different file of equal-or-greater
+    // length passes a `len < stored_offset` check, and the seek then lands
+    // mid-record in unrelated content — silently, and for good.
+    let fresh_fp = transcript_fingerprint(&mut file, len).await;
+
     // Truncated/rotated transcript (compaction): the file is shorter than where we
-    // last read, so the old offset is meaningless — start over from the top.
-    let start = if len < stored_offset {
+    // last read, so the old offset is meaningless — start over from the top. Same
+    // for a file whose prologue changed under a still-valid offset. An ABSENT
+    // fingerprint means an install upgrading into this check: accept the offset
+    // and record the fingerprint below, rather than re-reading megabytes.
+    let swapped = matches!((stored_fp, fresh_fp), (Some(a), Some(b)) if a != b);
+    let start = if len < stored_offset || swapped {
         0
     } else {
         stored_offset
     };
-    if len == start {
-        return; // nothing appended since the last capture
-    }
-    if start > 0 {
-        if let Err(e) = file.seek(SeekFrom::Start(start)).await {
-            tracing::debug!("transcript seek failed ({transcript_path}): {e}");
-            return;
+    if len == start && !swapped {
+        // Nothing appended since the last capture. Still record the fingerprint
+        // if this is the first pass that computed one, so the NEXT swap is caught.
+        if stored_fp.is_none() {
+            if let Some(fp) = fresh_fp {
+                if let Err(e) = state.store.meta_set(&fp_key, &fp.to_string()).await {
+                    tracing::warn!("token fingerprint write failed ({session_id}): {e}");
+                }
+            }
         }
-    }
-    let mut tail = String::new();
-    if let Err(e) = file.read_to_string(&mut tail).await {
-        tracing::debug!("transcript read failed ({transcript_path}): {e}");
         return;
     }
+    if let Err(e) = file.seek(SeekFrom::Start(start)).await {
+        tracing::warn!("transcript seek failed ({transcript_path}): {e}");
+        return;
+    }
+    // Bytes, not `read_to_string`. That call is all-or-nothing on UTF-8
+    // validity, so a single invalid byte anywhere in the tail aborted the whole
+    // capture and returned BEFORE advancing the watermark — leaving the session
+    // to re-read the identical bad tail on every later turn boundary, forever.
+    // A lossy decode costs the one corrupt line instead (the per-line JSON parse
+    // skips it) and keeps everything after it reachable.
+    let mut raw = Vec::new();
+    if let Err(e) = file.read_to_end(&mut raw).await {
+        tracing::warn!("transcript read failed ({transcript_path}): {e}");
+        return;
+    }
+    let tail = String::from_utf8_lossy(&raw);
 
     let turns = match harness {
         Harness::Grok => dira_core::tokens::parse_grok_updates_usage(&tail),
@@ -646,8 +712,13 @@ async fn capture_tokens(
     // the next read starts on a clean line boundary (any partial trailing line is
     // re-read next time — uuid dedup makes that overlap harmless). If the tail has
     // no newline at all, leave the offset where it was and re-read it next call.
-    let new_offset = tail
-        .rfind('\n')
+    //
+    // Searched over the RAW bytes, never the decoded string: `from_utf8_lossy`
+    // substitutes a 3-byte U+FFFD for each 1–3 invalid bytes, so an index into
+    // `tail` is not a byte offset into the file once anything was replaced.
+    let new_offset = raw
+        .iter()
+        .rposition(|b| *b == b'\n')
         .map(|i| start + i as u64 + 1)
         .unwrap_or(start);
     if new_offset > start {
@@ -656,7 +727,14 @@ async fn capture_tokens(
             .meta_set(&offset_key, &new_offset.to_string())
             .await
         {
-            tracing::debug!("token offset write failed ({session_id}): {e}");
+            // `warn`, not `debug`: this is the write whose silent failure makes a
+            // watermark stop advancing with nothing to show for it.
+            tracing::warn!("token offset write failed ({session_id}): {e}");
+        }
+        if let Some(fp) = fresh_fp {
+            if let Err(e) = state.store.meta_set(&fp_key, &fp.to_string()).await {
+                tracing::warn!("token fingerprint write failed ({session_id}): {e}");
+            }
         }
     }
     if captured > 0 {
@@ -901,6 +979,151 @@ mod tests {
         capture_tokens(&state, m, Harness::ClaudeCode, "sess-1", None).await;
         capture_tokens(&state, s, Harness::ClaudeCode, "sess-1", None).await;
         assert_eq!(state.store.count_token_usage_after(None).await.unwrap(), 3);
+    }
+
+    /// One invalid byte used to stall a session's token capture FOREVER.
+    ///
+    /// `read_to_string` is all-or-nothing on UTF-8: it returned `InvalidData`,
+    /// `capture_tokens` returned early, and the watermark never advanced — so
+    /// every later `Stop` re-read the identical bad tail and failed identically.
+    /// Everything after the bad byte, including turns appended days later, was
+    /// unreachable. It logged at `debug`, which is off in production.
+    #[tokio::test]
+    async fn a_corrupt_line_does_not_stall_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-bad.jsonl");
+
+        // Two good turns, a line carrying a lone 0xFF (invalid UTF-8), then a
+        // third good turn after it.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(turn_line("ok-1", "claude-opus-4-8", 10).as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(turn_line("ok-2", "claude-opus-4-8", 20).as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(br#"{"type":"assistant","uuid":"bad"#);
+        bytes.push(0xFF);
+        bytes.extend_from_slice(br#""}"#);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(turn_line("ok-3", "claude-opus-4-8", 30).as_bytes());
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+
+        let state = state_in_memory().await;
+        let p = path.to_str().unwrap();
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-bad", None).await;
+
+        // The corrupt line is dropped by the per-line JSON parse; the three good
+        // turns around it are captured.
+        assert_eq!(
+            state.store.count_token_usage_after(None).await.unwrap(),
+            3,
+            "a bad byte must cost one line, not the whole file"
+        );
+
+        // And the watermark reached the end of the file, so the session is not
+        // wedged. This is the assertion that fails on the old code.
+        let offset: u64 = state
+            .store
+            .meta_get("token_offset:sess-bad")
+            .await
+            .unwrap()
+            .expect("watermark must exist")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            offset,
+            bytes.len() as u64,
+            "the watermark must clear the corrupt line, not stall before it"
+        );
+
+        // A turn appended afterwards still arrives — the real cost of the stall.
+        let mut appended = bytes.clone();
+        appended.extend_from_slice(turn_line("ok-4", "claude-opus-4-8", 40).as_bytes());
+        appended.push(b'\n');
+        std::fs::write(&path, &appended).unwrap();
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-bad", None).await;
+        assert_eq!(state.store.count_token_usage_after(None).await.unwrap(), 4);
+    }
+
+    /// Truncation detection was length-only (`len < stored_offset`), so a
+    /// transcript REPLACED by a different file of equal-or-greater length passed
+    /// the guard and the seek landed mid-record in unrelated content — silently,
+    /// and for good. A prologue fingerprint catches the swap.
+    #[tokio::test]
+    async fn a_replaced_transcript_of_equal_length_is_re_read_from_the_top() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-swap.jsonl");
+
+        let first = format!(
+            "{}\n{}\n",
+            turn_line("aaa-1", "claude-opus-4-8", 100),
+            turn_line("aaa-2", "claude-opus-4-8", 200)
+        );
+        std::fs::write(&path, &first).unwrap();
+
+        let state = state_in_memory().await;
+        let p = path.to_str().unwrap();
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-swap", None).await;
+        assert_eq!(state.store.count_token_usage_after(None).await.unwrap(), 2);
+
+        // A DIFFERENT transcript, byte-length identical (same uuid widths, same
+        // model, same output widths — only the uuids differ).
+        let second = format!(
+            "{}\n{}\n",
+            turn_line("bbb-1", "claude-opus-4-8", 100),
+            turn_line("bbb-2", "claude-opus-4-8", 200)
+        );
+        assert_eq!(first.len(), second.len(), "the swap must be same-length");
+        std::fs::write(&path, &second).unwrap();
+
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-swap", None).await;
+        assert_eq!(
+            state.store.count_token_usage_after(None).await.unwrap(),
+            4,
+            "a same-length replacement must be re-read from byte 0, not skipped"
+        );
+    }
+
+    /// An install upgrading into the fingerprint must not re-read its
+    /// multi-megabyte transcripts: an absent `token_fp:` key means "accept the
+    /// offset and record the fingerprint", never "start over".
+    #[tokio::test]
+    async fn an_upgraded_install_keeps_its_offset_without_a_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-up.jsonl");
+        let body = format!(
+            "{}\n{}\n",
+            turn_line("old-1", "claude-opus-4-8", 100),
+            turn_line("old-2", "claude-opus-4-8", 200)
+        );
+        std::fs::write(&path, &body).unwrap();
+
+        let state = state_in_memory().await;
+        // Pre-seed only the legacy watermark, as an upgrade would leave it: the
+        // whole file already consumed, no fingerprint recorded.
+        state
+            .store
+            .meta_set("token_offset:sess-up", &body.len().to_string())
+            .await
+            .unwrap();
+
+        let p = path.to_str().unwrap();
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-up", None).await;
+
+        assert_eq!(
+            state.store.count_token_usage_after(None).await.unwrap(),
+            0,
+            "an upgrade must not re-import a transcript it already consumed"
+        );
+        assert!(
+            state
+                .store
+                .meta_get("token_fp:sess-up")
+                .await
+                .unwrap()
+                .is_some(),
+            "the fingerprint is recorded on the first pass that sees none"
+        );
     }
 
     /// Test-only compatibility shim reconstructing the pre-WP-B7 `keep_event`

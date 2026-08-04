@@ -571,7 +571,19 @@ fn build_session_views(
             // presence heartbeat's "Right Now" idle, so a busy agent reads `active`
             // rather than `idle` even when you last prompted it long ago.
             let human_idle = s.is_idle(now, idle);
-            let agent_active = human_idle && (now - s.last_event_at) <= idle;
+            // The agent's liveness ceiling is the AGENT policy's, not the human
+            // `idle` knob. A harness emits nothing during a tool call, so judging
+            // "is its agent working?" by the 5-minute human-attention threshold
+            // flipped every long build to `idle` at the 5-minute mark — the same
+            // false inference (silence means absence) that the accounting layer
+            // stopped making. Use exactly the ceiling `agent_gap_seconds` will
+            // apply to this gap, so the live state and the settled number agree.
+            let ceiling = if s.last_opens_span {
+                agent_policy.max_span
+            } else {
+                agent_policy.idle
+            };
+            let agent_active = human_idle && (now - s.last_event_at) <= ceiling;
             SessionView {
                 handle: s.handle(),
                 session_id: s.session_id.clone(),

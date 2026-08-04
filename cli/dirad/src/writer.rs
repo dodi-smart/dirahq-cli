@@ -175,10 +175,15 @@ async fn process_message(
 
     // Capture-time coalescing (Phase 2a): drop a tool-activity event when the
     // session's last *stored* activity is younger than the coalesce window.
-    // Only the high-volume PreTool/PostTool pair is eligible — human signals,
-    // lifecycle, Stop, and CwdChanged are always stored. `coalesce < idle`
-    // (clamped in Config::coalesce) guarantees every surviving gap stays under
-    // the idle threshold, so accounting::active_seconds is preserved.
+    // Only the high-volume `PostTool` is eligible — human signals, lifecycle,
+    // Stop, CwdChanged and `PreTool` are always stored. `PreTool` is excluded
+    // because it is the sole opener of an agent span; see `coalesces`.
+    //
+    // Note this no longer keeps every surviving gap under the idle threshold —
+    // a coalesced-away `PostTool` can leave a wider one. That is fine and
+    // deliberate: human accounting is unaffected (it counts only human signals),
+    // and agent accounting now clamps rather than discards, so a wide gap is
+    // credited up to its ceiling instead of being thrown away.
     //
     // This is a READ-ONLY decision over `last_stored_activity` — see the
     // ordering invariant above for why the watermark itself may only be
@@ -298,6 +303,26 @@ async fn process_message(
     }
     if let Some((path, harness)) = transcript {
         capture_tokens(state, &path, harness, &ev.session_id, ev.project.as_deref()).await;
+        // Claude Code writes `Task`-tool subagent turns to sibling
+        // `agent-*.jsonl` files that no hook ever names, so the main transcript
+        // alone misses them entirely. Attributed to the parent session — the id
+        // dedup keeps the sweep idempotent, and each sidecar carries its own
+        // watermark so an unchanged one costs a single `metadata` call.
+        //
+        // Claude only: the sidecar convention is Claude Code's, and grok's
+        // transcript is a single `updates.jsonl` with a different layout.
+        if harness == Harness::ClaudeCode {
+            for sidecar in subagent_transcripts(&path) {
+                capture_tokens(
+                    state,
+                    &sidecar,
+                    harness,
+                    &ev.session_id,
+                    ev.project.as_deref(),
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -369,13 +394,36 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// The high-volume tool-activity events eligible for capture-time coalescing.
-/// Deliberately narrow: only `PreTool`/`PostTool`, which `dira init` hooks on
-/// *every* tool call. Human signals (UserPrompt, PermissionDecision, ManualTick),
+///
+/// Only `PostTool`. Human signals (UserPrompt, PermissionDecision, ManualTick),
 /// lifecycle (SessionStart/End, ManualStart/Stop), the agent-pause `Stop`, and
 /// `CwdChanged` are never coalesced — they're low-volume and load-bearing for
 /// accounting and project resolution.
+///
+/// `PreTool` used to be eligible too, and dropping it silently destroyed the
+/// agent time it was opening. `PreTool` is the *only* event that sets
+/// `EventKind::opens_agent_span`, which is what lets a long tool call be
+/// credited in full rather than clamped to `agent_idle_seconds`. Coalescing it
+/// away left the preceding `PostTool` as the gap's opener, so:
+///
+/// ```text
+/// T=0      PostTool stored            (opens_span = false)
+/// T=30s    PreTool for a 2h build     DROPPED — within coalesce (45s)
+/// T=2h30s  closing PostTool stored
+///          → gap keyed on a non-opener → clamped to 300s, not 2 hours
+/// ```
+///
+/// Two hours of real work banked five minutes — the exact failure mode the
+/// clamp-not-discard fix set out to end, reachable whenever a tool call starts
+/// within `coalesce_seconds` of the previous activity, i.e. the common case in a
+/// burst. `opens_agent_span` is deliberately keyed on the opener so a *lost*
+/// `PostToolUse` cannot zero the work; the coalescer was dropping the opener
+/// itself, through the same door.
+///
+/// The volume argument still holds for `PostTool`, which fires at the same rate,
+/// so the cap on stored rows is halved rather than removed.
 fn coalesces(kind: EventKind) -> bool {
-    matches!(kind, EventKind::PreTool | EventKind::PostTool)
+    matches!(kind, EventKind::PostTool)
 }
 
 /// Hooks that mark the end of an agent turn — good points to (re-)read the
@@ -460,6 +508,70 @@ fn enrich(
 /// small overlap at the offset boundary is harmless. Best-effort throughout: any
 /// IO error logs at debug and leaves the offset untouched (the next capture
 /// retries from the same point).
+/// Is this transcript a subagent sidecar rather than the session's own file?
+///
+/// Claude Code writes `Task`-tool subagent turns to `agent-<id>.jsonl` beside the
+/// main `<session-uuid>.jsonl`. The name is the only signal available — the hook
+/// payload never distinguishes them.
+fn is_subagent_transcript(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("agent-"))
+}
+
+/// The `meta` key holding the byte watermark for one transcript FILE.
+///
+/// The watermark is a byte offset into a specific file, but the key used to be
+/// keyed on `session_id` alone. That was safe only while exactly one file was
+/// ever read per session. A subagent sidecar carries the *parent's* session id,
+/// so sharing the key would make each capture seek into one file using the
+/// other's offset: the `len < stored_offset` guard resets to 0, a full re-read
+/// follows, and the smaller file's offset is then written back under the shared
+/// key — leaving the main transcript to restart far too early, forever.
+///
+/// The session's own transcript keeps the legacy key so existing watermarks stay
+/// valid and no install re-reads a multi-megabyte transcript on upgrade; only
+/// sidecars get the qualified form.
+fn offset_key_for(session_id: &str, transcript_path: &str) -> String {
+    let path = std::path::Path::new(transcript_path);
+    if is_subagent_transcript(path) {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("subagent");
+        format!("token_offset:{session_id}:{stem}")
+    } else {
+        format!("token_offset:{session_id}")
+    }
+}
+
+/// Sibling `agent-*.jsonl` transcripts beside the session's own, oldest-first.
+///
+/// Claude Code writes subagent turns to separate files that no hook ever names,
+/// so without this sweep their usage never enters the store on any platform —
+/// measured at 840 turns / 85M tokens / ~$158 in a single week on one machine.
+/// Directory reads are cheap and happen only at a turn boundary; each file
+/// carries its own watermark, so an unchanged sidecar costs one `metadata` call.
+fn subagent_transcripts(main: &str) -> Vec<String> {
+    let Some(dir) = std::path::Path::new(main).parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            is_subagent_transcript(p) && p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+        })
+        .filter_map(|p| p.to_str().map(str::to_string))
+        .collect();
+    // Deterministic order so a capture sweep is reproducible.
+    found.sort();
+    found
+}
+
 async fn capture_tokens(
     state: &AppState,
     transcript_path: &str,
@@ -469,7 +581,7 @@ async fn capture_tokens(
 ) {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
-    let offset_key = format!("token_offset:{session_id}");
+    let offset_key = offset_key_for(session_id, transcript_path);
     let stored_offset: u64 = match state.store.meta_get(&offset_key).await {
         Ok(Some(s)) => s.parse().unwrap_or(0),
         Ok(None) => 0,
@@ -522,6 +634,9 @@ async fn capture_tokens(
     };
     let mut captured = 0usize;
     for t in &turns {
+        // Leave a trace when a model family has no bundled price, so a sonnet-rate
+        // estimate for an unrecognised model is noticeable rather than silent.
+        dira_core::tokens::warn_if_unpriced(&t.model);
         match state.store.upsert_token_usage(t, session_id, project).await {
             Ok(()) => captured += 1,
             Err(e) => tracing::warn!("token upsert failed: {e}"),
@@ -570,6 +685,222 @@ mod tests {
             activity: None,
             note: None,
         }
+    }
+
+    /// A `PreTool` opening a long tool call must survive coalescing, even when it
+    /// lands well inside the coalesce window.
+    ///
+    /// `PreTool` is the only event that sets `opens_agent_span`. Dropping it left
+    /// the previous `PostTool` as the gap's opener, so the tool call was clamped
+    /// to `agent_idle_seconds` instead of credited in full: a 2-hour build banked
+    /// 5 minutes. This asserts both the survival and the resulting credit.
+    #[test]
+    fn a_pretool_opening_a_long_build_survives_coalescing_and_is_credited() {
+        use dira_core::accounting::{agent_active_seconds, AgentPolicy, AgentSample};
+
+        let coalesce = Duration::seconds(45);
+        let t0 = OffsetDateTime::now_utc();
+        let mut last = HashMap::new();
+
+        // A fast tool call lands first, so the session's watermark is fresh.
+        assert!(keep_event(
+            &mut last,
+            &tool_ev("s1", t0, EventKind::PostTool),
+            coalesce
+        ));
+        // 30s later — inside the 45s window — a PreTool opens a 2-hour build.
+        let pre_at = t0 + Duration::seconds(30);
+        assert!(
+            keep_event(
+                &mut last,
+                &tool_ev("s1", pre_at, EventKind::PreTool),
+                coalesce
+            ),
+            "a span-opening PreTool must never be coalesced away"
+        );
+        // The closing PostTool, 2 hours on.
+        let post_at = pre_at + Duration::hours(2);
+        assert!(keep_event(
+            &mut last,
+            &tool_ev("s1", post_at, EventKind::PostTool),
+            coalesce
+        ));
+
+        // With the PreTool stored, the 2h gap is keyed on an opener and credited
+        // in full. Without it the same span clamps to agent_idle (300s).
+        let policy = AgentPolicy::default();
+        let stored = [
+            AgentSample {
+                at: t0,
+                opens_span: false,
+            },
+            AgentSample {
+                at: pre_at,
+                opens_span: true,
+            },
+            AgentSample {
+                at: post_at,
+                opens_span: false,
+            },
+        ];
+        assert_eq!(
+            agent_active_seconds(&stored, policy),
+            30 + 7200,
+            "the full build must be credited"
+        );
+
+        let coalesced_away = [
+            AgentSample {
+                at: t0,
+                opens_span: false,
+            },
+            AgentSample {
+                at: post_at,
+                opens_span: false,
+            },
+        ];
+        assert_eq!(
+            agent_active_seconds(&coalesced_away, policy),
+            policy.idle.whole_seconds(),
+            "sanity: dropping the opener is what used to clamp 2h to the idle ceiling"
+        );
+    }
+
+    /// The watermark is a byte offset into a FILE, so two files read for the same
+    /// session must never share a key. A sidecar carries the parent's session id,
+    /// so a shared key would make each capture seek into one file using the
+    /// other's offset and thrash both forever.
+    #[test]
+    fn a_sidecar_never_shares_a_watermark_with_the_session_transcript() {
+        let main = offset_key_for("sess-1", "/p/sess-1.jsonl");
+        let side = offset_key_for("sess-1", "/p/agent-abc.jsonl");
+        assert_ne!(main, side);
+        // The session's own transcript keeps the legacy key, so upgrading does not
+        // orphan existing watermarks and re-read multi-megabyte transcripts.
+        assert_eq!(main, "token_offset:sess-1");
+        assert_eq!(side, "token_offset:sess-1:agent-abc");
+        // Two different sidecars are also distinct from each other.
+        assert_ne!(side, offset_key_for("sess-1", "/p/agent-def.jsonl"));
+        // `nuke` clears these with `LIKE 'token_offset:%'` — both forms match.
+        assert!(main.starts_with("token_offset:") && side.starts_with("token_offset:"));
+    }
+
+    #[test]
+    fn subagent_discovery_finds_siblings_and_ignores_the_main_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("11111111-2222.jsonl");
+        for name in [
+            "11111111-2222.jsonl",
+            "agent-aaa.jsonl",
+            "agent-bbb.jsonl",
+            "agent-notes.md",
+            "other.jsonl",
+        ] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let found = subagent_transcripts(main.to_str().unwrap());
+        let names: Vec<&str> = found
+            .iter()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["agent-aaa.jsonl", "agent-bbb.jsonl"],
+            "only agent-*.jsonl siblings, sorted, never the main transcript"
+        );
+    }
+
+    #[test]
+    fn subagent_discovery_is_quiet_on_a_missing_directory() {
+        assert!(subagent_transcripts("/definitely/not/here/s.jsonl").is_empty());
+    }
+
+    fn turn_line(uuid: &str, model: &str, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","timestamp":"2026-06-27T15:18:07.732Z","message":{{"model":"{model}","usage":{{"input_tokens":2,"output_tokens":{output},"cache_read_input_tokens":1000,"cache_creation_input_tokens":10}}}}}}"#
+        )
+    }
+
+    async fn state_in_memory() -> AppState {
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, Default::default()).await.unwrap();
+        state
+    }
+
+    /// Subagent turns live in files no hook ever names. Capturing them must add
+    /// their usage without moving the main transcript's watermark — the two are
+    /// byte offsets into different files.
+    #[tokio::test]
+    async fn a_sidecar_is_captured_without_disturbing_the_main_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("sess-1.jsonl");
+        let side = dir.path().join("agent-aaa.jsonl");
+        // The main transcript is deliberately the LONGER file: under the old
+        // shared key the sidecar's much smaller offset was written back over it,
+        // which is the thrash this separation prevents.
+        std::fs::write(
+            &main,
+            format!(
+                "{}\n{}\n",
+                turn_line("main-1", "claude-opus-4-8", 100),
+                turn_line("main-2", "claude-opus-4-8", 200)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &side,
+            format!("{}\n", turn_line("sub-1", "claude-haiku", 5)),
+        )
+        .unwrap();
+
+        let state = state_in_memory().await;
+        let (m, s) = (main.to_str().unwrap(), side.to_str().unwrap());
+
+        capture_tokens(&state, m, Harness::ClaudeCode, "sess-1", None).await;
+        let main_offset = state
+            .store
+            .meta_get("token_offset:sess-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        for sidecar in subagent_transcripts(m) {
+            capture_tokens(&state, &sidecar, Harness::ClaudeCode, "sess-1", None).await;
+        }
+
+        // All three turns are stored — the subagent's usage is no longer invisible.
+        assert_eq!(state.store.count_token_usage_after(None).await.unwrap(), 3);
+
+        // The main watermark is untouched by the sidecar capture, and the sidecar
+        // has its own.
+        assert_eq!(
+            state
+                .store
+                .meta_get("token_offset:sess-1")
+                .await
+                .unwrap()
+                .unwrap(),
+            main_offset,
+            "capturing a sidecar must not rewind the main transcript"
+        );
+        assert!(state
+            .store
+            .meta_get("token_offset:sess-1:agent-aaa")
+            .await
+            .unwrap()
+            .is_some());
+
+        // Re-running captures nothing new: both watermarks hold.
+        capture_tokens(&state, m, Harness::ClaudeCode, "sess-1", None).await;
+        capture_tokens(&state, s, Harness::ClaudeCode, "sess-1", None).await;
+        assert_eq!(state.store.count_token_usage_after(None).await.unwrap(), 3);
     }
 
     /// Test-only compatibility shim reconstructing the pre-WP-B7 `keep_event`

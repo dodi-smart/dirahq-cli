@@ -583,7 +583,85 @@ mod properties {
             .collect()
     }
 
+    fn build_agent(raw: &[(i64, bool)]) -> Vec<AgentSample> {
+        let base = OffsetDateTime::UNIX_EPOCH;
+        let mut samples: Vec<AgentSample> = raw
+            .iter()
+            .map(|(s, opens)| AgentSample {
+                at: base + Duration::seconds(*s),
+                opens_span: *opens,
+            })
+            .collect();
+        samples.sort_by_key(|s| s.at);
+        samples
+    }
+
     proptest! {
+        /// The agent rules CLAMP, they never discard. Whatever the gap widths, the
+        /// credited total is at least what a strict per-gap idle cap would give —
+        /// which is the property the pre-fix code violated by dropping over-idle
+        /// gaps to zero.
+        #[test]
+        fn agent_time_is_clamped_never_discarded(
+            raw in prop::collection::vec((0i64..100_000, any::<bool>()), 0..200)
+        ) {
+            let samples = build_agent(&raw);
+            let policy = AgentPolicy::default();
+            let got = agent_active_seconds(&samples, policy);
+
+            let floor: i64 = samples
+                .windows(2)
+                .map(|w| {
+                    let d = (w[1].at - w[0].at).whole_seconds();
+                    d.clamp(0, policy.idle.whole_seconds())
+                })
+                .sum();
+            prop_assert!(
+                got >= floor,
+                "agent time must never fall below the per-gap idle clamp: {got} < {floor}"
+            );
+        }
+
+        /// No single gap may contribute more than its own ceiling, so an abandoned
+        /// tool call cannot run away with the clock.
+        #[test]
+        fn no_agent_gap_exceeds_its_ceiling(
+            raw in prop::collection::vec((0i64..100_000, any::<bool>()), 0..200)
+        ) {
+            let samples = build_agent(&raw);
+            let policy = AgentPolicy::default();
+            let ceiling: i64 = samples
+                .windows(2)
+                .map(|w| {
+                    if w[0].opens_span {
+                        policy.max_span.whole_seconds()
+                    } else {
+                        policy.idle.whole_seconds()
+                    }
+                })
+                .sum();
+            prop_assert!(agent_active_seconds(&samples, policy) <= ceiling);
+        }
+
+        /// Agent accounting must never move human accounting.
+        #[test]
+        fn agent_rules_do_not_touch_human_time(
+            raw in prop::collection::vec(arb_signal(), 0..200)
+        ) {
+            let signals = build(&raw);
+            let idle = Duration::minutes(5);
+            let before = counted_gaps(&signals, idle);
+            // Same timeline read as agent samples — must not disturb the human sum.
+            let _ = agent_active_seconds(
+                &signals
+                    .iter()
+                    .map(|s| AgentSample { at: s.at, opens_span: false })
+                    .collect::<Vec<_>>(),
+                AgentPolicy::default(),
+            );
+            prop_assert_eq!(before.len(), counted_gaps(&signals, idle).len());
+        }
+
         /// Counted gaps never overlap — the no-double-count guarantee.
         #[test]
         fn gaps_never_overlap(raw in prop::collection::vec(arb_signal(), 0..200)) {

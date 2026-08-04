@@ -170,12 +170,15 @@ pub struct Config {
     /// session abandoned with an unmatched `PreTool`, cannot bank days.
     #[serde(default = "default_agent_max_span_seconds")]
     pub agent_max_span_seconds: u64,
-    /// Capture-time coalescing window in seconds. A high-volume tool-activity
-    /// event (PreTool/PostTool) is dropped at capture if the session's last
-    /// *stored* activity event is younger than this. Human signals, lifecycle,
-    /// and CwdChanged events are never coalesced. MUST be `< idle_seconds` so
-    /// `accounting::active_seconds` gap-counting is preserved (every surviving
-    /// gap stays under the idle threshold); [`Config::coalesce`] clamps it.
+    /// Capture-time coalescing window in seconds. A high-volume `PostTool` event
+    /// is dropped at capture if the session's last *stored* activity event is
+    /// younger than this. Human signals, lifecycle, CwdChanged — and `PreTool`,
+    /// the sole opener of an agent span — are never coalesced.
+    ///
+    /// Still clamped `< idle_seconds` by [`Config::coalesce`], but no longer
+    /// because gap-counting depends on it: human time counts only human signals,
+    /// which are never coalesced, and agent time now clamps rather than discards,
+    /// so a wider surviving gap is credited up to its ceiling instead of lost.
     pub coalesce_seconds: u64,
     /// Retention window in days. Raw events older than this AND already synced
     /// (id ≤ sync cursor) are rolled up into `session_rollup_daily` and pruned

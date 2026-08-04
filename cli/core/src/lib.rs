@@ -11,6 +11,7 @@ pub mod accounting;
 pub mod config;
 pub mod identity;
 pub mod model;
+pub mod pricing;
 pub mod project;
 pub mod protocol;
 pub mod report;

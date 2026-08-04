@@ -44,6 +44,26 @@ vector:
 # Regenerate both contract artifacts (schema + signing fixture).
 contract: contract-schema vector
 
+# Refresh the bundled model-price table from models.dev.
+#
+# NOT a contract artifact and deliberately NOT part of `just ci`: it needs the
+# network, and the table is an estimate for local display only. The cloud keeps
+# its own copy, is authoritative, and re-prices historical rows — the two are
+# allowed to drift between refreshes. Runs monthly in CI; run it by hand after a
+# model launch or a price change.
+#
+# Writes via a temp file so a failed fetch or a rejected payload can never
+# truncate the vendored table.
+pricing-sync:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' EXIT
+    curl -fsSL https://models.dev/api.json \
+      | cargo run -q -p dira-core --bin pricing_sync > "$tmp"
+    mv "$tmp" cli/core/pricing/models.json
+    echo "wrote cli/core/pricing/models.json"
+
 # ---------- Local dev loop (dogfooding) ----------
 
 # Run the daemon in the foreground (Ctrl-C to stop).

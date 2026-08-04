@@ -1,0 +1,11 @@
+{
+  "$comment": "Hand-maintained corrections merged over models.json (overrides win; a null value suppresses a bad upstream entry). Same shape as models.json: model id -> USD per 1M tokens. Never touched by `just pricing-sync`.",
+  "models": {
+    "grok": {
+      "input": 3,
+      "output": 15,
+      "cacheRead": 0.75,
+      "cacheWrite": 0
+    }
+  }
+}

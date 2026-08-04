@@ -77,7 +77,13 @@ cursor and not a wider window.
   count in the flush log line. Missing the last one is why this defect survived
   weeks in production: a flush shipping zero token rows logged byte-identically
   to one shipping a thousand.
-- Never advance the token cursor anywhere but the `is_last` chunk's 2xx.
+- ~~Never advance the token cursor anywhere but the `is_last` chunk's 2xx.~~
+  **Struck — corrected by D-0020.** Advance a stream's watermark on the chunk
+  that carried the rows, in that chunk's own 2xx branch, to the high rowid *it*
+  carried. Gating on `is_last` made progress depend on an unbounded run of
+  consecutive successes, so one 429 or one restart mid-drain cost the whole
+  backlog. See D-0020 for the replacement directive; the rest of this record
+  stands.
 
 ## Verification
 

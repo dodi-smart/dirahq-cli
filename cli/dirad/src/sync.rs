@@ -462,6 +462,37 @@ pub(crate) fn transient_wait(
         .min(MAX_BACKOFF)
 }
 
+/// Minimum spacing between consecutive ingest POSTs inside one flush. 2.5s ⇒ at
+/// most 24/min, leaving headroom under the 30/min budget for the periodic syncs
+/// and retries that share the same window.
+pub(crate) const INGEST_CHUNK_SPACING: StdDuration = StdDuration::from_millis(2_500);
+
+/// Chunk count at or below which a flush is never paced. Normal traffic is one or
+/// two chunks; pacing those would add latency to every ordinary sync to solve a
+/// problem only a large drain has.
+pub(crate) const UNPACED_CHUNKS: usize = 10;
+
+/// How long to wait before POSTing the next chunk of a `chunk_count`-chunk flush,
+/// given that the previous POST already took `already_elapsed`.
+///
+/// A drain that fires every chunk back-to-back is what put a 49-chunk token
+/// backlog against a 30/min budget and got throttled at chunk 31 (#88). Pacing
+/// keeps a long drain inside the budget; per-chunk cursors (D-0020) are what make
+/// it survivable when pacing is not enough. Pure, so the policy is testable
+/// without a clock or a network.
+pub(crate) fn chunk_pace_delay(
+    chunk_count: usize,
+    already_elapsed: StdDuration,
+) -> Option<StdDuration> {
+    if chunk_count <= UNPACED_CHUNKS {
+        return None;
+    }
+    // The round-trip itself counts toward the interval — a slow network needs no
+    // help spacing requests out.
+    let remaining = INGEST_CHUNK_SPACING.saturating_sub(already_elapsed);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
 /// Which channel a health snapshot belongs to: its `meta` keys plus the log
 /// prefix. Both sync tasks persist the same [`dira_core::sync::SyncHealth`]
 /// shape through [`record_channel_health`]; only the keys differ.
@@ -817,6 +848,8 @@ async fn flush(
         let interval_count = chunk.batch.intervals.len();
         let session_count = chunk.batch.sessions.len();
         let cursor_event_id = chunk.cursor_event_id;
+        let token_rowid_high = chunk.token_rowid_high;
+        let artifact_rowid_high = chunk.artifact_rowid_high;
         let is_last = chunk.is_last;
         let envelope = Envelope {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -824,6 +857,11 @@ async fn flush(
             payload: chunk.batch,
             sig,
         };
+        // Pace a long drain so it stays inside the cloud's ingest budget instead of
+        // being throttled part-way through (#88). Measured across the POST, so the
+        // round-trip counts toward the interval; skipped entirely for the ordinary
+        // one- or two-chunk flush. See D-0020.
+        let posted_at = Instant::now();
         let resp = client
             .post(&url)
             .timeout(HTTP_TIMEOUT)
@@ -897,33 +935,45 @@ async fn flush(
                         .await
                         .map_err(|e| SyncError::Fatal(format!("advance cursor: {e}")))?;
                 }
-                if is_last {
-                    if let Some(u) = art_until {
-                        state
-                            .store
-                            .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
-                            .await
-                            .map_err(|e| {
-                                SyncError::Fatal(format!("advance artifacts cursor: {e}"))
-                            })?;
-                    }
-                    if let Some(u) = tok_until {
-                        state
-                            .store
-                            .meta_set(META_TOKEN_CURSOR, &u.to_string())
-                            .await
-                            .map_err(|e| SyncError::Fatal(format!("advance token cursor: {e}")))?;
-                    }
-                    if !partial_ids.is_empty() {
-                        if let Ok(mut reg) = state.sessions.lock() {
-                            reg.mark_partials_sent(&partial_ids);
-                        }
+                // Row cursors advance on the chunk that CARRIED the rows, to the
+                // watermark that chunk covered — not on `is_last`, and never to
+                // the flush-wide snapshot bound. Gating these on the final chunk
+                // made progress depend on an unbounded run of consecutive
+                // successes: a 49-chunk token drain against the cloud's 30/min
+                // ingest budget recorded nothing at all and restarted at row 1
+                // forever (#88), and any mid-drain restart cost the whole
+                // backlog the same way. See D-0020.
+                if let Some(u) = artifact_rowid_high {
+                    state
+                        .store
+                        .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
+                        .await
+                        .map_err(|e| SyncError::Fatal(format!("advance artifacts cursor: {e}")))?;
+                }
+                if let Some(u) = token_rowid_high {
+                    state
+                        .store
+                        .meta_set(META_TOKEN_CURSOR, &u.to_string())
+                        .await
+                        .map_err(|e| SyncError::Fatal(format!("advance token cursor: {e}")))?;
+                }
+                // Partial rollups are a live-registry snapshot, not a cursor over
+                // stored rows, so they stay on the final chunk. See D-0020.
+                if is_last && !partial_ids.is_empty() {
+                    if let Ok(mut reg) = state.sessions.lock() {
+                        reg.mark_partials_sent(&partial_ids);
                     }
                 }
             }
             total_intervals += interval_count;
             total_sessions += session_count;
             last_body = body;
+            // Nothing follows the final chunk, so it never pays the spacing.
+            if !is_last {
+                if let Some(wait) = chunk_pace_delay(chunk_count, posted_at.elapsed()) {
+                    sleep(wait).await;
+                }
+            }
             continue;
         }
 
@@ -1778,6 +1828,182 @@ mod tests {
             before,
             state.store.meta_get(META_TOKEN_CURSOR).await.unwrap(),
             "a rejected batch must not advance the token cursor"
+        );
+    }
+
+    /// The cloud's per-device ingest budget, requests per fixed 60s window. Lives
+    /// in the tests because production never reads it — it is the external fact the
+    /// production spacing is checked against. The authority is the cloud's own rate
+    /// limiter; a deployment that lowers it must lower `INGEST_CHUNK_SPACING` too.
+    const CLOUD_INGEST_BUDGET_PER_MIN: u64 = 30;
+
+    /// The pacing constant is only meaningful relative to the cloud's per-device
+    /// ingest budget (30/min, fixed window). Pin the arithmetic so a future edit to
+    /// the spacing cannot silently push a drain back over the limit. See D-0020.
+    #[test]
+    fn pacing_keeps_a_drain_inside_the_cloud_ingest_budget() {
+        let per_min = 60_000 / INGEST_CHUNK_SPACING.as_millis() as u64;
+        assert!(
+            per_min <= CLOUD_INGEST_BUDGET_PER_MIN,
+            "paced drain would issue {per_min}/min against a {CLOUD_INGEST_BUDGET_PER_MIN}/min budget"
+        );
+    }
+
+    /// Ordinary flushes are one or two chunks and must not pay a pacing delay —
+    /// the latency of normal sync is the thing pacing must not regress.
+    #[test]
+    fn pacing_leaves_an_ordinary_flush_alone() {
+        assert_eq!(chunk_pace_delay(1, StdDuration::ZERO), None);
+        assert_eq!(chunk_pace_delay(UNPACED_CHUNKS, StdDuration::ZERO), None);
+    }
+
+    /// A drain long enough to threaten the budget gets spaced.
+    #[test]
+    fn pacing_spaces_a_long_drain() {
+        assert_eq!(
+            chunk_pace_delay(UNPACED_CHUNKS + 1, StdDuration::ZERO),
+            Some(INGEST_CHUNK_SPACING)
+        );
+        assert_eq!(
+            chunk_pace_delay(49, StdDuration::ZERO),
+            Some(INGEST_CHUNK_SPACING)
+        );
+    }
+
+    /// The POST itself counts toward the spacing. A slow round-trip already spent
+    /// the budget's worth of wall clock, so sleeping the full interval on top would
+    /// add latency for nothing.
+    #[test]
+    fn pacing_credits_the_time_the_post_already_took() {
+        assert_eq!(
+            chunk_pace_delay(49, INGEST_CHUNK_SPACING / 4),
+            Some(INGEST_CHUNK_SPACING - INGEST_CHUNK_SPACING / 4)
+        );
+        assert_eq!(chunk_pace_delay(49, INGEST_CHUNK_SPACING), None);
+        assert_eq!(chunk_pace_delay(49, StdDuration::from_secs(30)), None);
+    }
+
+    /// The policy tests above pin the arithmetic; this one pins that `flush`
+    /// actually consults it. Eleven token chunks clear `UNPACED_CHUNKS`, and the
+    /// second chunk is throttled so the flush ends after exactly one spacing
+    /// interval instead of ten — the wiring is proved for ~2.5s, not ~25s.
+    #[tokio::test]
+    async fn pacing_is_applied_between_chunks_of_a_real_drain() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+        cloud.push(
+            "/api/v1/ingest",
+            MockResp::status(429, r#"{"error":"rate_limited","retryAfterSecs":1}"#),
+        );
+        let state = linked_state_with_one_event(&cloud).await;
+        seed_token_rows(&state, dira_core::sync::CHUNK_TOKENS * UNPACED_CHUNKS + 1).await;
+
+        let key = DeviceKey::generate();
+        let started = Instant::now();
+        flush(&state, &key, &state.http)
+            .await
+            .expect_err("the throttled second chunk ends this flush");
+
+        assert!(
+            started.elapsed() >= INGEST_CHUNK_SPACING,
+            "a drain past UNPACED_CHUNKS must space its POSTs; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Seed `n` token rows on one session, ordered by rowid. `turn-<rowid>` ids make
+    /// the assertion about *which* rows reached the wire readable.
+    async fn seed_token_rows(state: &AppState, n: usize) {
+        for i in 0..n {
+            let turn = dira_core::tokens::TokenTurn {
+                id: format!("turn-{i}"),
+                at: "2026-06-15T12:52:19Z".into(),
+                model: "claude-opus-4-8".into(),
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_create: 0,
+            };
+            state
+                .store
+                .upsert_token_usage(&turn, "s1", Some("github.com/acme/api"))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Issue #88. A token backlog bigger than the cloud's per-device ingest budget
+    /// used to be undrainable: `META_TOKEN_CURSOR` advanced only on the `is_last`
+    /// chunk, so a drain throttled part-way threw away every chunk the cloud had
+    /// already accepted and restarted at row 1 on the next flush — forever, with
+    /// 49 chunks needed against a 30/min budget. See D-0020.
+    #[tokio::test]
+    async fn a_throttled_token_drain_keeps_the_chunks_the_cloud_already_acked() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        // Chunk 0 lands; chunk 1 is throttled — the shape of a mid-drain 429.
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+        cloud.push(
+            "/api/v1/ingest",
+            MockResp::status(429, r#"{"error":"rate_limited","retryAfterSecs":51}"#),
+        );
+        let state = linked_state_with_one_event(&cloud).await;
+
+        // One row past CHUNK_TOKENS ⇒ exactly two token chunks.
+        seed_token_rows(&state, dira_core::sync::CHUNK_TOKENS + 1).await;
+        let total = state.store.max_token_usage_rowid().await.unwrap().unwrap();
+
+        let key = DeviceKey::generate();
+        flush(&state, &key, &state.http)
+            .await
+            .expect_err("the throttled chunk must fail this flush");
+
+        let cursor = state
+            .store
+            .meta_get(META_TOKEN_CURSOR)
+            .await
+            .unwrap()
+            .and_then(|s| s.parse::<i64>().ok());
+        assert_eq!(
+            cursor,
+            Some(total - 1),
+            "the accepted chunk's watermark must survive the throttled one that followed it"
+        );
+    }
+
+    /// The other half of #88: having kept the acked progress, the next flush must
+    /// ship only the remainder — not re-send the whole backlog.
+    #[tokio::test]
+    async fn a_resumed_token_drain_ships_only_the_rows_left() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+        cloud.push(
+            "/api/v1/ingest",
+            MockResp::status(429, r#"{"error":"rate_limited","retryAfterSecs":1}"#),
+        );
+        let state = linked_state_with_one_event(&cloud).await;
+        seed_token_rows(&state, dira_core::sync::CHUNK_TOKENS + 1).await;
+        let total = state.store.max_token_usage_rowid().await.unwrap().unwrap();
+
+        let key = DeviceKey::generate();
+        flush(&state, &key, &state.http)
+            .await
+            .expect_err("first attempt is throttled mid-drain");
+
+        let sent_before = cloud.requests("/api/v1/ingest").len();
+        flush(&state, &key, &state.http)
+            .await
+            .expect("the remainder must ship");
+
+        let reqs = cloud.requests("/api/v1/ingest");
+        assert_eq!(
+            reqs.len() - sent_before,
+            1,
+            "only the one leftover chunk should be re-sent, not the whole backlog"
+        );
+        assert_eq!(
+            state.store.meta_get(META_TOKEN_CURSOR).await.unwrap(),
+            Some(total.to_string()),
+            "a completed drain lands the cursor on the snapshot bound"
         );
     }
 

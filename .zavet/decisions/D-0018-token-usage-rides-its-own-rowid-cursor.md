@@ -8,6 +8,7 @@ guards:
 checks:
   - a token backlog ships with no new events :: cargo test -p dirad --lib flush_ships_a_token_backlog_with_no_new_events
   - re-captured rows still ship after a nuke :: cargo test -p dirad --lib re_captured_rows_still_ship_after_a_nuke
+corrected-by: D-0020
 origin: session
 verified: false
 ---

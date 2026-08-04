@@ -545,7 +545,7 @@ impl Store {
         let rows = match cursor {
             Some(c) => {
                 sqlx::query(
-                    "SELECT sha, repo, git_ref, kind, authored_at, author_email, author_name, source_session, patch_id, session_change_id, touched_paths, blobs \
+                    "SELECT rowid, sha, repo, git_ref, kind, authored_at, author_email, author_name, source_session, patch_id, session_change_id, touched_paths, blobs \
                      FROM artifacts \
                      WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid ASC",
                 )
@@ -556,7 +556,7 @@ impl Store {
             }
             None => {
                 sqlx::query(
-                    "SELECT sha, repo, git_ref, kind, authored_at, author_email, author_name, source_session, patch_id, session_change_id, touched_paths, blobs \
+                    "SELECT rowid, sha, repo, git_ref, kind, authored_at, author_email, author_name, source_session, patch_id, session_change_id, touched_paths, blobs \
                      FROM artifacts \
                      WHERE rowid <= ?1 ORDER BY rowid ASC",
                 )
@@ -594,7 +594,7 @@ impl Store {
         let rows = match cursor {
             Some(c) => {
                 sqlx::query(
-                    "SELECT id, session_id, project, model, input, output, \
+                    "SELECT rowid, id, session_id, project, model, input, output, \
                      cache_read, cache_create, est_cost, at \
                      FROM token_usage \
                      WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid ASC",
@@ -606,7 +606,7 @@ impl Store {
             }
             None => {
                 sqlx::query(
-                    "SELECT id, session_id, project, model, input, output, \
+                    "SELECT rowid, id, session_id, project, model, input, output, \
                      cache_read, cache_create, est_cost, at \
                      FROM token_usage \
                      WHERE rowid <= ?1 ORDER BY rowid ASC",
@@ -2286,6 +2286,7 @@ fn row_to_artifact_row(row: &sqlx::sqlite::SqliteRow) -> ArtifactRow {
         .get::<Option<String>, _>("blobs")
         .and_then(|s| serde_json::from_str::<Vec<dira_contract::BlobRef>>(&s).ok());
     ArtifactRow {
+        rowid: row.get("rowid"),
         sha: row.get("sha"),
         repo: row.get("repo"),
         git_ref: row.get("git_ref"),
@@ -2303,6 +2304,7 @@ fn row_to_artifact_row(row: &sqlx::sqlite::SqliteRow) -> ArtifactRow {
 
 fn row_to_token_row(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRow, Error> {
     Ok(TokenRow {
+        rowid: row.get("rowid"),
         id: row.get("id"),
         session_id: row.get("session_id"),
         project: row.get("project"),

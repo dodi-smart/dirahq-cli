@@ -63,7 +63,7 @@ single flush window (issue #40).
   session's `SessionEnd`/`ManualStop`, but are aggregated over the session's
   FULL retained event history (`Store::events_for_sessions`, bounded by the
   window's `until` id), not just the tail window — prompts, branch,
-  `started_at`, and idle-trimmed `agent_wall_seconds` cover the whole
+  `started_at`, and clamped `agent_wall_seconds` cover the whole
   session. Best-effort: compaction prunes events that are both synced and
   past retention, so a session outliving retention rolls up from what
   remains (still a superset of the tail window).
@@ -73,7 +73,7 @@ single flush window (issue #40).
   rollup. When both a stale and a real end exist, `(at, id)`-sorted merging
   makes the latest end win.
 - Partial rollups describe still-live sessions from the daemon's in-memory
-  registry: rolling idle-trimmed `active_seconds`, a live `prompts` counter,
+  registry: rolling clamped `active_seconds`, a live `prompts` counter,
   and the last-resolved branch (last-wins — the honest answer for a live
   session, deliberately unlike the terminal rollup's start-branch policy,
   whose write supersedes the partial anyway). The registry is a pure fold

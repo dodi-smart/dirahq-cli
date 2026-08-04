@@ -51,6 +51,16 @@ const KNOBS: &[Knob] = &[
         help: "idle threshold; gaps wider than this aren't counted as human time",
     },
     Knob {
+        key: "agent_idle_seconds",
+        kind: Kind::U64,
+        help: "agent gap ceiling; a gap NOT opened by a tool call is clamped to this",
+    },
+    Knob {
+        key: "agent_max_span_seconds",
+        kind: Kind::U64,
+        help: "ceiling for a gap opened by a tool call (an abandoned call can't run away)",
+    },
+    Knob {
         key: "heartbeat_active_secs",
         kind: Kind::U64,
         help: "fast heartbeat cadence while a live session is active",
@@ -333,6 +343,29 @@ fn validate_u64(config: &Config, key: &str, n: u64) -> Result<()> {
                 );
             }
         }
+        // `Config::agent_policy` floors max_span at agent_idle, so a smaller value
+        // would be silently raised. Reject instead, for the same reason as above.
+        "agent_max_span_seconds" => {
+            if n < config.agent_idle_seconds {
+                bail!(
+                    "agent_max_span_seconds ({n}) must be >= agent_idle_seconds ({}) — \
+                     a tool call's ceiling can't be tighter than an ordinary gap's",
+                    config.agent_idle_seconds
+                );
+            }
+        }
+        "agent_idle_seconds" => {
+            if n == 0 {
+                bail!("agent_idle_seconds must be > 0");
+            }
+            if n > config.agent_max_span_seconds {
+                bail!(
+                    "agent_idle_seconds ({n}) must be <= the current \
+                     agent_max_span_seconds ({}) — raise that first",
+                    config.agent_max_span_seconds
+                );
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -354,6 +387,40 @@ mod tests {
     fn rejects_unknown_key() {
         let err = set(&cfg(), "socket_path", "/tmp/x.sock").unwrap_err();
         assert!(err.to_string().contains("not settable"));
+    }
+
+    /// The agent thresholds are the knobs that decide whether a long tool call is
+    /// credited, so they must be reachable from `dira config set` — they were
+    /// file/env-only, which meant the one number a user would want to raise after
+    /// hitting the clamp could not be raised.
+    #[test]
+    fn the_agent_thresholds_are_settable() {
+        for key in ["agent_idle_seconds", "agent_max_span_seconds"] {
+            assert!(knob(key).is_some(), "{key} must be listed as a knob");
+        }
+        let k = knob("agent_idle_seconds").unwrap();
+        assert!(parse_and_validate(&cfg(), k, "1800").is_ok());
+        assert!(
+            parse_and_validate(&cfg(), k, "0").is_err(),
+            "a zero agent idle would clamp every unbracketed gap to nothing"
+        );
+    }
+
+    /// `Config::agent_policy` floors max_span at agent_idle, so a smaller value
+    /// would be silently raised — reject it instead of accepting a lie.
+    #[test]
+    fn max_span_cannot_sit_below_agent_idle() {
+        let c = Config {
+            agent_idle_seconds: 300,
+            agent_max_span_seconds: 28_800,
+            ..cfg()
+        };
+        let k = knob("agent_max_span_seconds").unwrap();
+        assert!(parse_and_validate(&c, k, "60").is_err());
+        assert!(parse_and_validate(&c, k, "300").is_ok());
+
+        let k = knob("agent_idle_seconds").unwrap();
+        assert!(parse_and_validate(&c, k, "36000").is_err());
     }
 
     #[test]

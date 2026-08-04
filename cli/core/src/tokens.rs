@@ -46,6 +46,53 @@ pub struct ModelPricing {
     pub cache_write: f64,
 }
 
+/// Which bundled pricing family a model id resolves to, or `None` when nothing
+/// matched and the sonnet-shaped fallback is being used.
+///
+/// Exposed so an unrecognised family can be *noticed*. The fallback is a
+/// deliberate design (a cost label must always render), but silently pricing an
+/// unknown model at sonnet rates is indistinguishable from pricing a known one
+/// correctly. `claude-fable-5` is the live example: it matches none of the
+/// branches below and is currently estimated at sonnet rates. That stays until
+/// someone supplies its real published price — inventing a number here would
+/// convert a *visible* approximation into an invisible wrong one.
+pub fn pricing_family(model: &str) -> Option<&'static str> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") {
+        Some("opus")
+    } else if m.contains("haiku") {
+        Some("haiku")
+    } else if m.contains("grok") {
+        Some("grok")
+    } else if m.contains("sonnet") {
+        Some("sonnet")
+    } else {
+        None
+    }
+}
+
+/// Log once per process for each model family with no explicit pricing entry, so
+/// a silent sonnet-rate estimate leaves a trace. Advisory only — never affects
+/// the value returned by [`pricing_for`].
+pub fn warn_if_unpriced(model: &str) {
+    if pricing_family(model).is_some() {
+        return;
+    }
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(model.to_string()) {
+        tracing::info!(
+            model = %model,
+            "tokens: no bundled pricing for this model family — cost estimated at sonnet rates"
+        );
+    }
+}
+
 /// Bundled, approximate pricing by model family (USD per million tokens). These
 /// are estimates for the compute *label* only — see the module docs.
 pub fn pricing_for(model: &str) -> ModelPricing {

@@ -42,14 +42,21 @@ pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy
         .collect();
     let human_by_project = accounting::per_project_seconds(&signals, idle);
 
-    // --- agent wall-clock: idle-trimmed active time per session, summed freely ---
-    // The wall-clock is the idle-trimmed active span over each session's own event
-    // timestamps ([`accounting::active_seconds`]), NOT the raw `last - first`
+    // --- agent wall-clock: clamped active time per session, summed freely ---
+    // The wall-clock is the clamped active span over each session's own event
+    // timestamps ([`accounting::agent_active_seconds`]), NOT the raw `last - first`
     // lifetime: a session left open for hours between bursts of work reads as the
     // time it was actually active, so dead spans can't inflate it. This is the same
     // measure the sync/rollup path (`sync::batch`) and the cloud already use, so the
     // local report, the historical rollups folded in by [`build_merged`], and the
     // synced totals all agree.
+    //
+    // "Clamped", not "idle-trimmed": a gap opened by a `PreTool` is a tool call in
+    // flight and is credited in FULL up to `agent_max_span_seconds`; any other gap
+    // is capped at `agent_idle_seconds`. Neither is discarded. Trimming over-idle
+    // gaps the way human time does is what used to bank zero seconds for a
+    // two-hour build — human silence means absence, agent silence usually means
+    // work.
     let mut sessions: BTreeMap<&str, (Option<String>, Vec<accounting::AgentSample>, bool)> =
         BTreeMap::new();
     for e in events {

@@ -30,7 +30,7 @@ use tokio::time::{sleep, sleep_until, Instant};
 /// `meta` key: the last event id confirmed-synced to the cloud. Defined in
 /// `dira_core::sync` so the store (`nuke`) and CLI share one definition; re-
 /// exported here for the daemon's existing references.
-pub use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR};
+pub use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR, META_TOKEN_CURSOR};
 
 /// Debounce window: coalesce a burst of triggers into one flush.
 const DEBOUNCE: StdDuration = StdDuration::from_secs(3);
@@ -684,23 +684,40 @@ async fn flush(
         _ => Vec::new(),
     };
 
-    if events.is_empty() && artifact_rows.is_empty() {
+    // Token rows in `(tok_cursor, tok_until]` — like artifacts, they ride their own
+    // rowid cursor rather than the event window. They used to be selected by the
+    // at-range of this batch's events, which dropped almost all of them: a turn is
+    // discovered by the `Stop` that FOLLOWS it, so its transcript timestamp always
+    // sorts below the window's own first event. The cloud dedups token_usage by id,
+    // so over-inclusion is free; under-inclusion was permanent, because nothing
+    // recorded that a row had never been sent.
+    let tok_cursor = state
+        .store
+        .meta_get(META_TOKEN_CURSOR)
+        .await
+        .map_err(|e| SyncError::Fatal(format!("read token cursor: {e}")))?
+        .and_then(|s| s.parse::<i64>().ok());
+    let tok_until = state
+        .store
+        .max_token_usage_rowid()
+        .await
+        .map_err(|e| SyncError::Fatal(format!("read max token rowid: {e}")))?;
+    let token_rows =
+        match tok_until {
+            Some(u) if tok_cursor != Some(u) => state
+                .store
+                .unsynced_token_usage(tok_cursor, u)
+                .await
+                .map_err(|e| SyncError::Fatal(format!("load token rows: {e}")))?,
+            _ => Vec::new(),
+        };
+
+    // Tokens join the flush gate. Without this a caught-up event log meant a token
+    // backlog could never drain — `flush` returned `Nothing` and no later flush
+    // reconsidered it.
+    if events.is_empty() && artifact_rows.is_empty() && token_rows.is_empty() {
         return Ok(FlushOutcome::Nothing);
     }
-
-    // Token rows: bound by the at-range of this event window (empty when there are
-    // no new events). The cloud dedups token_usage by id, so over-inclusion is fine.
-    let token_rows = if events.is_empty() {
-        Vec::new()
-    } else {
-        let since_at = events.first().map(fmt_at);
-        let until_at = events.last().map(fmt_at).unwrap_or_default();
-        state
-            .store
-            .token_usage_between(since_at.as_deref(), &until_at)
-            .await
-            .map_err(|e| SyncError::Fatal(format!("load token rows: {e}")))?
-    };
 
     // 3. Build deterministic, capped sub-batches for the window. Each chunk derives
     //    its own intervals/sessions (split only at idle breaks, so no counted gap is
@@ -890,6 +907,13 @@ async fn flush(
                                 SyncError::Fatal(format!("advance artifacts cursor: {e}"))
                             })?;
                     }
+                    if let Some(u) = tok_until {
+                        state
+                            .store
+                            .meta_set(META_TOKEN_CURSOR, &u.to_string())
+                            .await
+                            .map_err(|e| SyncError::Fatal(format!("advance token cursor: {e}")))?;
+                    }
                     if !partial_ids.is_empty() {
                         if let Ok(mut reg) = state.sessions.lock() {
                             reg.mark_partials_sent(&partial_ids);
@@ -949,6 +973,10 @@ async fn flush(
     tracing::info!(
         events = events.len(),
         artifacts = artifact_rows.len(),
+        // Without this a flush shipping zero token rows logged byte-identically to
+        // one shipping a thousand, which is why a 97% compute loss produced no
+        // warning, no counter and no log line for weeks.
+        tokens = token_rows.len(),
         partial_rollups = partial_ids.len(),
         chunks = chunk_count,
         intervals = total_intervals,
@@ -1048,6 +1076,7 @@ pub(crate) async fn note_data_epoch(state: &AppState, epoch: &str) -> Result<boo
             for key in [
                 META_SYNC_CURSOR,
                 META_ARTIFACTS_CURSOR,
+                META_TOKEN_CURSOR,
                 META_KNOWLEDGE_DECISION_CURSOR,
                 META_KNOWLEDGE_SPEC_CURSOR,
                 META_KNOWLEDGE_TRAILER_CURSOR,
@@ -1107,12 +1136,6 @@ fn partial_rollups(
             label: s.label,
         })
         .collect()
-}
-
-/// RFC 3339 timestamp of an event (the storage format for `token_usage.at`).
-fn fmt_at(e: &dira_core::model::RawEvent) -> String {
-    e.at.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
 }
 
 /// Render an optional cloud-reported count for a log line: the number when the
@@ -1227,6 +1250,13 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use crate::test_support::{keychain_lock, use_mock_keychain, MockCloud, MockResp};
+
+    /// RFC 3339 timestamp of an event (the storage format for `token_usage.at`).
+    /// Test-only since token rows stopped being selected by `at`.
+    fn fmt_at(e: &dira_core::model::RawEvent) -> String {
+        e.at.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    }
 
     /// The body the live cloud actually returns on a successful ingest.
     ///
@@ -1635,6 +1665,191 @@ mod tests {
             art_before,
             state.store.meta_get(META_ARTIFACTS_CURSOR).await.unwrap(),
             "nor the artifact cursor — the artifacts never landed"
+        );
+    }
+
+    /// A token row dated well before the flush window, with NO new events at all.
+    ///
+    /// This is the reported compute bug in one test. Token rows used to be
+    /// selected by the `at`-span of the batch's own events and gated behind
+    /// `!events.is_empty()`, so a caught-up daemon shipped nothing and a
+    /// back-dated row — which is every row, since a turn is discovered by the
+    /// `Stop` that FOLLOWS it — fell below the window's exclusive lower bound and
+    /// was never reconsidered. Measured field impact: 97% of captured compute
+    /// never reached the cloud.
+    #[tokio::test]
+    async fn flush_ships_a_token_backlog_with_no_new_events() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+        let state = linked_state_with_one_event(&cloud).await;
+
+        // Drain the one seeded event so the event cursor is caught up — the
+        // steady state in which the old code could never ship a token row.
+        let key = DeviceKey::generate();
+        flush(&state, &key, &state.http).await.expect("seed flush");
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+
+        // A turn dated a month before anything in the event log.
+        let turn = dira_core::tokens::TokenTurn {
+            id: "turn-backdated".into(),
+            at: "2026-06-15T12:52:19Z".into(),
+            model: "claude-opus-4-8".into(),
+            input: 10,
+            output: 20,
+            cache_read: 3000,
+            cache_create: 40,
+        };
+        state
+            .store
+            .upsert_token_usage(&turn, "s1", Some("github.com/acme/api"))
+            .await
+            .unwrap();
+
+        let before = cloud.requests("/api/v1/ingest").len();
+        let outcome = flush(&state, &key, &state.http)
+            .await
+            .expect("a token backlog alone must produce a flush");
+        assert!(
+            matches!(outcome, FlushOutcome::Synced),
+            "tokens must be able to trigger a flush on their own, got {outcome:?}"
+        );
+
+        let reqs = cloud.requests("/api/v1/ingest");
+        assert_eq!(reqs.len(), before + 1, "exactly one new batch");
+        assert!(
+            reqs.last().unwrap().contains("turn-backdated"),
+            "the back-dated token row must ride the batch"
+        );
+
+        assert_eq!(
+            state.store.meta_get(META_TOKEN_CURSOR).await.unwrap(),
+            state
+                .store
+                .max_token_usage_rowid()
+                .await
+                .unwrap()
+                .map(|r| r.to_string()),
+            "the ack must advance the token cursor to the snapshot bound"
+        );
+
+        // Drained: a second flush has nothing left to send.
+        assert!(
+            matches!(
+                flush(&state, &key, &state.http).await.unwrap(),
+                FlushOutcome::Nothing
+            ),
+            "an already-shipped token row must not re-send"
+        );
+    }
+
+    /// A rejected batch must not advance the token cursor — otherwise the rows it
+    /// was carrying would be skipped forever, which is the failure mode the
+    /// cursor exists to prevent.
+    #[tokio::test]
+    async fn a_rejected_batch_leaves_the_token_cursor_put() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        cloud.push(
+            "/api/v1/ingest",
+            MockResp::status(413, "Request Entity Too Large"),
+        );
+        let state = linked_state_with_one_event(&cloud).await;
+        let turn = dira_core::tokens::TokenTurn {
+            id: "turn-rejected".into(),
+            at: "2026-06-15T12:52:19Z".into(),
+            model: "claude-opus-4-8".into(),
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_create: 0,
+        };
+        state
+            .store
+            .upsert_token_usage(&turn, "s1", Some("github.com/acme/api"))
+            .await
+            .unwrap();
+        let before = state.store.meta_get(META_TOKEN_CURSOR).await.unwrap();
+
+        let key = DeviceKey::generate();
+        flush(&state, &key, &state.http)
+            .await
+            .expect_err("a 413 must fail this flush");
+
+        assert_eq!(
+            before,
+            state.store.meta_get(META_TOKEN_CURSOR).await.unwrap(),
+            "a rejected batch must not advance the token cursor"
+        );
+    }
+
+    /// `nuke` empties `token_usage`, which lets SQLite hand out rowid 1 again. If
+    /// the token cursor survived at its old high-water mark, every re-captured row
+    /// would sort below it and be skipped — re-creating the original bug through a
+    /// new door. `nuke` also clears the `token_offset:%` capture watermarks, so a
+    /// full transcript re-import is guaranteed, not hypothetical.
+    #[tokio::test]
+    async fn re_captured_rows_still_ship_after_a_nuke() {
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+        let state = linked_state_with_one_event(&cloud).await;
+        let key = DeviceKey::generate();
+
+        for i in 0..3 {
+            let turn = dira_core::tokens::TokenTurn {
+                id: format!("pre-nuke-{i}"),
+                at: "2026-06-15T12:52:19Z".into(),
+                model: "claude-opus-4-8".into(),
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_create: 0,
+            };
+            state
+                .store
+                .upsert_token_usage(&turn, "s1", None)
+                .await
+                .unwrap();
+        }
+        flush(&state, &key, &state.http).await.expect("first flush");
+        assert!(state
+            .store
+            .meta_get(META_TOKEN_CURSOR)
+            .await
+            .unwrap()
+            .is_some_and(|c| !c.is_empty()));
+
+        state.store.nuke().await.unwrap();
+        assert_eq!(
+            state.store.meta_get(META_TOKEN_CURSOR).await.unwrap(),
+            Some(String::new()),
+            "nuke must blank the token cursor, or re-used rowids fall below it"
+        );
+
+        // Re-capture: a fresh row that reuses rowid 1.
+        let turn = dira_core::tokens::TokenTurn {
+            id: "post-nuke".into(),
+            at: "2026-06-15T12:52:19Z".into(),
+            model: "claude-opus-4-8".into(),
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_create: 0,
+        };
+        state
+            .store
+            .upsert_token_usage(&turn, "s1", None)
+            .await
+            .unwrap();
+
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+        let before = cloud.requests("/api/v1/ingest").len();
+        flush(&state, &key, &state.http)
+            .await
+            .expect("the re-imported row must still reach a batch");
+        let reqs = cloud.requests("/api/v1/ingest");
+        assert_eq!(reqs.len(), before + 1);
+        assert!(
+            reqs.last().unwrap().contains("post-nuke"),
+            "a row re-captured after a nuke must ship"
         );
     }
 

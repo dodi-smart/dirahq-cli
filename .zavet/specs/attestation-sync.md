@@ -1,16 +1,16 @@
 ---
 title: Attestation sync and session rollups
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-07-31
+date: 2026-08-04
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
   - cli/dirad/src/sync.rs
   - cli/dirad/src/state.rs
-decisions: [D-0001, D-0006]
+decisions: [D-0001, D-0006, D-0018]
 ---
 
 ## Overview
@@ -26,12 +26,24 @@ single flush window (issue #40).
 - A flush reads events in `(META_SYNC_CURSOR, until]`, splits the window into
   chunks only at > idle breaks (never inside a billable interval), POSTs each
   chunk, and advances the cursor per 2xx ack. The final chunk carries the
-  token rows and partial rollups; its ack also marks partials sent and
-  advances the artifact cursor.
-- Artifacts are spread across those chunks, at most `CHUNK_ARTIFACTS` each,
-  with extra artifact-only chunks appended when the backlog outlasts the
+  partial rollups; its ack also marks partials sent and advances the artifact
+  and token cursors.
+- Token rows ride `META_TOKEN_CURSOR`, a `token_usage.rowid` watermark, on
+  exactly the artifact cursor's discipline. They are NOT selected by the
+  `at`-span of the window's events, and they participate in the flush gate, so
+  a caught-up event log still drains a compute backlog. Both properties are
+  load-bearing (D-0018): a turn is discovered by the `Stop` that *follows* it,
+  so its transcript timestamp always sorts below the window's own first event,
+  and the old `at`-window selection therefore skipped ~97% of captured compute
+  permanently — nothing recorded that a row had never been sent, so no later
+  flush reconsidered it. `nuke` and a full `dira device resync` both blank the
+  cursor; for `nuke` that is required, not tidy, because emptying the table
+  lets SQLite re-issue rowid 1 beneath a surviving watermark.
+- Artifacts and token rows are spread across those chunks, at most
+  `CHUNK_ARTIFACTS` / `CHUNK_TOKENS` each,
+  with extra artifact-/token-only chunks appended when the backlog outlasts the
   event chunks. Spreading rather than capping the store read is what keeps
-  the artifact cursor honest — it still advances exactly once, on the true
+  those cursors honest — each still advances exactly once, on the true
   final chunk, to the same snapshot bound the caller read, so the cursor can
   never move past a row that was not sent. Artifacts are the fat rows
   (`touched_paths`, `blobs`); unbounded, a `dira device resync` built one
@@ -51,7 +63,7 @@ single flush window (issue #40).
   session's `SessionEnd`/`ManualStop`, but are aggregated over the session's
   FULL retained event history (`Store::events_for_sessions`, bounded by the
   window's `until` id), not just the tail window — prompts, branch,
-  `started_at`, and idle-trimmed `agent_wall_seconds` cover the whole
+  `started_at`, and clamped `agent_wall_seconds` cover the whole
   session. Best-effort: compaction prunes events that are both synced and
   past retention, so a session outliving retention rolls up from what
   remains (still a superset of the tail window).
@@ -61,7 +73,7 @@ single flush window (issue #40).
   rollup. When both a stale and a real end exist, `(at, id)`-sorted merging
   makes the latest end win.
 - Partial rollups describe still-live sessions from the daemon's in-memory
-  registry: rolling idle-trimmed `active_seconds`, a live `prompts` counter,
+  registry: rolling clamped `active_seconds`, a live `prompts` counter,
   and the last-resolved branch (last-wins — the honest answer for a live
   session, deliberately unlike the terminal rollup's start-branch policy,
   whose write supersedes the partial anyway). The registry is a pure fold

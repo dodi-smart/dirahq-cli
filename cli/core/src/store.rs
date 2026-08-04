@@ -253,6 +253,26 @@ impl Store {
         Ok(row.get::<i64, _>("n") as u64)
     }
 
+    /// Count token rows with rowid strictly greater than `cursor` (the un-synced
+    /// compute backlog). `cursor = None` counts every row, which is what an
+    /// install that has not yet advanced [`crate::sync::META_TOKEN_CURSOR`] sees.
+    pub async fn count_token_usage_after(&self, cursor: Option<i64>) -> Result<u64, Error> {
+        let row = match cursor {
+            Some(c) => {
+                sqlx::query("SELECT COUNT(*) AS n FROM token_usage WHERE rowid > ?1")
+                    .bind(c)
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query("SELECT COUNT(*) AS n FROM token_usage")
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+        };
+        Ok(row.get::<i64, _>("n") as u64)
+    }
+
     /// Delete every stored event for one session, returning how many rows went.
     ///
     /// Used by the writer to prune a *degenerate* session — one whose entire life
@@ -273,47 +293,6 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())
-    }
-
-    /// Load per-row token usage in the time window `(since_at, until_at]`, ordered
-    /// by time. Unlike [`Self::token_totals_since`] (which sums), this yields one
-    /// [`TokenRow`] per stored turn so the batch builder can emit individual
-    /// `TokenUsage` records.
-    ///
-    /// Token rows aren't ULID-ordered against events, so the caller bounds them by
-    /// the `at`-range of the event sync-window rather than by the event-id cursor.
-    /// A slightly over-inclusive lower bound is harmless: the cloud dedups
-    /// `token_usage` by id, so a row that ships in two batches is a no-op the
-    /// second time.
-    pub async fn token_usage_between(
-        &self,
-        since_at: Option<&str>,
-        until_at: &str,
-    ) -> Result<Vec<TokenRow>, Error> {
-        let rows = match since_at {
-            Some(start) => {
-                sqlx::query(
-                    "SELECT id, session_id, project, model, input, output, \
-                     cache_read, cache_create, est_cost, at \
-                     FROM token_usage WHERE at > ?1 AND at <= ?2 ORDER BY at ASC",
-                )
-                .bind(start)
-                .bind(until_at)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query(
-                    "SELECT id, session_id, project, model, input, output, \
-                     cache_read, cache_create, est_cost, at \
-                     FROM token_usage WHERE at <= ?1 ORDER BY at ASC",
-                )
-                .bind(until_at)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-        rows.iter().map(row_to_token_row).collect()
     }
 
     /// Read a meta value by key.
@@ -405,9 +384,17 @@ impl Store {
         // Reset the sync cursors in the same transaction so they can't point past
         // the wiped tables. We blank them rather than delete the keys to keep reads
         // simple.
+        //
+        // For the two rowid cursors this is load-bearing, not tidiness: emptying a
+        // table lets SQLite hand out rowid 1 again to the next insert, so a cursor
+        // left at the old high-water mark would silently skip every re-captured row.
+        // For `token_usage` that would re-create the exact defect
+        // `META_TOKEN_CURSOR` exists to fix, since `nuke` also clears the
+        // `token_offset:%` watermarks above and thus guarantees a full re-import.
         for key in [
             crate::sync::META_SYNC_CURSOR,
             crate::sync::META_ARTIFACTS_CURSOR,
+            crate::sync::META_TOKEN_CURSOR,
             crate::sync::META_LAST_EPOCH,
             crate::sync::META_CLOUD_WATERMARK,
             crate::sync::knowledge::META_KNOWLEDGE_DECISION_CURSOR,
@@ -585,6 +572,57 @@ impl Store {
     /// upper bound for advancing the artifacts sync cursor after a 2xx.
     pub async fn max_artifact_rowid(&self) -> Result<Option<i64>, Error> {
         let row = sqlx::query("SELECT MAX(rowid) AS m FROM artifacts")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<Option<i64>, _>("m"))
+    }
+
+    /// Load token rows in the rowid window `(cursor, until]`, ordered by `rowid` —
+    /// the un-synced token backlog for a flush. `cursor = None` means "from the
+    /// beginning", which is also what an install upgrading into
+    /// [`crate::sync::META_TOKEN_CURSOR`] sees, so the first flush after upgrade
+    /// drains whatever the old `at`-window selection stranded.
+    ///
+    /// Bounding by a snapshot `until` (taken with [`Self::max_token_usage_rowid`])
+    /// makes the window a clean cursor range, so a turn captured mid-flush ships in
+    /// the *next* window rather than being skipped past when the cursor advances.
+    pub async fn unsynced_token_usage(
+        &self,
+        cursor: Option<i64>,
+        until: i64,
+    ) -> Result<Vec<TokenRow>, Error> {
+        let rows = match cursor {
+            Some(c) => {
+                sqlx::query(
+                    "SELECT id, session_id, project, model, input, output, \
+                     cache_read, cache_create, est_cost, at \
+                     FROM token_usage \
+                     WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid ASC",
+                )
+                .bind(c)
+                .bind(until)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, session_id, project, model, input, output, \
+                     cache_read, cache_create, est_cost, at \
+                     FROM token_usage \
+                     WHERE rowid <= ?1 ORDER BY rowid ASC",
+                )
+                .bind(until)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.iter().map(row_to_token_row).collect()
+    }
+
+    /// The largest `token_usage.rowid`, or `None` when no usage is captured. The
+    /// upper bound for advancing the token sync cursor after a 2xx.
+    pub async fn max_token_usage_rowid(&self) -> Result<Option<i64>, Error> {
+        let row = sqlx::query("SELECT MAX(rowid) AS m FROM token_usage")
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<Option<i64>, _>("m"))
@@ -2499,11 +2537,8 @@ mod tests {
 
         // Both stats tables are empty.
         assert!(store.events_since(None).await.unwrap().is_empty());
-        assert!(store
-            .token_usage_between(None, "2099-01-01T00:00:00Z")
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(store.max_token_usage_rowid().await.unwrap(), None);
+        assert_eq!(store.count_token_usage_after(None).await.unwrap(), 0);
         assert_eq!(store.max_event_id().await.unwrap(), None);
 
         // Identity is preserved; the sync cursor is cleared.

@@ -396,6 +396,14 @@ pub struct StatusView {
     pub active: Vec<SessionView>,
     pub today: Report,
     pub sync_pending: u64,
+    /// Un-synced `token_usage` rows past the confirmed token cursor. Reported
+    /// separately from `sync_pending` because the two backlogs drain on separate
+    /// cursors: status could show a full day of local compute alongside
+    /// "0 event(s) pending sync" while none of those tokens had ever reached the
+    /// cloud, and nothing anywhere revealed the difference. Defaulted so an older
+    /// daemon (which cannot report it) reads as zero rather than failing the parse.
+    #[serde(default)]
+    pub tokens_pending: u64,
     /// `true` while the daemon is still replaying the recent log into its live
     /// registry at startup. The control socket answers immediately (before
     /// hydration), so a status issued during warm-up returns a valid but possibly
@@ -883,6 +891,7 @@ mod tests {
                 session_count: 0,
             },
             sync_pending: 0,
+            tokens_pending: 0,
             hydrating: false,
             tokens: None,
             billing: None,
@@ -890,10 +899,15 @@ mod tests {
             sync_health: None,
         };
         let json = serde_json::to_string(&v).unwrap();
-        assert!(!json.contains("tokens"));
-        assert!(!json.contains("billing"));
-        assert!(!json.contains("writer_health"));
-        assert!(!json.contains("sync_health"));
+        // Match the exact key, not a substring: `tokens_pending` is a distinct,
+        // always-present counter, so a bare `contains("tokens")` would conflate
+        // "the optional compute view was omitted" with "the word appears anywhere".
+        assert!(!json.contains("\"tokens\":"));
+        assert!(!json.contains("\"billing\":"));
+        assert!(!json.contains("\"writer_health\":"));
+        assert!(!json.contains("\"sync_health\":"));
+        // The pending counters are NOT optional — they always ride.
+        assert!(json.contains("\"tokens_pending\":0"));
 
         let v = StatusView {
             tokens: Some(ComputeView {

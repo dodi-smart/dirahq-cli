@@ -238,8 +238,16 @@ pub async fn start(config: &Config) -> Result<()> {
 /// `restart_scheduled_task` — ~5s total, generous enough to cover a slow
 /// shutdown (event-log flush, keychain teardown) without hanging the CLI
 /// indefinitely on a wedged daemon.
-const STOP_GRACE_ATTEMPTS: u32 = 50;
+/// 15 s. Must exceed `dirad`'s worst-case teardown, which is the 3 s shutdown
+/// offline beat (`heartbeat::SHUTDOWN_BEAT_TIMEOUT`) plus the 5 s WAL checkpoint
+/// budget, plus slack. The old 5 s sat *below* that, so an orderly shutdown was
+/// routinely force-killed partway through its checkpoint.
+const STOP_GRACE_ATTEMPTS: u32 = 150;
 const STOP_GRACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// 5 s. After `taskkill /F` the kernel should reap almost immediately; this only
+/// has to cover handle release, and a long wait here would just delay the error
+/// path for a process that is never coming back.
+const KILL_CONFIRM_ATTEMPTS: u32 = 50;
 
 /// Poll [`is_up`] every `interval`, up to `attempts` times; `true` if the daemon
 /// is still answering after all of them. `attempts`/`interval` are parameters —
@@ -258,25 +266,50 @@ async fn still_up_after(config: &Config, attempts: u32, interval: std::time::Dur
 }
 
 /// Ask a bare (non-service-managed) windows dirad to shut down gracefully over
-/// the pipe, then escalate to `taskkill /F` if it's still up after the grace
-/// window. Windows has no unix-style signal a process can trap for a clean
+/// the pipe, wait for the PROCESS to exit, then escalate to `taskkill /F` and
+/// wait again. Windows has no unix-style signal a process can trap for a clean
 /// shutdown, so this asks nicely first via the same in-band `Request::Shutdown`
 /// `dirad` already answers with `Response::Ok` before winding itself down. A
 /// plain `taskkill` (no `/F`) can't reliably stop a windowless background
 /// process, so the escalation goes straight to the force flag rather than
 /// trying a graceful `taskkill` first. Shared by `stop`'s and `restart_bare`'s
 /// windows branches — same escalation order both places.
+///
+/// Returns whether the process is confirmed gone. Callers that are about to
+/// start a replacement MUST NOT proceed on `false`: the single-instance guard is
+/// the pipe bind, and the pipe name stays taken until the old process's handles
+/// are released, so spawning early races a guard that cannot yet refuse.
 async fn graceful_then_force_windows(
     config: &Config,
     pid: &str,
     runner: &dyn Runner,
     attempts: u32,
     interval: std::time::Duration,
-) {
+) -> bool {
     let _ = client::send(&config.socket_path, &Request::Shutdown).await;
-    if still_up_after(config, attempts, interval).await {
-        let _ = runner.run("taskkill", &["/PID", pid, "/F"]);
+
+    // Without a parseable pid there is no process to wait on; fall back to the
+    // old channel-based probe and report honestly that exit was not confirmed.
+    let Ok(parsed) = pid.trim().parse::<u32>() else {
+        let _ = still_up_after(config, attempts, interval).await;
+        return false;
+    };
+
+    if wait_for_exit(parsed, runner, Os::Windows, attempts, interval).await {
+        return true;
     }
+    let _ = runner.run("taskkill", &["/PID", pid, "/F"]);
+    // Cap the post-kill confirmation at the production budget, but never exceed
+    // the caller's own — a test injecting a few milliseconds must not then block
+    // on a five-second reap.
+    wait_for_exit(
+        parsed,
+        runner,
+        Os::Windows,
+        attempts.min(KILL_CONFIRM_ATTEMPTS),
+        interval,
+    )
+    .await
 }
 
 pub async fn stop(config: &Config) -> Result<()> {
@@ -294,7 +327,7 @@ async fn stop_with(config: &Config, runner: &dyn Runner, os: Os) -> Result<()> {
     };
 
     if os == Os::Windows {
-        graceful_then_force_windows(
+        let stopped = graceful_then_force_windows(
             config,
             &pid,
             runner,
@@ -302,12 +335,27 @@ async fn stop_with(config: &Config, runner: &dyn Runner, os: Os) -> Result<()> {
             STOP_GRACE_INTERVAL,
         )
         .await;
+        if !stopped {
+            // The pidfile stays: it is the only handle left on a process we
+            // could not stop. Printing "stopped" here would be a plain lie, and
+            // the common cause is a `taskkill` refused against an elevated
+            // daemon from a non-elevated shell.
+            anyhow::bail!(
+                "could not confirm dirad (pid {pid}) exited — it may be running with \
+                 different privileges (e.g. started from an Administrator terminal). \
+                 Stop it from a terminal at the same privilege level:\n  \
+                 taskkill /PID {pid} /F"
+            );
+        }
+        std::fs::remove_file(&pf).ok();
     } else {
         let _ = Command::new("kill").arg(&pid).status();
+        std::fs::remove_file(&pf).ok();
+        // A named pipe isn't a filesystem object, so there is nothing to unlink
+        // on windows — `run()`'s own teardown already gates this the same way.
+        std::fs::remove_file(&config.socket_path).ok();
     }
 
-    std::fs::remove_file(&pf).ok();
-    std::fs::remove_file(&config.socket_path).ok();
     println!("stopped dirad (pid {pid})");
     Ok(())
 }
@@ -740,7 +788,18 @@ impl Runner for SystemRunner {
 fn alive_pid_at(pidfile: &Path, runner: &dyn Runner, os: Os) -> Option<u32> {
     let contents = std::fs::read_to_string(pidfile).ok()?;
     let pid: u32 = contents.trim().parse().ok()?;
+    pid_is_alive(pid, runner, os).then_some(pid)
+}
 
+/// Does this PROCESS still exist? Distinct from [`is_up`], which asks whether the
+/// control channel answers — a strictly weaker question, because the channel
+/// keeps serving for the whole of `dirad`'s teardown (offline beat + WAL
+/// checkpoint) and the process outlives it.
+///
+/// A probe failure reads as "not alive": the callers use this to decide whether
+/// to escalate or give up, and both are safer than looping forever on a probe
+/// that cannot answer.
+fn pid_is_alive(pid: u32, runner: &dyn Runner, os: Os) -> bool {
     if os == Os::Windows {
         // `tasklist /FI "PID eq <pid>"` exits 0 whether or not anything
         // matched — a non-matching filter just prints an "INFO: No tasks are
@@ -751,13 +810,44 @@ fn alive_pid_at(pidfile: &Path, runner: &dyn Runner, os: Os) -> Option<u32> {
         // actually names `dirad` (its Image Name column) before calling it
         // alive.
         let filter = format!("PID eq {pid}");
-        let out = runner.run("tasklist", &["/FI", &filter, "/NH"])?;
-        let alive = out.status.success() && String::from_utf8_lossy(&out.stdout).contains("dirad");
-        return alive.then_some(pid);
+        let Some(out) = runner.run("tasklist", &["/FI", &filter, "/NH"]) else {
+            return false;
+        };
+        return out.status.success() && String::from_utf8_lossy(&out.stdout).contains("dirad");
     }
 
-    let out = runner.run("kill", &["-0", &pid.to_string()])?;
-    out.status.success().then_some(pid)
+    let Some(out) = runner.run("kill", &["-0", &pid.to_string()]) else {
+        return false;
+    };
+    out.status.success()
+}
+
+/// Poll until `pid` is gone, up to `attempts × interval`. Returns whether exit
+/// was actually observed.
+///
+/// This is the question the restart path has to ask and never did. It polled
+/// [`is_up`] instead — but `dirad`'s control listener is a detached accept loop
+/// that nothing cancels, and the shutdown notify fires only *after* the response
+/// is written, so the pipe answers `Ping` throughout teardown. "Still answering"
+/// therefore meant "still tearing down", not "wedged", and the old 5 s budget
+/// sat below the ~8 s worst case (3 s offline beat + 5 s WAL checkpoint) — so a
+/// daemon honouring the request exactly as designed got `taskkill /F` mid
+/// checkpoint, and its replacement was spawned into a pipe whose handles had not
+/// been released.
+async fn wait_for_exit(
+    pid: u32,
+    runner: &dyn Runner,
+    os: Os,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> bool {
+    for _ in 0..attempts {
+        if !pid_is_alive(pid, runner, os) {
+            return true;
+        }
+        tokio::time::sleep(interval).await;
+    }
+    !pid_is_alive(pid, runner, os)
 }
 
 fn alive_pidfile_pid(config: &Config, runner: &dyn Runner, os: Os) -> Option<u32> {
@@ -917,14 +1007,88 @@ fn restart_systemd(runner: &dyn Runner) -> Result<()> {
 }
 
 /// Restart a windows daemon supervised by the scheduled task or Run-key
-/// fallback (see [`Supervision::ScheduledTask`]): ask it to shut down
-/// gracefully first — `Listener::bind`'s `first_pipe_instance` guard means a
-/// still-live old instance would make a freshly launched one fail to bind the
-/// pipe, the same way a live UDS bind already refuses a second `dirad` — then
-/// relaunch via `schtasks /Run`, the same start-now step `install` uses.
+/// fallback (see [`Supervision::ScheduledTask`]): stop the running daemon and
+/// CONFIRM IT EXITED, then relaunch via `schtasks /Run`, the same start-now step
+/// `install` uses.
+///
+/// This used to send `Shutdown`, wait 5 s, **discard the result**, and run
+/// `schtasks /Run` regardless — no force-kill on this path at all. That is a
+/// guaranteed second daemon rather than a race whenever the old one is slow,
+/// wedged, or unreachable, and it is the branch every user who ran
+/// `dira daemon install` takes. `detect_supervision` returns `ScheduledTask` on
+/// mere *registration*, returning before the pidfile probe, so the pid is
+/// resolved here explicitly rather than inherited from detection.
+///
+/// With no resolvable pid and something still answering, this refuses and prints
+/// manual instructions — the standard the legacy-socket path already holds
+/// itself to, rather than starting a second daemon beside the first.
 async fn restart_scheduled_task(config: &Config, runner: &dyn Runner) -> Result<()> {
-    let _ = client::send(&config.socket_path, &Request::Shutdown).await;
-    still_up_after(config, STOP_GRACE_ATTEMPTS, STOP_GRACE_INTERVAL).await;
+    restart_scheduled_task_with(config, runner, STOP_GRACE_ATTEMPTS, STOP_GRACE_INTERVAL).await
+}
+
+/// [`restart_scheduled_task`] with an injectable grace budget — see
+/// [`restart_bare_with`].
+async fn restart_scheduled_task_with(
+    config: &Config,
+    runner: &dyn Runner,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> Result<()> {
+    let pid = match alive_pidfile_pid(config, runner, Os::Windows) {
+        Some(p) => Some(p),
+        None => match client::send(&config.socket_path, &Request::DaemonInfo).await {
+            Ok(Response::DaemonInfo { pid, .. }) => Some(pid),
+            _ => None,
+        },
+    };
+
+    match pid {
+        Some(pid) => {
+            if !graceful_then_force_windows(config, &pid.to_string(), runner, attempts, interval)
+                .await
+            {
+                anyhow::bail!(
+                    "dirad (pid {pid}) did not exit — refusing to start a second daemon \
+                     beside it. Stop it yourself, then start it again:\n  \
+                     taskkill /PID {pid} /F\n  schtasks /Run /TN DiraDaemon"
+                );
+            }
+        }
+        // Nothing there and no pid: nothing to stop, so relaunching is safe.
+        // Anything else with no resolvable pid is refused.
+        //
+        // The tri-state `reach` rather than `is_up` (D-0016): `is_up` collapses
+        // ERROR_ACCESS_DENIED into "down", so an elevated daemon refusing this
+        // non-elevated caller would read as "nothing running" — and this is
+        // precisely the function that would then launch a second one beside it.
+        None => match reach(config).await {
+            client::Reach::Down => {}
+            client::Reach::Up => anyhow::bail!(
+                "a dirad is answering but its pid could not be determined — refusing \
+                 to start a second daemon beside it. Stop it via Task Manager, then:\n  \
+                 schtasks /Run /TN DiraDaemon"
+            ),
+            client::Reach::Denied => anyhow::bail!(
+                "a dirad is running but refuses this connection — it was very likely \
+                 started with different privileges (e.g. from an Administrator \
+                 terminal). Refusing to start a second daemon beside it. Stop it from \
+                 a terminal at the same privilege level, then:\n  \
+                 schtasks /Run /TN DiraDaemon"
+            ),
+            // Busy means a daemon IS listening, every instance just happened to
+            // be taken. That is emphatically not "nothing running".
+            client::Reach::Busy => anyhow::bail!(
+                "a dirad is listening but every pipe instance was busy — refusing to \
+                 start a second daemon beside it. Retry in a moment:\n  \
+                 dira daemon restart"
+            ),
+            // An unclassified connect error is not evidence of absence either.
+            client::Reach::Other => anyhow::bail!(
+                "could not determine whether a dirad is running — refusing to start a \
+                 second daemon beside it. Check `dira daemon status` first."
+            ),
+        },
+    }
 
     if let Some(out) = runner.run("schtasks", &["/Run", "/TN", "DiraDaemon"]) {
         if out.status.success() {
@@ -981,15 +1145,49 @@ async fn restart_bare(
     runner: &dyn Runner,
     os: Os,
 ) -> Result<()> {
+    restart_bare_with(
+        config,
+        pid,
+        sock,
+        runner,
+        os,
+        STOP_GRACE_ATTEMPTS,
+        STOP_GRACE_INTERVAL,
+    )
+    .await
+}
+
+/// [`restart_bare`] with an injectable grace budget, so tests can exercise the
+/// refuse-to-spawn branch on a few milliseconds instead of the real 15 s window
+/// — the same seam, and for the same reason, as
+/// [`graceful_then_force_windows`]'s parameters.
+async fn restart_bare_with(
+    config: &Config,
+    pid: u32,
+    sock: &Path,
+    runner: &dyn Runner,
+    os: Os,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> Result<()> {
     if os == Os::Windows {
-        graceful_then_force_windows(
-            config,
-            &pid.to_string(),
-            runner,
-            STOP_GRACE_ATTEMPTS,
-            STOP_GRACE_INTERVAL,
-        )
-        .await;
+        // Confirm the PROCESS is gone before spawning a replacement. On windows
+        // the single-instance guard is the pipe bind, and the pipe name stays
+        // taken until the old process's handles are released — so starting while
+        // it lingers races a guard that cannot yet refuse, and the replacement
+        // either dies on `first_pipe_instance` (leaving zero daemons) or, on the
+        // scheduled-task path, lands beside a live one.
+        if !graceful_then_force_windows(config, &pid.to_string(), runner, attempts, interval).await
+        {
+            // Deliberately leave the pidfile: it is the only remaining handle on
+            // a process we could not stop, and deleting it would make the
+            // survivor untrackable by `daemon status`/`stop`.
+            anyhow::bail!(
+                "dirad (pid {pid}) did not exit after a graceful shutdown and a forced kill — \
+                 refusing to start a second daemon beside it. Stop it yourself, then \
+                 `dira daemon start`:\n  taskkill /PID {pid} /F"
+            );
+        }
         std::fs::remove_file(pidfile(config)).ok();
     } else {
         reap(pid, sock, runner).await;
@@ -1101,6 +1299,10 @@ mod tests {
     struct FakeRunner {
         responses: HashMap<String, (i32, String)>,
         calls: std::cell::RefCell<Vec<String>>,
+        /// When set, `tasklist` reports the process alive until a `taskkill` has
+        /// been issued, then reports it gone. Models the one transition the
+        /// restart sequence turns on.
+        dies_when_killed: bool,
     }
 
     impl FakeRunner {
@@ -1108,6 +1310,23 @@ mod tests {
             self.responses
                 .insert(key(prog, args), (code, stdout.to_string()));
             self
+        }
+
+        /// `tasklist` reports alive until `taskkill` runs, then reports gone.
+        fn dying_when_killed(mut self) -> Self {
+            self.dies_when_killed = true;
+            self
+        }
+
+        /// `tasklist` always reports the process alive — a daemon that survives
+        /// even a forced kill (the access-denied-against-elevated case).
+        fn always_alive(self) -> Self {
+            self.returning(
+                "tasklist",
+                &["/FI", "PID eq 4242", "/NH"],
+                0,
+                "dirad.exe                     4242 Console   1     12,345 K",
+            )
         }
 
         fn called(&self, prog: &str, args: &[&str]) -> bool {
@@ -1125,6 +1344,26 @@ mod tests {
     impl Runner for FakeRunner {
         fn run(&self, prog: &str, args: &[&str]) -> Option<Output> {
             self.calls.borrow_mut().push(key(prog, args));
+            // A live process that stops being live once it is killed. Static
+            // responses can't express that, and the whole point of the restart
+            // sequence is the transition — "still listed" before the kill,
+            // "gone" after it.
+            if self.dies_when_killed && prog == "tasklist" {
+                let killed = self
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|c| c.starts_with("taskkill "));
+                return Some(Output {
+                    status: fake_exit_status(0),
+                    stdout: if killed {
+                        b"INFO: No tasks are running which match the specified criteria.".to_vec()
+                    } else {
+                        b"dirad.exe                     4242 Console   1     12,345 K".to_vec()
+                    },
+                    stderr: Vec::new(),
+                });
+            }
             let (code, stdout) = self.responses.get(&key(prog, args))?;
             Some(Output {
                 status: fake_exit_status(*code),
@@ -1787,13 +2026,12 @@ mod tests {
     // -- windows stop/restart escalation (`graceful_then_force_windows`) ----
 
     #[tokio::test]
-    async fn graceful_then_force_windows_skips_taskkill_when_daemon_goes_down() {
+    async fn graceful_then_force_windows_skips_taskkill_when_the_process_exits() {
         let config = test_config("win-stop-graceful");
-        // Nothing is listening at `config.socket_path` — `is_up` reports down
-        // on the very first poll, matching a dirad that honored the graceful
-        // `Shutdown` request before this ever has to check a second time.
+        // `tasklist` has no stub, so the probe reports the process gone on the
+        // first poll — a dirad that honoured the graceful `Shutdown`.
         let runner = FakeRunner::default();
-        graceful_then_force_windows(
+        let stopped = graceful_then_force_windows(
             &config,
             "4242",
             &runner,
@@ -1801,33 +2039,55 @@ mod tests {
             std::time::Duration::from_millis(5),
         )
         .await;
+        assert!(stopped, "an exited process must be reported as stopped");
         assert!(!runner.called("taskkill", &["/PID", "4242", "/F"]));
     }
 
+    /// A daemon that stops ANSWERING is not a daemon that has exited.
+    ///
+    /// `dirad`'s control listener is a detached accept loop nothing cancels, and
+    /// the shutdown notify fires only after the response is written, so the pipe
+    /// answers `Ping` throughout teardown. The escalation must therefore key on
+    /// the process, not the channel — this pins that it does, by leaving nothing
+    /// listening (channel says "down") while `tasklist` still lists the process.
     #[tokio::test]
-    async fn graceful_then_force_windows_escalates_to_taskkill_when_daemon_stays_up() {
+    async fn escalation_keys_on_the_process_not_the_control_channel() {
         let config = test_config("win-stop-escalate");
-        // A listener that answers every request with `Pong`, standing in for a
-        // dirad that never acts on the graceful `Shutdown` request — the case
-        // the taskkill escalation exists to handle. `attempts`/`interval` are
-        // shrunk to a few milliseconds (rather than the real ~5s grace window)
-        // so this test doesn't actually block on it.
-        let mut listener = dira_ipc::Listener::bind(&config.socket_path).await.unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok(mut stream) = listener.accept().await else {
-                    return;
-                };
-                if dira_ipc::read_frame(&mut stream).await.is_err() {
-                    return;
-                }
-                let bytes = serde_json::to_vec(&Response::Pong).unwrap();
-                let _ = dira_ipc::write_frame(&mut stream, &bytes).await;
-            }
-        });
+        let runner = FakeRunner::default().always_alive().returning(
+            "taskkill",
+            &["/PID", "4242", "/F"],
+            0,
+            "",
+        );
+        let stopped = graceful_then_force_windows(
+            &config,
+            "4242",
+            &runner,
+            2,
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert!(
+            runner.called("taskkill", &["/PID", "4242", "/F"]),
+            "a still-listed process must be force-killed even though nothing answers"
+        );
+        assert!(
+            !stopped,
+            "a process still listed after the kill must NOT report as stopped — \
+             the caller uses this to refuse spawning a replacement"
+        );
+    }
 
-        let runner = FakeRunner::default().returning("taskkill", &["/PID", "4242", "/F"], 0, "");
-        graceful_then_force_windows(
+    #[tokio::test]
+    async fn a_forced_kill_that_works_reports_stopped() {
+        let config = test_config("win-stop-escalate-ok");
+        let runner = FakeRunner::default().dying_when_killed().returning(
+            "taskkill",
+            &["/PID", "4242", "/F"],
+            0,
+            "",
+        );
+        let stopped = graceful_then_force_windows(
             &config,
             "4242",
             &runner,
@@ -1836,6 +2096,65 @@ mod tests {
         )
         .await;
         assert!(runner.called("taskkill", &["/PID", "4242", "/F"]));
+        assert!(stopped, "exit observed after the kill must report stopped");
+    }
+
+    /// The reported bug, pinned without a live daemon: a replacement must never
+    /// be spawned while the old process is still listed. `restart_bare` is
+    /// otherwise untested on windows because its success path calls `start`,
+    /// which spawns a real process — the failure path needs no such thing.
+    #[tokio::test]
+    async fn restart_refuses_to_spawn_a_replacement_while_the_old_pid_lives() {
+        let config = test_config("win-restart-no-double");
+        let runner = FakeRunner::default().always_alive().returning(
+            "taskkill",
+            &["/PID", "4242", "/F"],
+            0,
+            "",
+        );
+        let err = restart_bare_with(
+            &config,
+            4242,
+            &config.socket_path,
+            &runner,
+            Os::Windows,
+            2,
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect_err("a surviving daemon must fail the restart, not gain a sibling");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not exit") && msg.contains("4242"),
+            "the error must name the surviving pid: {msg}"
+        );
+        assert!(
+            msg.contains("taskkill /PID 4242 /F"),
+            "and give the manual command: {msg}"
+        );
+    }
+
+    /// The scheduled-task path used to discard its liveness result and run
+    /// `schtasks /Run` unconditionally, with no force-kill at all — a guaranteed
+    /// second daemon rather than a race, on the branch every user who ran
+    /// `dira daemon install` takes.
+    #[tokio::test]
+    async fn scheduled_task_restart_never_launches_beside_a_live_daemon() {
+        let config = test_config("win-task-no-double");
+        write_pidfile(&config, "4242");
+        let runner = FakeRunner::default()
+            .always_alive()
+            .returning("taskkill", &["/PID", "4242", "/F"], 0, "")
+            .returning("schtasks", &["/Run", "/TN", "DiraDaemon"], 0, "");
+        let err =
+            restart_scheduled_task_with(&config, &runner, 2, std::time::Duration::from_millis(5))
+                .await
+                .expect_err("must refuse while the old daemon is alive");
+        assert!(err.to_string().contains("did not exit"));
+        assert!(
+            !runner.called("schtasks", &["/Run", "/TN", "DiraDaemon"]),
+            "schtasks /Run must not fire while the old process is still listed"
+        );
     }
 
     #[tokio::test]

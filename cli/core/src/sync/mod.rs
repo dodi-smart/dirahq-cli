@@ -30,6 +30,21 @@ pub const META_SYNC_CURSOR: &str = "sync_cursor_event_id";
 /// cloud dedups on `sha`, making an over-inclusive lower bound harmless.
 pub const META_ARTIFACTS_CURSOR: &str = "sync_cursor_artifact_rowid";
 
+/// `meta` key: the largest `token_usage.rowid` confirmed-synced to the cloud.
+///
+/// Deliberately a rowid and not an `at` watermark. Token rows carry the
+/// *transcript's* timestamp, which is not monotonic with respect to capture
+/// order: a turn is discovered by the `Stop` that follows it, so it is always
+/// back-dated relative to its trigger, and a re-read after `nuke` re-imports a
+/// whole transcript at its original historical timestamps. Selecting on `at`
+/// therefore skips rows permanently — which is exactly the defect this cursor
+/// replaces. `rowid` is insertion-ordered by construction, so it cannot.
+///
+/// The cloud dedups on `TokenUsage.id` (the transcript uuid), so an
+/// over-inclusive lower bound is free; under-inclusion is the only direction
+/// the id cannot protect against.
+pub const META_TOKEN_CURSOR: &str = "sync_cursor_token_rowid";
+
 /// `meta` key: the last `dataEpoch` the cloud reported. A change means the cloud's
 /// durable log was reset → the daemon re-sends from scratch (see [`handshake`]).
 pub const META_LAST_EPOCH: &str = "sync_last_data_epoch";

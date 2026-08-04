@@ -1,0 +1,173 @@
+//! Regenerate the bundled model-price table from the models.dev catalog.
+//!
+//! Reads the raw catalog on **stdin** and writes the normalized table to
+//! **stdout**, so the fetch stays in the caller (`just pricing-sync`) and this
+//! binary needs no HTTP client — the same shape as `sign_vector`.
+//!
+//!     curl -fsSL https://models.dev/api.json \
+//!       | cargo run -q -p dira-core --bin pricing_sync > cli/core/pricing/models.json
+//!
+//! Only the providers behind the harnesses dira tracks are kept: the full
+//! catalog carries the same model under dozens of resellers at *different*
+//! prices. Keys are canonicalized with the very same
+//! [`dira_core::pricing::normalize_model`] the runtime resolver applies to
+//! observed model strings, so wrapper forms collapse onto one bare id instead
+//! of shipping as near-duplicates — sharing that function is the point, since a
+//! second copy of the normalization would drift from the lookups silently.
+//!
+//! Exits non-zero if the payload doesn't look like the catalog, so a truncated
+//! or error response can never overwrite a good table with a bad one.
+//!
+//! Deliberately mirrors the cloud's `scripts/pricing-sync.ts`. The two tables
+//! are allowed to drift between refreshes: the cloud is authoritative and
+//! re-prices historical rows, while this copy only labels local views.
+
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+use std::io::Read;
+
+/// models.dev provider ids to vendor, in precedence order — when two publish the
+/// same canonical id, the earlier wins. One entry per supported harness family:
+/// anthropic → Claude Code, openai → Codex, google → Gemini CLI, xai → grok,
+/// opencode → OpenCode's zen gateway.
+const PROVIDERS: &[&str] = &["anthropic", "openai", "google", "xai", "opencode"];
+
+fn num(v: Option<&Value>) -> Option<f64> {
+    match v.and_then(Value::as_f64) {
+        Some(n) if n.is_finite() && n >= 0.0 => Some(n),
+        _ => None,
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw)?;
+    let catalog: Map<String, Value> = serde_json::from_str(&raw)?;
+
+    // A catalog this small means a truncated or error payload, not a real
+    // shrink — bail rather than publish it.
+    if catalog.len() < 10 {
+        return Err(format!("catalog looks truncated: {} providers", catalog.len()).into());
+    }
+    let missing: Vec<&str> = PROVIDERS
+        .iter()
+        .copied()
+        .filter(|p| !catalog.contains_key(*p))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("providers missing from catalog: {}", missing.join(", ")).into());
+    }
+
+    let mut models: BTreeMap<String, Value> = BTreeMap::new();
+    let mut claimed: BTreeMap<String, &str> = BTreeMap::new();
+    let (mut considered, mut collisions) = (0usize, 0usize);
+
+    for pid in PROVIDERS {
+        let Some(list) = catalog
+            .get(*pid)
+            .and_then(|p| p.get("models"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (mid, m) in list {
+            let cost = m.get("cost");
+            let (Some(input), Some(output)) = (
+                num(cost.and_then(|c| c.get("input"))),
+                num(cost.and_then(|c| c.get("output"))),
+            ) else {
+                continue;
+            };
+            // Subscription-plan providers report 0/0 because inference is
+            // bundled in the plan. That is "no price data", not "free" — letting
+            // it claim an id would zero out every estimate for that model.
+            if input == 0.0 && output == 0.0 {
+                continue;
+            }
+            // Keep only models a coding harness can actually drive. Tool calling
+            // IS the interaction model for every harness dira supports, so a
+            // model without it can never produce a turn we capture: embeddings,
+            // image/TTS/live models, and pre-tool chat models like
+            // gpt-3.5-turbo. Derived from the catalog rather than a hand list,
+            // so it stays right as models come and go.
+            if m.get("tool_call").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            considered += 1;
+
+            let key = dira_core::pricing::normalize_model(mid);
+            let mut entry = Map::new();
+            entry.insert("input".into(), input.into());
+            entry.insert("output".into(), output.into());
+            if let Some(r) = num(cost.and_then(|c| c.get("cache_read"))) {
+                entry.insert("cacheRead".into(), r.into());
+            }
+            if let Some(w) = num(cost.and_then(|c| c.get("cache_write"))) {
+                entry.insert("cacheWrite".into(), w.into());
+            }
+
+            match models.get(&key) {
+                None => {
+                    models.insert(key.clone(), Value::Object(entry));
+                    claimed.insert(key, pid);
+                }
+                // Only report collisions that would have changed the price —
+                // those are the ones worth eyeballing in the refresh PR.
+                Some(existing) => {
+                    if existing.get("input") != entry.get("input")
+                        || existing.get("output") != entry.get("output")
+                    {
+                        collisions += 1;
+                        eprintln!(
+                            "collision: {key} kept {} , dropped {pid}",
+                            claimed.get(&key).copied().unwrap_or("?")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Drop dated aliases whose undated form is already present at the same
+    // price: the resolver's cascade strips `-20251001` before looking up, so the
+    // entry can never be reached and only bloats the bundle. Kept when the
+    // prices differ — then the pin is load-bearing and the strip would be wrong.
+    let redundant: Vec<String> = models
+        .keys()
+        .filter(|k| {
+            let base = dira_core::pricing::strip_release(k);
+            base != **k && models.get(&base).is_some_and(|b| b == &models[*k])
+        })
+        .cloned()
+        .collect();
+    for k in &redundant {
+        models.remove(k);
+    }
+
+    eprintln!(
+        "pricing sync: {} models from {considered} tool-calling, cost-bearing entries across {}, \
+         {collisions} price collisions resolved by provider precedence, \
+         {} redundant dated aliases dropped",
+        models.len(),
+        PROVIDERS.join(", "),
+        redundant.len()
+    );
+
+    let mut out = Map::new();
+    out.insert(
+        "$comment".into(),
+        "Generated by `just pricing-sync` from https://models.dev/api.json — do not hand-edit; \
+         corrections go in overrides.json. Prices are USD per 1M tokens. Scope: tool-calling, \
+         cost-bearing models from the providers behind the supported harnesses, minus dated \
+         aliases the resolver already reaches by stripping the pin. The cloud keeps its own \
+         copy and is authoritative; this one only labels local views and may drift between \
+         monthly refreshes."
+            .into(),
+    );
+    out.insert("providers".into(), PROVIDERS.into());
+    out.insert("models".into(), Value::Object(models.into_iter().collect()));
+    // No `generatedAt`: it would churn the file on every run and open an empty
+    // PR each month even when no price moved.
+    println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
+    Ok(())
+}

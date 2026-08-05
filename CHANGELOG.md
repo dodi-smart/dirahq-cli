@@ -1,3 +1,18 @@
+## [0.2.3](https://github.com/dodi-smart/dirahq-cli/compare/v0.2.2...v0.2.3) (2026-08-05)
+
+### 🐛 Bug Fixes
+
+* **daemon:** keep token capture alive across a corrupt transcript tail ([c0662ad](https://github.com/dodi-smart/dirahq-cli/commit/c0662ad8e1093cea5a55c359d042b34727f06504)), closes [#91](https://github.com/dodi-smart/dirahq-cli/issues/91)
+* **daemon:** report the store path instead of silently using a throwaway one ([077c54e](https://github.com/dodi-smart/dirahq-cli/commit/077c54efba53efdffb66c0ef57e69b548a4c9ff8)), closes [#76](https://github.com/dodi-smart/dirahq-cli/issues/76) [#92](https://github.com/dodi-smart/dirahq-cli/issues/92)
+
+### 📚 Documentation
+
+* **repo:** strike D-0018's directive that D-0020 already corrected ([4927e5a](https://github.com/dodi-smart/dirahq-cli/commit/4927e5a371f7251a6b84db392c4fcccfc5383ca4))
+
+### ✅ Tests
+
+* **cli:** isolate the update e2e suite and restore its exec-staging lock ([3902da7](https://github.com/dodi-smart/dirahq-cli/commit/3902da7ca2aca7644eee84ad900141f0ddf9c299)), closes [#80](https://github.com/dodi-smart/dirahq-cli/issues/80) [#80](https://github.com/dodi-smart/dirahq-cli/issues/80)
+
 ## [0.2.2](https://github.com/dodi-smart/dirahq-cli/compare/v0.2.1...v0.2.2) (2026-08-04)
 
 ### 🐛 Bug Fixes

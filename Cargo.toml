@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3-develop.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/dodi-smart/dirahq-cli"

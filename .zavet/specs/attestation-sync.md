@@ -1,6 +1,6 @@
 ---
 title: Attestation sync and session rollups
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
@@ -10,6 +10,8 @@ paths:
   - cli/core/src/store.rs
   - cli/dirad/src/sync.rs
   - cli/dirad/src/state.rs
+  - cli/dirad/src/writer.rs
+  - cli/core/src/tokens.rs
 decisions: [D-0001, D-0006, D-0018, D-0020]
 ---
 
@@ -40,6 +42,22 @@ single flush window (issue #40).
   flush reconsidered it. `nuke` and a full `dira device resync` both blank the
   cursor; for `nuke` that is required, not tidy, because emptying the table
   lets SQLite re-issue rowid 1 beneath a surviving watermark.
+- Upstream of that cursor, `capture_tokens` reads each transcript from a
+  per-file byte watermark (`token_offset:<session>[:<sidecar stem>]`) paired
+  with a prologue fingerprint (`token_fp:` — FNV-1a over the first ≤4 KiB).
+  The offset says WHERE to resume; the fingerprint says WHICH file it refers
+  to, because a length comparison alone cannot see a transcript replaced by a
+  different file of equal-or-greater length. An ABSENT fingerprint means an
+  install upgrading into the check and never triggers a re-read. `nuke` clears
+  both key families.
+- The tail is read as BYTES and decoded lossily, and the new watermark is the
+  last newline in those raw bytes. `read_to_string` was all-or-nothing on
+  UTF-8, so one invalid byte aborted the capture before the watermark advanced
+  and that session re-read the same bad tail forever; and once a lossy decode
+  is in play, an index into the decoded string is no longer a file offset
+  (U+FFFD is 3 bytes per 1–3 replaced). Watermark read/write failures log at
+  `warn` — a watermark that silently stops advancing is what made a 97%
+  compute loss invisible for weeks.
 - Artifacts and token rows are spread across those chunks, at most
   `CHUNK_ARTIFACTS` / `CHUNK_TOKENS` each,
   with extra artifact-/token-only chunks appended when the backlog outlasts the

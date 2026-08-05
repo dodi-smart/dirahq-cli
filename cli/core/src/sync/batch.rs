@@ -905,6 +905,22 @@ fn batch_id_for_chunk(
     }
 }
 
+/// FNV-1a over raw bytes.
+///
+/// Deliberately not `DefaultHasher`: std makes no stability guarantee across
+/// releases, and callers persist the result. A toolchain bump that changed the
+/// digest would silently invalidate every stored value — for the transcript
+/// prologue fingerprint, that means a full re-read of every multi-megabyte
+/// transcript on every install.
+pub fn fnv1a_bytes(bytes: &[u8], seed: u64) -> u64 {
+    let mut h = seed;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 pub(crate) fn fnv1a(ids: &[&str], seed: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     // A tiny deterministic hasher (std's DefaultHasher is not stable across
@@ -953,6 +969,19 @@ mod tests {
     use super::*;
     use crate::accounting::{counted_gaps, Signal};
     use crate::report;
+
+    /// The digest is PERSISTED (transcript prologue fingerprints in `meta`), so
+    /// it is part of the on-disk format. Pinned against a literal so a refactor
+    /// or a toolchain bump cannot silently invalidate every install's watermark
+    /// and trigger a full re-read of every multi-megabyte transcript.
+    #[test]
+    fn fnv1a_bytes_is_stable() {
+        const SEED: u64 = 0xcbf29ce484222325;
+        assert_eq!(fnv1a_bytes(b"", SEED), SEED, "empty input is the seed");
+        assert_eq!(fnv1a_bytes(b"dira", SEED), 0xca40b967578bc70f);
+        // Order matters, so a swapped prologue cannot collide by accident.
+        assert_ne!(fnv1a_bytes(b"ab", SEED), fnv1a_bytes(b"ba", SEED));
+    }
 
     fn ev(session: &str, secs: i64, kind: EventKind, project: &str) -> RawEvent {
         RawEvent {

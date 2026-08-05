@@ -7,7 +7,7 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The hosted dira cloud — the out-of-the-box sync target. Local dev and
 /// self-hosters override it per the layering above (`config.toml`'s
@@ -301,6 +301,48 @@ fn default_socket_path(xdg_runtime: Option<PathBuf>, data_dir: Option<PathBuf>) 
     std::env::temp_dir().join("dira.sock")
 }
 
+/// Where the capture store lives: `<data_dir>/dira.db`, else the temp dir.
+///
+/// Inputs injected for the same reason [`default_socket_path`]'s are (D-0008) —
+/// the fallback branch is otherwise only reachable on a machine where
+/// `project_dirs()` fails, which is exactly the machine we cannot test on.
+///
+/// The temp-dir last resort is kept on purpose; see
+/// [`unanchored_store_warning`] for why the daemon reports it rather than
+/// refusing to start.
+fn default_db_path(data_dir: Option<PathBuf>) -> PathBuf {
+    data_dir
+        .map(|d| d.join("dira.db"))
+        .unwrap_or_else(|| std::env::temp_dir().join("dira.db"))
+}
+
+/// A warning when the store is NOT anchored to a real per-user data directory,
+/// i.e. `project_dirs()` did not resolve and [`default_db_path`] fell through to
+/// the temp dir.
+///
+/// This is a whole capture history — every event, every token row, every sync
+/// cursor and the device identity — sitting somewhere the OS may clear on
+/// reboot. Silently, which is the actual defect: a Windows user running `dirad`
+/// elevated found an empty database and reasonably read it as total data loss.
+///
+/// Deliberately a WARNING and not a refusal to start. Two independent reasons:
+/// `dirad`'s log sink resolves through the same `project_dirs()`
+/// (`logfile::log_dir`), and on Windows all three stdio handles are nulled — so
+/// an early `bail!` is invisible on the one platform that hits this. And per
+/// D-0009 an exiting daemon under launchd/systemd/`schtasks` respawn-loops,
+/// after which every client reports "down" instead of the real problem.
+pub fn unanchored_store_warning(db_path: &Path, dirs_resolved: bool) -> Option<String> {
+    if dirs_resolved {
+        return None;
+    }
+    Some(format!(
+        "no per-user data directory could be resolved, so the capture store is \
+         at {} — a temporary location the system may clear on reboot. Set \
+         DIRA_DB_PATH to a durable path and restart the daemon.",
+        db_path.display()
+    ))
+}
+
 /// Where the control socket lived *before* [`default_socket_path`] anchored it
 /// to a per-user location — `$TMPDIR/dira.sock`.
 ///
@@ -326,9 +368,7 @@ impl Default for Config {
         Self {
             socket_path,
             http_port: 8722,
-            db_path: dirs
-                .map(|d| d.data_dir().join("dira.db"))
-                .unwrap_or_else(|| std::env::temp_dir().join("dira.db")),
+            db_path: default_db_path(dirs.map(|d| d.data_dir().to_path_buf())),
             idle_seconds: 300,
             agent_idle_seconds: default_agent_idle_seconds(),
             agent_max_span_seconds: default_agent_max_span_seconds(),
@@ -629,6 +669,53 @@ mod tests {
     fn socket_path_last_resort_is_the_temp_dir() {
         let got = default_socket_path(None, None);
         assert_eq!(got, std::env::temp_dir().join("dira.sock"));
+    }
+
+    // The store path has the same shape as the socket path, and the same last
+    // resort — but a different consequence. A socket in `$TMPDIR` presents as
+    // "daemon down" and a restart fixes it; a DATABASE in `$TMPDIR` is a whole
+    // capture history that disappears on reboot with nothing said about it. A
+    // Windows reporter running `dirad` elevated hit this shape and read it as
+    // total data loss. Same injected-inputs style as `default_socket_path`, so
+    // every branch is testable from one machine (D-0008).
+
+    #[test]
+    fn db_path_prefers_the_data_dir() {
+        let got = default_db_path(Some(PathBuf::from("/home/u/.local/share/dira")));
+        assert_eq!(got, PathBuf::from("/home/u/.local/share/dira/dira.db"));
+    }
+
+    #[test]
+    fn db_path_last_resort_is_the_temp_dir() {
+        // Behaviour deliberately unchanged: refusing to start would be WORSE.
+        // `dirad`'s log sink resolves through the same `project_dirs()`, and on
+        // Windows all three stdio handles are nulled — so a bail is invisible on
+        // the one platform that hits this, and the daemon respawn-loops (D-0009).
+        assert_eq!(default_db_path(None), std::env::temp_dir().join("dira.db"));
+    }
+
+    #[test]
+    fn an_unanchored_store_warns_and_names_the_override() {
+        let db = std::env::temp_dir().join("dira.db");
+        let warning = unanchored_store_warning(&db, false)
+            .expect("an unresolvable data dir must not be silent");
+        assert!(
+            warning.contains("DIRA_DB_PATH"),
+            "the warning must name the escape hatch, got: {warning}"
+        );
+        assert!(
+            warning.contains(&db.display().to_string()),
+            "the warning must name the path actually in use, got: {warning}"
+        );
+    }
+
+    #[test]
+    fn an_anchored_store_is_quiet() {
+        assert!(
+            unanchored_store_warning(&PathBuf::from("/home/u/.local/share/dira/dira.db"), true)
+                .is_none(),
+            "a normally-resolved store must not nag"
+        );
     }
 
     #[cfg(unix)]

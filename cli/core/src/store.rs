@@ -381,6 +381,13 @@ impl Store {
         sqlx::query("DELETE FROM meta WHERE key LIKE 'token_offset:%'")
             .execute(&mut *tx)
             .await?;
+        // The prologue fingerprints are those offsets' siblings — they identify
+        // WHICH file each offset belonged to. A fingerprint outliving its offset
+        // is harmless (an absent offset already means "read from the top"), but
+        // leaving them behind is drift, and `nuke` means a clean slate.
+        sqlx::query("DELETE FROM meta WHERE key LIKE 'token_fp:%'")
+            .execute(&mut *tx)
+            .await?;
         // Reset the sync cursors in the same transaction so they can't point past
         // the wiped tables. We blank them rather than delete the keys to keep reads
         // simple.

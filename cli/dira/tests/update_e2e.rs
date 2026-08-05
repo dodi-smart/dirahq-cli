@@ -25,6 +25,16 @@
 //! nothing here can reach it. `DIRA_SOCKET_PATH` is also isolated, purely as
 //! defense in depth.
 //!
+//! The subprocess's HOME is redirected into the same tempdir by
+//! [`isolate_user_dirs`], because `--bin-dir` does NOT cover everything
+//! `dira update` writes: the update-check cache lives at
+//! `project_dirs()?.cache_dir()/update-check.json`, resolved from the real
+//! `$HOME` and reachable by no CLI flag. Without that redirect a `--check`
+//! run here persisted the mock's fixture tag into the developer's own cache,
+//! and every subsequent real `dira` invocation on that machine advertised an
+//! upgrade to a version that does not exist. Any new env var that steers a
+//! *write* path belongs in `isolate_user_dirs`, not in one test.
+//!
 //! # Why the subprocess is a *copy* of the test binary, not a symlink or the
 //! # original path
 //!
@@ -197,14 +207,15 @@ fn build_fixture_archive(workdir: &Path, version: &str) -> (Vec<u8>, String, Vec
 
     let tarball_name = format!("dira-{version}-{TARGET}.tar.gz");
     let tarball_path = workdir.join(&tarball_name);
-    let status = Command::new("tar")
-        .arg("-czf")
+    // `tar` forks like any other subprocess, so its child can inherit a write fd
+    // to a binary another thread is staging. Same lock, same reason.
+    let mut tar = Command::new("tar");
+    tar.arg("-czf")
         .arg(&tarball_path)
         .arg("-C")
         .arg(&root)
-        .args(["dira", "dirad"])
-        .status()
-        .expect("spawn tar to build the fixture archive");
+        .args(["dira", "dirad"]);
+    let status = status_staged(&mut tar).expect("spawn tar to build the fixture archive");
     assert!(
         status.success(),
         "building the fixture archive with tar failed"
@@ -230,24 +241,100 @@ fn build_fixture_archive(workdir: &Path, version: &str) -> (Vec<u8>, String, Vec
 fn seed_install(bin_dir: &Path) -> (Vec<u8>, Vec<u8>) {
     std::fs::create_dir_all(bin_dir).unwrap();
     let dira_src = std::fs::read(env!("CARGO_BIN_EXE_dira")).unwrap();
-    std::fs::write(bin_dir.join("dira"), &dira_src).unwrap();
-    std::fs::set_permissions(bin_dir.join("dira"), std::fs::Permissions::from_mode(0o755)).unwrap();
-
     let dirad_src =
         b"#!/bin/sh\necho \"dirad (placeholder, never executed by this test)\"\n".to_vec();
-    std::fs::write(bin_dir.join("dirad"), &dirad_src).unwrap();
-    std::fs::set_permissions(
-        bin_dir.join("dirad"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+
+    // Held across BOTH writes so no other test thread can fork while a write fd
+    // to a staged executable is open. See `EXEC_STAGING`.
+    let _staging = lock_staging();
+    for (name, bytes) in [("dira", &dira_src), ("dirad", &dirad_src)] {
+        let path = bin_dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     (dira_src, dirad_src)
+}
+
+/// Serialises *writing* an executable against *forking* a subprocess.
+///
+/// `execve` returns `ETXTBSY` when any process holds the target open for
+/// writing — and that check is per **inode**, not per path. `cargo test` runs
+/// these tests on several threads, so:
+///
+///   1. thread A opens `A/bin/dira` to stage it (`i_writecount` > 0);
+///   2. thread B forks for its own subprocess and the child inherits A's fd —
+///      `O_CLOEXEC` does not save us, because it is only applied on a
+///      *successful* exec;
+///   3. B's child keeps that inode pinned for as long as it lives;
+///   4. thread A execs its freshly-staged binary → `ETXTBSY`.
+///
+/// Each test has its own tempdir, so this is not path contention — it is fd
+/// inheritance across a fork inside one process. Go hit the identical race in
+/// golang/go#22315.
+///
+/// Note this is also why write-then-rename would **not** be enough on its own,
+/// which is what issue #80 originally proposed: the inherited fd refers to the
+/// inode, and renaming merely gives that inode another name. The window has to
+/// be closed on the fork side, which is what this lock does.
+///
+/// Only the `spawn` is serialised, never the wait, so tests still overlap while
+/// their subprocesses run.
+static EXEC_STAGING: Mutex<()> = Mutex::new(());
+
+fn lock_staging() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking test elsewhere must not cascade into "all subsequent spawns
+    // panic on a poisoned lock" — the guarded data is `()`, so there is no
+    // invariant left to protect.
+    EXEC_STAGING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`Command::output`] with the fork serialised against binary staging.
+///
+/// Mirrors `output()`'s own stdio setup (stdin null, stdout/stderr piped); the
+/// only difference is that the `spawn` happens under [`EXEC_STAGING`].
+fn output_staged(cmd: &mut Command) -> std::io::Result<Output> {
+    let child = {
+        let _staging = lock_staging();
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?
+    };
+    child.wait_with_output()
+}
+
+/// [`Command::status`] with the same serialisation. Inherits stdio, as
+/// `status()` does.
+fn status_staged(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = {
+        let _staging = lock_staging();
+        cmd.spawn()?
+    };
+    child.wait()
 }
 
 /// Run `<bin_dir>/dira update <extra_args...>` with the mock GitHub wired up
 /// and the daemon path hard-disabled (`--no-restart` + an isolated,
 /// never-created socket path — see the module doc's safety section).
+/// Point every user-directory lookup the subprocess makes at the test's own
+/// tempdir. `directories::ProjectDirs` reads `$HOME` on macOS and
+/// `$XDG_CACHE_HOME`/`$HOME` on Linux, so both are set; neither is exposed as a
+/// CLI flag, which is why `--bin-dir` alone is not containment. See the module
+/// doc's safety section.
+fn isolate_user_dirs(cmd: &mut Command, bin_dir: &Path) {
+    // `bin_dir` is `<tempdir>/bin`, so its parent is the per-test tempdir.
+    let home = bin_dir
+        .parent()
+        .expect("bin_dir always has a tempdir parent");
+    cmd.env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"));
+}
+
 fn run_update(bin_dir: &Path, download_base: &str, extra_args: &[&str]) -> Output {
     let sock = bin_dir.join("isolated-never-created.sock");
     let mut cmd = Command::new(bin_dir.join("dira"));
@@ -261,7 +348,8 @@ fn run_update(bin_dir: &Path, download_base: &str, extra_args: &[&str]) -> Outpu
         .env("DIRA_SOCKET_PATH", &sock)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN");
-    cmd.output().expect("spawn the copied dira binary")
+    isolate_user_dirs(&mut cmd, bin_dir);
+    output_staged(&mut cmd).expect("spawn the copied dira binary")
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -333,8 +421,8 @@ async fn a_rejected_token_falls_back_to_anonymous_resolution() {
     mock.reject_authorized_requests();
 
     let sock = bin_dir.join("isolated-never-created.sock");
-    let out = Command::new(bin_dir.join("dira"))
-        .arg("update")
+    let mut cmd = Command::new(bin_dir.join("dira"));
+    cmd.arg("update")
         .arg("--bin-dir")
         .arg(&bin_dir)
         .arg("--no-restart")
@@ -347,8 +435,9 @@ async fn a_rejected_token_falls_back_to_anonymous_resolution() {
         // The whole point: a credential the server rejects.
         .env("GITHUB_TOKEN", "ghp_expiredAndNoLongerValid")
         .env_remove("GH_TOKEN")
-        .output()
-        .expect("spawn the copied dira binary");
+        .stdin(std::process::Stdio::null());
+    isolate_user_dirs(&mut cmd, &bin_dir);
+    let out = output_staged(&mut cmd).expect("spawn the copied dira binary");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -377,8 +466,8 @@ async fn check_resolves_against_the_latest_endpoint_and_mutates_nothing() {
     // Deliberately never register any asset — `--check` must never download.
 
     let sock = bin_dir.join("isolated-never-created.sock");
-    let out = Command::new(bin_dir.join("dira"))
-        .arg("update")
+    let mut cmd = Command::new(bin_dir.join("dira"));
+    cmd.arg("update")
         .arg("--bin-dir")
         .arg(&bin_dir)
         .arg("--no-restart")
@@ -392,8 +481,9 @@ async fn check_resolves_against_the_latest_endpoint_and_mutates_nothing() {
         .env("DIRA_SOCKET_PATH", &sock)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
-        .output()
-        .expect("spawn the copied dira binary");
+        .stdin(std::process::Stdio::null());
+    isolate_user_dirs(&mut cmd, &bin_dir);
+    let out = output_staged(&mut cmd).expect("spawn the copied dira binary");
     assert!(
         out.status.success(),
         "--check must exit 0: stdout={}\nstderr={}",
@@ -430,8 +520,8 @@ async fn check_exits_zero_even_when_the_asset_host_is_unreachable() {
     seed_install(&bin_dir);
 
     let sock = bin_dir.join("isolated-never-created.sock");
-    let out = Command::new(bin_dir.join("dira"))
-        .arg("update")
+    let mut cmd = Command::new(bin_dir.join("dira"));
+    cmd.arg("update")
         .arg("--bin-dir")
         .arg(&bin_dir)
         .arg("--no-restart")
@@ -441,8 +531,9 @@ async fn check_exits_zero_even_when_the_asset_host_is_unreachable() {
         .env("DIRA_SOCKET_PATH", &sock)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
-        .output()
-        .expect("spawn the copied dira binary");
+        .stdin(std::process::Stdio::null());
+    isolate_user_dirs(&mut cmd, &bin_dir);
+    let out = output_staged(&mut cmd).expect("spawn the copied dira binary");
 
     assert!(
         out.status.success(),

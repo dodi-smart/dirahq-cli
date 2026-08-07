@@ -2,3 +2,4 @@ D-0015	pg suite forbids module mocks	run-the-pg-suite
 D-0015	run-the-lint-suite	run-the-lint-suite
 D-0016	keeps a hash	runner -c 'a # b'
 D-0016	keeps later separators	runner --grep 'A::b'
+ZAVET-0018	prefix set round-trips	run-the-dialect-suite

@@ -1,10 +1,10 @@
 ---
 title: Zavet capture pipeline
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-07-31
+date: 2026-08-07
 paths:
   - cli/dirad/src/capture.rs
   - cli/core/src/zavet.rs
@@ -42,8 +42,11 @@ commit poll — no filesystem watcher, no extra daemon.
   keeps its body, so append-only holds; every recall path leads with the
   correction. The pointer canonicalizes like any decision id and may dangle.
 - Dot-prefixed files (`.template.md`, `.spec-template.md`) and subdirectories
-  are never captured; decision files must be flat `D-*.md`, specs flat
-  `<slug>.md` (the filename stem is the spec's identity).
+  are never captured; decision files must be flat `<PREFIX>-<digits>[-slug].md`
+  with the prefix UPPERCASE, specs flat `<slug>.md` (the filename stem is the
+  spec's identity). Uppercase is load-bearing rather than cosmetic: the old
+  `D-` literal excluded stray files for free, and a case-insensitive shape
+  would let `notes-2024.md` read as a record.
 - Spec staleness is never materialized: it is computed at query time as
   `git log <last_commit>..HEAD -- :(glob)<path>…` over the spec's declared
   paths, in the repo dir the daemon last observed (else the caller's cwd;
@@ -57,6 +60,22 @@ commit poll — no filesystem watcher, no extra daemon.
   ids canonicalize to their zero-padded form at every ingestion point —
   which is also why this body avoids example refs: any id mentioned here
   auto-links.
+- Ids carry a PER-REPO prefix and padding width, read from `.zavet/config`
+  into a `ZavetConfig` once per sweep (`capture.rs`) or per resolved repo
+  (`dirad::zavet`). No config means `D` at width 4, so a repo scaffolded
+  before prefixes behaves byte-identically and needs no migration. Retired
+  prefixes live in `prefix-aliases` and stay resolvable forever, because
+  records are append-only and an id keeps the prefix it was minted under.
+- The prefix set restricts FREE-TEXT scanning only (`scan_all_decision_refs`,
+  which feeds trailer refs and spec body auto-linking). Filename and
+  frontmatter grammar are shape-only: the decisions directory is closed, so a
+  generic prefix is safe there, while prose is full of `UTF-8`, `SHA-256`,
+  `RFC-2119` and `CVE-2024` that a generic scanner would read as references.
+- A guard event is normalized but NOT padded by `parse_guard_event`: it is
+  parsed before its `cwd` is resolved to a repo, so the width is unknown, and
+  padding at the wrong width would key the event away from the record captured
+  from that same repo. `dirad::zavet::ingest` canonicalizes once it can read
+  the config.
 - Storage: `zavet_decisions`/`zavet_guards` (0002), `zavet_specs`/
   `zavet_spec_paths`/`zavet_spec_decisions` (0003), `zavet_checks` +
   `zavet_decisions.corrected_by` (0005), `zavet_trailers` keyed `(sha, seq)`.

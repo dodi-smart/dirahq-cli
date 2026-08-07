@@ -11,3 +11,4 @@ D-0011	src/core/**
 D-0012	api/**
 D-0012	web/
 D-0013	cli/core/src/lib.rs
+ZAVET-0018	cli/core/src/zavet.rs

@@ -12,3 +12,4 @@ D-0013	active	Block items trim trailing whitespace
 D-0015	active	Checks bind an invariant to a command
 D-0016	active	Check items follow the list dialect
 D-0017	active	An empty checks list is not a check
+ZAVET-0018	active	A record minted under a non-default prefix

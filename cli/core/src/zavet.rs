@@ -18,12 +18,131 @@ pub const DECISIONS_DIR: &str = ".zavet/decisions/";
 /// for prefix-stripping repo-relative paths).
 pub const SPECS_DIR: &str = ".zavet/specs/";
 
-/// Whether a repo-relative path is a real decision record (`D-*.md`, flat):
-/// scaffolding like `.template.md` lives alongside the records and must never
-/// be captured as a decision.
+/// Where the per-repo id conventions live, relative to the repo toplevel.
+pub const CONFIG_PATH: &str = ".zavet/config";
+
+/// The historical prefix, and the one a repo with no config still mints.
+pub const DEFAULT_PREFIX: &str = "D";
+/// The historical padding width, likewise.
+pub const DEFAULT_ID_WIDTH: usize = 4;
+/// Longest accepted prefix — an id has to stay quotable in a commit trailer.
+const MAX_PREFIX: usize = 6;
+
+/// Per-repo decision-id conventions, read from `.zavet/config`.
+///
+/// [`Default`] is the pre-prefix behaviour (`D`, width 4), which is what a
+/// repo with no config gets — every call path below is then byte-identical to
+/// what it did before prefixes existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZavetConfig {
+    /// Every prefix an id in this repo may carry: the one currently minting,
+    /// followed by any retired by `zavet prefix`. Never empty. Retired
+    /// prefixes stay resolvable because records are append-only — an id keeps
+    /// the prefix it was minted under, forever.
+    pub prefixes: Vec<String>,
+    /// Zero-padding width for canonical ids. Fixed per repo: an id minted at
+    /// one width would never join a shorthand ref resolved at another.
+    pub id_width: usize,
+}
+
+impl Default for ZavetConfig {
+    fn default() -> Self {
+        Self {
+            prefixes: vec![DEFAULT_PREFIX.to_string()],
+            id_width: DEFAULT_ID_WIDTH,
+        }
+    }
+}
+
+/// A well-formed prefix as it appears in a FILENAME: uppercase only.
+///
+/// Uppercase is load-bearing here rather than cosmetic. `.zavet/decisions/` is
+/// a closed directory, but a generic prefix would otherwise make
+/// `notes-2024.md` read as decision `NOTES-2024`; requiring the case that
+/// `next-id` actually mints keeps stray files out.
+fn is_prefix_filename(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= MAX_PREFIX
+        && p.starts_with(|c: char| c.is_ascii_uppercase())
+        && p.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// A well-formed prefix in an ID STRING. Case-insensitive — `d-42` has always
+/// canonicalized to `D-0042`, and hand-authored frontmatter still may.
+fn is_prefix_id(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= MAX_PREFIX
+        && p.starts_with(|c: char| c.is_ascii_alphabetic())
+        && p.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Split `<PREFIX>-<digits>` out of a decision filename stem, or `None`.
+fn decision_filename_parts(file: &str) -> Option<(&str, &str)> {
+    let stem = file.strip_suffix(".md")?;
+    let (prefix, rest) = stem.split_once('-')?;
+    if !is_prefix_filename(prefix) {
+        return None;
+    }
+    let num = rest.split('-').next()?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((prefix, num))
+}
+
+/// Whether a repo-relative path is a real decision record
+/// (`<PREFIX>-<digits>[-slug].md`, flat): scaffolding like `.template.md`
+/// lives alongside the records and must never be captured as a decision.
+///
+/// Shape alone, no config needed — the prefix set only matters when scanning
+/// FREE TEXT, where a generic prefix would swallow `UTF-8` and `SHA-256`.
 pub fn is_decision_path(path: &str) -> bool {
     path.strip_prefix(DECISIONS_DIR)
-        .is_some_and(|file| !file.contains('/') && file.starts_with("D-") && file.ends_with(".md"))
+        .is_some_and(|file| !file.contains('/') && decision_filename_parts(file).is_some())
+}
+
+/// Parse `.zavet/config` — plain `key: value` with `#` comments, the same item
+/// grammar as frontmatter bodies minus the fences.
+///
+/// Anything missing or malformed falls back to the default rather than
+/// failing: a typo in config must not cost the whole capture.
+pub fn parse_config(text: &str) -> ZavetConfig {
+    let mut cfg = ZavetConfig::default();
+    let mut minting: Option<String> = None;
+    let mut retired: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = unquote(decomment(value.trim())).trim();
+        match key.trim() {
+            "prefix" => {
+                if is_prefix_filename(value) {
+                    minting = Some(value.to_string());
+                }
+            }
+            "prefix-aliases" => {
+                for p in value.split([',', ' ']).filter(|p| !p.is_empty()) {
+                    if is_prefix_filename(p) && !retired.iter().any(|r| r == p) {
+                        retired.push(p.to_string());
+                    }
+                }
+            }
+            "id-width" => {
+                if let Ok(w) = value.parse::<usize>() {
+                    if (1..=9).contains(&w) {
+                        cfg.id_width = w;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let minting = minting.unwrap_or_else(|| DEFAULT_PREFIX.to_string());
+    retired.retain(|p| *p != minting);
+    cfg.prefixes = std::iter::once(minting).chain(retired).collect();
+    cfg
 }
 
 /// Whether a repo-relative path is a living spec (flat `<slug>.md`):
@@ -45,60 +164,118 @@ pub const TRAILER_KEYS: &[&str] = &[
     "spec",
 ];
 
-/// Normalize something that looks like a decision id (`d-42`, `D-0042`) to the
-/// zero-padded canonical form, or `None` when it isn't one. Every ingestion
-/// point runs ids through this, so `D-7` in a trailer and `D-0007` in a record
-/// frontmatter land in the store as the same key. Numbers above 9999 keep
-/// their natural width (`{:04}` only pads).
-pub fn canonical_decision_id(s: &str) -> Option<String> {
+/// Split an id string into its prefix and digits, case-insensitively.
+fn split_id(s: &str) -> Option<(&str, &str)> {
     let q = s.trim();
-    let digits = q
-        .strip_prefix("D-")
-        .or_else(|| q.strip_prefix("d-"))
-        .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))?;
+    let (prefix, digits) = q.split_once('-')?;
+    if !is_prefix_id(prefix) {
+        return None;
+    }
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((prefix, digits))
+}
+
+/// Uppercase the prefix of something that looks like a decision id, leaving
+/// its digits exactly as written. `None` when it isn't one.
+///
+/// The no-padding counterpart of [`canonical_decision_id`], for the one call
+/// site that has no repo config to hand: a guard event is parsed before its
+/// `cwd` has been resolved to a repo, and re-padding it there at the WRONG
+/// width would be worse than not padding at all. The daemon canonicalizes it
+/// properly once the repo is known.
+pub fn normalize_decision_id(s: &str) -> Option<String> {
+    let (prefix, digits) = split_id(s)?;
+    Some(format!("{}-{}", prefix.to_ascii_uppercase(), digits))
+}
+
+/// Normalize something that looks like a decision id (`d-42`, `CLOUD-0042`) to
+/// the zero-padded canonical form, or `None` when it isn't one. Every
+/// ingestion point runs ids through this, so `D-7` in a trailer and `D-0007`
+/// in a record frontmatter land in the store as the same key. Numbers wider
+/// than the field keep their natural width (`{:0w$}` only pads), so no width
+/// imposes a ceiling.
+///
+/// Deliberately permissive about WHICH prefix: a record declares its own, and
+/// validating a whole string cannot produce a false positive. Only free-text
+/// scanning restricts to the repo's prefix set.
+pub fn canonical_decision_id(s: &str, width: usize) -> Option<String> {
+    let (prefix, digits) = split_id(s)?;
     let n: u64 = digits.parse().ok()?;
-    Some(format!("D-{n:04}"))
+    Some(format!(
+        "{}-{:0width$}",
+        prefix.to_ascii_uppercase(),
+        n,
+        width = width
+    ))
 }
 
-/// The first `D-<digits>` decision reference in `s`, canonicalized, if any.
-pub fn scan_decision_ref(s: &str) -> Option<String> {
-    scan_all_decision_refs(s).into_iter().next()
+/// The first decision reference in `s`, canonicalized, if any.
+pub fn scan_decision_ref(s: &str, cfg: &ZavetConfig) -> Option<String> {
+    scan_all_decision_refs(s, cfg).into_iter().next()
 }
 
-/// EVERY `D-<digits>` decision reference in `s`, canonicalized, deduplicated,
-/// in order of first appearance. Spec bodies auto-link the decisions they
-/// mention through this. Hand-rolled scan — not worth a regex dependency.
-pub fn scan_all_decision_refs(s: &str) -> Vec<String> {
+/// EVERY decision reference in `s`, canonicalized, deduplicated, in order of
+/// first appearance. Spec bodies auto-link the decisions they mention through
+/// this. Hand-rolled scan — not worth a regex dependency.
+///
+/// Restricted to `cfg.prefixes`, and that restriction is the whole point: this
+/// walks free prose, where accepting any `[A-Z]+-<digits>` would read `UTF-8`,
+/// `SHA-256`, `RFC-2119` and `CVE-2024` as decision references.
+pub fn scan_all_decision_refs(s: &str, cfg: &ZavetConfig) -> Vec<String> {
     let bytes = s.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
-    while i + 2 < bytes.len() {
-        if bytes[i] == b'D'
-            && bytes[i + 1] == b'-'
-            && bytes[i + 2].is_ascii_digit()
-            // A word boundary on the left so e.g. `CMD-1` doesn't count.
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-        {
-            let mut j = i + 2;
+    while i < bytes.len() {
+        // A word boundary on the left so e.g. `CMD-1` doesn't count. A
+        // continuation byte of a multi-byte char is never ascii-alphanumeric,
+        // and no prefix byte is either, so `i` can only advance to a char
+        // boundary before any slicing happens.
+        if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
+            i += 1;
+            continue;
+        }
+        let mut matched = false;
+        for p in &cfg.prefixes {
+            let pb = p.as_bytes();
+            // prefix + '-' + at least one digit
+            if i + pb.len() + 1 >= bytes.len() {
+                continue;
+            }
+            if !bytes[i..i + pb.len()].eq_ignore_ascii_case(pb) {
+                continue;
+            }
+            if bytes[i + pb.len()] != b'-' {
+                continue;
+            }
+            let start = i + pb.len() + 1;
+            let mut j = start;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            if let Some(id) = canonical_decision_id(&s[i..j]) {
+            if j == start {
+                continue;
+            }
+            if let Some(id) = canonical_decision_id(&s[i..j], cfg.id_width) {
                 if !out.contains(&id) {
                     out.push(id);
                 }
             }
             i = j;
-            continue;
+            matched = true;
+            break;
         }
-        i += 1;
+        if !matched {
+            i += 1;
+        }
     }
     out
 }
 
 /// Filter raw `key: value` trailer pairs down to the zavet allowlist,
 /// normalizing keys to lowercase and extracting the first decision reference.
-pub fn normalize_trailers(raw: &[(String, String)]) -> Vec<ZavetTrailer> {
+pub fn normalize_trailers(raw: &[(String, String)], cfg: &ZavetConfig) -> Vec<ZavetTrailer> {
     raw.iter()
         .filter_map(|(k, v)| {
             let key = k.trim().to_ascii_lowercase();
@@ -109,7 +286,7 @@ pub fn normalize_trailers(raw: &[(String, String)]) -> Vec<ZavetTrailer> {
             if value.is_empty() {
                 return None;
             }
-            let decision_id = scan_decision_ref(&value);
+            let decision_id = scan_decision_ref(&value, cfg);
             Some(ZavetTrailer {
                 key,
                 value,
@@ -248,7 +425,7 @@ fn body_of(text: &str, body_start: Option<usize>) -> Option<String> {
 /// Malformed documents yield `None` (capture is best-effort); unknown keys
 /// are ignored. `content_hash` is left empty for the caller (it comes from
 /// git, not the text).
-pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
+pub fn parse_decision(text: &str, path: &str, cfg: &ZavetConfig) -> Option<ZavetDecisionCapture> {
     let fm = parse_frontmatter(text)?;
     let mut cap = ZavetDecisionCapture {
         path: path.to_string(),
@@ -270,14 +447,14 @@ pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
             // drop rather than reject the document — a typo'd pointer must not
             // cost the record itself.
             ("corrected-by", FmValue::Scalar(v)) => {
-                cap.corrected_by = canonical_decision_id(unquote(decomment(v)))
+                cap.corrected_by = canonical_decision_id(unquote(decomment(v)), cfg.id_width)
             }
             _ => {} // unknown keys (tags, …) are fine
         }
     }
     // Ids are stored canonical (`D-1` → `D-0001`); a frontmatter id that
     // doesn't canonicalize (`D-x7`, missing) rejects the whole document.
-    cap.id = canonical_decision_id(&cap.id)?;
+    cap.id = canonical_decision_id(&cap.id, cfg.id_width)?;
     cap.body_md = body_of(text, fm.body_start);
     if cap.status.is_none() {
         cap.status = Some("active".to_string());
@@ -295,7 +472,7 @@ pub fn parse_decision(text: &str, path: &str) -> Option<ZavetDecisionCapture> {
 /// append-only. Missing `origin`/`confidence` default to the most skeptical
 /// values (`reverse-engineered`, `low`): an unlabeled spec never renders more
 /// trustworthy than a labeled one.
-pub fn parse_spec(text: &str, path: &str) -> Option<ZavetSpecCapture> {
+pub fn parse_spec(text: &str, path: &str, cfg: &ZavetConfig) -> Option<ZavetSpecCapture> {
     let slug = spec_slug_of(path)?;
     let fm = parse_frontmatter(text)?;
     let mut cap = ZavetSpecCapture {
@@ -328,7 +505,8 @@ pub fn parse_spec(text: &str, path: &str) -> Option<ZavetSpecCapture> {
             ("paths", FmValue::List(items)) => cap.paths.extend(clean_list(items)),
             ("checks", FmValue::List(items)) => cap.checks.extend(clean_checks(items)),
             ("decisions", FmValue::List(items)) => {
-                for id in clean_list(items).filter_map(|d| canonical_decision_id(&d)) {
+                for id in clean_list(items).filter_map(|d| canonical_decision_id(&d, cfg.id_width))
+                {
                     if !decisions.contains(&id) {
                         decisions.push(id);
                     }
@@ -345,7 +523,7 @@ pub fn parse_spec(text: &str, path: &str) -> Option<ZavetSpecCapture> {
     }
     cap.body_md = body_of(text, fm.body_start);
     if let Some(body) = &cap.body_md {
-        for id in scan_all_decision_refs(body) {
+        for id in scan_all_decision_refs(body, cfg) {
             if !decisions.contains(&id) {
                 decisions.push(id);
             }
@@ -432,7 +610,7 @@ pub fn parse_guard_event(payload: &serde_json::Value) -> Option<GuardEventV1> {
     if kind.is_empty() || cwd.is_empty() {
         return None;
     }
-    let decision_id = canonical_decision_id(decision_id)?;
+    let decision_id = normalize_decision_id(decision_id)?;
     let file_path = payload
         .get("file_path")
         .and_then(|v| v.as_str())
@@ -599,7 +777,12 @@ mod tests {
 
     #[test]
     fn parses_a_full_record() {
-        let cap = parse_decision(DOC, ".zavet/decisions/D-0042-poll.md").unwrap();
+        let cap = parse_decision(
+            DOC,
+            ".zavet/decisions/D-0042-poll.md",
+            &ZavetConfig::default(),
+        )
+        .unwrap();
         assert_eq!(cap.id, "D-0042");
         assert_eq!(cap.slug.as_deref(), Some("poll"));
         assert_eq!(cap.title.as_deref(), Some("Poll git, don't watch"));
@@ -617,7 +800,8 @@ mod tests {
     #[test]
     fn parses_checks_splitting_label_from_command() {
         let doc = "---\nid: D-0001\nchecks:\n  - pg suite forbids mocks :: run-the-pg-suite\n  - run-the-lint-suite\n---\nbody";
-        let cap = parse_decision(doc, ".zavet/decisions/D-0001.md").unwrap();
+        let cap =
+            parse_decision(doc, ".zavet/decisions/D-0001.md", &ZavetConfig::default()).unwrap();
         assert_eq!(cap.checks.len(), 2);
         assert_eq!(cap.checks[0].label, "pg suite forbids mocks");
         assert_eq!(cap.checks[0].command, "run-the-pg-suite");
@@ -629,7 +813,8 @@ mod tests {
     #[test]
     fn check_keeps_later_separators_and_drops_a_commandless_item() {
         let doc = "---\nid: D-0001\nchecks:\n  - keeps later :: runner --grep 'A::b'\n  - label-only ::\n---\nbody";
-        let cap = parse_decision(doc, ".zavet/decisions/D-0001.md").unwrap();
+        let cap =
+            parse_decision(doc, ".zavet/decisions/D-0001.md", &ZavetConfig::default()).unwrap();
         assert_eq!(
             cap.checks.len(),
             1,
@@ -643,18 +828,25 @@ mod tests {
         // Unquoted, the shared decomment rule truncates at ` #` — same as
         // every other structured list item. Quoting is the escape hatch.
         let bare = "---\nid: D-0001\nchecks:\n  - t :: runner -c 'a # b'\n---\nbody";
-        let cap = parse_decision(bare, ".zavet/decisions/D-0001.md").unwrap();
+        let cap =
+            parse_decision(bare, ".zavet/decisions/D-0001.md", &ZavetConfig::default()).unwrap();
         assert_eq!(cap.checks[0].command, "runner -c 'a");
 
         let quoted = "---\nid: D-0001\nchecks:\n  - \"t :: runner -c 'a # b'\"\n---\nbody";
-        let cap = parse_decision(quoted, ".zavet/decisions/D-0001.md").unwrap();
+        let cap = parse_decision(
+            quoted,
+            ".zavet/decisions/D-0001.md",
+            &ZavetConfig::default(),
+        )
+        .unwrap();
         assert_eq!(cap.checks[0].command, "runner -c 'a # b'");
     }
 
     #[test]
     fn corrected_by_canonicalizes_and_never_rejects_the_record() {
         let doc = "---\nid: D-0014\ncorrected-by: D-7\n---\nbody";
-        let cap = parse_decision(doc, ".zavet/decisions/D-0014.md").unwrap();
+        let cap =
+            parse_decision(doc, ".zavet/decisions/D-0014.md", &ZavetConfig::default()).unwrap();
         assert_eq!(cap.corrected_by.as_deref(), Some("D-0007"));
         // A record stays ACTIVE when corrected — that is the whole point:
         // supersession replaces, correction annotates.
@@ -662,7 +854,8 @@ mod tests {
 
         // A malformed pointer drops the pointer, never the record.
         let bad = "---\nid: D-0014\ncorrected-by: nonsense\n---\nbody";
-        let cap = parse_decision(bad, ".zavet/decisions/D-0014.md").unwrap();
+        let cap =
+            parse_decision(bad, ".zavet/decisions/D-0014.md", &ZavetConfig::default()).unwrap();
         assert_eq!(cap.corrected_by, None);
         assert_eq!(cap.id, "D-0014");
     }
@@ -671,7 +864,7 @@ mod tests {
     fn specs_parse_checks_with_the_same_rule_as_decisions() {
         let doc =
             "---\ntitle: T\nchecks:\n  - no overflow :: run-the-sweep\nchecks2: []\n---\nbody";
-        let cap = parse_spec(doc, ".zavet/specs/mobile.md").unwrap();
+        let cap = parse_spec(doc, ".zavet/specs/mobile.md", &ZavetConfig::default()).unwrap();
         assert_eq!(cap.checks.len(), 1);
         assert_eq!(cap.checks[0].label, "no overflow");
         assert_eq!(cap.checks[0].command, "run-the-sweep");
@@ -680,7 +873,8 @@ mod tests {
     #[test]
     fn parses_inline_guard_lists_and_defaults_status() {
         let doc = "---\nid: D-0001\nguards: [a/**, \"b.rs\"]\n---\nbody";
-        let cap = parse_decision(doc, ".zavet/decisions/D-0001.md").unwrap();
+        let cap =
+            parse_decision(doc, ".zavet/decisions/D-0001.md", &ZavetConfig::default()).unwrap();
         assert_eq!(cap.guards, vec!["a/**", "b.rs"]);
         assert_eq!(cap.status.as_deref(), Some("active"));
         assert_eq!(cap.slug, None); // no slug segment in the filename
@@ -696,7 +890,11 @@ mod tests {
             "---\nid: D-x7\n---\nbody", // non-canonicalizable id
             "",
         ] {
-            assert_eq!(parse_decision(doc, "x.md"), None, "doc: {doc:?}");
+            assert_eq!(
+                parse_decision(doc, "x.md", &ZavetConfig::default()),
+                None,
+                "doc: {doc:?}"
+            );
         }
     }
 
@@ -704,7 +902,12 @@ mod tests {
 
     #[test]
     fn parses_a_full_spec_with_inline_comments() {
-        let cap = parse_spec(SPEC, ".zavet/specs/capture-pipeline.md").unwrap();
+        let cap = parse_spec(
+            SPEC,
+            ".zavet/specs/capture-pipeline.md",
+            &ZavetConfig::default(),
+        )
+        .unwrap();
         assert_eq!(cap.slug, "capture-pipeline");
         assert_eq!(cap.title.as_deref(), Some("Zavet capture pipeline"));
         assert_eq!(cap.version, 2);
@@ -723,7 +926,12 @@ mod tests {
 
     #[test]
     fn spec_defaults_are_the_most_skeptical() {
-        let cap = parse_spec("---\ntitle: X\n---\nbody", ".zavet/specs/x.md").unwrap();
+        let cap = parse_spec(
+            "---\ntitle: X\n---\nbody",
+            ".zavet/specs/x.md",
+            &ZavetConfig::default(),
+        )
+        .unwrap();
         assert_eq!(cap.origin, "reverse-engineered");
         assert_eq!(cap.confidence, "low");
         assert_eq!(cap.version, 1);
@@ -734,18 +942,44 @@ mod tests {
 
     #[test]
     fn spec_slug_comes_from_the_filename_and_templates_reject() {
-        assert!(parse_spec("---\n---\nbody", ".zavet/specs/.spec-template.md").is_none());
-        assert!(parse_spec("---\n---\nbody", ".zavet/specs/.md").is_none());
-        assert!(parse_spec("no frontmatter", ".zavet/specs/x.md").is_none());
-        assert!(parse_spec("---\nnever closed", ".zavet/specs/x.md").is_none());
-        let cap = parse_spec("---\n---\nbody", ".zavet/specs/auth-flow.md").unwrap();
+        assert!(parse_spec(
+            "---\n---\nbody",
+            ".zavet/specs/.spec-template.md",
+            &ZavetConfig::default()
+        )
+        .is_none());
+        assert!(parse_spec(
+            "---\n---\nbody",
+            ".zavet/specs/.md",
+            &ZavetConfig::default()
+        )
+        .is_none());
+        assert!(parse_spec(
+            "no frontmatter",
+            ".zavet/specs/x.md",
+            &ZavetConfig::default()
+        )
+        .is_none());
+        assert!(parse_spec(
+            "---\nnever closed",
+            ".zavet/specs/x.md",
+            &ZavetConfig::default()
+        )
+        .is_none());
+        let cap = parse_spec(
+            "---\n---\nbody",
+            ".zavet/specs/auth-flow.md",
+            &ZavetConfig::default(),
+        )
+        .unwrap();
         assert_eq!(cap.slug, "auth-flow");
     }
 
     #[test]
     fn decision_titles_keep_hashes_but_structured_values_decomment() {
         let doc = "---\nid: D-1\ntitle: Fix #123 handling\nstatus: active # hmm\nguards: [a/**] # inline comment\n---\nbody";
-        let cap = parse_decision(doc, ".zavet/decisions/D-0001.md").unwrap();
+        let cap =
+            parse_decision(doc, ".zavet/decisions/D-0001.md", &ZavetConfig::default()).unwrap();
         assert_eq!(cap.title.as_deref(), Some("Fix #123 handling"));
         assert_eq!(cap.status.as_deref(), Some("active"));
         assert_eq!(cap.guards, vec!["a/**"]);
@@ -754,26 +988,167 @@ mod tests {
     #[test]
     fn scan_all_refs_collects_deduped_in_order() {
         assert_eq!(
-            scan_all_decision_refs("D-7 then D-0042, D-7 again; CMD-9 no"),
+            scan_all_decision_refs(
+                "D-7 then D-0042, D-7 again; CMD-9 no",
+                &ZavetConfig::default()
+            ),
             vec!["D-0007", "D-0042"]
         );
-        assert!(scan_all_decision_refs("nothing here").is_empty());
+        assert!(scan_all_decision_refs("nothing here", &ZavetConfig::default()).is_empty());
+    }
+
+    /// Why free-text scanning is restricted to the repo's prefix set rather
+    /// than accepting any `[A-Z]+-<digits>`: prose is full of things that
+    /// would otherwise read as decision references.
+    #[test]
+    fn scan_ignores_lookalikes_outside_the_prefix_set() {
+        let cfg = ZavetConfig {
+            prefixes: vec!["CLOUD".to_string()],
+            id_width: 5,
+        };
+        let prose = "UTF-8 and SHA-256 per RFC-2119; see CVE-2024 and AES-128. \
+                     The decision is CLOUD-42.";
+        assert_eq!(scan_all_decision_refs(prose, &cfg), vec!["CLOUD-00042"]);
+        // And the historical prefix is NOT magic — a repo that mints CLOUD
+        // does not silently pick up D-refs it never retired.
+        assert!(scan_all_decision_refs("see D-7", &cfg).is_empty());
+    }
+
+    /// A retired prefix stays resolvable: records are append-only, so ids
+    /// minted before a `zavet prefix` change keep their old prefix forever.
+    #[test]
+    fn scan_resolves_retired_prefixes() {
+        let cfg = ZavetConfig {
+            prefixes: vec!["CLOUD".to_string(), "D".to_string()],
+            id_width: 5,
+        };
+        assert_eq!(
+            scan_all_decision_refs("D-41 then CLOUD-42", &cfg),
+            vec!["D-00041", "CLOUD-00042"]
+        );
+    }
+
+    /// One prefix being a prefix of another must not shadow it — the `-`
+    /// is what disambiguates.
+    #[test]
+    fn scan_disambiguates_overlapping_prefixes() {
+        let cfg = ZavetConfig {
+            prefixes: vec!["D".to_string(), "DB".to_string()],
+            id_width: 4,
+        };
+        assert_eq!(
+            scan_all_decision_refs("D-1 and DB-2", &cfg),
+            vec!["D-0001", "DB-0002"]
+        );
+    }
+
+    #[test]
+    fn config_defaults_to_the_pre_prefix_behaviour() {
+        // The guarantee that makes this migration-free.
+        for text in ["", "# nothing\n", "garbage\nno colons\n"] {
+            let cfg = parse_config(text);
+            assert_eq!(cfg.prefixes, vec!["D".to_string()], "text: {text:?}");
+            assert_eq!(cfg.id_width, DEFAULT_ID_WIDTH);
+        }
+    }
+
+    #[test]
+    fn config_parses_prefix_aliases_and_width() {
+        let cfg = parse_config(
+            "# comment\nprefix: CLOUD  # minting\nprefix-aliases: D, LEGACY\nid-width: 5\n",
+        );
+        assert_eq!(cfg.prefixes, vec!["CLOUD", "D", "LEGACY"]);
+        assert_eq!(cfg.id_width, 5);
+        // Malformed values fall back rather than failing the whole capture.
+        let cfg = parse_config("prefix: not-valid\nid-width: 99\n");
+        assert_eq!(cfg.prefixes, vec!["D".to_string()]);
+        assert_eq!(cfg.id_width, DEFAULT_ID_WIDTH);
+        // The minting prefix is never duplicated into the retired list.
+        let cfg = parse_config("prefix: CLOUD\nprefix-aliases: CLOUD D\n");
+        assert_eq!(cfg.prefixes, vec!["CLOUD", "D"]);
+    }
+
+    #[test]
+    fn decision_paths_accept_any_prefix_but_reject_stray_files() {
+        for ok in [
+            ".zavet/decisions/D-0042-poll.md",
+            ".zavet/decisions/CLOUD-00042-poll-not-watch.md",
+            ".zavet/decisions/A1-7.md",
+        ] {
+            assert!(is_decision_path(ok), "should accept: {ok}");
+        }
+        for bad in [
+            ".zavet/decisions/notes-2024.md", // lowercase prefix: not a record
+            ".zavet/decisions/.template.md",
+            ".zavet/decisions/README.md",
+            ".zavet/decisions/TOOLONGPREFIX-1.md",
+            ".zavet/decisions/D-x7.md",
+            ".zavet/decisions/nested/D-1.md",
+        ] {
+            assert!(!is_decision_path(bad), "should reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn canonical_id_pads_to_the_repo_width() {
+        assert_eq!(
+            canonical_decision_id("CLOUD-42", 5).as_deref(),
+            Some("CLOUD-00042")
+        );
+        // Padding only widens — no width imposes a ceiling.
+        assert_eq!(
+            canonical_decision_id("CLOUD-123456", 5).as_deref(),
+            Some("CLOUD-123456")
+        );
+        // normalize keeps the digits exactly as written.
+        assert_eq!(
+            normalize_decision_id("cloud-0042").as_deref(),
+            Some("CLOUD-0042")
+        );
+        assert_eq!(
+            normalize_decision_id("CLOUD-42").as_deref(),
+            Some("CLOUD-42")
+        );
+        for bad in ["TOOLONGPREFIX-1", "-1", "1-2", "D-", "D-x"] {
+            assert_eq!(normalize_decision_id(bad), None, "input: {bad:?}");
+        }
     }
 
     #[test]
     fn frontmatter_ids_are_stored_canonical() {
-        let cap = parse_decision("---\nid: D-1\n---\nbody", ".zavet/decisions/D-0001.md").unwrap();
+        let cap = parse_decision(
+            "---\nid: D-1\n---\nbody",
+            ".zavet/decisions/D-0001.md",
+            &ZavetConfig::default(),
+        )
+        .unwrap();
         assert_eq!(cap.id, "D-0001");
     }
 
     #[test]
     fn canonical_id_pads_and_rejects() {
-        assert_eq!(canonical_decision_id("D-7").as_deref(), Some("D-0007"));
-        assert_eq!(canonical_decision_id("d-42").as_deref(), Some("D-0042"));
-        assert_eq!(canonical_decision_id(" D-0042 ").as_deref(), Some("D-0042"));
-        assert_eq!(canonical_decision_id("D-12345").as_deref(), Some("D-12345"));
+        assert_eq!(
+            canonical_decision_id("D-7", DEFAULT_ID_WIDTH).as_deref(),
+            Some("D-0007")
+        );
+        assert_eq!(
+            canonical_decision_id("d-42", DEFAULT_ID_WIDTH).as_deref(),
+            Some("D-0042")
+        );
+        assert_eq!(
+            canonical_decision_id(" D-0042 ", DEFAULT_ID_WIDTH).as_deref(),
+            Some("D-0042")
+        );
+        assert_eq!(
+            canonical_decision_id("D-12345", DEFAULT_ID_WIDTH).as_deref(),
+            Some("D-12345")
+        );
         for bad in ["D-", "D-x7", "D-7x", "poll", "", "D-7 D-8"] {
-            assert_eq!(canonical_decision_id(bad), None, "input: {bad:?}");
+            assert_eq!(
+                canonical_decision_id(bad, DEFAULT_ID_WIDTH),
+                None,
+                "input: {bad:?}"
+            );
         }
     }
 
@@ -786,7 +1161,7 @@ mod tests {
             ("REJECTED".to_string(), "notify crate".to_string()),
             ("Constraint".to_string(), "".to_string()), // empty value dropped
         ];
-        let ts = normalize_trailers(&raw);
+        let ts = normalize_trailers(&raw, &ZavetConfig::default());
         assert_eq!(ts.len(), 3);
         assert_eq!(ts[0].key, "why");
         assert_eq!(ts[0].decision_id, None);
@@ -795,14 +1170,108 @@ mod tests {
         assert_eq!(ts[2].key, "rejected");
     }
 
+    /// A trailer's ref resolves through the repo's prefix set at the repo's
+    /// width — including a retired prefix, which is what keeps commits made
+    /// before a `zavet prefix` change attributable to their decision.
+    #[test]
+    fn trailer_refs_resolve_prefixed_and_retired_ids() {
+        let cfg = ZavetConfig {
+            prefixes: vec!["CLOUD".to_string(), "D".to_string()],
+            id_width: 5,
+        };
+        let ts = normalize_trailers(
+            &[
+                ("Refs".to_string(), "CLOUD-42".to_string()),
+                ("Supersedes".to_string(), "D-7".to_string()),
+                // Prose in a trailer value must not become a ref.
+                (
+                    "Why".to_string(),
+                    "UTF-8 everywhere per RFC-2119".to_string(),
+                ),
+            ],
+            &cfg,
+        );
+        assert_eq!(ts[0].decision_id.as_deref(), Some("CLOUD-00042"));
+        assert_eq!(ts[1].decision_id.as_deref(), Some("D-00007"));
+        assert_eq!(ts[2].decision_id, None);
+    }
+
+    /// The slug is the filename minus the id — it has to survive a prefix
+    /// that is not `D`, or every prefixed record would capture slugless.
+    #[test]
+    fn prefixed_records_keep_their_slug_and_pointers() {
+        let cfg = ZavetConfig {
+            prefixes: vec!["CLOUD".to_string()],
+            id_width: 5,
+        };
+        let doc = "---\nid: CLOUD-42\ntitle: T\nstatus: active\nsupersedes: CLOUD-00007\n\
+                   corrected-by: CLOUD-9\nguards:\n  - src/**\n---\n\nbody\n";
+        let cap = parse_decision(doc, ".zavet/decisions/CLOUD-00042-poll-not-watch.md", &cfg)
+            .expect("parses");
+        assert_eq!(cap.id, "CLOUD-00042");
+        assert_eq!(cap.slug.as_deref(), Some("poll-not-watch"));
+        // `supersedes` is stored verbatim (it always was); `corrected-by`
+        // canonicalizes, so the shorthand joins the padded record.
+        assert_eq!(cap.supersedes.as_deref(), Some("CLOUD-00007"));
+        assert_eq!(cap.corrected_by.as_deref(), Some("CLOUD-00009"));
+        assert_eq!(cap.guards, vec!["src/**"]);
+    }
+
+    /// Spec auto-linking is the widest free-text surface in the codebase —
+    /// the frontmatter list ∪ every body ref. Both go through the prefix set.
+    #[test]
+    fn prefixed_specs_autolink_only_real_refs() {
+        let cfg = ZavetConfig {
+            prefixes: vec!["CLOUD".to_string(), "D".to_string()],
+            id_width: 5,
+        };
+        let doc = "---\ntitle: Sync\ndecisions: [CLOUD-1, D-7]\n---\n\n\
+                   Per CLOUD-42 and D-7 again. Encoded as UTF-8, hashed with \
+                   SHA-256, per RFC-2119 and CVE-2024.\n";
+        let cap = parse_spec(doc, ".zavet/specs/sync.md", &cfg).expect("parses");
+        assert_eq!(
+            cap.decisions,
+            vec!["CLOUD-00001", "D-00007", "CLOUD-00042"],
+            "frontmatter list first, then body refs in order of appearance"
+        );
+    }
+
+    /// A repo that has NOT adopted a prefix must behave exactly as it did
+    /// before prefixes existed. This is the whole backward-compatibility
+    /// claim, asserted end to end rather than per-function.
+    #[test]
+    fn default_config_reproduces_pre_prefix_behaviour() {
+        let cfg = ZavetConfig::default();
+        let doc = "---\nid: D-1\ntitle: T\nstatus: active\nguards:\n  - a/**\n---\n\nSee D-7.\n";
+        let cap = parse_decision(doc, ".zavet/decisions/D-0001-poll.md", &cfg).unwrap();
+        assert_eq!(cap.id, "D-0001");
+        assert_eq!(cap.slug.as_deref(), Some("poll"));
+        assert_eq!(
+            scan_all_decision_refs("D-7 then D-0042, D-7 again; CMD-9 no", &cfg),
+            vec!["D-0007", "D-0042"]
+        );
+        assert_eq!(
+            canonical_decision_id("d-42", cfg.id_width).as_deref(),
+            Some("D-0042")
+        );
+        // And a prefix it never adopted is invisible to free-text scanning.
+        assert!(scan_all_decision_refs("CLOUD-42", &cfg).is_empty());
+    }
+
     #[test]
     fn decision_ref_scan_requires_word_boundary_and_digits() {
-        assert_eq!(scan_decision_ref("see D-0042 there"), Some("D-0042".into()));
+        assert_eq!(
+            scan_decision_ref("see D-0042 there", &ZavetConfig::default()),
+            Some("D-0042".into())
+        );
         // Short refs canonicalize, so `Refs: D-7` joins a record `D-0007`.
-        assert_eq!(scan_decision_ref("D-7"), Some("D-0007".into()));
-        assert_eq!(scan_decision_ref("CMD-123"), None);
-        assert_eq!(scan_decision_ref("D-"), None);
-        assert_eq!(scan_decision_ref("nothing"), None);
+        assert_eq!(
+            scan_decision_ref("D-7", &ZavetConfig::default()),
+            Some("D-0007".into())
+        );
+        assert_eq!(scan_decision_ref("CMD-123", &ZavetConfig::default()), None);
+        assert_eq!(scan_decision_ref("D-", &ZavetConfig::default()), None);
+        assert_eq!(scan_decision_ref("nothing", &ZavetConfig::default()), None);
     }
 
     #[test]
@@ -852,13 +1321,26 @@ mod tests {
         assert_eq!(ev.decision_id, "D-0042");
         assert_eq!(ev.ts.as_deref(), Some("2026-07-15T12:00:00Z"));
         // Unknown kinds are stored verbatim, not rejected (plugin newer than
-        // daemon); short ids canonicalize on the way in.
+        // daemon).
+        //
+        // The id is NORMALIZED, not padded: this runs before `cwd` has been
+        // resolved to a repo, so the padding width is not yet known, and
+        // guessing it would key a width-5 repo's ids wrong. The daemon pads
+        // in `zavet::ingest` once it has read the repo's config.
         let ev = parse_guard_event(&serde_json::json!({
-            "v": 9, "kind": "guard_hyperdrive", "decision_id": "D-1", "cwd": "/r",
+            "v": 9, "kind": "guard_hyperdrive", "decision_id": "d-1", "cwd": "/r",
         }))
         .unwrap();
         assert_eq!(ev.kind, "guard_hyperdrive");
-        assert_eq!(ev.decision_id, "D-0001");
+        assert_eq!(ev.decision_id, "D-1");
+        assert_eq!(
+            canonical_decision_id(&ev.decision_id, DEFAULT_ID_WIDTH).as_deref(),
+            Some("D-0001")
+        );
+        assert_eq!(
+            canonical_decision_id(&ev.decision_id, 5).as_deref(),
+            Some("D-00001")
+        );
     }
 
     #[test]
@@ -888,20 +1370,42 @@ mod tests {
         /// return `None`/empty, byte-offset math stays in bounds.
         #[test]
         fn parse_decision_never_panics(text in ".{0,400}", path in "[a-zA-Z0-9./-]{0,40}") {
-            let _ = parse_decision(&text, &path);
+            let _ = parse_decision(&text, &path, &ZavetConfig::default());
         }
 
         #[test]
         fn parse_spec_never_panics(text in ".{0,400}", path in "[a-zA-Z0-9./-]{0,40}") {
-            let _ = parse_spec(&text, &path);
-            let _ = scan_all_decision_refs(&text);
+            let _ = parse_spec(&text, &path, &ZavetConfig::default());
+            let _ = scan_all_decision_refs(&text, &ZavetConfig::default());
         }
 
         #[test]
         fn trailer_scan_never_panics(s in ".{0,200}") {
-            let _ = scan_decision_ref(&s);
+            let _ = scan_decision_ref(&s, &ZavetConfig::default());
             let _ = parse_trailer_block(&s);
-            let _ = canonical_decision_id(&s);
+            let _ = canonical_decision_id(&s, DEFAULT_ID_WIDTH);
+            let _ = normalize_decision_id(&s);
+        }
+
+        /// The scanner slices `&s[i..j]` off byte offsets, so an arbitrary
+        /// prefix set over arbitrary (possibly multi-byte) text must never
+        /// land mid-char. Widths and prefixes both vary.
+        #[test]
+        fn scan_never_panics_on_any_prefix_set(
+            s in ".{0,200}",
+            prefixes in proptest::collection::vec("[A-Z][A-Z0-9]{0,5}", 1..4),
+            width in 1usize..9,
+        ) {
+            let cfg = ZavetConfig { prefixes, id_width: width };
+            let _ = scan_all_decision_refs(&s, &cfg);
+        }
+
+        #[test]
+        fn parse_config_never_panics(text in ".{0,400}") {
+            let cfg = parse_config(&text);
+            // The invariant every caller leans on: never an empty prefix set.
+            assert!(!cfg.prefixes.is_empty());
+            assert!((1..=9).contains(&cfg.id_width));
         }
 
         /// The guard-event parser must never panic on arbitrary plugin input —

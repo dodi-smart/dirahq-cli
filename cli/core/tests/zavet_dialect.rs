@@ -9,7 +9,7 @@
 //! corpus README for the projection rules and the documented out-of-scope
 //! divergences.
 
-use dira_core::zavet::{parse_decision, parse_spec};
+use dira_core::zavet::{parse_config, parse_decision, parse_spec, ZavetConfig};
 use std::path::{Path, PathBuf};
 
 fn corpus() -> PathBuf {
@@ -28,6 +28,16 @@ fn md_files(sub: &str) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+
+/// The corpus's own `.zavet/config`. Both sides read it: the plugin's
+/// `test/run.sh` copies it into the fixture repo, this walker parses it here.
+/// It is what makes `ZAVET-0018` and the older `D-*` records resolve side by
+/// side — the retired prefix stays in the set.
+fn corpus_config() -> ZavetConfig {
+    std::fs::read_to_string(corpus().join("config"))
+        .map(|t| parse_config(&t))
+        .unwrap_or_default()
 }
 
 fn golden(name: &str) -> String {
@@ -52,7 +62,7 @@ fn decisions_meta_matches_golden() {
             ".zavet/decisions/{}",
             f.file_name().unwrap().to_str().unwrap()
         );
-        let Some(cap) = parse_decision(&text, &rel) else {
+        let Some(cap) = parse_decision(&text, &rel, &corpus_config()) else {
             continue; // rejected documents yield no rows, matching the awk
         };
         out.push_str(&format!(
@@ -74,7 +84,7 @@ fn decisions_guards_matches_golden() {
             ".zavet/decisions/{}",
             f.file_name().unwrap().to_str().unwrap()
         );
-        let Some(cap) = parse_decision(&text, &rel) else {
+        let Some(cap) = parse_decision(&text, &rel, &corpus_config()) else {
             continue;
         };
         // Guard rows emit for ACTIVE decisions only (the enforcement surface).
@@ -95,7 +105,7 @@ fn specs_meta_matches_golden() {
         let text = std::fs::read_to_string(&f).unwrap();
         let rel = format!(".zavet/specs/{}", f.file_name().unwrap().to_str().unwrap());
         // Dot-prefixed templates and unclosed fences both reject → no rows.
-        let Some(cap) = parse_spec(&text, &rel) else {
+        let Some(cap) = parse_spec(&text, &rel, &corpus_config()) else {
             continue;
         };
         out.push_str(&format!(
@@ -119,7 +129,7 @@ fn decision_checks_matches_golden() {
             ".zavet/decisions/{}",
             f.file_name().unwrap().to_str().unwrap()
         );
-        let Some(cap) = parse_decision(&text, &rel) else {
+        let Some(cap) = parse_decision(&text, &rel, &corpus_config()) else {
             continue;
         };
         // Unlike guards, checks emit for superseded records too: a check is a
@@ -137,7 +147,7 @@ fn spec_checks_matches_golden() {
     for f in md_files("specs") {
         let text = std::fs::read_to_string(&f).unwrap();
         let rel = format!(".zavet/specs/{}", f.file_name().unwrap().to_str().unwrap());
-        let Some(cap) = parse_spec(&text, &rel) else {
+        let Some(cap) = parse_spec(&text, &rel, &corpus_config()) else {
             continue;
         };
         for c in &cap.checks {
@@ -153,7 +163,7 @@ fn spec_paths_matches_golden() {
     for f in md_files("specs") {
         let text = std::fs::read_to_string(&f).unwrap();
         let rel = format!(".zavet/specs/{}", f.file_name().unwrap().to_str().unwrap());
-        let Some(cap) = parse_spec(&text, &rel) else {
+        let Some(cap) = parse_spec(&text, &rel, &corpus_config()) else {
             continue;
         };
         for glob in &cap.paths {

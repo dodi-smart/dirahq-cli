@@ -37,7 +37,7 @@ the block by hand.
 
 <!-- zavet:specs:start -->
 - **attestation-sync** — Attestation sync and session rollups (session, high, 2026-08-04)
-- **capture-pipeline** — Zavet capture pipeline (session, high, 2026-07-31)
+- **capture-pipeline** — Zavet capture pipeline (session, high, 2026-08-07)
 - **daemon-lifecycle** — Daemon startup and ingress lifecycle (session, high, 2026-08-04)
 - **distribution-and-update** — Distribution and self-update (session, high, 2026-07-30)
 - **harness-sources** — Harness sources and hook ingestion (session, high, 2026-07-31)

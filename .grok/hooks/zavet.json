@@ -1,0 +1,34 @@
+{
+  "_generated": "by `zavet adapters` — do not edit; re-run zavet adapters",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": ".zavet/bin/zavet hook refresh", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "search_replace",
+        "hooks": [
+          { "type": "command", "command": ".zavet/bin/zavet hook refresh", "timeout": 10 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "search_replace",
+        "hooks": [
+          { "type": "command", "command": ".zavet/bin/zavet hook guard-edit --flavor grok", "timeout": 10 }
+        ]
+      },
+      {
+        "matcher": "run_terminal_command",
+        "hooks": [
+          { "type": "command", "command": ".zavet/bin/zavet hook guard-commit --flavor grok", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

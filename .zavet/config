@@ -1,0 +1,8 @@
+# Decision id prefix for NEW records. 1-6 uppercase chars, leading letter.
+prefix: DIRASH
+# Prefixes retired by `zavet prefix` — resolved on read, never minted again.
+# Records are append-only, so an id keeps the prefix it was minted under.
+prefix-aliases: D
+# Zero-padding width for minted ids. Fixed at scaffold time: an id minted at
+# one width never joins a shorthand ref resolved at another.
+id-width: 4

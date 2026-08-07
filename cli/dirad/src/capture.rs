@@ -180,11 +180,15 @@ struct ZavetSweep {
 /// `git log`/`diff-tree`/`show` subprocess calls — shares the walk's blocking
 /// budget.
 fn zavet_sweep(root: &Path, commits: &[CapturedCommit]) -> ZavetSweep {
+    // One config read per sweep. Read from the WORKING TREE, not from each
+    // historical blob: retired prefixes stay in `prefix-aliases`, so the
+    // current config is what resolves an id minted under an older one.
+    let cfg = crate::zavet::read_config(root);
     let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
     let trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)> =
         project::commit_trailers(root, &shas)
             .into_iter()
-            .map(|(sha, raw)| (sha, dira_core::zavet::normalize_trailers(&raw)))
+            .map(|(sha, raw)| (sha, dira_core::zavet::normalize_trailers(&raw, &cfg)))
             .filter(|(_, ts)| !ts.is_empty())
             .collect();
 
@@ -203,7 +207,7 @@ fn zavet_sweep(root: &Path, commits: &[CapturedCommit]) -> ZavetSweep {
                 continue;
             };
             if is_decision {
-                let Some(mut cap) = dira_core::zavet::parse_decision(&text, &path) else {
+                let Some(mut cap) = dira_core::zavet::parse_decision(&text, &path, &cfg) else {
                     tracing::debug!(sha = %c.sha, path, "zavet: unparseable decision record skipped");
                     continue;
                 };
@@ -214,7 +218,7 @@ fn zavet_sweep(root: &Path, commits: &[CapturedCommit]) -> ZavetSweep {
                     cap,
                 });
             } else {
-                let Some(mut cap) = dira_core::zavet::parse_spec(&text, &path) else {
+                let Some(mut cap) = dira_core::zavet::parse_spec(&text, &path, &cfg) else {
                     tracing::debug!(sha = %c.sha, path, "zavet: unparseable spec skipped");
                     continue;
                 };

@@ -1,4 +1,5 @@
-f5c011977770667483f63bdf89be6a4d1e361c65  README.md
+7d7c7e12581c6ae7f40610a44dc7bbed1cf5e5dc  README.md
+adb2f344ac501444b335f5ba24533ebe3c865e35  config
 4968a1455d16fedbb678f588bb3cbbda8a773b87  decisions/D-0001-happy-inline.md
 31f136f882b328a757129602a189653d6de7502c  decisions/D-0002-block-guards.md
 6fb9485de60ae5bd4a7818a22fa650d40555b385  decisions/D-0003-default-status.md
@@ -16,9 +17,10 @@ af750408f007b695395222b26d9f45673254a8ff  decisions/D-0013-trailing-ws.md
 360e71b19056bc83aba2c5fa57fa71a085711fa7  decisions/D-0015-checks-and-errata.md
 4db86e457553d8605516f9b5b140a772c18df2d9  decisions/D-0016-check-item-edges.md
 80d0acd4d45eb8e8fcbc9ade74d42bf745e6f40f  decisions/D-0017-empty-checks.md
-8d0a16a160447d820a089487a3ab8d1a2478dfa8  expected/decision-checks.tsv
-f06f095763ef469c142e49c99e053f1a1ba949af  expected/decisions-guards.tsv
-fd2111c3337505fdc4cddc8215e9e6ead5f22eff  expected/decisions-meta.tsv
+cae4431f1222ec0e574e12dbe08d276da363a4b3  decisions/ZAVET-0018-prefixed-id.md
+bd5751b4e1d1ff6afe47344daff60d6d4ed6e837  expected/decision-checks.tsv
+d9ecab597df1042c37dbc6267155599a3972608e  expected/decisions-guards.tsv
+3c75517c9df6465b04a3d2a262f1304b3b504334  expected/decisions-meta.tsv
 4777e1b7e559034f6e7f4d7bfb3720b80743cfc7  expected/spec-checks.tsv
 b5f62609b5b9e1be4cf0dca02aa27ed0db4066eb  expected/spec-paths.tsv
 78450bc2a605d61bf0f76e7dc80223cb0e875933  expected/specs-meta.tsv

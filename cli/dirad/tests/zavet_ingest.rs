@@ -221,3 +221,58 @@ async fn per_repo_override_beats_the_auto_probe() {
         other => panic!("expected ZavetStatus, got {other:?}"),
     }
 }
+
+/// A guard event's id is canonicalized against the REPO's config, not a
+/// guessed default.
+///
+/// The split matters: `parse_guard_event` runs before `cwd` has been resolved
+/// to a repo, so it only uppercases the prefix and leaves the digits alone;
+/// `zavet::ingest` pads once it can read `.zavet/config`. Padding at the parse
+/// layer would key a width-5 repo's ids at width 4, and the record captured
+/// from the same repo would land under a different key — the decision would
+/// silently show zero guard events.
+#[tokio::test]
+async fn guard_event_ids_canonicalize_at_the_repo_width() {
+    let state = test_state().await;
+    let repo = temp_repo(true);
+    std::fs::write(
+        repo.path().join(".zavet/config"),
+        "prefix: CLOUD\nprefix-aliases: D\nid-width: 5\n",
+    )
+    .expect("write config");
+
+    // Shorthand under the current prefix, and an id under the retired one.
+    for (sent, stored) in [("CLOUD-42", "CLOUD-00042"), ("d-7", "D-00007")] {
+        let mut payload = guard_event(repo.path(), "guard_shown");
+        payload["decision_id"] = serde_json::json!(sent);
+        let resp = dirad::control::dispatch(&state, Request::IngestZavet { payload }).await;
+        assert!(matches!(resp, Response::Ok), "got {resp:?}");
+
+        let stats = state
+            .store
+            .zavet_guard_event_stats("github.com/acme/api", Some(stored))
+            .await
+            .unwrap();
+        assert_eq!(stats.len(), 1, "{sent} should have stored as {stored}");
+        assert_eq!((stats[0].total, stats[0].kind.as_str()), (1, "guard_shown"));
+    }
+}
+
+/// A repo with no `.zavet/config` keeps the historical width — the guarantee
+/// that makes prefixes migration-free for every repo scaffolded before them.
+#[tokio::test]
+async fn guard_event_ids_keep_width_4_without_a_config() {
+    let state = test_state().await;
+    let repo = temp_repo(true);
+    let mut payload = guard_event(repo.path(), "guard_shown");
+    payload["decision_id"] = serde_json::json!("D-7");
+    let resp = dirad::control::dispatch(&state, Request::IngestZavet { payload }).await;
+    assert!(matches!(resp, Response::Ok), "got {resp:?}");
+
+    let stats = state
+        .store
+        .zavet_guard_event_stats("github.com/acme/api", Some("D-0007"))
+        .await
+        .unwrap();
+    assert_eq!(stats.len(), 1, "D-7 should have stored as D-0007");
+}

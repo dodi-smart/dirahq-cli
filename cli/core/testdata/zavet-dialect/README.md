@@ -46,10 +46,26 @@ Row order = filename sort order (the sh glob and the Rust walker both sort).
   its body, and a pointer at a record that does not exist still parses
   (danglingness is a store-side finding, not a parse error)
 
+## The corpus `config`
+
+`config` is the corpus's own `.zavet/config`, and BOTH sides read it: the
+plugin's `test/run.sh` copies it into the fixture repo, the Rust walker parses
+it in `corpus_config()`. It declares `prefix: ZAVET`, `prefix-aliases: D` and
+`id-width: 4`, which is what lets `ZAVET-0018` and every older `D-*` record
+resolve side by side — a retired prefix stays in the set forever, because
+records are append-only and an id keeps the prefix it was minted under.
+
+Decision filenames are matched by SHAPE (`<PREFIX>-<digits>[-slug].md`, the
+prefix uppercase) rather than against the config's prefix set — the directory
+is closed, so shape is enough, and requiring uppercase is what keeps a stray
+`notes-2024.md` from reading as a record. Free-text scanning is the opposite:
+it is restricted to the config's prefix set precisely because prose contains
+`UTF-8`, `SHA-256` and `RFC-2119`.
+
 ## Deliberately out of scope (documented divergences)
 
 - **Id canonicalization** is a Rust-only extra (`D-1` → `D-0001`; malformed
-  ids reject the document). Fixture ids are always canonical `D-NNNN`.
+  ids reject the document). Fixture ids are always canonical.
 - **Indented key lines** (`  title: x` outside a list): the Rust splitter
   tolerates them, the awk anchors keys at column 0. Frontmatter keys are
   top-level; don't indent them.

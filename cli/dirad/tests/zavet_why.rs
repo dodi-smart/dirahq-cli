@@ -7,6 +7,7 @@ use dira_contract::Harness;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::protocol::{Request, Response};
 use dira_core::store::{ZavetCheck, ZavetDecisionCapture, ZavetTrailer};
+use dira_core::zavet::ZavetConfig;
 use dira_core::{accounting, Config, Store};
 use dirad::state::AppState;
 use time::{Duration, OffsetDateTime};
@@ -203,10 +204,10 @@ async fn short_trailer_refs_join_zero_padded_decisions() {
 
     // The capture path canonicalizes refs at ingestion, so a shorthand
     // `Refs: D-7` in a commit footer lands on the padded record id.
-    let trailers = dira_core::zavet::normalize_trailers(&[(
-        "Refs".to_string(),
-        "see D-7 for the rationale".to_string(),
-    )]);
+    let trailers = dira_core::zavet::normalize_trailers(
+        &[("Refs".to_string(), "see D-7 for the rationale".to_string())],
+        &ZavetConfig::default(),
+    );
     assert_eq!(trailers.len(), 1);
     assert_eq!(trailers[0].decision_id.as_deref(), Some("D-0007"));
     state

@@ -1,3 +1,9 @@
+## [0.3.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.2.3...v0.3.0) (2026-08-07)
+
+### ✨ Features
+
+* **cli:** read decision ids against a per-repo prefix and width ([5569e7c](https://github.com/dodi-smart/dirahq-cli/commit/5569e7c95a5054315ff4d7d24a7d26dd0adafd6e))
+
 ## [0.2.3](https://github.com/dodi-smart/dirahq-cli/compare/v0.2.2...v0.2.3) (2026-08-05)
 
 ### 🐛 Bug Fixes

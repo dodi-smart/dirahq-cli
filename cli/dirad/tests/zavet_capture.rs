@@ -363,3 +363,84 @@ async fn repos_without_zavet_capture_commits_but_no_knowledge() {
         "zavet sweep must stay dormant without .zavet/",
     );
 }
+
+/// A prefixed record round-trips the real capture walk, and its retired
+/// prefix keeps older trailers attributable.
+///
+/// This is the end-to-end shape of adopting a prefix mid-project: the repo now
+/// mints `CLOUD-*`, one legacy `D-*` record is still on disk, and a commit
+/// trailer names each. Both must land in the store under their own canonical
+/// id, padded at the repo's width — and the stray `notes-2024.md` must not be
+/// mistaken for a record now that the filename grammar is no longer `D-*`.
+#[tokio::test]
+async fn capture_handles_prefixed_records_and_retired_refs() {
+    let state = test_state().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    git(p, &["init", "-q", "-b", "main"]);
+    git(
+        p,
+        &["remote", "add", "origin", "git@github.com:acme/api.git"],
+    );
+    git(p, &["config", "user.email", "t@t.dev"]);
+    git(p, &["config", "user.name", "T"]);
+    std::fs::create_dir_all(p.join(".zavet/decisions")).unwrap();
+    std::fs::write(
+        p.join(".zavet/config"),
+        "prefix: CLOUD\nprefix-aliases: D\nid-width: 5\n",
+    )
+    .unwrap();
+    // Minted before the rename, shorthand id in frontmatter.
+    std::fs::write(
+        p.join(".zavet/decisions/D-0001-legacy.md"),
+        "---\nid: D-1\ntitle: Legacy\nstatus: active\nguards:\n  - src/**\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Minted after it.
+    std::fs::write(
+        p.join(".zavet/decisions/CLOUD-00042-poll.md"),
+        "---\nid: CLOUD-00042\ntitle: Poll\nstatus: active\nguards:\n  - api/**\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Not a record: lowercase prefix. The old `D-*` glob excluded it for free;
+    // the shape-based grammar has to exclude it on purpose.
+    std::fs::write(
+        p.join(".zavet/decisions/notes-2024.md"),
+        "---\nid: NOTES-2024\ntitle: Not a record\nstatus: active\n---\n\nbody\n",
+    )
+    .unwrap();
+    git(p, &["add", "-A"]);
+    git(
+        p,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "docs: both prefixes\n\nRefs: CLOUD-42\nSupersedes: D-1",
+        ],
+    );
+
+    let cwd = p.display().to_string();
+    let canonical = "github.com/acme/api";
+    dirad::capture::capture_commits(&state, &cwd, canonical).await;
+
+    let ds = state.store.zavet_decisions_list(canonical).await.unwrap();
+    let mut ids: Vec<String> = ds.iter().map(|d| d.id.clone()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["CLOUD-00042".to_string(), "D-00001".to_string()],
+        "both records captured at the repo's width; notes-2024.md is not a record"
+    );
+
+    // The trailers resolve to the same canonical ids — `CLOUD-42` shorthand
+    // and the retired `D-1` both land on their record.
+    for id in ["CLOUD-00042", "D-00001"] {
+        let commits = state
+            .store
+            .zavet_commits_for_decision(canonical, id)
+            .await
+            .unwrap();
+        assert_eq!(commits.len(), 1, "{id} should be linked to the commit");
+    }
+}

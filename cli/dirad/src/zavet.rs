@@ -14,7 +14,10 @@ use dira_core::protocol::{
     ZavetSpecWhyView, ZavetStatusView, ZavetWhyView,
 };
 use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
-pub use dira_core::zavet::{parse_guard_event, GuardEventV1, ZAVET_DIR};
+pub use dira_core::zavet::{
+    canonical_decision_id, parse_config, parse_guard_event, GuardEventV1, ZavetConfig, CONFIG_PATH,
+    ZAVET_DIR,
+};
 use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -38,18 +41,28 @@ pub fn zavet_dir_exists(repo_root: &Path) -> bool {
     repo_root.join(ZAVET_DIR).is_dir()
 }
 
-/// Resolve a payload cwd to `(canonical repo, .zavet/ exists)` off the async
-/// path — `project::resolve` shells out to git.
-async fn resolve_repo(cwd: String) -> (Option<String>, bool) {
+/// The repo's decision-id conventions, or the pre-prefix defaults (`D`, width
+/// 4) when there is no readable config — which is every repo scaffolded before
+/// prefixes existed, and is why they need no migration.
+pub fn read_config(repo_root: &Path) -> ZavetConfig {
+    std::fs::read_to_string(repo_root.join(CONFIG_PATH))
+        .map(|t| parse_config(&t))
+        .unwrap_or_default()
+}
+
+/// Resolve a payload cwd to `(canonical repo, .zavet/ exists, id config)` off
+/// the async path — `project::resolve` shells out to git.
+async fn resolve_repo(cwd: String) -> (Option<String>, bool, ZavetConfig) {
     tokio::task::spawn_blocking(move || {
         let dir = PathBuf::from(cwd);
         let top = dira_core::project::toplevel(&dir);
         let repo = dira_core::project::resolve(&dir).project;
         let dir_exists = top.as_deref().map(zavet_dir_exists).unwrap_or(false);
-        (repo, dir_exists)
+        let cfg = top.as_deref().map(read_config).unwrap_or_default();
+        (repo, dir_exists, cfg)
     })
     .await
-    .unwrap_or((None, false))
+    .unwrap_or((None, false, ZavetConfig::default()))
 }
 
 /// Whether zavet is active for `repo`, per the standard precedence.
@@ -63,11 +76,18 @@ pub async fn active_for(state: &AppState, repo: &str, dir_exists: bool) -> bool 
 /// directly: guard events are low-volume control traffic and must never touch
 /// the writer channel / accounting hot path.
 pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
-    let Some(ev) = parse_guard_event(&payload) else {
+    let Some(mut ev) = parse_guard_event(&payload) else {
         tracing::debug!("zavet: dropped malformed guard event");
         return Response::Ok; // the shim is fire-and-forget; nothing to say
     };
-    let (repo, dir_exists) = resolve_repo(ev.cwd.clone()).await;
+    let (repo, dir_exists, cfg) = resolve_repo(ev.cwd.clone()).await;
+    // The id arrives with its prefix normalized but its digits as written —
+    // parse_guard_event runs before `cwd` is resolved, so this is the first
+    // point that knows the repo's padding width. Without it a hand-authored
+    // `id: D-7` would key differently from the `D-0007` its record captures as.
+    if let Some(id) = canonical_decision_id(&ev.decision_id, cfg.id_width) {
+        ev.decision_id = id;
+    }
     let Some(repo) = repo else {
         tracing::debug!(cwd = %ev.cwd, "zavet: guard event outside a resolvable repo");
         return Response::Ok;
@@ -112,18 +132,20 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
 async fn query_repo(
     repo: Option<String>,
     cwd: Option<String>,
-) -> Result<(String, Option<bool>), Response> {
+) -> Result<(String, Option<bool>, ZavetConfig), Response> {
+    // An explicit --project names a repo we are not standing in, so there is
+    // no config to read; callers that need one fall back to the defaults.
     if let Some(r) = repo {
-        return Ok((r, None));
+        return Ok((r, None, ZavetConfig::default()));
     }
     let dir = cwd.unwrap_or_else(|| {
         std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string())
     });
-    let (repo, dir_exists) = resolve_repo(dir).await;
+    let (repo, dir_exists, cfg) = resolve_repo(dir).await;
     match repo {
-        Some(r) => Ok((r, Some(dir_exists))),
+        Some(r) => Ok((r, Some(dir_exists), cfg)),
         None => Err(Response::Error {
             message: "not inside a repo with a recognizable remote; pass --project".into(),
         }),
@@ -361,7 +383,7 @@ fn guard_stat_views(stats: Vec<dira_core::store::ZavetGuardStat>) -> Vec<ZavetGu
 
 /// `Request::ZavetStatus`.
 pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, dir_exists) = match query_repo(repo, cwd).await {
+    let (repo, dir_exists, _) = match query_repo(repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -393,7 +415,7 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
 
 /// `Request::ZavetDecisions`.
 pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, _) = match query_repo(repo, cwd).await {
+    let (repo, _, _) = match query_repo(repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -415,7 +437,7 @@ pub async fn wiki(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _) = match query_repo(repo, cwd.clone()).await {
+    let (repo, _, _) = match query_repo(repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -488,7 +510,7 @@ pub async fn set_mode(
     repo: Option<String>,
     mode: String,
 ) -> Response {
-    let (repo, _) = match query_repo(repo, cwd).await {
+    let (repo, _, _) = match query_repo(repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -519,22 +541,42 @@ pub async fn why(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _) = match query_repo(repo, cwd.clone()).await {
+    let (repo, _, cfg) = match query_repo(repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     // Direct addressing first: a decision id, or an exact spec slug (slugs
     // are the spec's identity, like ids — a whitespace-free query is checked
     // against them before searching).
-    if let Some(id) = dira_core::zavet::canonical_decision_id(&query) {
-        return match state.store.zavet_decision_get(&repo, &id).await {
-            Ok(Some(d)) => decision_why(state, &repo, d, None).await,
-            Ok(None) => Response::Error {
-                message: format!("no captured decision `{id}` for {repo} (is it committed, and is the daemon watching this repo?)"),
-            },
-            Err(e) => Response::Error {
-                message: format!("zavet why failed: {e}"),
-            },
+    //
+    // Two candidate spellings, because the width this repo pads to is not
+    // always knowable here: `--project` names a repo we are not standing in,
+    // so cfg is the default. Canonical-at-cfg-width first (which resolves the
+    // shorthand a human actually types, `CLOUD-42`), then the query as
+    // written (which resolves a full id pasted from a repo of another width).
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(id) = dira_core::zavet::canonical_decision_id(&query, cfg.id_width) {
+        candidates.push(id);
+    }
+    if let Some(id) = dira_core::zavet::normalize_decision_id(&query) {
+        if !candidates.contains(&id) {
+            candidates.push(id);
+        }
+    }
+    if let Some(first) = candidates.first().cloned() {
+        for id in &candidates {
+            match state.store.zavet_decision_get(&repo, id).await {
+                Ok(Some(d)) => return decision_why(state, &repo, d, None).await,
+                Ok(None) => continue,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("zavet why failed: {e}"),
+                    }
+                }
+            }
+        }
+        return Response::Error {
+            message: format!("no captured decision `{first}` for {repo} (is it committed, and is the daemon watching this repo?)"),
         };
     }
     let slug = query.trim();

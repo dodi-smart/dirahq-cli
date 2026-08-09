@@ -1748,6 +1748,7 @@ mod tests {
             output: 20,
             cache_read: 3000,
             cache_create: 40,
+            cwd: None,
         };
         state
             .store
@@ -1811,6 +1812,7 @@ mod tests {
             output: 1,
             cache_read: 0,
             cache_create: 0,
+            cwd: None,
         };
         state
             .store
@@ -1923,6 +1925,7 @@ mod tests {
                 output: 1,
                 cache_read: 0,
                 cache_create: 0,
+                cwd: None,
             };
             state
                 .store
@@ -2028,6 +2031,7 @@ mod tests {
                 output: 1,
                 cache_read: 0,
                 cache_create: 0,
+                cwd: None,
             };
             state
                 .store
@@ -2059,6 +2063,7 @@ mod tests {
             output: 1,
             cache_read: 0,
             cache_create: 0,
+            cwd: None,
         };
         state
             .store

@@ -498,6 +498,9 @@ async fn status(state: &AppState) -> Response {
         stalls: state.progress.writer_stalls(),
         idle_secs: state.progress.writer_idle_secs(),
         wedged: crate::supervisor::writer_wedged(state),
+        // Issue #93: token turns stored with no repo, an operator signal under
+        // D-0026 (repo-less compute is invisible), same treatment as `panics`.
+        unattributed_token_rows: state.progress.unattributed_token_rows(),
     });
     // Sync self-report (WP-B9): the persisted per-flush snapshot `sync.rs`
     // writes after every attempt, plus the process-wide flush counters —
@@ -792,6 +795,7 @@ mod tests {
             output: 20,
             cache_read: 0,
             cache_create: 0,
+            cwd: None,
         }
     }
 

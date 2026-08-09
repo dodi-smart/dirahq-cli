@@ -73,6 +73,7 @@ async fn zavet_why_answers_knowledge_and_cost() {
         output: 2000,
         cache_read: 0,
         cache_create: 0,
+        cwd: None,
     };
     state
         .store

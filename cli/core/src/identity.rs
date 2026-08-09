@@ -300,8 +300,21 @@ pub async fn clear_device_id(store: &Store) -> Result<(), Error> {
 /// an in-flight rotation's pending key. Both `dira` and `dirad` resolve the
 /// same service+account pairs, so either process can read what the other
 /// wrote.
-fn keychain_entry(account: &str) -> Result<keyring::Entry, keyring::Error> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, account)
+///
+/// The entry is built against whatever store `keyring-core` currently has
+/// registered, after nudging keyring's `v1` wrapper to run its one-time
+/// platform-store install ([`keyring::Entry::store_status`] — idempotent, and
+/// its error is deliberately ignored). Going through `keyring_core::Entry`
+/// rather than `keyring::Entry` matters on hosts where that install *fails*
+/// (headless CI, a container with no secret-service): since keyring 4.1.6 the
+/// failure is memoized and every `keyring::Entry::new` returns `NoDefaultStore`
+/// forever, which would make an explicitly-registered store — the tests' mock —
+/// permanently unreachable. In production the two are equivalent: the platform
+/// store is installed by the same call, and a genuinely absent store still
+/// surfaces as `NoDefaultStore` from `keyring_core`.
+fn keychain_entry(account: &str) -> Result<keyring_core::Entry, keyring::Error> {
+    let _ = keyring::Entry::store_status();
+    keyring_core::Entry::new(KEYCHAIN_SERVICE, account)
 }
 
 /// Read a secret seed from the OS keychain under `account`; `None` on any
@@ -362,15 +375,14 @@ mod tests {
     /// per test restores that isolation; callers serialize via [`env_lock`] so the reset
     /// can't race a concurrent keychain op.
     ///
-    /// keyring 4's `v1` `Entry` wrapper lazily installs the platform-native store on its
-    /// first `Entry::new`, which would clobber our mock. We force that one-time init now
-    /// with a throwaway entry (result ignored — it errors when no platform store exists,
-    /// e.g. headless CI, and never touches the keychain) so every later `Entry::new`
-    /// reuses the already-fired init and resolves against whichever mock we set here.
+    /// keyring 4's `v1` wrapper lazily installs the platform-native store on first use,
+    /// which would clobber our mock. We force that one-time init now (result ignored — it
+    /// errors when no platform store exists, e.g. headless CI, and never touches the
+    /// keychain) so it can no longer fire *after* we register the mock below.
     fn use_mock_keychain() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            let _ = keyring::Entry::new("dira-test-init", "dira-test-init");
+            let _ = keyring::Entry::store_status();
         });
         keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
     }
@@ -740,9 +752,9 @@ mod tests {
             .await
             .unwrap();
 
-        // A fresh `keyring::Entry` for the SAME service+account (as a second
-        // process attaching to the same OS keychain would use) reads it back.
-        let reattached = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_PENDING)
+        // A fresh entry for the SAME service+account (as a second process
+        // attaching to the same OS keychain would use) reads it back.
+        let reattached = keyring_core::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_PENDING)
             .unwrap()
             .get_password()
             .unwrap();

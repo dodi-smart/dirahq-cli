@@ -139,8 +139,8 @@ impl MockCloud {
 /// resolution never touches (or blocks on) the real OS keychain in these
 /// tests. Mirrors `dira_core::identity::tests::use_mock_keychain` /
 /// `dira::test_support::use_mock_keychain` exactly (see either's doc comment
-/// for why the one-time `keyring::Entry::new` primer + per-test reset are
-/// both needed).
+/// for why the one-time platform-store primer + per-test reset are both
+/// needed).
 ///
 /// The mock store is process-global, so every test that calls this MUST also
 /// hold [`keychain_lock`] for the duration of its keychain-touching work.
@@ -148,7 +148,7 @@ pub fn use_mock_keychain() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let _ = keyring::Entry::new("dirad-test-init", "dirad-test-init");
+        let _ = keyring::Entry::store_status();
     });
     keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
 }

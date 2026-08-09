@@ -29,6 +29,9 @@ getrandom.workspace = true
 serde_jcs.workspace = true
 base64.workspace = true
 keyring.workspace = true
+# `keyring` installs the platform store; entries are built against whatever store
+# is registered, which is `keyring-core`'s job (see `identity::keychain_entry`).
+keyring-core.workspace = true
 
 [dev-dependencies]
 # `figment::Jail` (env-isolated config tests) is gated behind its `test` feature.
@@ -37,8 +40,6 @@ proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true }
 criterion.workspace = true
-# In-memory keyring store for tests (see `identity::tests::use_mock_keychain`).
-keyring-core.workspace = true
 
 [[bench]]
 name = "accounting"

@@ -18,7 +18,7 @@ esac
 jq -nc '{
   hookSpecificOutput: {
     hookEventName: "PostToolUse",
-    additionalContext: "You edited contract Rust types under /contract. Regenerate the derived artifacts with `just contract` (emits contract/attestation.schema.json, then the cloud TS/Zod under cloud/src/lib/contract). CI has separate drift gates for both — skipping this will turn CI red."
+    additionalContext: "You edited contract Rust types under /contract. Regenerate the derived artifacts with `just contract` (emits exactly two files: contract/attestation.schema.json and contract/testdata/signing-vector.json — the cloud repo vendors these separately). CI has separate drift gates for both — skipping this will turn CI red."
   }
 }'
 

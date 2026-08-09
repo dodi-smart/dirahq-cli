@@ -2717,6 +2717,7 @@ mod tests {
             output: 20,
             cache_read: 0,
             cache_create: 0,
+            cwd: None,
         };
         store
             .upsert_token_usage(&turn, "s1", Some("github.com/acme/api"))

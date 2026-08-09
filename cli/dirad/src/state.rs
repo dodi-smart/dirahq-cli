@@ -229,6 +229,11 @@ pub struct ProgressTracker {
     flush_attempts: AtomicU64,
     flush_successes: AtomicU64,
     flush_failures: AtomicU64,
+    /// Token turns stored with `project = NULL` since daemon start (issue #93).
+    /// Under D-0026, repo-less compute is neither counted nor shown, so a
+    /// nonzero value is usage that has gone invisible — an operator signal, not
+    /// itself an outage (mirrors `writer_panics`).
+    unattributed_token_rows: AtomicU64,
 }
 
 impl Default for ProgressTracker {
@@ -242,6 +247,7 @@ impl Default for ProgressTracker {
             flush_attempts: AtomicU64::new(0),
             flush_successes: AtomicU64::new(0),
             flush_failures: AtomicU64::new(0),
+            unattributed_token_rows: AtomicU64::new(0),
         }
     }
 }
@@ -302,6 +308,14 @@ impl ProgressTracker {
     /// Total times the watchdog has observed the writer stalled since daemon start.
     pub fn writer_stalls(&self) -> u64 {
         self.writer_stalls.load(Ordering::Relaxed)
+    }
+    /// Record that `n` token turns were stored with no project this capture pass.
+    pub fn mark_unattributed_token_rows(&self, n: u64) {
+        self.unattributed_token_rows.fetch_add(n, Ordering::Relaxed);
+    }
+    /// Total token turns stored with no project since daemon start.
+    pub fn unattributed_token_rows(&self) -> u64 {
+        self.unattributed_token_rows.load(Ordering::Relaxed)
     }
     /// Record that the sync task attempted a flush (WP-B9).
     pub fn mark_flush_attempt(&self) {
@@ -775,6 +789,15 @@ impl SessionRegistry {
             Some(_) => None, // more than one active session for this repo
             None => Some(first.session_id.clone()),
         }
+    }
+
+    /// This session's sticky project, if the registry has seen one. The
+    /// last-known-good fallback for token attribution (issue #93): `observe`
+    /// sets `project` first-non-null and never clears it, so this is the
+    /// registry's best answer even when the session's LATEST event carries no
+    /// project (or none at all, as in a session the registry hasn't hydrated).
+    pub fn project_for(&self, session_id: &str) -> Option<String> {
+        self.sessions.get(session_id)?.project.clone()
     }
 
     /// Resolve a stop selector to the session ids to close.

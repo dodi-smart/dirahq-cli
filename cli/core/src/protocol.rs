@@ -541,6 +541,12 @@ pub struct WriterHealthView {
     /// True when the writer currently looks wedged (no progress past the
     /// stall threshold while messages are backed up).
     pub wedged: bool,
+    /// Token turns stored with no repo since daemon start. Repo-less compute is
+    /// neither counted nor shown (D-0026), so a nonzero count is usage that has
+    /// gone invisible — an operator signal, not an outage. `0` from an older
+    /// daemon (issue #93).
+    #[serde(default)]
+    pub unattributed_token_rows: u64,
 }
 
 /// The sync task's self-reported health, attached to `status` (WP-B9). Mirrors
@@ -1012,6 +1018,7 @@ mod tests {
                 stalls: 0,
                 idle_secs: Some(5),
                 wedged: false,
+                unattributed_token_rows: 142,
             }),
             sync_health: Some(SyncHealthView {
                 last_attempt_at: Some("2026-07-09T10:00:00Z".into()),
@@ -1032,7 +1039,17 @@ mod tests {
         assert_eq!(back.tokens.unwrap().total_tokens, 2_060_000);
         assert_eq!(back.billing.unwrap().currency, "€");
         assert_eq!(back.writer_health.unwrap().panics, 2);
+        assert_eq!(back.writer_health.unwrap().unattributed_token_rows, 142);
         assert_eq!(back.sync_health.unwrap().flush_attempts, 10);
+    }
+
+    /// An older daemon's `WriterHealthView` predates issue #93 and omits
+    /// `unattributed_token_rows` entirely — it must deserialize to `0`, not fail.
+    #[test]
+    fn writer_health_unattributed_token_rows_defaults_zero_from_older_daemon() {
+        let json = r#"{"panics":1,"stalls":0,"idle_secs":null,"wedged":false}"#;
+        let v: WriterHealthView = serde_json::from_str(json).unwrap();
+        assert_eq!(v.unattributed_token_rows, 0);
     }
 
     #[test]

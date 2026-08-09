@@ -960,18 +960,11 @@ pub fn print_status(s: &StatusView, detailed: bool) {
         );
     }
 
-    // Writer health (WP-B7): only surfaced when there's something to say — a
-    // healthy writer (no panics, no stalls, not wedged) prints nothing extra.
-    // Omitted entirely for an older daemon (`writer_health: None`, skew-safe).
-    if let Some(h) = s.writer_health {
-        if h.panics > 0 || h.stalls > 0 || h.wedged {
-            let mut line = format!("writer: {} panic(s) caught", h.panics);
-            if h.stalls > 0 {
-                line.push_str(&format!(", {} stall(s) flagged", h.stalls));
-            }
-            if h.wedged {
-                line.push_str(", currently WEDGED — restart the daemon");
-            }
+    // Writer health (WP-B7, extended by issue #93): only surfaced when there's
+    // something to say — a fully healthy writer prints nothing extra. Omitted
+    // entirely for an older daemon (`writer_health: None`, skew-safe).
+    if let Some(h) = &s.writer_health {
+        if let Some(line) = writer_health_line(h) {
             println!("\n{}", theme::paint(&line, Role::Negative));
         }
     }
@@ -985,6 +978,34 @@ pub fn print_status(s: &StatusView, detailed: bool) {
             println!("\n{}", theme::paint(&line, Role::Negative));
         }
     }
+}
+
+/// Build the `writer: …` status line for a [`WriterHealthView`], or `None`
+/// when there's nothing worth surfacing. Pure (no printing), mirroring
+/// [`sync_health_line`], so the gate is unit-testable.
+///
+/// Extended by issue #93: `unattributed_token_rows` renders on its own even
+/// with zero panics/stalls and not wedged — a healthy writer can still be
+/// silently losing compute to attribution failures, and D-0026 makes that
+/// worth a line every time it's nonzero, not just alongside a panic.
+fn writer_health_line(h: &dira_core::protocol::WriterHealthView) -> Option<String> {
+    if h.panics == 0 && h.stalls == 0 && !h.wedged && h.unattributed_token_rows == 0 {
+        return None;
+    }
+    let mut line = format!("writer: {} panic(s) caught", h.panics);
+    if h.stalls > 0 {
+        line.push_str(&format!(", {} stall(s) flagged", h.stalls));
+    }
+    if h.unattributed_token_rows > 0 {
+        line.push_str(&format!(
+            ", {} token turn(s) with no repo — that usage is not counted",
+            h.unattributed_token_rows
+        ));
+    }
+    if h.wedged {
+        line.push_str(", currently WEDGED — restart the daemon");
+    }
+    Some(line)
 }
 
 /// Build the `sync: …` status line for a [`SyncHealthView`], or `None` when
@@ -1516,7 +1537,40 @@ mod tests {
         );
     }
 
-    use dira_core::protocol::SyncHealthView;
+    use dira_core::protocol::{SyncHealthView, WriterHealthView};
+
+    /// A nonzero `unattributed_token_rows` must render even with an otherwise
+    /// spotless writer — issue #93's whole point is that a healthy-looking
+    /// writer can still be silently losing compute.
+    #[test]
+    fn writer_health_line_surfaces_unattributed_token_rows() {
+        let h = WriterHealthView {
+            panics: 0,
+            stalls: 0,
+            idle_secs: Some(2),
+            wedged: false,
+            unattributed_token_rows: 142,
+        };
+        assert_eq!(
+            writer_health_line(&h),
+            Some(
+                "writer: 0 panic(s) caught, 142 token turn(s) with no repo — that usage is not counted"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn writer_health_line_is_silent_when_everything_is_clean() {
+        let h = WriterHealthView {
+            panics: 0,
+            stalls: 0,
+            idle_secs: Some(2),
+            wedged: false,
+            unattributed_token_rows: 0,
+        };
+        assert_eq!(writer_health_line(&h), None);
+    }
 
     /// Issue #94: the generic fallback must carry the SAME disclosure as
     /// `dira device resync`'s own summary. A user told only "cursor rewound"

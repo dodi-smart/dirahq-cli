@@ -274,6 +274,7 @@ async fn status_carries_token_totals_and_cached_billing() {
         output: 2_000,
         cache_read: 3_000,
         cache_create: 4_000,
+        cwd: None,
     };
     state
         .store

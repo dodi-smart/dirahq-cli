@@ -16,9 +16,66 @@ use dira_core::project::{self, Resolved};
 use futures::FutureExt as _;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
+use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc;
 use ulid::Ulid;
+
+/// How long a NEGATIVE (`project: None`) resolution stays cached before it's
+/// retried. `project::resolve` can't tell "no origin remote" (a permanent
+/// fact) from "git transiently failed" (a lock, a slow disk, a momentarily
+/// missing dir) apart, so caching a miss forever would poison that cwd's
+/// attribution until the daemon restarts — the same failure mode issue #93 is
+/// about, just moved from the trigger-event path into the cache. A POSITIVE
+/// resolution never expires: a repo's origin does not change under a running
+/// daemon.
+const NEGATIVE_TTL: StdDuration = StdDuration::from_secs(60);
+
+/// Memoized cwd -> project resolution, shared by [`enrich`] and per-turn
+/// resolution in [`capture_tokens`].
+///
+/// Performance note: this is the SAME map `enrich` already populates at the
+/// event's own cwd, so a per-turn resolution pass over a transcript costs ZERO
+/// new shell-outs in the steady state — the triggering event's cwd is already
+/// cached and every turn in the pass typically shares it. A mid-session `cd`
+/// costs exactly one extra `git` invocation, amortized across every turn after
+/// it. Deliberately unbounded (no eviction/size cap) — the map was already
+/// unbounded before this change; out of scope here.
+pub(crate) struct ProjectCache {
+    entries: HashMap<String, (Resolved, Instant)>,
+}
+
+impl ProjectCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Resolve `cwd`, memoized per the rules on [`ProjectCache`]. `f` is the
+    /// test seam — production always calls it with [`project::resolve`]; tests
+    /// inject a counting/fake closure to prove the memoization and TTL without
+    /// a real repo.
+    fn resolve_with(
+        &mut self,
+        cwd: &str,
+        f: impl FnOnce(&std::path::Path) -> Resolved,
+    ) -> Resolved {
+        if let Some((resolved, at)) = self.entries.get(cwd) {
+            if resolved.project.is_some() || at.elapsed() < NEGATIVE_TTL {
+                return resolved.clone();
+            }
+        }
+        let resolved = f(std::path::Path::new(cwd));
+        self.entries
+            .insert(cwd.to_string(), (resolved.clone(), Instant::now()));
+        resolved
+    }
+
+    pub(crate) fn resolve(&mut self, cwd: &str) -> Resolved {
+        self.resolve_with(cwd, project::resolve)
+    }
+}
 
 /// Bounded ingest queue. Full = drop (we never stall the agent loop). Generous so
 /// bursts of subagent tool calls don't trip it.
@@ -49,7 +106,7 @@ pub async fn writer(rx: mpsc::Receiver<EventMsg>, state: AppState) {
 /// accounting-ordering invariant this preserves between the store, the
 /// coalescing watermark, and the live registry.
 pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capture_fn: CaptureFn) {
-    let mut cache: HashMap<String, Resolved> = HashMap::new();
+    let mut cache = ProjectCache::new();
     // Per-repo throttle so a burst of tool calls doesn't shell out to git on every
     // event. The baseline check inside capture is already cheap, but this caps it.
     let mut throttle = Throttle::default();
@@ -133,7 +190,7 @@ pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capt
 async fn process_message(
     state: &AppState,
     msg: EventMsg,
-    cache: &mut HashMap<String, Resolved>,
+    cache: &mut ProjectCache,
     last_stored_activity: &mut HashMap<String, OffsetDateTime>,
     coalesce: Duration,
     idle: Duration,
@@ -327,7 +384,21 @@ async fn process_message(
         }
     }
     if let Some((path, harness)) = transcript {
-        capture_tokens(state, &path, harness, &ev.session_id, ev.project.as_deref()).await;
+        // The SAME cache `enrich` uses: the trigger event's own cwd is very
+        // likely already resolved in it, which is why a per-turn resolution
+        // pass costs zero new shell-outs in the steady state (see
+        // `ProjectCache`'s doc comment). `capture_tokens` marks the progress
+        // counter and warns internally per transcript, so main + every sidecar
+        // each contribute their own count to the running total (issue #93).
+        capture_tokens(
+            state,
+            &path,
+            harness,
+            &ev.session_id,
+            ev.project.as_deref(),
+            cache,
+        )
+        .await;
         // Claude Code writes `Task`-tool subagent turns to sibling
         // `agent-*.jsonl` files that no hook ever names, so the main transcript
         // alone misses them entirely. Attributed to the parent session — the id
@@ -344,6 +415,7 @@ async fn process_message(
                     harness,
                     &ev.session_id,
                     ev.project.as_deref(),
+                    cache,
                 )
                 .await;
             }
@@ -476,14 +548,9 @@ fn enrich(
     norm: dira_sources::Normalized,
     harness: Harness,
     at: OffsetDateTime,
-    cache: &mut HashMap<String, Resolved>,
+    cache: &mut ProjectCache,
 ) -> RawEvent {
-    let resolved = norm.cwd.as_ref().map(|cwd| {
-        cache
-            .entry(cwd.clone())
-            .or_insert_with(|| project::resolve(std::path::Path::new(cwd)))
-            .clone()
-    });
+    let resolved = norm.cwd.as_ref().map(|cwd| cache.resolve(cwd));
 
     // The session branch is volatile (a checkout can change it within a session),
     // so resolve it live per event rather than caching it with the project.
@@ -628,13 +695,21 @@ fn subagent_transcripts(main: &str) -> Vec<String> {
     found
 }
 
+/// Capture one transcript's worth of newly-appended token turns, resolving
+/// each turn's project independently and returning how many were stored with
+/// no project at all (for the caller to count and warn on — issue #93).
+///
+/// `event_project` is now only the LAST-resort fallback (the project of the
+/// hook event that triggered this capture pass), not the value every turn is
+/// stamped with — see the resolution chain in the loop below.
 async fn capture_tokens(
     state: &AppState,
     transcript_path: &str,
     harness: Harness,
     session_id: &str,
-    project: Option<&str>,
-) {
+    event_project: Option<&str>,
+    cache: &mut ProjectCache,
+) -> u64 {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
     let offset_key = offset_key_for(session_id, transcript_path);
@@ -662,14 +737,14 @@ async fn capture_tokens(
         Ok(f) => f,
         Err(e) => {
             tracing::debug!("transcript unreadable ({transcript_path}): {e}");
-            return;
+            return 0;
         }
     };
     let len = match file.metadata().await {
         Ok(m) => m.len(),
         Err(e) => {
             tracing::debug!("transcript metadata failed ({transcript_path}): {e}");
-            return;
+            return 0;
         }
     };
 
@@ -700,11 +775,11 @@ async fn capture_tokens(
                 }
             }
         }
-        return;
+        return 0;
     }
     if let Err(e) = file.seek(SeekFrom::Start(start)).await {
         tracing::warn!("transcript seek failed ({transcript_path}): {e}");
-        return;
+        return 0;
     }
     // Bytes, not `read_to_string`. That call is all-or-nothing on UTF-8
     // validity, so a single invalid byte anywhere in the tail aborted the whole
@@ -715,7 +790,7 @@ async fn capture_tokens(
     let mut raw = Vec::new();
     if let Err(e) = file.read_to_end(&mut raw).await {
         tracing::warn!("transcript read failed ({transcript_path}): {e}");
-        return;
+        return 0;
     }
     let tail = String::from_utf8_lossy(&raw);
 
@@ -723,12 +798,48 @@ async fn capture_tokens(
         Harness::Grok => dira_core::tokens::parse_grok_updates_usage(&tail),
         _ => dira_core::tokens::parse_transcript_usage(&tail),
     };
+    // Read once, not per turn: the registry's sticky first-non-null project for
+    // this session (`SessionRegistry::observe` already ran for every event that
+    // led here — see `writer.rs`'s ordering invariant). The last-known-good
+    // fallback of last resort, below the turn's own cwd and the trigger event.
+    let session_project = crate::control::lock_recover(&state.sessions).project_for(session_id);
+
     let mut captured = 0usize;
+    let mut unattributed = 0u64;
     for t in &turns {
         // Leave a trace when a model family has no bundled price, so a sonnet-rate
         // estimate for an unrecognised model is noticeable rather than silent.
         dira_core::tokens::warn_if_unpriced(&t.model);
-        match state.store.upsert_token_usage(t, session_id, project).await {
+
+        // The resolution chain, in priority order. Two deliberate calls:
+        //
+        // 1. TURN-first, not event-first. `event_project` is the cwd of whatever
+        //    hook triggered this capture pass — a `Stop`, say — but a turn's OWN
+        //    cwd is ground truth for THAT turn. Event-first would preserve this
+        //    very bug whenever the event resolves but to the WRONG repo after a
+        //    mid-session `cd` (a real case: `EventKind::CwdChanged` exists
+        //    because sessions do change directory mid-flight).
+        // 2. Fall back rather than write NULL. `project::resolve` cannot tell "no
+        //    origin remote" from "git transiently failed", so treating every
+        //    unresolved cwd as truly repo-less is wrong more often than it's
+        //    right. Under D-0026 an unattributed turn is invisible compute, so
+        //    attribution is favoured: worst case a genuinely repo-less turn
+        //    inherits its own session's repo, which is far cheaper than hundreds
+        //    of turns going uncounted.
+        let project = t
+            .cwd
+            .as_deref()
+            .and_then(|cwd| cache.resolve(cwd).project)
+            .or_else(|| event_project.map(str::to_string))
+            .or_else(|| session_project.clone());
+        if project.is_none() {
+            unattributed += 1;
+        }
+        match state
+            .store
+            .upsert_token_usage(t, session_id, project.as_deref())
+            .await
+        {
             Ok(()) => captured += 1,
             Err(e) => tracing::warn!("token upsert failed: {e}"),
         }
@@ -765,6 +876,19 @@ async fn capture_tokens(
     if captured > 0 {
         tracing::debug!(turns = captured, session = %session_id, "captured token usage");
     }
+    if unattributed > 0 {
+        state.progress.mark_unattributed_token_rows(unattributed);
+        // `warn`, not `debug`: the default filter is `dirad=info,warn`, and under
+        // D-0026 an unattributed turn is compute nobody will ever see — an
+        // operator signal, not routine noise.
+        tracing::warn!(
+            turns = unattributed,
+            session = %session_id,
+            transcript = %transcript_path,
+            "token turns captured with no repo — this usage is not counted (issue #93)"
+        );
+    }
+    unattributed
 }
 
 #[cfg(test)]
@@ -925,9 +1049,91 @@ mod tests {
     }
 
     fn turn_line(uuid: &str, model: &str, output: u64) -> String {
+        turn_line_in(uuid, model, output, None)
+    }
+
+    /// Like [`turn_line`] but with an explicit per-line `cwd` (or none), the way
+    /// live Claude Code transcripts stamp every assistant line (issue #93).
+    fn turn_line_in(uuid: &str, model: &str, output: u64, cwd: Option<&str>) -> String {
+        // The cwd must be JSON-ENCODED, not interpolated: on Windows a tempdir
+        // path is `C:\Users\...`, and every backslash in a bare `"{c}"` is an
+        // invalid JSON escape, so the line's cwd silently fails to parse and
+        // every turn falls through to the unattributed branch.
+        let cwd_field = match cwd {
+            Some(c) => format!(
+                r#","cwd":{}"#,
+                serde_json::to_string(c).expect("a str always encodes")
+            ),
+            None => String::new(),
+        };
         format!(
-            r#"{{"type":"assistant","uuid":"{uuid}","timestamp":"2026-06-27T15:18:07.732Z","message":{{"model":"{model}","usage":{{"input_tokens":2,"output_tokens":{output},"cache_read_input_tokens":1000,"cache_creation_input_tokens":10}}}}}}"#
+            r#"{{"type":"assistant","uuid":"{uuid}","timestamp":"2026-06-27T15:18:07.732Z"{cwd_field},"message":{{"model":"{model}","usage":{{"input_tokens":2,"output_tokens":{output},"cache_read_input_tokens":1000,"cache_creation_input_tokens":10}}}}}}"#
         )
+    }
+
+    /// A real temp git repo with an `origin` remote, for tests that exercise
+    /// actual `project::resolve` behavior rather than a fake resolver. Mirrors
+    /// `project.rs`'s own `init_plain_repo` helper.
+    fn git_repo(dir: &std::path::Path, origin: &str) {
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                status.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["remote", "add", "origin", origin]);
+    }
+
+    /// Issue #93: a `Stop` whose OWN cwd fails to resolve used to strip
+    /// attribution from every turn parsed in that pass, even when each turn's own
+    /// cwd — recorded on the transcript line itself — resolves fine. Per D-0026,
+    /// repo-less compute is invisible, so this must not happen.
+    #[tokio::test]
+    async fn a_repo_less_trigger_does_not_strip_attribution_from_resolvable_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path(), "https://github.com/acme/api");
+        let cwd = dir.path().to_str().unwrap();
+
+        let path = dir.path().join("sess-1.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                turn_line_in("t1", "claude-opus-4-8", 10, Some(cwd)),
+                turn_line_in("t2", "claude-opus-4-8", 20, Some(cwd)),
+            ),
+        )
+        .unwrap();
+
+        let state = state_in_memory().await;
+        let mut cache = ProjectCache::new();
+        let p = path.to_str().unwrap();
+        // `event_project = None` simulates the triggering `Stop` whose OWN cwd
+        // failed to resolve — the exact shape of issue #93.
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-1", None, &mut cache).await;
+
+        let until = state.store.max_token_usage_rowid().await.unwrap().unwrap();
+        let rows = state.store.unsynced_token_usage(None, until).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(
+                row.project.as_deref(),
+                Some("github.com/acme/api"),
+                "each turn's OWN cwd must resolve it, independent of the trigger"
+            );
+        }
     }
 
     async fn state_in_memory() -> AppState {
@@ -935,6 +1141,262 @@ mod tests {
         let (state, _rx, _sync_rx, _knowledge_rx) =
             crate::build_state(store, Default::default()).await.unwrap();
         state
+    }
+
+    /// The fixture must emit a cwd the parser can actually read on every
+    /// platform. A Windows tempdir is `C:\Users\...`, and interpolating that
+    /// into a bare `"{c}"` produces invalid JSON escapes — which took out the
+    /// WHOLE line, not just its cwd, so the attribution tests saw zero turns
+    /// and failed on windows-only CI while passing everywhere else.
+    #[test]
+    fn turn_line_json_encodes_a_windows_style_cwd() {
+        let line = turn_line_in("t1", "claude-opus-4-8", 10, Some(r"C:\Users\dev\api"));
+        let turns = dira_core::tokens::parse_transcript_usage(&line);
+        assert_eq!(turns.len(), 1, "the line must parse at all: {line}");
+        assert_eq!(turns[0].cwd.as_deref(), Some(r"C:\Users\dev\api"));
+    }
+
+    /// Two turns from two DIFFERENT repos in the same transcript tail must each
+    /// resolve to their own project, independent of the trigger's project and of
+    /// each other — proving attribution is per-turn, not per-pass.
+    #[tokio::test]
+    async fn turns_from_two_repos_in_one_pass_are_attributed_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("a");
+        let repo_b = dir.path().join("b");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        git_repo(&repo_a, "https://github.com/acme/api");
+        git_repo(&repo_b, "https://github.com/acme/web");
+        let (a, b) = (repo_a.to_str().unwrap(), repo_b.to_str().unwrap());
+
+        let path = dir.path().join("sess-two.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                turn_line_in("t1", "claude-opus-4-8", 10, Some(a)),
+                turn_line_in("t2", "claude-opus-4-8", 20, Some(b)),
+                turn_line_in("t3", "claude-opus-4-8", 30, Some(a)),
+                turn_line_in("t4", "claude-opus-4-8", 40, Some(b)),
+            ),
+        )
+        .unwrap();
+
+        let state = state_in_memory().await;
+        let mut cache = ProjectCache::new();
+        capture_tokens(
+            &state,
+            path.to_str().unwrap(),
+            Harness::ClaudeCode,
+            "sess-two",
+            None,
+            &mut cache,
+        )
+        .await;
+
+        let until = state.store.max_token_usage_rowid().await.unwrap().unwrap();
+        let rows = state.store.unsynced_token_usage(None, until).await.unwrap();
+        assert_eq!(rows.len(), 4);
+        let by_id: std::collections::HashMap<&str, &dira_core::sync::TokenRow> =
+            rows.iter().map(|r| (r.id.as_str(), r)).collect();
+        assert_eq!(by_id["t1"].project.as_deref(), Some("github.com/acme/api"));
+        assert_eq!(by_id["t2"].project.as_deref(), Some("github.com/acme/web"));
+        assert_eq!(by_id["t3"].project.as_deref(), Some("github.com/acme/api"));
+        assert_eq!(by_id["t4"].project.as_deref(), Some("github.com/acme/web"));
+    }
+
+    /// A turn whose cwd doesn't resolve (not a git repo, no origin) falls back
+    /// to the triggering event's project — the SECOND rung of the chain.
+    #[tokio::test]
+    async fn an_unresolvable_turn_cwd_falls_back_to_the_event_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let unresolvable = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&unresolvable).unwrap();
+        let cwd = unresolvable.to_str().unwrap();
+
+        let path = dir.path().join("sess-fb.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", turn_line_in("t1", "claude-opus-4-8", 10, Some(cwd))),
+        )
+        .unwrap();
+
+        let state = state_in_memory().await;
+        let mut cache = ProjectCache::new();
+        capture_tokens(
+            &state,
+            path.to_str().unwrap(),
+            Harness::ClaudeCode,
+            "sess-fb",
+            Some("github.com/acme/event-fallback"),
+            &mut cache,
+        )
+        .await;
+
+        let until = state.store.max_token_usage_rowid().await.unwrap().unwrap();
+        let rows = state.store.unsynced_token_usage(None, until).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].project.as_deref(),
+            Some("github.com/acme/event-fallback")
+        );
+    }
+
+    /// A turn with NO cwd at all (older transcript, or a harness that doesn't
+    /// carry it) falls back to the session's sticky last-known-good project —
+    /// the THIRD and last rung, seeded by an earlier `observe`.
+    #[tokio::test]
+    async fn a_cwd_less_turn_falls_back_to_the_session_last_known_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-lkg.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", turn_line("t1", "claude-opus-4-8", 10)), // no cwd
+        )
+        .unwrap();
+
+        let state = state_in_memory().await;
+        // Seed the registry's sticky project the way `observe` runs BEFORE
+        // `capture_tokens` on the real writer path (writer.rs's ordering).
+        crate::control::lock_recover(&state.sessions).observe(
+            &tool_ev("sess-lkg", OffsetDateTime::UNIX_EPOCH, EventKind::PreTool),
+            Duration::minutes(5),
+        );
+
+        let mut cache = ProjectCache::new();
+        capture_tokens(
+            &state,
+            path.to_str().unwrap(),
+            Harness::ClaudeCode,
+            "sess-lkg",
+            None,
+            &mut cache,
+        )
+        .await;
+
+        let until = state.store.max_token_usage_rowid().await.unwrap().unwrap();
+        let rows = state.store.unsynced_token_usage(None, until).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].project.as_deref(),
+            Some("github.com/acme/api"), // `tool_ev`'s project
+            "the session's sticky project is the last-resort fallback"
+        );
+    }
+
+    /// When every rung of the chain comes up empty, the row is stored NULL AND
+    /// the observability counter reflects exactly how many turns went
+    /// unattributed — the issue's explicit ask.
+    #[tokio::test]
+    async fn fully_unattributable_turns_are_counted_and_warned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-none.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                turn_line("t1", "claude-opus-4-8", 10),
+                turn_line("t2", "claude-opus-4-8", 20),
+            ),
+        )
+        .unwrap();
+
+        let state = state_in_memory().await;
+        let mut cache = ProjectCache::new();
+        assert_eq!(state.progress.unattributed_token_rows(), 0);
+        capture_tokens(
+            &state,
+            path.to_str().unwrap(),
+            Harness::ClaudeCode,
+            "sess-none",
+            None,
+            &mut cache,
+        )
+        .await;
+
+        let until = state.store.max_token_usage_rowid().await.unwrap().unwrap();
+        let rows = state.store.unsynced_token_usage(None, until).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.project.is_none()));
+        assert_eq!(
+            state.progress.unattributed_token_rows(),
+            2,
+            "the counter must match the number of NULL-project rows exactly"
+        );
+    }
+
+    /// The perf guard: 100 lookups of the SAME cwd must shell out (call the
+    /// resolver) exactly once. This is what makes a per-turn resolution pass
+    /// costless in the steady state.
+    #[test]
+    fn project_cache_shells_out_once_per_distinct_cwd() {
+        let mut cache = ProjectCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        for _ in 0..100 {
+            cache.resolve_with("/some/cwd", |_| {
+                calls.set(calls.get() + 1);
+                Resolved {
+                    project: Some("github.com/acme/api".into()),
+                    identity_email: None,
+                    identity_name: None,
+                }
+            });
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "a positive verdict must never be re-resolved"
+        );
+    }
+
+    /// A NEGATIVE verdict (transient git failure, e.g.) must be retried once
+    /// its TTL has elapsed — never cached forever, which is the exact failure
+    /// mode issue #93 is about, just moved into the cache.
+    #[test]
+    fn project_cache_retries_a_negative_verdict_after_the_ttl() {
+        let mut cache = ProjectCache::new();
+        let first = cache.resolve_with("/flaky/cwd", |_| Resolved {
+            project: None,
+            identity_email: None,
+            identity_name: None,
+        });
+        assert_eq!(first.project, None);
+
+        // Backdate the cached entry past the TTL, simulating time passing.
+        if let Some(entry) = cache.entries.get_mut("/flaky/cwd") {
+            entry.1 = Instant::now() - NEGATIVE_TTL - StdDuration::from_secs(1);
+        }
+
+        let calls = std::cell::Cell::new(0u32);
+        let second = cache.resolve_with("/flaky/cwd", |_| {
+            calls.set(calls.get() + 1);
+            Resolved {
+                project: Some("github.com/acme/api".into()),
+                identity_email: None,
+                identity_name: None,
+            }
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "an expired negative verdict must be retried"
+        );
+        assert_eq!(second.project.as_deref(), Some("github.com/acme/api"));
+
+        // And now that it's positive, it must never be re-resolved again, TTL or not.
+        let calls2 = std::cell::Cell::new(0u32);
+        for _ in 0..10 {
+            cache.resolve_with("/flaky/cwd", |_| {
+                calls2.set(calls2.get() + 1);
+                Resolved {
+                    project: Some("should-not-be-called".into()),
+                    identity_email: None,
+                    identity_name: None,
+                }
+            });
+        }
+        assert_eq!(calls2.get(), 0, "a positive verdict is sticky, TTL or not");
     }
 
     /// Subagent turns live in files no hook ever names. Capturing them must add
@@ -964,9 +1426,10 @@ mod tests {
         .unwrap();
 
         let state = state_in_memory().await;
+        let mut cache = ProjectCache::new();
         let (m, s) = (main.to_str().unwrap(), side.to_str().unwrap());
 
-        capture_tokens(&state, m, Harness::ClaudeCode, "sess-1", None).await;
+        capture_tokens(&state, m, Harness::ClaudeCode, "sess-1", None, &mut cache).await;
         let main_offset = state
             .store
             .meta_get("token_offset:sess-1")
@@ -975,7 +1438,15 @@ mod tests {
             .unwrap();
 
         for sidecar in subagent_transcripts(m) {
-            capture_tokens(&state, &sidecar, Harness::ClaudeCode, "sess-1", None).await;
+            capture_tokens(
+                &state,
+                &sidecar,
+                Harness::ClaudeCode,
+                "sess-1",
+                None,
+                &mut cache,
+            )
+            .await;
         }
 
         // All three turns are stored — the subagent's usage is no longer invisible.
@@ -1001,8 +1472,8 @@ mod tests {
             .is_some());
 
         // Re-running captures nothing new: both watermarks hold.
-        capture_tokens(&state, m, Harness::ClaudeCode, "sess-1", None).await;
-        capture_tokens(&state, s, Harness::ClaudeCode, "sess-1", None).await;
+        capture_tokens(&state, m, Harness::ClaudeCode, "sess-1", None, &mut cache).await;
+        capture_tokens(&state, s, Harness::ClaudeCode, "sess-1", None, &mut cache).await;
         assert_eq!(state.store.count_token_usage_after(None).await.unwrap(), 3);
     }
 
@@ -1034,8 +1505,9 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let state = state_in_memory().await;
+        let mut cache = ProjectCache::new();
         let p = path.to_str().unwrap();
-        capture_tokens(&state, p, Harness::ClaudeCode, "sess-bad", None).await;
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-bad", None, &mut cache).await;
 
         // The corrupt line is dropped by the per-line JSON parse; the three good
         // turns around it are captured.
@@ -1066,7 +1538,7 @@ mod tests {
         appended.extend_from_slice(turn_line("ok-4", "claude-opus-4-8", 40).as_bytes());
         appended.push(b'\n');
         std::fs::write(&path, &appended).unwrap();
-        capture_tokens(&state, p, Harness::ClaudeCode, "sess-bad", None).await;
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-bad", None, &mut cache).await;
         assert_eq!(state.store.count_token_usage_after(None).await.unwrap(), 4);
     }
 
@@ -1087,8 +1559,17 @@ mod tests {
         std::fs::write(&path, &first).unwrap();
 
         let state = state_in_memory().await;
+        let mut cache = ProjectCache::new();
         let p = path.to_str().unwrap();
-        capture_tokens(&state, p, Harness::ClaudeCode, "sess-swap", None).await;
+        capture_tokens(
+            &state,
+            p,
+            Harness::ClaudeCode,
+            "sess-swap",
+            None,
+            &mut cache,
+        )
+        .await;
         assert_eq!(state.store.count_token_usage_after(None).await.unwrap(), 2);
 
         // A DIFFERENT transcript, byte-length identical (same uuid widths, same
@@ -1101,7 +1582,15 @@ mod tests {
         assert_eq!(first.len(), second.len(), "the swap must be same-length");
         std::fs::write(&path, &second).unwrap();
 
-        capture_tokens(&state, p, Harness::ClaudeCode, "sess-swap", None).await;
+        capture_tokens(
+            &state,
+            p,
+            Harness::ClaudeCode,
+            "sess-swap",
+            None,
+            &mut cache,
+        )
+        .await;
         assert_eq!(
             state.store.count_token_usage_after(None).await.unwrap(),
             4,
@@ -1124,6 +1613,7 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
 
         let state = state_in_memory().await;
+        let mut cache = ProjectCache::new();
         // Pre-seed only the legacy watermark, as an upgrade would leave it: the
         // whole file already consumed, no fingerprint recorded.
         state
@@ -1133,7 +1623,7 @@ mod tests {
             .unwrap();
 
         let p = path.to_str().unwrap();
-        capture_tokens(&state, p, Harness::ClaudeCode, "sess-up", None).await;
+        capture_tokens(&state, p, Harness::ClaudeCode, "sess-up", None, &mut cache).await;
 
         assert_eq!(
             state.store.count_token_usage_after(None).await.unwrap(),
@@ -1255,7 +1745,7 @@ mod tests {
         let config = dira_core::Config::default();
         let (state, _rx, _sync_rx, _knowledge_rx) =
             crate::build_state(store, config).await.unwrap();
-        let mut cache = HashMap::new();
+        let mut cache = ProjectCache::new();
         let mut last_stored = HashMap::new();
         let (mut ingested, mut coalesced) = (0u64, 0u64);
         let mut throttle = Throttle::default();

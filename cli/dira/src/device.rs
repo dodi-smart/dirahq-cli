@@ -39,7 +39,7 @@ use dira_contract::{
 };
 use dira_core::protocol::{Request, Response};
 use dira_core::signing::DeviceKey;
-use dira_core::sync::META_CLOUD_WATERMARK;
+use dira_core::sync::{META_CLOUD_WATERMARK, META_SYNC_CURSOR};
 use dira_core::{identity, Config, Store};
 use std::io::Write;
 use time::format_description::well_known::Rfc3339;
@@ -541,7 +541,7 @@ pub(crate) struct DeviceProbe {
 
 pub(crate) async fn probe(store: &Store) -> Result<DeviceProbe> {
     let cursor = store
-        .meta_get(SYNC_CURSOR_KEY)
+        .meta_get(META_SYNC_CURSOR)
         .await?
         .filter(|s| !s.is_empty());
     let pending = store.count_events_after(cursor.as_deref()).await?;
@@ -637,19 +637,53 @@ fn pending_rotation_line(rotated_at: &str) -> String {
 /// never double-count.
 pub async fn resync(config: &Config, from: Option<String>) -> Result<()> {
     match client::send(&config.socket_path, &Request::ResyncCursor { from }).await? {
-        Response::ResyncQueued { pending, from } => {
-            match from {
-                Some(id) => println!("resync:    cursor rewound to {id}"),
-                None => println!("resync:    cursor rewound to the beginning (full re-send)"),
+        Response::ResyncQueued {
+            pending,
+            pending_tokens,
+            from,
+        } => {
+            for line in resync_lines(pending, pending_tokens, from.as_deref()) {
+                println!("{line}");
             }
-            println!(
-                "pending:   {pending} event(s) will re-sync now — safe; the cloud dedups (no double counting)"
-            );
             Ok(())
         }
         Response::Error { message } => Err(anyhow!("resync failed: {message}")),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
     }
+}
+
+/// The lines `dira device resync` prints for a completed rewind. Pure, so the
+/// disclosure wording is unit-testable — see `cloud_status_line` above for the
+/// same pattern.
+///
+/// A `--from` rewind (`from = Some(id)`) only ever moves `META_SYNC_CURSOR`; the
+/// artifacts and token-usage cursors ride their own rowid cursors and stay put
+/// by design (D-0018/D-0020 — there is no sound event-id→rowid mapping, and
+/// rewinding them here would re-ship the whole backlog). That must be said
+/// explicitly, not left for the operator to infer from `pending_tokens` reading
+/// 0 next to a nonzero event count.
+fn resync_lines(pending: u64, pending_tokens: u64, from: Option<&str>) -> Vec<String> {
+    let mut lines = Vec::new();
+    match from {
+        Some(id) => {
+            lines.push(format!("resync:    cursor rewound to {id}"));
+            lines.push(
+                "resync:    only the event cursor moved — artifacts and token usage \
+                 are untouched. Run `dira device resync` (no --from) to re-send those too."
+                    .to_string(),
+            );
+        }
+        None => lines.push("resync:    cursor rewound to the beginning (full re-send)".to_string()),
+    }
+    lines.push(format!(
+        "pending:   {pending} event(s) will re-sync now — safe; the cloud dedups (no double counting)"
+    ));
+    if pending_tokens > 0 {
+        lines.push(format!(
+            "pending:   {pending_tokens} token usage row(s) will re-sync too"
+        ));
+    }
+    lines
 }
 
 /// Honest one-line cloud-coverage summary for `device status`. Compares the cloud's
@@ -690,7 +724,7 @@ pub async fn unlink(config: &Config, yes: bool) -> Result<()> {
     }
 
     let cursor = store
-        .meta_get(SYNC_CURSOR_KEY)
+        .meta_get(META_SYNC_CURSOR)
         .await?
         .filter(|s| !s.is_empty());
     let pending = store.count_events_after(cursor.as_deref()).await?;
@@ -717,10 +751,6 @@ pub async fn unlink(config: &Config, yes: bool) -> Result<()> {
 fn needs_confirmation(pending: u64, yes: bool) -> bool {
     pending > 0 && !yes
 }
-
-/// Mirror of `dirad::sync::META_SYNC_CURSOR` (kept in sync; the daemon owns the
-/// canonical constant, but the CLI reads the same `meta` key for status).
-const SYNC_CURSOR_KEY: &str = "sync_cursor_event_id";
 
 /// A reasonable default device label: the machine hostname.
 ///
@@ -859,6 +889,56 @@ mod tests {
         // ...unless `--yes` is given.
         assert!(!needs_confirmation(3, true));
         assert!(!needs_confirmation(0, true));
+    }
+
+    /// Issue #94, defect 1: a targeted `--from` rewind only ever moves
+    /// `META_SYNC_CURSOR` — artifacts and token usage stay put by design
+    /// (D-0018/D-0020) — but the old output said nothing, so it read as if
+    /// everything had been rewound. The rendering must say so explicitly.
+    #[test]
+    fn targeted_resync_discloses_it_rewound_only_events() {
+        let lines = resync_lines(3, 0, Some("01EVENTID"));
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("01EVENTID"),
+            "must name the id it rewound to: {joined}"
+        );
+        assert!(
+            joined.to_lowercase().contains("only the event cursor"),
+            "must disclose that only the event cursor moved: {joined}"
+        );
+        assert!(
+            joined.contains("dira device resync"),
+            "must name the bare command that re-sends artifacts and token usage too: {joined}"
+        );
+    }
+
+    /// A full (`from = None`) rewind blanks the token cursor too, so its own
+    /// backlog is real and must be surfaced — not silently folded into
+    /// `pending`, and not omitted just because it's a separate stream.
+    #[test]
+    fn full_resync_reports_the_token_backlog_line() {
+        let lines = resync_lines(0, 12_345, None);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("12345") || joined.contains("12,345"),
+            "must surface the token backlog as its own number: {joined}"
+        );
+        assert!(
+            !joined.to_lowercase().contains("only the event cursor"),
+            "a full rewind is not a targeted rewind — no disclosure caveat: {joined}"
+        );
+    }
+
+    /// A rewind with no pending tokens (the common case for `--from`) must not
+    /// print a spurious "0 token usage row(s)" line.
+    #[test]
+    fn resync_lines_omits_the_token_line_when_nothing_is_pending() {
+        let lines = resync_lines(3, 0, Some("01EVENTID"));
+        assert!(
+            !lines.iter().any(|l| l.contains("token usage row")),
+            "no token backlog means no token line: {lines:?}"
+        );
     }
 
     // --- WP-B1b: two-phase key rotation ------------------------------------

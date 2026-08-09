@@ -152,17 +152,56 @@ async fn resync_cursor(state: &AppState, from: Option<String>) -> Response {
         }
     }
     let cursor_ref = Some(new_cursor.as_str()).filter(|s| !s.is_empty());
-    let pending = state
-        .store
-        .count_events_after(cursor_ref)
-        .await
-        .unwrap_or(0);
+    let pending = match state.store.count_events_after(cursor_ref).await {
+        Ok(n) => n,
+        Err(e) => {
+            // Collapsing this to 0 used to be indistinguishable from a genuinely
+            // empty queue right after the user asked for a rewind — the exact
+            // moment an operator most needs to trust the number. Warn, don't hide.
+            tracing::warn!("resync: count_events_after failed: {e}");
+            0
+        }
+    };
+    // The token backlog rides its own rowid cursor (`META_TOKEN_CURSOR`), so it
+    // must be counted from THAT cursor's post-rewind value, not derived from
+    // `cursor_ref` above — the two cursors are independent by design (D-0018/
+    // D-0020). On a full rewind the token cursor was just blanked above, so this
+    // counts every row; on a `--from` rewind it's untouched, so this reports
+    // exactly what's still queued behind it (0 unless a prior partial sync left
+    // some token rows pending) rather than the whole backlog that stayed put.
+    let token_cursor_ref = if from.is_none() {
+        None
+    } else {
+        state
+            .store
+            .meta_get(META_TOKEN_CURSOR)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i64>().ok())
+    };
+    let pending_tokens = match state.store.count_token_usage_after(token_cursor_ref).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("resync: count_token_usage_after failed: {e}");
+            0
+        }
+    };
     // Nudge the sync task to drain now rather than waiting for the backstop.
     let _ = state.sync.trigger.try_send(());
     // A manual resync is user-initiated activity — wake the heartbeat too (WP-A3).
     state.presence_wake.notify_waiters();
-    tracing::info!(pending, from = ?from, "resync: cursor rewound, flush triggered");
-    Response::ResyncQueued { pending, from }
+    tracing::info!(
+        pending,
+        pending_tokens,
+        from = ?from,
+        "resync: cursor rewound, flush triggered"
+    );
+    Response::ResyncQueued {
+        pending,
+        pending_tokens,
+        from,
+    }
 }
 
 /// Build + runtime info for the running daemon (`dira version`). The version is
@@ -706,6 +745,209 @@ fn start_of_today(state: &AppState) -> OffsetDateTime {
         None => {
             tracing::debug!("local offset unavailable; using UTC day boundary");
             now.replace_time(time::Time::MIDNIGHT)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dira_contract::Harness;
+    use dira_core::model::{EventKind, RawEvent};
+    use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR, META_TOKEN_CURSOR};
+    use dira_core::tokens::TokenTurn;
+    use dira_core::{Config, Store};
+
+    async fn test_state() -> AppState {
+        let store = Store::open_in_memory().await.unwrap();
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, Config::default()).await.unwrap();
+        state
+    }
+
+    fn ev(id: &str, kind: EventKind) -> RawEvent {
+        RawEvent {
+            id: id.to_string(),
+            at: OffsetDateTime::UNIX_EPOCH,
+            session_id: "s1".to_string(),
+            harness: Harness::ClaudeCode,
+            kind,
+            cwd: None,
+            project: Some("github.com/acme/api".to_string()),
+            identity_email: Some("dev@example.com".to_string()),
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+        }
+    }
+
+    fn turn(id: &str) -> TokenTurn {
+        TokenTurn {
+            id: id.to_string(),
+            at: "2026-06-27T10:00:00Z".to_string(),
+            model: "claude-opus-4-8".to_string(),
+            input: 10,
+            output: 20,
+            cache_read: 0,
+            cache_create: 0,
+        }
+    }
+
+    /// Regression for issue #94: a full resync used to report an events-only
+    /// `pending` count, so tens of thousands of silently-rewound token rows
+    /// showed up next to "0 event(s)". `pending_tokens` must be its own
+    /// non-zero number.
+    #[tokio::test]
+    async fn full_resync_reports_the_token_backlog() {
+        let state = test_state().await;
+        state
+            .store
+            .append(&ev("01A", EventKind::SessionStart))
+            .await
+            .unwrap();
+        state
+            .store
+            .append(&ev("01B", EventKind::UserPrompt))
+            .await
+            .unwrap();
+        state
+            .store
+            .upsert_token_usage(&turn("tok1"), "s1", Some("github.com/acme/api"))
+            .await
+            .unwrap();
+        state
+            .store
+            .upsert_token_usage(&turn("tok2"), "s1", Some("github.com/acme/api"))
+            .await
+            .unwrap();
+
+        let resp = resync_cursor(&state, None).await;
+        match resp {
+            Response::ResyncQueued { pending_tokens, .. } => {
+                assert_eq!(
+                    pending_tokens, 2,
+                    "a full rewind must report the token backlog as its own number"
+                );
+            }
+            other => panic!("expected ResyncQueued, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_resync_blanks_all_three_cursors_and_counts_both_streams() {
+        let state = test_state().await;
+        state
+            .store
+            .append(&ev("01A", EventKind::SessionStart))
+            .await
+            .unwrap();
+        state
+            .store
+            .upsert_token_usage(&turn("tok1"), "s1", Some("github.com/acme/api"))
+            .await
+            .unwrap();
+        state.store.meta_set(META_SYNC_CURSOR, "01A").await.unwrap();
+        state
+            .store
+            .meta_set(META_ARTIFACTS_CURSOR, "5")
+            .await
+            .unwrap();
+        state.store.meta_set(META_TOKEN_CURSOR, "5").await.unwrap();
+
+        let _ = resync_cursor(&state, None).await;
+
+        assert_eq!(
+            state
+                .store
+                .meta_get(META_SYNC_CURSOR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            state
+                .store
+                .meta_get(META_ARTIFACTS_CURSOR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "a full resync must blank the artifacts cursor too"
+        );
+        assert_eq!(
+            state
+                .store
+                .meta_get(META_TOKEN_CURSOR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "a full resync must blank the token cursor too"
+        );
+    }
+
+    /// Defect 1: `--from` must leave the row cursors (artifacts, token) exactly
+    /// where they are — see D-0018/D-0020 for why rewinding them on a targeted
+    /// event rewind would be wrong, not merely untested.
+    #[tokio::test]
+    async fn targeted_resync_leaves_row_cursors_put_and_reports_zero_tokens() {
+        let state = test_state().await;
+        state
+            .store
+            .append(&ev("01A", EventKind::SessionStart))
+            .await
+            .unwrap();
+        state
+            .store
+            .append(&ev("01B", EventKind::UserPrompt))
+            .await
+            .unwrap();
+        state
+            .store
+            .upsert_token_usage(&turn("tok1"), "s1", Some("github.com/acme/api"))
+            .await
+            .unwrap();
+        state
+            .store
+            .meta_set(META_ARTIFACTS_CURSOR, "5")
+            .await
+            .unwrap();
+        state.store.meta_set(META_TOKEN_CURSOR, "5").await.unwrap();
+
+        let resp = resync_cursor(&state, Some("01A".to_string())).await;
+
+        assert_eq!(
+            state
+                .store
+                .meta_get(META_ARTIFACTS_CURSOR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("5"),
+            "a targeted rewind must not touch the artifacts cursor"
+        );
+        assert_eq!(
+            state
+                .store
+                .meta_get(META_TOKEN_CURSOR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("5"),
+            "a targeted rewind must not touch the token cursor"
+        );
+        match resp {
+            Response::ResyncQueued { pending_tokens, .. } => {
+                assert_eq!(
+                    pending_tokens, 0,
+                    "a targeted rewind leaves the token cursor put by design (D-0018/D-0020) \
+                     so it must report zero, not the whole backlog"
+                );
+            }
+            other => panic!("expected ResyncQueued, got {other:?}"),
         }
     }
 }

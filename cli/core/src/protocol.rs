@@ -224,7 +224,16 @@ pub enum Response {
     Nuked { events: u64, tokens: u64 },
     /// `ResyncCursor`: the cursor was rewound and a flush was triggered; `pending`
     /// is how many events will now re-sync, from `from` (None = the beginning).
-    ResyncQueued { pending: u64, from: Option<String> },
+    /// `pending_tokens` is the token-usage backlog the rewind re-sends — its own
+    /// number, never folded into `pending`: conflating events and token rows in one
+    /// counter is worse than the under-count it replaces. Always 0 for a `--from`
+    /// rewind, which leaves the token cursor put by design (D-0018/D-0020).
+    ResyncQueued {
+        pending: u64,
+        #[serde(default)]
+        pending_tokens: u64,
+        from: Option<String>,
+    },
     /// `DaemonInfo`: the running daemon's build + runtime info.
     DaemonInfo {
         /// Daemon binary version (`CARGO_PKG_VERSION`).

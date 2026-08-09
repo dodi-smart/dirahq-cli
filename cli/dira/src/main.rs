@@ -16,6 +16,7 @@ mod test_support;
 mod theme;
 mod tui;
 mod update;
+mod zavet_adapters;
 mod zavet_install;
 
 use anyhow::Result;
@@ -23,7 +24,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use dira_core::protocol::{ReportScope, Request, Response, StopSelector};
 use dira_core::Config;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Help styling — ANSI-16 only, deliberately: clap renders help before we can
 /// probe `COLORTERM`, and theme.rs's own ANSI fallback maps Engaged→cyan and
@@ -550,13 +551,23 @@ falling back to Claude Code's own installed_plugins.json) so a repeat run
 is a clean no-op instead of a duplicate install. Reports the installed
 version, scope, install path, and an advisory skew line comparing this dira
 build against the plugin's declared minimum — advisory only, never a hard
-error, since each product works fully without the other.",
+error, since each product works fully without the other.
+
+Also refreshes this repo's cross-harness adapters (AGENTS.md, .grok/, the
+vendored .zavet/bin/zavet copy, git hooks scaffolding) as a best-effort
+tail step — but ONLY when cwd resolves to a git toplevel carrying `.zavet/`
+AND the installed zavet reports `adapters --check` as stale AND that zavet
+is 1.3.0 or newer (older builds have no `adapters` subcommand at all).
+`--no-adapters` skips this even when it would otherwise apply. Git hooks are
+never installed by dira — `core.hooksPath` is reported, not touched.",
         after_help = "\
 Examples:
   dira zavet install                 install at user scope (the default)
   dira zavet install --scope project
   dira zavet install --update        already installed: refresh it
-  dira zavet install --dry-run       print the exact `claude` invocations only"
+  dira zavet install --dry-run       print the exact `claude` invocations only
+  dira zavet install --update --no-adapters
+                                      refresh the plugin but skip this repo's adapters"
     )]
     Install {
         /// Installation scope passed to `claude plugin install` (default: user).
@@ -568,6 +579,9 @@ Examples:
         /// Print the exact `claude` invocations without running them.
         #[arg(long)]
         dry_run: bool,
+        /// Do not refresh this repo's zavet adapters, even when they are stale.
+        #[arg(long)]
+        no_adapters: bool,
     },
 }
 
@@ -656,6 +670,22 @@ Examples:
     Restart,
 }
 
+/// Whether a `dira zavet status` invocation is about the directory the process
+/// is standing in, and so may carry the repo-scoped adapter/githook lines.
+///
+/// `--project <name>` names a REMOTE project with no relationship to cwd, so
+/// reporting this checkout's adapter staleness under it would be a plain lie.
+/// Pure, so the suppression rule is pinned by a test rather than by reading the
+/// dispatch site.
+fn zavet_status_is_cwd_scoped(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Zavet {
+            action: ZavetAction::Status { project: None }
+        }
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -740,12 +770,14 @@ async fn main() -> Result<()> {
                     scope,
                     update,
                     dry_run,
+                    no_adapters,
                 },
         } => {
             return zavet_install::install(zavet_install::InstallArgs {
                 scope: scope.clone(),
                 update: *update,
                 dry_run: *dry_run,
+                no_adapters: *no_adapters,
             });
         }
         Command::Nuke { yes } => return nuke(&config, *yes).await,
@@ -847,6 +879,14 @@ async fn main() -> Result<()> {
             action: ZavetAction::Status { .. }
         }
     );
+    // `--project` names a REMOTE project with no necessary relationship to
+    // `cwd` — reporting this cwd's adapter staleness against it would be a
+    // lie, so the adapter lines are cwd-scoped and print only when the
+    // status is genuinely about the directory the process is standing in.
+    // Cloned (not moved) here because `cwd` itself is consumed piecemeal by
+    // the `req` match below.
+    let zavet_status_cwd_scoped = zavet_status_is_cwd_scoped(&cli.command);
+    let cwd_for_adapter_status = cwd.clone();
 
     // Commands that talk to the daemon.
     let req = match cli.command {
@@ -967,6 +1007,15 @@ async fn main() -> Result<()> {
     if is_zavet_status {
         if let Some(line) = zavet_install::status_line() {
             println!("{line}");
+        }
+        // Only for `dira zavet status` with no `--project` — see
+        // `zavet_status_cwd_scoped`'s doc comment above.
+        if zavet_status_cwd_scoped {
+            if let Some(cwd) = cwd_for_adapter_status {
+                for line in zavet_install::adapter_status_lines(Path::new(&cwd)) {
+                    println!("{line}");
+                }
+            }
         }
     }
     if !ok {
@@ -1220,6 +1269,28 @@ mod tests {
     #[test]
     fn clap_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// Issue #98: the repo-scoped adapter lines may only ride a status that is
+    /// genuinely about cwd. `--project` names a remote project, so claiming
+    /// THIS checkout's adapter staleness under it would be a lie.
+    #[test]
+    fn adapter_status_lines_are_suppressed_under_an_explicit_project() {
+        let bare = Cli::parse_from(["dira", "zavet", "status"]);
+        assert!(
+            zavet_status_is_cwd_scoped(&bare.command),
+            "a bare `dira zavet status` is about the cwd"
+        );
+
+        let named = Cli::parse_from(["dira", "zavet", "status", "--project", "acme/api"]);
+        assert!(
+            !zavet_status_is_cwd_scoped(&named.command),
+            "--project names a remote project with no relationship to cwd"
+        );
+
+        // Any other command never carries them either.
+        let other = Cli::parse_from(["dira", "status"]);
+        assert!(!zavet_status_is_cwd_scoped(&other.command));
     }
 
     /// Every subcommand ships a long help; the flagship ones ship examples.

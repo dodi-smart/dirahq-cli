@@ -82,6 +82,63 @@ exit, unparseable output) — degrades to an "unknown" skew line, never an
 error: the whole product promise is that dira and zavet each work fully
 without the other.
 
+### Cross-harness adapter refresh (repo-scope, gated)
+
+As of zavet **1.3.0** the plugin also writes a set of generated, COMMITTED
+cross-harness adapter artifacts into a repo — `.zavet/bin/zavet` (a vendored
+copy of the CLI), an `AGENTS.md` marker block, `.grok/rules/zavet.md`,
+`.grok/hooks/zavet.json`, and `.zavet/githooks/{commit-msg,pre-commit}` — via
+`zavet adapters`. Existing repos get none of it on upgrade, and the vendored
+copy goes stale silently on every later plugin update. `dira zavet install`
+folds that refresh in as a best-effort tail step, **but only when every one
+of these holds**:
+
+1. `cwd` resolves to a git toplevel (`RepoGate::NotGit` otherwise).
+2. That toplevel carries a `.zavet/` directory (`RepoGate::NoZavetDir`
+   otherwise) — a repo that never adopted zavet has nothing for adapters to
+   refresh.
+3. The **installed** zavet (via `zavet version --json`, parsed and compared
+   as a release triple) is **1.3.0 or newer** — 1.2.0 has no `adapters`
+   subcommand at all, and running `adapters --check` against it prints
+   general usage/help text and exits 1, the SAME exit code 1.3.0 uses for
+   "stale". Exit code alone cannot tell those apart, so this version guard
+   runs before `adapters --check` is ever invoked.
+4. `zavet adapters --check` (run pinned to the repo root, never dira's own
+   cwd) reports the artifacts stale.
+
+Steps 1–3 are deliberately checked by dira itself, before zavet is ever
+spawned: `zavet adapters --check` from a non-git directory (e.g. `$HOME`)
+prints "not inside a git repository", reports all six artifacts
+missing/stale, and exits 1 — indistinguishable by exit code from genuine
+staleness. Without dira's own gate, running `dira zavet install` (a
+machine-scope command, valid from anywhere) from an unrelated directory
+could otherwise write adapter files where none belong.
+
+Every printed adapter line names the repo path it applies to, so a user who
+ran `--update` from an unexpected checkout can see which tree was touched.
+Pass `--no-adapters` to skip this refresh even when it would otherwise
+apply:
+
+```
+dira zavet install --update --no-adapters   refresh the plugin, skip adapters
+dira zavet install --update --dry-run       plans the adapters invocation too,
+                                             printed but never run:
+                                             [dry-run] <plugin-root>/bin/zavet adapters   # in <repo>
+```
+
+**Git hooks are never installed by dira.** `zavet hooks --check` is run
+alongside the adapters check purely to report `githooks: active` or
+`githooks: inactive — run \`zavet hooks install\` in <repo>`; dira never runs
+`zavet hooks install` itself, because `core.hooksPath` is not zavet's alone
+to own — Husky, lefthook, and plain pre-commit all set it too, and zavet
+itself refuses to take it over.
+
+**The four-item stable contract above is unchanged.** This is a
+version-gated best-effort addition layered on top of it, not a fifth item —
+an installed zavet older than 1.3.0 (or a repo with no `.zavet/`, or a
+non-git cwd) simply sees a `not checked`/`unknown` line and nothing else
+about `dira zavet install` changes.
+
 ## Activation
 
 | Layer | Mechanism | Precedence |
@@ -177,9 +234,16 @@ evidence still counts and is reported, so costs read as honest lower bounds.
 
 ## Query surface
 
-- `dira zavet status` — activation verdict (and why), capture health, and a
+- `dira zavet status` — activation verdict (and why), capture health, a
   client-side plugin line (installed version, scope, enabled) resolved the
-  same way `dira zavet install` detects state — see "Install" above.
+  same way `dira zavet install` detects state — see "Install" above — and,
+  when the installed zavet is 1.3.0+, read-only `adapters:`/`githooks:`
+  lines from the same gate described in "Cross-harness adapter refresh"
+  (never a write — `status` only ever checks). These lines are **cwd-scoped**
+  and are suppressed entirely when `--project` is passed: a named remote
+  project has no necessary relationship to the directory the process is
+  standing in, and reporting this cwd's adapter staleness against it would
+  be misleading.
 - `dira zavet why <question, D-0042, or spec slug>` — answer "why?" from
   recorded knowledge. A decision id or an exact spec slug answers directly;
   free text ("why are we polling instead of a filesystem watcher") ranks

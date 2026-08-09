@@ -468,7 +468,7 @@ fn enrich(
         .and_then(|cwd| project::current_branch(std::path::Path::new(cwd)));
 
     RawEvent {
-        id: Ulid::new().to_string(),
+        id: Ulid::generate().to_string(),
         at,
         session_id: norm.session_id,
         harness,
@@ -749,7 +749,7 @@ mod tests {
 
     fn tool_ev(session: &str, at: OffsetDateTime, kind: EventKind) -> RawEvent {
         RawEvent {
-            id: Ulid::new().to_string(),
+            id: Ulid::generate().to_string(),
             at,
             session_id: session.to_string(),
             harness: Harness::ClaudeCode,

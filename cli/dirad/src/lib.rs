@@ -880,7 +880,7 @@ pub async fn resolve_bearer(store: &Store) -> anyhow::Result<String> {
     if let Some(existing) = store.meta_get("bearer").await? {
         return Ok(existing);
     }
-    let token = Ulid::new().to_string();
+    let token = Ulid::generate().to_string();
     store.meta_set("bearer", &token).await?;
     Ok(token)
 }

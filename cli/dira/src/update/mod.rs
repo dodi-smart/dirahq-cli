@@ -89,7 +89,7 @@ struct Workdir(PathBuf);
 
 impl Workdir {
     fn new() -> Result<Self> {
-        let dir = std::env::temp_dir().join(format!("dira-update-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("dira-update-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create temp working dir {}", dir.display()))?;
         Ok(Self(dir))

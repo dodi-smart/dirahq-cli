@@ -42,7 +42,7 @@ fn wait_for_socket(sock: &std::path::Path, timeout: Duration) {
 #[test]
 fn sigterm_triggers_the_same_orderly_shutdown_as_ctrl_c() {
     let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    let unique = &Ulid::new().to_string()[..12];
+    let unique = &Ulid::generate().to_string()[..12];
     let sock = std::path::Path::new(&tmp).join(format!("dsig{unique}.sock"));
     let db = std::path::Path::new(&tmp).join(format!("dsig{unique}.db"));
     let _ = std::fs::remove_file(&sock);

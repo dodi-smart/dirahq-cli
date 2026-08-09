@@ -1002,7 +1002,7 @@ impl Store {
         file_path: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<String, Error> {
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         sqlx::query(
             "INSERT INTO zavet_guard_events (id, at, repo, decision_id, kind, file_path, session_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

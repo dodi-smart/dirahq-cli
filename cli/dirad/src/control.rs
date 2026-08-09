@@ -252,7 +252,7 @@ async fn start(
     if let (Some(p), Some(dir)) = (project.as_deref(), cwd.as_deref()) {
         lock_recover_map(&state.repo_dirs).insert(p.to_string(), dir.to_string());
     }
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     let handle = handle_of(&session_id);
     let ev = manual_event(
         &session_id,
@@ -351,7 +351,7 @@ async fn log(
     let (project, identity) = resolve(project, cwd);
     let end = OffsetDateTime::now_utc();
     let start = end - Duration::seconds(duration_secs as i64);
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     let handle = handle_of(&session_id);
     let events = materialize_interval(
         &session_id,

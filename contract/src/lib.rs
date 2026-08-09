@@ -141,26 +141,22 @@ pub struct SessionRollup {
     /// Total agent wall-clock seconds observed for this session.
     pub agent_wall_seconds: u64,
     /// Count of human prompts (user_prompt events) observed in this session.
-    /// Optional + omitted-when-absent so older payloads (and the signing vector)
-    /// stay byte-identical.
+    /// Optional + omitted-when-absent so older payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts: Option<u64>,
     /// The session branch (`git rev-parse --abbrev-ref HEAD`), if resolved. Lets
     /// the cloud anchor commits on this session to the branch it was worked on.
-    /// Optional + omitted-when-absent so older payloads (and the signing vector)
-    /// stay byte-identical.
+    /// Optional + omitted-when-absent so older payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Free-text human description for a manual session (`dira log`/`invoice`/`start`
     /// `--note`, or the trailing comment). Purely descriptive — the invoice line.
-    /// Optional + omitted-when-absent so older payloads (and the signing vector)
-    /// stay byte-identical.
+    /// Optional + omitted-when-absent so older payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// Operational tag for a manual session (`--label`), used locally to select/stop
     /// sessions; surfaced read-only in the cloud.
-    /// Optional + omitted-when-absent so older payloads (and the signing vector)
-    /// stay byte-identical.
+    /// Optional + omitted-when-absent so older payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }

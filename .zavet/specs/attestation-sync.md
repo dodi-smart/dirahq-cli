@@ -1,10 +1,10 @@
 ---
 title: Attestation sync and session rollups
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
-date: 2026-08-04
+date: 2026-08-09
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
@@ -12,7 +12,7 @@ paths:
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025]
 ---
 
 ## Overview
@@ -125,6 +125,15 @@ single flush window (issue #40).
 
 ## Invariants
 
+- A token turn's repo comes from that turn's own `cwd`, not from the event that
+  triggered the capture pass (DIRASH-0025). Attribution is per turn because one
+  unresolved `Stop` would otherwise mark every turn since the last watermark
+  repo-less, and repo-less compute is invisible rather than merely unlabelled.
+- A row is written with no project only when the turn's cwd, the triggering
+  event, and the session's sticky project are all unavailable — and every such
+  row is counted and warned, never silently dropped.
+- `TokenTurn.cwd` is capture-time provenance only. It never reaches the
+  `token_usage` table, the contract, or the wire.
 - Nothing content-bearing crosses the wire — rollups are metadata only
   (D-0001); the flush path performs no foreground network I/O outside the
   sync task (D-0006).

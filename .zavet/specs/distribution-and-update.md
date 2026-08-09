@@ -1,10 +1,10 @@
 ---
 title: Distribution and self-update
-version: 5
+version: 6
 origin: session
 verified: false
 confidence: high
-date: 2026-07-30
+date: 2026-08-09
 paths:
   - install.sh
   - install.ps1
@@ -12,7 +12,7 @@ paths:
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0021]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0021, DIRASH-0024]
 ---
 
 ## Overview
@@ -134,6 +134,15 @@ both executables and restarts whatever is supervising the daemon.
 
 ## Invariants
 
+- `dira update` may refresh the zavet *plugin* (machine scope, the blast radius
+  it already has) but never a repo's adapters or git hooks (DIRASH-0024). No cwd
+  is resolved anywhere in that path.
+- The plugin refresh runs only inside the successful swap-and-restart arm: never
+  on `--no-restart`, never on `--check` (D-0006 keeps that path free of network
+  I/O), and never after a rollback — a rolled-back machine must not come out of
+  an update with a bumped plugin.
+- An update never *installs* a plugin the user never asked for. Absent or
+  inconclusive detection is a silent no-op.
 - Checksum verification is mandatory and has no override flag. An
   unverifiable download is a pipeline bug, not a user decision.
 - The binary being replaced is never opened for writing — only renamed onto

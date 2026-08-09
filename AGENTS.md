@@ -33,6 +33,14 @@ agent context at session start — keep it short and non-negotiable.
   (user-only DACL + medium integrity label) — in `bind` **and** in the accept
   loop, or connection #2 silently loses it. Never report `ERROR_ACCESS_DENIED`
   as "daemon not running". See D-0016.
+- `dira doctor` diagnoses and never acts: no `--fix`, and a check whose inputs
+  are missing reports `skip`, never `fail`. Exit codes 0/1/2 are a contract.
+  See DIRASH-0022.
+- The capture probe's session id is minted by the daemon under the reserved
+  `dira-probe-` prefix and admitted only while its arm is live; every `Store`
+  read filters that prefix, and the daemon never spawns the hook child — a
+  child it forked would inherit an elevated token and certify the very bug the
+  probe exists to catch. See DIRASH-0023.
 
 ### Recorded decisions (read the file before changing guarded code; ask /zavet:why)
 
@@ -57,6 +65,10 @@ agent context at session start — keep it short and non-negotiable.
 - D-0019 — A replacement daemon is never started until the previous process is confirmed exited (active)
 - D-0020 — Sync watermarks advance per acked chunk, and a long drain paces itself (active)
 - D-0021 — Tests that exec the real binary serialise staging against forks and isolate every user dir (active)
+- DIRASH-0022 — dira doctor reports and never repairs, and absent evidence is a skip (active)
+- DIRASH-0023 — The capture probe rides a daemon-minted reserved session prefix, and the daemon never spawns the child (active)
+- DIRASH-0024 — Repo-scope zavet writes are gated on cwd, and dira never sets core.hooksPath (active)
+- DIRASH-0025 — Token attribution resolves per turn, and never writes NULL when a fallback exists (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 
@@ -64,6 +76,7 @@ agent context at session start — keep it short and non-negotiable.
 - capture-pipeline — Zavet capture pipeline (session, high)
 - daemon-lifecycle — Daemon startup and ingress lifecycle (session, high)
 - distribution-and-update — Distribution and self-update (session, high)
+- doctor — Diagnostics — dira doctor and the capture probe (session, high)
 - harness-sources — Harness sources and hook ingestion (session, high)
 
 Capture bar: record non-obvious choices a future reader could not reconstruct — micro-decisions as commit trailers (Why:/Rejected:/Constraint:/Refs:), structural ones via /zavet:decide.

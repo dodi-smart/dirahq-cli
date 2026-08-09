@@ -1,10 +1,10 @@
 ---
 title: Harness sources and hook ingestion
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-07-31
+date: 2026-08-09
 paths:
   - cli/sources/src/
   - cli/dira/src/init.rs
@@ -70,6 +70,12 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 
 ## Invariants
 
+- Metadata that crosses the wire is routinely non-ASCII — notes, branch names,
+  labels, and U+FFFD from a lossy transcript decode — so the cross-language
+  signing vector carries Cyrillic, a non-BMP emoji (a surrogate pair on the JS
+  side) and U+FFFD. A JCS disagreement on string escaping rejects the whole
+  batch, not one field, so this is pinned by a fixture rather than asserted in
+  a comment.
 - Only metadata crosses ingestion; hook payload content fields are ignored.
 - Every unknown event/payload is a silent ack — never an error to the
   harness, never a retry loop.

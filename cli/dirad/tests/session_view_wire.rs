@@ -31,7 +31,7 @@ async fn test_state() -> (AppState, tokio::sync::mpsc::Receiver<EventMsg>) {
 
 fn event(session: &str, harness: Harness, kind: EventKind, at: OffsetDateTime) -> RawEvent {
     RawEvent {
-        id: Ulid::new().to_string(),
+        id: Ulid::generate().to_string(),
         at,
         session_id: session.to_string(),
         harness,

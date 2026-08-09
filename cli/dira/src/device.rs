@@ -89,7 +89,7 @@ pub async fn link(config: &Config, code: Option<String>, label: Option<String>) 
     // collapse a retried claim onto the same device row; it never becomes the
     // device id (the cloud assigns that). We do NOT persist anything yet: the
     // device stays unlinked until the cloud hands back an authoritative id.
-    let client_nonce = Ulid::new().to_string();
+    let client_nonce = Ulid::generate().to_string();
 
     let url = format!("{}/api/v1/devices/claim", base.trim_end_matches('/'));
     let body = claim_request_body(&code, &key.public_base64(), label.as_deref(), &client_nonce);

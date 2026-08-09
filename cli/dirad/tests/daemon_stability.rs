@@ -33,7 +33,7 @@ async fn test_state() -> (AppState, tokio::sync::mpsc::Receiver<EventMsg>) {
 /// cwd and wouldn't). The timestamp is explicit so accrual is deterministic.
 fn manual_tick_with_repo(session: &str, at: OffsetDateTime) -> RawEvent {
     RawEvent {
-        id: Ulid::new().to_string(),
+        id: Ulid::generate().to_string(),
         at,
         session_id: session.to_string(),
         harness: Harness::Manual,
@@ -346,7 +346,7 @@ async fn rpc(stream: &mut dira_ipc::Stream, req: &Request) -> Response {
 /// uniquely-named pipe on windows (the pipe namespace is flat and global, so
 /// uniqueness comes from the name, and nothing is created on disk).
 fn test_endpoint(tag: &str) -> std::path::PathBuf {
-    let unique = &Ulid::new().to_string()[..10];
+    let unique = &Ulid::generate().to_string()[..10];
     #[cfg(unix)]
     {
         let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());

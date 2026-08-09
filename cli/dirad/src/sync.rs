@@ -1318,13 +1318,13 @@ mod tests {
 
     /// A minimal single-event window for `flush` to have something to send.
     fn test_event(session: &str, at: time::OffsetDateTime) -> dira_core::model::RawEvent {
-        test_event_with_id(&ulid::Ulid::new().to_string(), session, at)
+        test_event_with_id(&ulid::Ulid::generate().to_string(), session, at)
     }
 
     /// Like [`test_event`] but with an explicit `id`. `events_between` orders
     /// rows by `id ASC` (lexicographic), so a multi-event test that needs the
     /// fetched order to match a specific `at` sequence must NOT rely on
-    /// [`ulid::Ulid::new`] — freshly-minted ULIDs in a tight loop can share a
+    /// [`ulid::Ulid::generate`] — freshly-minted ULIDs in a tight loop can share a
     /// millisecond and sort by their random tail instead of insertion order.
     /// Zero-padded decimal ids sort exactly in call order.
     fn test_event_with_id(

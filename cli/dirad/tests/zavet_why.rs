@@ -26,7 +26,7 @@ async fn test_state() -> AppState {
 
 fn ev(session: &str, kind: EventKind, at: OffsetDateTime) -> RawEvent {
     RawEvent {
-        id: Ulid::new().to_string(),
+        id: Ulid::generate().to_string(),
         at,
         session_id: session.to_string(),
         harness: Harness::ClaudeCode,

@@ -27,6 +27,7 @@ pub mod http;
 pub mod jitter;
 pub mod knowledge_sync;
 pub mod logfile;
+pub mod probe;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
@@ -129,6 +130,7 @@ pub async fn build_state(
         shutdown: Arc::new(tokio::sync::Notify::new()),
         http_ingress_error: Arc::new(Mutex::new(None)),
         control_channel_warning: Arc::new(Mutex::new(None)),
+        probe: Arc::new(Mutex::new(None)),
     };
     Ok((state, rx, sync_rx, knowledge_rx))
 }
@@ -427,6 +429,17 @@ pub async fn run() -> anyhow::Result<()> {
     // Rebuild live-session state from the log so a daemon bounce loses nothing.
     // Off the critical path so it never delays socket readiness; flips
     // `hydrated` when done so `status` can stop reporting `hydrating`.
+    // Sweep any capture-probe row left behind by a daemon that died between the
+    // append and the reap. Hygiene, not correctness: such a row is already
+    // invisible to every read the store serves, so it can never be synced,
+    // counted or rolled up however long it survives — this just keeps the table
+    // from accumulating them. Runs BEFORE hydrate so the replay never sees one.
+    match state.store.delete_probe_events().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(n, "swept leaked capture-probe rows"),
+        Err(e) => tracing::debug!("capture-probe sweep failed: {e}"),
+    }
+
     spawn_hydrate(state.clone());
 
     // The single writer + the idle ticker run under a supervisor that tracks their
@@ -809,6 +822,14 @@ pub async fn maintenance_sweep(
     dirty_since_vacuum: &mut bool,
 ) -> SweepOutcome {
     let mut outcome = SweepOutcome::default();
+
+    // See the startup sweep in `run` for why this is hygiene rather than
+    // containment.
+    match state.store.delete_probe_events().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(n, "swept leaked capture-probe rows"),
+        Err(e) => tracing::debug!("capture-probe sweep failed: {e}"),
+    }
 
     let cursor = state.store.sync_cursor().await.ok().flatten();
     let cutoff = OffsetDateTime::now_utc() - state.config.retention();

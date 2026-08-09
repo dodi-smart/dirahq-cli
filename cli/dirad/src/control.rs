@@ -115,6 +115,13 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
         // why the ordering matters and `dispatch` doesn't touch `shutdown`
         // itself.
         Request::Shutdown => Response::Ok,
+        Request::CaptureProbe { phase } => match phase {
+            dira_core::protocol::ProbePhase::Arm => crate::probe::arm(state).await,
+            dira_core::protocol::ProbePhase::Verify {
+                session_id,
+                wait_ms,
+            } => crate::probe::verify(state, session_id, wait_ms).await,
+        },
     }
 }
 
@@ -212,6 +219,16 @@ async fn ingest_hook(state: &AppState, harness: String, payload: serde_json::Val
             };
         }
     };
+
+    // Reserved-prefix enforcement. A probe row is admitted only when THIS
+    // daemon minted the id moments ago and the arm has not lapsed, so a stale
+    // hook replay, a hand-crafted payload, or a `doctor` that died between arm
+    // and verify can never create one.
+    if dira_core::model::is_probe_session(&norm.session_id) {
+        if let Err(why) = crate::probe::admit(state, &norm.session_id) {
+            return Response::Error { message: why };
+        }
+    }
 
     let msg = EventMsg::Hook {
         norm,

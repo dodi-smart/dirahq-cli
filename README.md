@@ -59,6 +59,7 @@ musl — works on Alpine and old glibc alike); Windows via WSL2.
 dira init             # wire Claude Code hooks (also: codex, gemini, cursor, opencode, grok)
 dira daemon start     # start the resident tracker daemon
 dira status           # today's summary — engaged, agent, compute, unbilled
+dira doctor           # is capture actually working? (add --probe to prove it end to end)
 ```
 
 Run `dira daemon install` once so `dirad` survives reboots (launchd/systemd-user).

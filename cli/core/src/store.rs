@@ -6,7 +6,7 @@
 //! trivial (just replay).
 
 use crate::accounting;
-use crate::model::{EventKind, RawEvent};
+use crate::model::{EventKind, RawEvent, PROBE_LIKE_PATTERN};
 use crate::project::CapturedCommit;
 use crate::sync::{ArtifactRow, TokenRow};
 use crate::tokens::TokenTurn;
@@ -111,13 +111,18 @@ impl Store {
     ) -> Result<Vec<RawEvent>, Error> {
         let rows = match since {
             Some(ts) => {
-                sqlx::query("SELECT * FROM events WHERE at >= ?1 ORDER BY at ASC")
-                    .bind(ts.format(&Rfc3339).map_err(Error::time)?)
-                    .fetch_all(&self.pool)
-                    .await?
+                sqlx::query(
+                    "SELECT * FROM events WHERE at >= ?1 AND session_id NOT LIKE ?2 \
+                     ORDER BY at ASC",
+                )
+                .bind(ts.format(&Rfc3339).map_err(Error::time)?)
+                .bind(PROBE_LIKE_PATTERN)
+                .fetch_all(&self.pool)
+                .await?
             }
             None => {
-                sqlx::query("SELECT * FROM events ORDER BY at ASC")
+                sqlx::query("SELECT * FROM events WHERE session_id NOT LIKE ?1 ORDER BY at ASC")
+                    .bind(PROBE_LIKE_PATTERN)
                     .fetch_all(&self.pool)
                     .await?
             }
@@ -140,17 +145,25 @@ impl Store {
     ) -> Result<Vec<RawEvent>, Error> {
         let rows = match since {
             Some(cursor) => {
-                sqlx::query("SELECT * FROM events WHERE id > ?1 AND id <= ?2 ORDER BY id ASC")
-                    .bind(cursor)
-                    .bind(until)
-                    .fetch_all(&self.pool)
-                    .await?
+                sqlx::query(
+                    "SELECT * FROM events WHERE id > ?1 AND id <= ?2 \
+                     AND session_id NOT LIKE ?3 ORDER BY id ASC",
+                )
+                .bind(cursor)
+                .bind(until)
+                .bind(PROBE_LIKE_PATTERN)
+                .fetch_all(&self.pool)
+                .await?
             }
             None => {
-                sqlx::query("SELECT * FROM events WHERE id <= ?1 ORDER BY id ASC")
-                    .bind(until)
-                    .fetch_all(&self.pool)
-                    .await?
+                sqlx::query(
+                    "SELECT * FROM events WHERE id <= ?1 AND session_id NOT LIKE ?2 \
+                     ORDER BY id ASC",
+                )
+                .bind(until)
+                .bind(PROBE_LIKE_PATTERN)
+                .fetch_all(&self.pool)
+                .await?
             }
         };
         rows.iter().map(row_to_event).collect()
@@ -176,10 +189,12 @@ impl Store {
         let mut out = Vec::new();
         for session_id in session_ids {
             let rows = sqlx::query(
-                "SELECT * FROM events WHERE session_id = ?1 AND id <= ?2 ORDER BY at ASC",
+                "SELECT * FROM events WHERE session_id = ?1 AND id <= ?2 \
+                 AND session_id NOT LIKE ?3 ORDER BY at ASC",
             )
             .bind(session_id)
             .bind(until)
+            .bind(PROBE_LIKE_PATTERN)
             .fetch_all(&self.pool)
             .await?;
             for row in &rows {
@@ -215,11 +230,12 @@ impl Store {
         let rows = sqlx::query(
             "SELECT * FROM events WHERE id <= ?1 AND kind IN \
              ('user_prompt','permission_decision','manual_start','manual_tick','manual_stop') \
-             AND at >= ?2 AND at <= ?3 ORDER BY at ASC",
+             AND at >= ?2 AND at <= ?3 AND session_id NOT LIKE ?4 ORDER BY at ASC",
         )
         .bind(cursor)
         .bind(at_lo.format(&Rfc3339).map_err(Error::time)?)
         .bind(at_hi.format(&Rfc3339).map_err(Error::time)?)
+        .bind(PROBE_LIKE_PATTERN)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_event).collect()
@@ -227,6 +243,11 @@ impl Store {
 
     /// The largest event id in the log, or `None` when the log is empty. This is
     /// the snapshot upper bound for a sync window (`until`).
+    ///
+    /// Deliberately **not** filtered for capture-probe rows, unlike every other
+    /// read here. It is only an upper bound, and excluding a probe id would
+    /// stall the cursor behind a row that is about to be deleted rather than
+    /// letting the window close past it.
     pub async fn max_event_id(&self) -> Result<Option<String>, Error> {
         let row = sqlx::query("SELECT MAX(id) AS m FROM events")
             .fetch_one(&self.pool)
@@ -239,13 +260,17 @@ impl Store {
     pub async fn count_events_after(&self, cursor: Option<&str>) -> Result<u64, Error> {
         let row = match cursor {
             Some(c) => {
-                sqlx::query("SELECT COUNT(*) AS n FROM events WHERE id > ?1")
-                    .bind(c)
-                    .fetch_one(&self.pool)
-                    .await?
+                sqlx::query(
+                    "SELECT COUNT(*) AS n FROM events WHERE id > ?1 AND session_id NOT LIKE ?2",
+                )
+                .bind(c)
+                .bind(PROBE_LIKE_PATTERN)
+                .fetch_one(&self.pool)
+                .await?
             }
             None => {
-                sqlx::query("SELECT COUNT(*) AS n FROM events")
+                sqlx::query("SELECT COUNT(*) AS n FROM events WHERE session_id NOT LIKE ?1")
+                    .bind(PROBE_LIKE_PATTERN)
                     .fetch_one(&self.pool)
                     .await?
             }
@@ -290,6 +315,33 @@ impl Store {
     pub async fn delete_session_events(&self, session_id: &str) -> Result<u64, Error> {
         let res = sqlx::query("DELETE FROM events WHERE session_id = ?1")
             .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// How many stored events belong to `session_id`.
+    ///
+    /// The capture probe's landed/not-landed oracle, and the one read here that
+    /// deliberately *can* see a probe session — every other read filters the
+    /// reserved prefix out.
+    pub async fn session_event_count(&self, session_id: &str) -> Result<u64, Error> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM events WHERE session_id = ?1")
+            .bind(session_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("n") as u64)
+    }
+
+    /// Delete every leaked capture-probe row, returning how many went.
+    ///
+    /// Hygiene, not correctness. A probe row is already invisible to every read
+    /// above, so it cannot be synced, counted or rolled up however long it
+    /// survives; this exists so the table does not accumulate rows left behind
+    /// by a daemon that died between the append and the reap.
+    pub async fn delete_probe_events(&self) -> Result<u64, Error> {
+        let res = sqlx::query("DELETE FROM events WHERE session_id LIKE ?1")
+            .bind(PROBE_LIKE_PATTERN)
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())
@@ -710,11 +762,18 @@ impl Store {
 
         // Snapshot the eligible rows (synced AND old). Ordered by time so the
         // accounting gap model sees them in timeline order.
-        let rows = sqlx::query("SELECT * FROM events WHERE id <= ?1 AND at < ?2 ORDER BY at ASC")
-            .bind(cursor)
-            .bind(&cutoff_str)
-            .fetch_all(&mut *tx)
-            .await?;
+        // The probe exclusion matters here more than anywhere else: a rollup is
+        // permanent, and no prefix filter can reach `session_rollups` once a
+        // probe row has been folded into one.
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE id <= ?1 AND at < ?2 AND session_id NOT LIKE ?3 \
+             ORDER BY at ASC",
+        )
+        .bind(cursor)
+        .bind(&cutoff_str)
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_all(&mut *tx)
+        .await?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -2384,6 +2443,137 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].kind, EventKind::SessionStart);
         assert_eq!(all[1].project.as_deref(), Some("github.com/acme/api"));
+    }
+
+    /// The containment invariant for `dira doctor --probe`, asserted at the one
+    /// boundary every read crosses.
+    ///
+    /// A probe row must be invisible to the sync batch, the backlog count, the
+    /// hydrate replay, the gap-anchor seed and compaction — so it cannot reach
+    /// the cloud, skew a count, anchor a counted gap, or be immortalised into a
+    /// rollup no prefix filter can reach. Only `session_event_count` (the
+    /// probe's own oracle) and the deletes may see it.
+    #[tokio::test]
+    async fn a_capture_probe_row_is_invisible_to_every_read() {
+        let store = Store::open_in_memory().await.unwrap();
+        let probe_id = format!("{}01PROBE", crate::model::PROBE_SESSION_PREFIX);
+
+        // Two prompts a counted gap apart, so the session actually accrues time
+        // and would be rolled up by `compact` — otherwise the rollup assertion
+        // below passes vacuously.
+        for (id, secs) in [("01A", 10), ("01C", 70)] {
+            let mut real = ev(id, EventKind::UserPrompt);
+            real.at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs);
+            store.append(&real).await.unwrap();
+        }
+        // The same shape in every respect — `user_prompt` is exactly what
+        // `human_signal_seed` selects — differing only in the session id.
+        for (id, secs) in [("01B", 11), ("01D", 71)] {
+            let mut probe = ev(id, EventKind::UserPrompt);
+            probe.session_id = probe_id.clone();
+            probe.at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs);
+            store.append(&probe).await.unwrap();
+        }
+
+        let only_real = |evs: Vec<RawEvent>| {
+            assert!(
+                !evs.iter()
+                    .any(|e| crate::model::is_probe_session(&e.session_id)),
+                "probe row leaked: {evs:?}"
+            );
+            assert_eq!(evs.len(), 2, "expected both real rows: {evs:?}");
+        };
+        only_real(store.events_since(None).await.unwrap());
+        only_real(
+            store
+                .events_since(Some(OffsetDateTime::UNIX_EPOCH))
+                .await
+                .unwrap(),
+        );
+        only_real(store.events_between(None, "01Z").await.unwrap());
+        only_real(store.events_between(Some("019"), "01Z").await.unwrap());
+        only_real(
+            store
+                .events_for_sessions(&["s1".into(), probe_id.clone()], "01Z")
+                .await
+                .unwrap(),
+        );
+        only_real(
+            store
+                .human_signal_seed(
+                    Some("01Z"),
+                    OffsetDateTime::UNIX_EPOCH,
+                    OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(120),
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(store.count_events_after(None).await.unwrap(), 2);
+        assert_eq!(store.count_events_after(Some("019")).await.unwrap(), 2);
+
+        // The upper bound is deliberately unfiltered, so the cursor can move
+        // past a probe id instead of stalling behind a ghost.
+        assert_eq!(store.max_event_id().await.unwrap().as_deref(), Some("01D"));
+
+        // The probe's own oracle DOES see it — that is how `verify` decides
+        // whether the row landed.
+        assert_eq!(store.session_event_count(&probe_id).await.unwrap(), 2);
+        assert_eq!(store.session_event_count("s1").await.unwrap(), 2);
+
+        // A rollup outlives the events it summarises and no prefix filter can
+        // reach it, so compaction is the one place a leak would be permanent.
+        // Both sessions are identical apart from the id and both accrue counted
+        // time, so a missing filter here would roll up two sessions, not one.
+        store
+            .compact(
+                Some("01Z"),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
+                time::Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.rollup_session_count(None).await.unwrap(), 1);
+    }
+
+    /// `delete_probe_events` clears leaked probe rows and nothing else.
+    #[tokio::test]
+    async fn delete_probe_events_removes_only_probe_rows() {
+        let store = Store::open_in_memory().await.unwrap();
+        let probe_id = format!("{}01PROBE", crate::model::PROBE_SESSION_PREFIX);
+
+        store
+            .append(&ev("01A", EventKind::UserPrompt))
+            .await
+            .unwrap();
+        let mut probe = ev("01B", EventKind::UserPrompt);
+        probe.session_id = probe_id.clone();
+        store.append(&probe).await.unwrap();
+
+        assert_eq!(store.delete_probe_events().await.unwrap(), 1);
+        assert_eq!(store.session_event_count(&probe_id).await.unwrap(), 0);
+        assert_eq!(store.session_event_count("s1").await.unwrap(), 1);
+        // Idempotent: a sweep with nothing to sweep is a no-op.
+        assert_eq!(store.delete_probe_events().await.unwrap(), 0);
+    }
+
+    /// The `LIKE` pattern is a const for the query path; this is what keeps it
+    /// honest against the prefix it is supposed to match.
+    #[test]
+    fn the_probe_like_pattern_matches_the_prefix() {
+        use crate::model::{PROBE_LIKE_PATTERN, PROBE_SESSION_PREFIX};
+        assert_eq!(PROBE_LIKE_PATTERN, format!("{PROBE_SESSION_PREFIX}%"));
+    }
+
+    #[tokio::test]
+    async fn probe_session_ids_need_a_suffix() {
+        use crate::model::{is_probe_session, PROBE_SESSION_PREFIX};
+        assert!(is_probe_session(&format!("{PROBE_SESSION_PREFIX}01JQ")));
+        // The bare prefix is not a probe id, so it can never be admitted.
+        assert!(!is_probe_session(PROBE_SESSION_PREFIX));
+        assert!(!is_probe_session("dira-probe"));
+        assert!(!is_probe_session("01JQABCDEF"));
+        assert!(!is_probe_session(""));
     }
 
     #[tokio::test]

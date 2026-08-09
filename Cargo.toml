@@ -26,7 +26,7 @@ rust-version = "1.88"
 # Centralized dependency versions. Members opt in via `dep.workspace = true`.
 [workspace.dependencies]
 # Async runtime + ingress
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs", "process"] }
 # `flock(2)` for the daemon's single-instance lock (D-0009); already in the
 # tree transitively, MSRV-safe where `std`'s file locks (1.89) are not.
 libc = "0.2"

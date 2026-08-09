@@ -31,15 +31,15 @@ use std::path::PathBuf;
 const TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct Health {
+pub(crate) struct Health {
     /// Unix seconds of the most recent failure.
-    last_error_at: i64,
-    last_error: String,
-    harness: String,
+    pub last_error_at: i64,
+    pub last_error: String,
+    pub harness: String,
     /// Approximate. Hooks run as concurrent one-shot processes, so this
     /// read-modify-write races; the timestamp and message are the load-bearing
     /// fields and this is only ever used to say "a lot" vs "one".
-    consecutive: u64,
+    pub consecutive: u64,
 }
 
 fn path() -> Option<PathBuf> {
@@ -87,11 +87,20 @@ pub fn record_success() {
     }
 }
 
-/// The warning line for `dira status` / `dira version`, or `None`.
-pub fn warning() -> Option<String> {
+/// The breadcrumb itself, TTL-filtered — for callers (`dira doctor --json`)
+/// that want the structured fields rather than the rendered prose. `None` when
+/// the file is absent, corrupt, or expired, which is the same set of states
+/// [`warning`] stays silent for.
+pub(crate) fn snapshot() -> Option<Health> {
     let raw = std::fs::read(path()?).ok()?;
     let h: Health = serde_json::from_slice(&raw).ok()?;
-    warning_for(&h, now_secs())
+    // Expiry lives in `warning_for`; asking it is how the two stay consistent.
+    warning_for(&h, now_secs()).map(|_| h)
+}
+
+/// The warning line for `dira status` / `dira version`, or `None`.
+pub fn warning() -> Option<String> {
+    warning_for(&snapshot()?, now_secs())
 }
 
 /// Pure so the TTL and wording are testable without touching the filesystem.

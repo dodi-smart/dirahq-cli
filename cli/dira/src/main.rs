@@ -426,14 +426,19 @@ verify its sha256 against the published checksum, and atomically swap both
 and exits 0 in every non-error case, including offline, so it's safe to run
 speculatively (it also refreshes the cache behind the passive update
 notice). `--version` allows downgrading to any published release, not only
-upgrading to a newer one.",
+upgrading to a newer one.
+
+After a successful swap-and-restart, an already-installed zavet Claude Code
+plugin is also refreshed (marketplace + plugin update, machine scope only —
+never writes to a repo). Pass --no-zavet to skip that.",
         after_help = "\
 Examples:
   dira update --check               is a newer release available?
   dira update                       update to the latest release, restart the daemon
   dira update --channel prerelease  opt into a prerelease build
   dira update --version 0.2.0       pin to (or downgrade to) an exact version
-  dira update --no-restart          swap the binaries, leave the running daemon alone"
+  dira update --no-restart          swap the binaries, leave the running daemon alone
+  dira update --no-zavet            skip the post-update zavet plugin refresh"
     )]
     Update {
         /// Resolve only — report what's available, change nothing.
@@ -454,6 +459,9 @@ Examples:
         /// Install directory for the new binaries (default: alongside the running `dira`).
         #[arg(long, value_name = "DIR", env = "DIRA_BIN_DIR")]
         bin_dir: Option<PathBuf>,
+        /// Do not refresh the zavet Claude Code plugin after updating dira.
+        #[arg(long)]
+        no_zavet: bool,
     },
     /// Zavet knowledge module: what the tracked time produced, and why.
     #[command(
@@ -819,6 +827,7 @@ async fn main() -> Result<()> {
             force,
             no_restart,
             bin_dir,
+            no_zavet,
         } => {
             return update::run(
                 &config,
@@ -829,6 +838,7 @@ async fn main() -> Result<()> {
                     force: *force,
                     no_restart: *no_restart,
                     bin_dir: bin_dir.clone(),
+                    no_zavet: *no_zavet,
                 },
             )
             .await;

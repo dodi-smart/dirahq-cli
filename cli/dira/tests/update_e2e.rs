@@ -342,6 +342,15 @@ fn run_update(bin_dir: &Path, download_base: &str, extra_args: &[&str]) -> Outpu
         .arg("--bin-dir")
         .arg(bin_dir)
         .arg("--no-restart")
+        // `--no-restart` already means the D2 plugin-refresh arm (inside
+        // `daemon::restart`'s `Ok(())` branch) can never run here, but
+        // `--no-zavet` is added anyway on the same D-0021 principle as the
+        // rest of this helper: a test that execs the real binary isolates
+        // every user dir it touches, rather than relying on one guard
+        // (`--no-restart`) to also cover a second, unrelated one. Without
+        // this, a dev machine with a real `claude` on PATH would be one
+        // refactor away from this test suite shelling out to it for real.
+        .arg("--no-zavet")
         .args(extra_args)
         .env("DIRA_DOWNLOAD_URL", download_base)
         .env("DIRA_TARGET", TARGET)
@@ -400,6 +409,34 @@ async fn successful_update_replaces_both_binaries_mode_0755_and_cleans_up_backup
     assert!(
         !bin_dir.join(".dirad.bak").exists(),
         "backup must be cleaned up on success"
+    );
+}
+
+/// `--no-zavet` (baked into every `run_update` call — see its comment) must
+/// actually suppress the post-update zavet plugin refresh: a successful
+/// update's stdout must carry no `zavet plugin:` line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_update_with_no_zavet_prints_no_plugin_refresh_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    seed_install(&bin_dir);
+
+    let mock = MockGitHub::start().await;
+    let (tarball, tarball_name, sha, sha_name) = build_fixture_archive(tmp.path(), "9.9.8");
+    mock.put_asset(&tarball_name, tarball);
+    mock.put_asset(&sha_name, sha);
+
+    let out = run_update(&bin_dir, &mock.download_base(), &["--version", "9.9.8"]);
+    assert!(
+        out.status.success(),
+        "update failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("zavet plugin:"),
+        "--no-zavet must suppress the plugin refresh line: stdout={stdout:?}"
     );
 }
 

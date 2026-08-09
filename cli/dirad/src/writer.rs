@@ -173,6 +173,31 @@ async fn process_message(
         EventMsg::Hook { norm, harness, at } => enrich(norm, harness, at, cache),
     };
 
+    // A `dira doctor --probe` row is a transport test, not a session. It takes
+    // the store append and nothing else: no coalescing watermark, no
+    // degenerate-session pruning, no live-registry fold, no sync trigger, no
+    // commit capture, no token capture, no repo_dirs entry.
+    //
+    // This is an unconditional early return, NOT fallible work spliced between
+    // the append and the watermark/registry updates, so the ordering invariant
+    // documented above is preserved: neither of those is ever reached for a
+    // probe row.
+    //
+    // Giving the probe its own short path — rather than engineering a payload
+    // that survives coalescing and degenerate pruning — is deliberate. Those
+    // behaviours are correct, and a diagnostic that has to fight them breaks
+    // every time they are tuned. Everything the probe actually asserts
+    // (`normalize_for` → `EventMsg` → the queue → here → `enrich` → `append`)
+    // is still traversed unmodified.
+    if dira_core::model::is_probe_session(&ev.session_id) {
+        match state.store.append(&ev).await {
+            Ok(()) => crate::probe::note_landed(state, &ev.session_id),
+            Err(e) => tracing::warn!("capture-probe append failed: {e}"),
+        }
+        state.progress.mark_writer();
+        return;
+    }
+
     // Capture-time coalescing (Phase 2a): drop a tool-activity event when the
     // session's last *stored* activity is younger than the coalesce window.
     // Only the high-volume `PostTool` is eligible — human signals, lifecycle,

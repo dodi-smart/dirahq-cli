@@ -122,6 +122,13 @@ pub struct AppState {
     /// `http_ingress_error` — D-0009: a daemon that cannot do its job must never
     /// look plainly healthy.
     pub control_channel_warning: Arc<Mutex<Option<String>>>,
+    /// The single in-flight `dira doctor --probe` capture probe, or `None`.
+    ///
+    /// A `std::sync::Mutex` like `sessions`/`repo_dirs`: every hold is a field
+    /// read or a swap with no `await` inside, and it is taken via
+    /// `control::lock_recover` so a poisoned lock degrades to "stale but
+    /// serving" rather than killing the control surface.
+    pub probe: Arc<Mutex<Option<crate::probe::ProbeSlot>>>,
 }
 
 impl AppState {
@@ -500,6 +507,17 @@ impl SessionRegistry {
     /// (`Config::idle()`); see [`LiveSession`] for why the incremental sum equals
     /// the one-shot accounting scan.
     pub fn observe(&mut self, ev: &RawEvent, idle: Duration) {
+        // A `dira doctor --probe` row is a transport test, not a session, and
+        // the registry is not backed by SQL — `partial_rollups` ships straight
+        // from here and `build_session_views` renders from here, so the store's
+        // prefix filters cannot reach either. Refusing it at the single entry
+        // point covers both the writer's live fold and hydrate's replay.
+        //
+        // The writer already returns early for probe rows; this is the guard
+        // that makes the property hold rather than depend on that.
+        if dira_core::model::is_probe_session(&ev.session_id) {
+            return;
+        }
         let kind = match ev.kind {
             EventKind::ManualStart | EventKind::ManualStop | EventKind::ManualTick => {
                 SessionKind::Manual

@@ -408,12 +408,6 @@ async fn legacy_daemon_socket(config: &Config, legacy: &Path) -> Option<PathBuf>
     answers(legacy).await.then(|| legacy.to_path_buf())
 }
 
-/// `legacy_daemon_socket` against the real legacy path — for callers (like
-/// `dira version`'s skew note) that have no reason to inject one.
-pub(crate) async fn legacy_daemon_socket_default(config: &Config) -> Option<PathBuf> {
-    legacy_daemon_socket(config, &dira_core::config::legacy_socket_path()).await
-}
-
 /// The `dirad: up` line. A daemon whose hook ingress failed to bind answers
 /// every control request but captures nothing, so it is reported as **degraded**
 /// with the reason rather than as a healthy "up" (D-0009).
@@ -453,6 +447,183 @@ fn up_message(sock: &std::path::Path, ingress_error: Option<&str>) -> String {
     }
 }
 
+/// What the daemon said about itself, in one `DaemonInfo` round-trip.
+///
+/// Mirrors `Response::DaemonInfo` field for field so callers never have to
+/// re-send: `dira version`, `dira daemon status` and four `dira doctor` checks
+/// all read from one probe.
+#[derive(Debug, Clone)]
+pub(crate) struct Info {
+    pub version: String,
+    pub schema_version: String,
+    pub pid: u32,
+    pub uptime_seconds: u64,
+    pub http_ingress_error: Option<String>,
+    pub control_channel_warning: Option<String>,
+    pub db_path: Option<String>,
+    pub storage_warning: Option<String>,
+}
+
+/// One round-trip's worth of daemon truth.
+///
+/// Exists because the three diagnostic surfaces used to each ask the daemon
+/// their own question and print the answer inline, so nothing could compose
+/// them. Gathering once also keeps [`client::Reach`] intact: [`client::send`]
+/// collapses a typed `io::Error` into a string, and the `Denied` discriminant
+/// is precisely the one a diagnostic must not lose.
+///
+/// Diagnostic only. Nothing here licenses a restart decision — that path asks
+/// whether the *process* exited, not whether the channel answers (D-0019).
+#[derive(Debug, Clone)]
+pub(crate) struct DaemonProbe {
+    /// How the control endpoint answered a connect attempt. Recorded here
+    /// rather than re-derived, because `client::send` collapses the typed
+    /// `io::Error` into a string and `Denied` — a daemon that is running and
+    /// refusing us — is the one discriminant a diagnostic cannot afford to
+    /// lose (D-0016).
+    pub reach: client::Reach,
+    /// `Some` when the daemon answered `DaemonInfo`.
+    pub info: Option<Info>,
+    /// The daemon answered *something* — either `DaemonInfo`, or `Ping` during
+    /// a partial update where it is too old for `DaemonInfo`. Distinct from
+    /// `info.is_some()`, and distinct again from no daemon at all.
+    pub answered_ping: bool,
+    /// The daemon answered the `DaemonInfo` request with something that was not
+    /// a `DaemonInfo`. Kept separate from `answered_ping` because `dira version`
+    /// says "unexpected daemon response" for this and "not running" for a
+    /// transport failure, and collapsing the two would change its output.
+    pub unexpected: bool,
+    /// A pre-D-0008 daemon still answering on the legacy `$TMPDIR` socket.
+    /// Only ever probed once the configured socket has already failed.
+    pub legacy: Option<PathBuf>,
+}
+
+impl DaemonProbe {
+    /// The `dira daemon status` line, unchanged from when `status_with` built
+    /// it inline.
+    pub(crate) fn status_line(&self, sock: &Path) -> String {
+        match (&self.info, self.answered_ping) {
+            (Some(i), _) => up_message(sock, i.http_ingress_error.as_deref()),
+            (None, true) => up_message(sock, None),
+            (None, false) => down_message(self.legacy.as_deref()),
+        }
+    }
+
+    /// `true` iff a daemon is running somewhere — see [`status`] for why
+    /// "legacy" counts.
+    pub(crate) fn running(&self) -> bool {
+        self.info.is_some() || self.answered_ping || self.legacy.is_some()
+    }
+}
+
+/// Probe the daemon once, against the real legacy socket path.
+pub(crate) async fn probe(config: &Config) -> DaemonProbe {
+    probe_with(config, &dira_core::config::legacy_socket_path()).await
+}
+
+/// [`probe`] with the legacy socket injected, mirroring `detect_supervision_with`
+/// so tests never poke the real `$TMPDIR/dira.sock` on a dogfooding machine.
+///
+/// The order is load-bearing and reproduces what `status_with` did: `DaemonInfo`
+/// first (only it carries the degradation), then `Ping` (a daemon too old for
+/// `DaemonInfo` still answers it, so a partial update must not be called down),
+/// and only then the legacy socket — probing that eagerly would make every
+/// healthy `dira version` stat `$TMPDIR`.
+pub(crate) async fn probe_with(config: &Config, legacy_sock: &Path) -> DaemonProbe {
+    match client::send(&config.socket_path, &Request::DaemonInfo).await {
+        Ok(Response::DaemonInfo {
+            version,
+            schema_version,
+            pid,
+            uptime_seconds,
+            http_ingress_error,
+            control_channel_warning,
+            db_path,
+            storage_warning,
+        }) => {
+            return DaemonProbe {
+                reach: client::Reach::Up,
+                info: Some(Info {
+                    version,
+                    schema_version,
+                    pid,
+                    uptime_seconds,
+                    http_ingress_error,
+                    control_channel_warning,
+                    db_path,
+                    storage_warning,
+                }),
+                answered_ping: true,
+                unexpected: false,
+                legacy: None,
+            };
+        }
+        // The daemon answered, just not with what we asked for. It is up.
+        Ok(_) => {
+            return DaemonProbe {
+                reach: client::Reach::Up,
+                info: None,
+                answered_ping: true,
+                unexpected: true,
+                legacy: None,
+            };
+        }
+        Err(_) => {}
+    }
+
+    // `DaemonInfo` did not get through. The legacy socket is probed from here
+    // on regardless of `Ping`, because `dira version`'s not-running line needs
+    // the hint and the healthy path (`info: Some`) already returned above.
+    let legacy = legacy_daemon_socket(config, legacy_sock).await;
+
+    if is_up(config).await {
+        return DaemonProbe {
+            reach: client::Reach::Up,
+            info: None,
+            answered_ping: true,
+            unexpected: false,
+            legacy,
+        };
+    }
+
+    DaemonProbe {
+        reach: reach(config).await,
+        info: None,
+        answered_ping: false,
+        unexpected: false,
+        legacy,
+    }
+}
+
+/// The CLI/daemon skew warning, or `None` when they match. Pure so the wording
+/// is testable without a live daemon.
+pub(crate) fn version_skew_line(cli: &str, daemon: &str) -> Option<String> {
+    (cli != daemon).then(|| {
+        format!(
+            "warning: CLI ({cli}) and daemon ({daemon}) differ — restart the daemon \
+             (`dira daemon stop && dira daemon start`) so they match"
+        )
+    })
+}
+
+/// The human label for a supervision state, or `None` when there is nothing to
+/// say. Pure so `dira daemon status` and `dira doctor` speak with one voice.
+pub(crate) fn supervision_label(s: &Supervision) -> Option<String> {
+    Some(match s {
+        Supervision::Launchd => "launchd".to_string(),
+        Supervision::SystemdUser => "systemd --user".to_string(),
+        Supervision::ScheduledTask => "scheduled task".to_string(),
+        Supervision::Pidfile(pid) => format!("pidfile (pid {pid})"),
+        Supervision::Socket(pid) => format!("unmanaged (pid {pid}, no pidfile)"),
+        Supervision::LegacySocket { pid, sock } => format!(
+            "pre-upgrade daemon on legacy socket {} (pid {})",
+            sock.display(),
+            pid.map_or("unknown".into(), |p| p.to_string())
+        ),
+        Supervision::NotRunning => return None,
+    })
+}
+
 /// `true` iff a daemon is running somewhere — healthy, degraded, or still
 /// answering on the legacy socket. install.sh (and any other scripted
 /// caller) keys a restart-after-upgrade decision off this exit code, so
@@ -464,32 +635,9 @@ pub async fn status(config: &Config) -> Result<bool> {
 }
 
 async fn status_with(config: &Config, legacy_sock: &Path) -> Result<bool> {
-    // `DaemonInfo` rather than `Ping`, because only it carries the degradation.
-    // A daemon too old to answer it still answers `Ping`, so fall back rather
-    // than calling a live daemon down during a partial update.
-    let ingress_error = match client::send(&config.socket_path, &Request::DaemonInfo).await {
-        Ok(Response::DaemonInfo {
-            http_ingress_error, ..
-        }) => Some(http_ingress_error),
-        _ => None,
-    };
-
-    match ingress_error {
-        Some(err) => {
-            println!("{}", up_message(&config.socket_path, err.as_deref()));
-            Ok(true)
-        }
-        None if is_up(config).await => {
-            println!("{}", up_message(&config.socket_path, None));
-            Ok(true)
-        }
-        None => {
-            let legacy = legacy_daemon_socket(config, legacy_sock).await;
-            let running = legacy.is_some();
-            println!("{}", down_message(legacy.as_deref()));
-            Ok(running)
-        }
-    }
+    let probe = probe_with(config, legacy_sock).await;
+    println!("{}", probe.status_line(&config.socket_path));
+    Ok(probe.running())
 }
 
 /// Write and load an OS service so the daemon survives reboots.
@@ -1289,6 +1437,111 @@ async fn restart_with(
     }
 
     wait_up_and_report(config).await
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    fn info(version: &str) -> Info {
+        Info {
+            version: version.to_string(),
+            schema_version: "3".into(),
+            pid: 1,
+            uptime_seconds: 0,
+            http_ingress_error: None,
+            control_channel_warning: None,
+            db_path: None,
+            storage_warning: None,
+        }
+    }
+
+    fn probe_of(info: Option<Info>, answered_ping: bool, legacy: Option<PathBuf>) -> DaemonProbe {
+        DaemonProbe {
+            reach: if answered_ping {
+                client::Reach::Up
+            } else {
+                client::Reach::Down
+            },
+            info,
+            answered_ping,
+            unexpected: false,
+            legacy,
+        }
+    }
+
+    /// install.sh keys a restart-after-upgrade decision off `dira daemon
+    /// status`'s exit code, and "legacy" must count as running (W1). This is
+    /// that contract, pinned away from the printing.
+    #[test]
+    fn running_matches_the_install_sh_contract() {
+        assert!(probe_of(Some(info("0.3.0")), true, None).running());
+        assert!(probe_of(None, true, None).running());
+        assert!(probe_of(None, false, Some(PathBuf::from("/tmp/dira.sock"))).running());
+        assert!(!probe_of(None, false, None).running());
+    }
+
+    #[test]
+    fn status_line_reports_degradation_only_from_daemon_info() {
+        let sock = Path::new("/run/dira.sock");
+        let mut degraded = info("0.3.0");
+        degraded.http_ingress_error = Some("port busy".into());
+        assert!(probe_of(Some(degraded), true, None)
+            .status_line(sock)
+            .contains("DEGRADED"));
+        // A daemon too old for `DaemonInfo` is up, not degraded.
+        assert_eq!(
+            probe_of(None, true, None).status_line(sock),
+            up_message(sock, None)
+        );
+        assert_eq!(
+            probe_of(None, false, None).status_line(sock),
+            down_message(None)
+        );
+    }
+
+    #[test]
+    fn version_skew_line_is_silent_when_they_match() {
+        assert!(version_skew_line("0.3.0", "0.3.0").is_none());
+        let line = version_skew_line("0.4.0", "0.3.0").expect("skew");
+        assert!(line.contains("0.4.0") && line.contains("0.3.0"));
+        assert!(line.contains("dira daemon stop && dira daemon start"));
+    }
+
+    #[test]
+    fn supervision_label_covers_every_variant() {
+        assert_eq!(
+            supervision_label(&Supervision::Launchd).as_deref(),
+            Some("launchd")
+        );
+        assert_eq!(
+            supervision_label(&Supervision::SystemdUser).as_deref(),
+            Some("systemd --user")
+        );
+        assert_eq!(
+            supervision_label(&Supervision::ScheduledTask).as_deref(),
+            Some("scheduled task")
+        );
+        assert_eq!(
+            supervision_label(&Supervision::Pidfile(7)).as_deref(),
+            Some("pidfile (pid 7)")
+        );
+        assert_eq!(
+            supervision_label(&Supervision::Socket(7)).as_deref(),
+            Some("unmanaged (pid 7, no pidfile)")
+        );
+        assert_eq!(
+            supervision_label(&Supervision::LegacySocket {
+                pid: None,
+                sock: PathBuf::from("/tmp/dira.sock"),
+            })
+            .as_deref(),
+            Some("pre-upgrade daemon on legacy socket /tmp/dira.sock (pid unknown)")
+        );
+        // Nothing running has nothing to say — this reproduces the early
+        // `return` `print_supervision` used to do inline.
+        assert!(supervision_label(&Supervision::NotRunning).is_none());
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ mod client;
 mod config_cmd;
 mod daemon;
 mod device;
+mod doctor;
 mod duration;
 mod format;
 mod hook_health;
@@ -374,6 +375,44 @@ Examples:
   dira version               CLI + daemon build, wire schema, uptime — and a
                              warning when the CLI and daemon builds differ")]
     Version,
+    /// Diagnose whether capture is actually working.
+    #[command(
+        long_about = "\
+Run every diagnostic dira has and say, in one place, whether agent activity is
+actually being captured: daemon reachability (including a daemon that is
+running and refusing you), hook wiring, the local store, and cloud sync.
+
+Exit codes are a contract — 0 all clear, 1 at least one warning, 2 at least
+one failure — so an install script can tell \"works, could be better\" from
+\"capture is broken\".
+
+Checks whose inputs can't be gathered report `skipped`, never a failure: one
+dead daemon should produce one red line, not five.
+
+doctor reports; it never repairs. Every remedy is a command you should run
+knowingly.",
+        after_help = "\
+Examples:
+  dira doctor                           the full report
+  dira doctor --json                    one JSON object — for scripts and bug reports
+  dira doctor --check daemon.reachable  just that check (repeatable)
+  dira doctor --verbose                 also show skipped checks and their detail"
+    )]
+    Doctor {
+        /// Machine-readable output: one JSON object on stdout, nothing else.
+        #[arg(long)]
+        json: bool,
+        /// Run only these checks (repeatable).
+        #[arg(long = "check", value_name = "ID")]
+        checks: Vec<String>,
+        /// Also show skipped checks and each check's structured detail.
+        #[arg(long, short)]
+        verbose: bool,
+        /// Run the end-to-end capture probe: inject a synthetic hook through the
+        /// command your harness config actually invokes, and verify a row lands.
+        #[arg(long)]
+        probe: bool,
+    },
     /// Update dira to the latest release (resolve, verify, atomic swap, restart).
     #[command(
         long_about = "\
@@ -681,7 +720,17 @@ async fn main() -> Result<()> {
                 ConfigAction::Path => config_cmd::path(),
             };
         }
-        Command::Hook { harness } => return forward_hook(&config, harness).await,
+        Command::Hook { harness } => {
+            let probe = hook_probe_mode();
+            let outcome = forward_hook(&config, harness, probe).await;
+            // The harness contract is unchanged: a hook always exits 0 and
+            // never writes stdout. Probe mode is the one exception, and only a
+            // process `dira doctor` spawned itself can be in it.
+            if probe && outcome == HookOutcome::Failed {
+                std::process::exit(HOOK_PROBE_FAILURE_EXIT);
+            }
+            return Ok(());
+        }
         Command::Zavet {
             action: ZavetAction::Emit,
         } => return forward_zavet_event(&config).await,
@@ -705,6 +754,31 @@ async fn main() -> Result<()> {
             hook_health::maybe_warn();
             update::notice::maybe_print(&config);
             return Ok(());
+        }
+        Command::Doctor {
+            json,
+            checks,
+            verbose,
+            probe,
+        } => {
+            let code = doctor::run(
+                &config,
+                doctor::Args {
+                    json: *json,
+                    verbose: *verbose,
+                    probe: *probe,
+                    only: checks.clone(),
+                },
+            )
+            .await;
+            // Neither of the usual trailers runs here: `hook.breadcrumb` is
+            // already a check, and in --json mode stdout must carry exactly one
+            // object. The update notice is stderr-and-TTY-gated anyway, but
+            // skipping it keeps the contract explicit.
+            if !*json {
+                update::notice::maybe_print(&config);
+            }
+            std::process::exit(code);
         }
         Command::Update {
             check,
@@ -884,6 +958,7 @@ async fn main() -> Result<()> {
         | Command::Nuke { .. }
         | Command::Completions { .. }
         | Command::Version
+        | Command::Doctor { .. }
         | Command::Update { .. } => unreachable!(),
     };
 
@@ -930,18 +1005,21 @@ const HOOK_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 async fn forward_stdin(
     config: &Config,
     label: &str,
+    probe: bool,
     wrap: impl FnOnce(serde_json::Value) -> Request,
-) -> Result<()> {
+) -> HookOutcome {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-        note_hook_failure(label, &format!("could not read the hook payload: {e}"));
-        return Ok(());
+        return note_hook_failure(
+            label,
+            probe,
+            &format!("could not read the hook payload: {e}"),
+        );
     }
     let payload: serde_json::Value = match serde_json::from_str(&buf) {
         Ok(v) => v,
         Err(e) => {
-            note_hook_failure(label, &format!("hook payload was not JSON: {e}"));
-            return Ok(());
+            return note_hook_failure(label, probe, &format!("hook payload was not JSON: {e}"))
         }
     };
     let req = wrap(payload);
@@ -954,24 +1032,71 @@ async fn forward_stdin(
         // A `Response::Error` is the daemon answering — an unknown harness or an
         // unaccounted event kind is a *semantic* non-result, not a transport
         // failure, and stays silent by design.
-        Ok(Ok(_)) => hook_health::record_success(),
-        Ok(Err(e)) => note_hook_failure(label, &e.to_string()),
-        Err(_) => note_hook_failure(label, "timed out reaching dirad"),
+        Ok(Ok(_)) => {
+            if !probe {
+                hook_health::record_success();
+            }
+            HookOutcome::Delivered
+        }
+        Ok(Err(e)) => note_hook_failure(label, probe, &e.to_string()),
+        Err(_) => note_hook_failure(label, probe, "timed out reaching dirad"),
     }
-    Ok(())
 }
 
-fn note_hook_failure(label: &str, reason: &str) {
-    hook_health::record_failure(label, reason);
+/// Whether this hook shim was spawned by `dira doctor --probe`.
+///
+/// Flips exactly two things, and nothing else about the harness contract:
+///
+/// 1. A **transport** failure exits non-zero instead of 0, so the probe can
+///    distinguish "the hook never reached the daemon" (the elevated-channel
+///    bug) from "the daemon acked it and dropped it" (a saturated queue).
+///    Those have completely different remedies and the row-landed signal alone
+///    cannot tell them apart.
+/// 2. `hook_health` is not touched at all. This is not cosmetic: without it a
+///    probe failure would write the probe's own error into the breadcrumb
+///    `dira status` reads, and — worse — a probe SUCCESS would call
+///    `record_success()` and clear a genuine failure counter the user still
+///    needs to see. A diagnostic must never overwrite the evidence.
+///
+/// Read ONCE, at the `dira hook` call site, and passed down explicitly — never
+/// consulted from inside the shared stdin plumbing. `dira zavet emit` goes
+/// through the same helper, and an ambient `DIRA_HOOK_PROBE` must not silently
+/// suppress its bookkeeping too.
+///
+/// No harness sets this; the only process that does is one `dira doctor`
+/// spawned itself with a pipe on its stdin.
+fn hook_probe_mode() -> bool {
+    std::env::var("DIRA_HOOK_PROBE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether a hook payload reached the daemon.
+#[derive(Debug, PartialEq, Eq)]
+enum HookOutcome {
+    Delivered,
+    /// A transport failure — the daemon was never reached.
+    Failed,
+}
+
+/// Exit code a probe-mode hook uses to report a transport failure.
+///
+/// Distinct from 1 (a generic error) and 2 (clap usage) so the probe can tell
+/// its own signal from an unrelated failure.
+const HOOK_PROBE_FAILURE_EXIT: i32 = 3;
+
+fn note_hook_failure(label: &str, probe: bool, reason: &str) -> HookOutcome {
+    if !probe {
+        hook_health::record_failure(label, reason);
+    }
     if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
         eprintln!("dira hook {label}: {reason}");
     }
+    HookOutcome::Failed
 }
 
 /// Forward a harness hook payload from stdin to the daemon.
-async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
+async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcome {
     let owned = harness.to_string();
-    forward_stdin(config, harness, move |payload| Request::IngestHook {
+    forward_stdin(config, harness, probe, move |payload| Request::IngestHook {
         harness: owned,
         payload,
     })
@@ -980,7 +1105,12 @@ async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
 
 /// Forward a zavet guard event from stdin to the daemon.
 async fn forward_zavet_event(config: &Config) -> Result<()> {
-    forward_stdin(config, "zavet", |payload| Request::IngestZavet { payload }).await
+    // Never probe mode: this shim is not the one `dira doctor` drives.
+    forward_stdin(config, "zavet", false, |payload| Request::IngestZavet {
+        payload,
+    })
+    .await;
+    Ok(())
 }
 
 /// Print the CLI version (and wire schema), then best-effort query the running
@@ -990,52 +1120,42 @@ async fn print_version(config: &Config) -> Result<()> {
     let cli = env!("CARGO_PKG_VERSION");
     println!("dira    {cli}  (schema {})", dira_contract::SCHEMA_VERSION);
 
-    match client::send(&config.socket_path, &Request::DaemonInfo).await {
-        Ok(Response::DaemonInfo {
-            version,
-            schema_version,
-            pid,
-            uptime_seconds,
-            http_ingress_error,
-            control_channel_warning,
-            db_path,
-            storage_warning,
-        }) => {
+    let probe = daemon::probe(config).await;
+    match &probe.info {
+        Some(info) => {
             println!(
-                "dirad   {version}  (schema {schema_version}, pid {pid}, up {})",
-                format::hms(uptime_seconds as i64)
+                "dirad   {}  (schema {}, pid {}, up {})",
+                info.version,
+                info.schema_version,
+                info.pid,
+                format::hms(info.uptime_seconds as i64)
             );
-            if let Some(reason) = http_ingress_error {
+            if let Some(reason) = &info.http_ingress_error {
                 println!("warning: daemon is DEGRADED — {reason}");
             }
             // Distinct from DEGRADED on purpose: an elevated-but-reachable daemon
             // captures fine, so it gets an advisory rather than the word reserved
             // for "captures nothing".
-            if let Some(reason) = control_channel_warning {
+            if let Some(reason) = &info.control_channel_warning {
                 println!("note: {reason}");
             }
-            if let Some(reason) = storage_warning {
+            if let Some(reason) = &info.storage_warning {
                 println!("warning: {reason}");
             }
             // Only the comparison can see this — see `store_divergence_line`.
-            if let Some(line) = daemon::store_divergence_line(&config.db_path, db_path.as_deref()) {
+            if let Some(line) =
+                daemon::store_divergence_line(&config.db_path, info.db_path.as_deref())
+            {
                 println!("{line}");
             }
-            if version != cli {
-                println!(
-                    "warning: CLI ({cli}) and daemon ({version}) differ — restart the daemon \
-                     (`dira daemon stop && dira daemon start`) so they match"
-                );
+            if let Some(line) = daemon::version_skew_line(cli, &info.version) {
+                println!("{line}");
             }
         }
-        Ok(_) => println!("dirad   (unexpected daemon response)"),
-        Err(_) => println!(
+        _ if probe.unexpected => println!("dirad   (unexpected daemon response)"),
+        _ => println!(
             "{}",
-            daemon::version_not_running_message(
-                daemon::legacy_daemon_socket_default(config)
-                    .await
-                    .as_deref()
-            )
+            daemon::version_not_running_message(probe.legacy.as_deref())
         ),
     }
     Ok(())
@@ -1046,20 +1166,10 @@ async fn print_version(config: &Config) -> Result<()> {
 /// pick a restart strategy, surfaced here so a user can tell why a bare `kill`
 /// isn't enough before reaching for `restart`.
 async fn print_supervision(config: &Config) {
-    let label = match daemon::detect_supervision(config).await {
-        daemon::Supervision::Launchd => "launchd".to_string(),
-        daemon::Supervision::SystemdUser => "systemd --user".to_string(),
-        daemon::Supervision::ScheduledTask => "scheduled task".to_string(),
-        daemon::Supervision::Pidfile(pid) => format!("pidfile (pid {pid})"),
-        daemon::Supervision::Socket(pid) => format!("unmanaged (pid {pid}, no pidfile)"),
-        daemon::Supervision::LegacySocket { pid, sock } => format!(
-            "pre-upgrade daemon on legacy socket {} (pid {})",
-            sock.display(),
-            pid.map_or("unknown".into(), |p| p.to_string())
-        ),
-        daemon::Supervision::NotRunning => return,
-    };
-    println!("supervised by: {label}");
+    let supervision = daemon::detect_supervision(config).await;
+    if let Some(label) = daemon::supervision_label(&supervision) {
+        println!("supervised by: {label}");
+    }
 }
 
 /// Wipe all local statistics via the daemon (so its live-session registry is

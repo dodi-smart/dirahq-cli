@@ -48,6 +48,52 @@ pub struct RawEvent {
     pub note: Option<String>,
 }
 
+/// Session-id prefix reserved for `dira doctor --probe`'s end-to-end capture
+/// probe.
+///
+/// Rows carrying it are invisible to every read the store serves (see the
+/// `NOT LIKE` guards in `Store`), so a probe row can never be synced, counted,
+/// rolled up, or billed — and the daemon refuses to create one at all unless
+/// it minted the id itself moments earlier.
+///
+/// Nothing outside the probe path can produce one: `dira start` mints a bare
+/// ULID and every harness session id comes from the harness.
+pub const PROBE_SESSION_PREFIX: &str = "dira-probe-";
+
+/// Is this a capture-probe session id?
+///
+/// Requires a non-empty suffix, so the bare literal `dira-probe-` — or a real
+/// session that merely starts the same way — is not mistaken for one.
+pub fn is_probe_session(session_id: &str) -> bool {
+    session_id.len() > PROBE_SESSION_PREFIX.len() && session_id.starts_with(PROBE_SESSION_PREFIX)
+}
+
+/// The SQL `LIKE` pattern matching probe session ids.
+///
+/// Bound as a parameter, never interpolated. The prefix contains no `LIKE`
+/// metacharacter (`%`/`_`), so no `ESCAPE` clause is needed. A `const` rather
+/// than a `format!` because it is bound on every filtered read; the test below
+/// keeps it from drifting from [`PROBE_SESSION_PREFIX`].
+pub const PROBE_LIKE_PATTERN: &str = "dira-probe-%";
+
+/// The synthetic Claude Code hook payload the capture probe sends.
+///
+/// Metadata only, and deliberately minimal:
+/// - `UserPromptSubmit` maps to [`EventKind::UserPrompt`], a *human signal*, so
+///   it is never coalesced (only `PostTool` is) and would survive the writer's
+///   degenerate-session pruning even without the probe's own short path.
+/// - exactly one event, so "did a row land" has an unambiguous answer.
+/// - no `transcript_path`, so the writer's token-capture path is never entered
+///   and the probe cannot touch `token_usage`.
+/// - nothing drawn from the user's machine beyond the temp dir it runs in.
+pub fn probe_hook_payload(session_id: &str, cwd: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": session_id,
+        "cwd": cwd,
+    })
+}
+
 /// What happened. Split into human signals, agent activity, and lifecycle so the
 /// accounting engine can treat them differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

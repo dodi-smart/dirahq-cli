@@ -157,7 +157,7 @@ pub fn run_grok(global: bool, print_only: bool) -> Result<()> {
 /// once embedded into a hook config — breaks both Git Bash and PowerShell
 /// (neither treats `\\?\` as an ordinary path). `dunce` strips the prefix
 /// when it's safe to and is a no-op on unix.
-fn dira_exe_path() -> String {
+pub(crate) fn dira_exe_path() -> String {
     let raw = std::env::current_exe()
         .ok()
         .and_then(|p| dunce::canonicalize(&p).ok())
@@ -204,6 +204,203 @@ fn hook_commands(harness: &str) -> (String, String) {
     let command = format!("{} hook {harness}", quote_if_needed(&exe));
     let legacy_command = format!("{exe} hook {harness}");
     (command, legacy_command)
+}
+
+/// Does this hook group already invoke our command, in either form?
+///
+/// The single source of truth for "is dira wired here", shared by `dira init`'s
+/// idempotency check and `dira doctor`'s reader — they cannot disagree about
+/// what a wired entry looks like if they ask the same function.
+fn group_has_command(group: &Value, command: &str, legacy_command: &str) -> bool {
+    group
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|hs| {
+            hs.iter().any(|h| {
+                matches!(
+                    h.get("command").and_then(|c| c.as_str()),
+                    Some(c) if c == command || c == legacy_command
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Does this command string invoke *some* `dira hook <harness>`, whatever
+/// binary it names?
+///
+/// This — not an exact string match — is the right question for "are hooks
+/// wired". The path in a working config is routinely not this process's path:
+/// the user may be running a dev build, a different install prefix, or a
+/// command with a shell variable in it (`$HOME/.local/bin/dira hook claude`,
+/// which the harness expands and we cannot). Whether the configured binary is
+/// the right one is a separate question, and `hooks.exe_path` answers it.
+/// Matched on the command's *suffix* rather than by parsing out the executable
+/// first. The pre-upgrade unquoted form can itself contain spaces
+/// (`/Users/John Doe/bin/dira hook claude`), so splitting on whitespace
+/// mis-reads exactly the configs that most need recognising. Requiring a
+/// non-empty prefix keeps a bare `hook claude` from matching, and anchoring
+/// the end keeps `dira hook claude --dry-run` from doing so either.
+pub(crate) fn command_invokes_hook(command: &str, harness: &str) -> bool {
+    let command = command.trim();
+    let suffix = format!(" hook {harness}");
+    command.ends_with(&suffix) && command.len() > suffix.len()
+}
+
+/// Is `event` wired to a dira hook for `harness` in this settings tree?
+///
+/// Handles both shapes we write, because they cannot be confused with each
+/// other: a nested group (Claude/Gemini/Grok) carries its commands one level
+/// down under `hooks`, and a Cursor entry carries `command` directly. Accepting
+/// either means the caller never has to know which shape it is looking at.
+///
+/// Deliberately tolerant: a missing `hooks` object or a non-array
+/// `hooks.<Event>` reads as "not wired", never as an error. A diagnostic that
+/// refuses to run on a hand-edited config is a diagnostic nobody can use.
+fn event_is_wired(settings: &Value, event: &str, harness: &str) -> bool {
+    let invokes = |v: &Value| {
+        v.get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| command_invokes_hook(c, harness))
+    };
+    settings
+        .get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|a| a.as_array())
+        .is_some_and(|entries| {
+            entries.iter().any(|e| {
+                invokes(e)
+                    || e.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .is_some_and(|inner| inner.iter().any(invokes))
+            })
+        })
+}
+
+/// Which of `events` have no dira entry for `harness`. Empty ⇒ fully wired.
+pub(crate) fn missing_hooks(settings: &Value, events: &[&str], harness: &str) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| !event_is_wired(settings, e, harness))
+        .map(|e| (*e).to_string())
+        .collect()
+}
+
+/// Every dira-looking hook command string in a settings tree — including ones
+/// pointing at a *different* binary, which is exactly what the "did you move or
+/// reinstall dira" check needs and what a wired/not-wired predicate cannot see.
+///
+/// Walks both shapes: nested groups (`hooks.<Event>[].hooks[].command`) and
+/// Cursor's flat entries (`hooks.<event>[].command`).
+pub(crate) fn dira_hook_commands(settings: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(events) = settings.get("hooks").and_then(|h| h.as_object()) else {
+        return out;
+    };
+    let mut push = |v: &Value| {
+        if let Some(c) = v.get("command").and_then(|c| c.as_str()) {
+            if c.contains(" hook ") && !out.iter().any(|s: &String| s == c) {
+                out.push(c.to_string());
+            }
+        }
+    };
+    for entries in events.values().filter_map(|e| e.as_array()) {
+        for entry in entries {
+            // Cursor's flat form: the command sits on the entry itself.
+            push(entry);
+            // Nested form: one level deeper, under the group's `hooks`.
+            for inner in entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .into_iter()
+                .flatten()
+            {
+                push(inner);
+            }
+        }
+    }
+    out
+}
+
+/// Split the executable back out of a configured hook command string — the
+/// inverse of [`quote_if_needed`].
+///
+/// Honours a leading double quote (a path with whitespace, the form `init`
+/// writes today), otherwise splits on the first whitespace (the pre-upgrade
+/// unquoted form). `None` for an empty or quote-only string.
+pub(crate) fn hook_command_exe(command: &str) -> Option<String> {
+    let command = command.trim();
+    let exe = match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or_default(),
+        None => command.split_whitespace().next().unwrap_or_default(),
+    };
+    (!exe.is_empty()).then(|| exe.to_string())
+}
+
+/// A harness config file `dira doctor` inspects, and the events it should carry.
+pub(crate) struct HarnessConfig {
+    pub harness: &'static str,
+    pub scope: &'static str,
+    pub path: PathBuf,
+    /// Event names only. The writer additionally needs to know which take a
+    /// matcher; a reader only has to know what should be present.
+    pub events: Vec<&'static str>,
+}
+
+/// Every harness config `dira init` can write: `(harness, relative path, event
+/// names, project-scoped)`.
+///
+/// Codex is absent on purpose — `dira init codex` only prints a TOML snippet
+/// for the user to paste, so there is no file we own and nothing to verify.
+/// Grok is user-level only, matching `run_grok`.
+type HarnessRow = (&'static str, &'static str, fn() -> Vec<&'static str>, bool);
+const HARNESS_CONFIGS: &[HarnessRow] = &[
+    ("claude", ".claude/settings.json", claude_events, true),
+    ("gemini", ".gemini/settings.json", gemini_events, true),
+    ("cursor", ".cursor/hooks.json", cursor_events, true),
+    ("grok", ".grok/hooks/dira.json", grok_events, false),
+];
+
+fn claude_events() -> Vec<&'static str> {
+    CLAUDE_EVENTS.iter().map(|(e, _)| *e).collect()
+}
+fn gemini_events() -> Vec<&'static str> {
+    GEMINI_EVENTS.iter().map(|(e, _)| *e).collect()
+}
+fn cursor_events() -> Vec<&'static str> {
+    CURSOR_EVENTS.to_vec()
+}
+fn grok_events() -> Vec<&'static str> {
+    GROK_EVENTS.iter().map(|(e, _)| *e).collect()
+}
+
+/// Every harness config to inspect, **project scope first** — that is Claude
+/// Code's own precedence, so the first match for a harness is the entry that
+/// would actually run.
+pub(crate) fn harness_config_paths() -> Vec<HarnessConfig> {
+    let home = dira_core::config::home_dir();
+    let mut out = Vec::new();
+    for (harness, rel, events, project_scoped) in HARNESS_CONFIGS {
+        if *project_scoped {
+            out.push(HarnessConfig {
+                harness,
+                scope: "project",
+                path: PathBuf::from(rel),
+                events: events(),
+            });
+        }
+    }
+    if let Ok(home) = &home {
+        for (harness, rel, events, _) in HARNESS_CONFIGS {
+            out.push(HarnessConfig {
+                harness,
+                scope: "global",
+                path: home.join(rel),
+                events: events(),
+            });
+        }
+    }
+    out
 }
 
 /// Load a JSON settings file (or start empty), let `inject` merge our hooks in,
@@ -362,20 +559,9 @@ fn inject_nested_hooks(
             None => continue,
         };
 
-        let already = arr.iter().any(|group| {
-            group
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|hs| {
-                    hs.iter().any(|h| {
-                        matches!(
-                            h.get("command").and_then(|c| c.as_str()),
-                            Some(c) if c == command || c == legacy_command
-                        )
-                    })
-                })
-                .unwrap_or(false)
-        });
+        let already = arr
+            .iter()
+            .any(|group| group_has_command(group, command, legacy_command));
         if already {
             continue;
         }
@@ -419,6 +605,194 @@ fn inject_cursor_hooks(settings: &mut Value, command: &str, legacy_command: &str
             continue;
         }
         arr.push(json!({ "command": command }));
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    const CMD: &str = "\"/Users/John Doe/.local/bin/dira\" hook claude";
+    const LEGACY: &str = "/Users/John Doe/.local/bin/dira hook claude";
+
+    /// The anti-drift test: whatever the writer injects, the reader must
+    /// recognise. Without it the two halves are free to disagree and `doctor`
+    /// reports a correctly-wired machine as broken.
+    #[test]
+    fn the_reader_recognises_everything_the_writer_injects() {
+        let mut s = json!({});
+        inject_nested_hooks(&mut s, CMD, LEGACY, CLAUDE_EVENTS, "*");
+        assert!(missing_hooks(&s, &claude_events(), "claude").is_empty());
+
+        let cursor_cmd = "\"/Users/John Doe/.local/bin/dira\" hook cursor";
+        let mut c = json!({});
+        inject_cursor_hooks(&mut c, cursor_cmd, cursor_cmd);
+        assert!(missing_hooks(&c, CURSOR_EVENTS, "cursor").is_empty());
+    }
+
+    /// The wiring question is "does a dira hook entry exist", NOT "does it
+    /// name this exact binary". A correctly-wired machine reads as unwired
+    /// otherwise, every time doctor runs from a different path than the config
+    /// records — a dev build, a different install prefix, or a command with an
+    /// unexpanded `$HOME` in it. Binary identity is `hooks.exe_path`'s job.
+    #[test]
+    fn wiring_is_recognised_whatever_binary_the_command_names() {
+        for cmd in [
+            "$HOME/.local/bin/dira hook claude",
+            "/opt/homebrew/bin/dira hook claude",
+            "~/bin/dira hook claude",
+            "\"C:/Program Files/dira/dira.exe\" hook claude",
+            "dira hook claude",
+        ] {
+            let mut s = json!({});
+            inject_nested_hooks(&mut s, cmd, cmd, CLAUDE_EVENTS, "*");
+            assert!(
+                missing_hooks(&s, &claude_events(), "claude").is_empty(),
+                "{cmd} should read as wired"
+            );
+        }
+    }
+
+    /// ...and it must not confuse one harness's hooks for another's.
+    #[test]
+    fn a_hook_for_another_harness_is_not_this_harness_wiring() {
+        let mut s = json!({});
+        inject_nested_hooks(&mut s, "/bin/dira hook gemini", "x", CLAUDE_EVENTS, "*");
+        assert_eq!(
+            missing_hooks(&s, &claude_events(), "claude").len(),
+            CLAUDE_EVENTS.len()
+        );
+        assert!(command_invokes_hook("/bin/dira hook gemini", "gemini"));
+        // A command that merely starts the same way is not a hook entry.
+        assert!(!command_invokes_hook(
+            "/bin/dira hook claude --dry-run",
+            "claude"
+        ));
+        assert!(!command_invokes_hook("/bin/dira status", "claude"));
+    }
+
+    /// Project scope before global, per harness — Claude Code's own precedence,
+    /// so the first match is the entry that would actually run. The capture
+    /// probe drives that entry, so the ordering is load-bearing, not cosmetic.
+    #[test]
+    fn harness_config_paths_put_project_scope_first() {
+        let paths = harness_config_paths();
+        let claude: Vec<&str> = paths
+            .iter()
+            .filter(|h| h.harness == "claude")
+            .map(|h| h.scope)
+            .collect();
+        assert_eq!(claude.first(), Some(&"project"));
+        assert!(
+            claude.contains(&"global"),
+            "global scope must be inspected too"
+        );
+        // Grok has no trusted project scope (see `run_grok`), so it is global only.
+        assert!(paths
+            .iter()
+            .filter(|h| h.harness == "grok")
+            .all(|h| h.scope == "global"));
+        // Every entry carries the events its harness should have wired.
+        assert!(paths.iter().all(|h| !h.events.is_empty()));
+    }
+
+    /// A pre-upgrade `init` wrote the unquoted form; it is still wired.
+    #[test]
+    fn legacy_unquoted_entries_are_recognised() {
+        let mut s = json!({});
+        inject_nested_hooks(&mut s, LEGACY, LEGACY, CLAUDE_EVENTS, "*");
+        assert!(missing_hooks(&s, &claude_events(), "claude").is_empty());
+    }
+
+    #[test]
+    fn a_partially_wired_config_names_only_the_missing_events() {
+        let mut s = json!({});
+        inject_nested_hooks(&mut s, CMD, LEGACY, &CLAUDE_EVENTS[..2], "*");
+        let missing = missing_hooks(&s, &claude_events(), "claude");
+        assert_eq!(missing.len(), CLAUDE_EVENTS.len() - 2);
+        assert!(!missing.contains(&"SessionStart".to_string()));
+        assert!(missing.contains(&"PostToolUse".to_string()));
+    }
+
+    /// A hand-edited config must read as "not wired", never blow up.
+    #[test]
+    fn malformed_settings_read_as_not_wired() {
+        for s in [
+            json!({}),
+            json!({ "hooks": "nonsense" }),
+            json!({ "hooks": { "SessionStart": 7 } }),
+            json!({ "hooks": { "SessionStart": [ { "matcher": "*" } ] } }),
+        ] {
+            let missing = missing_hooks(&s, &claude_events(), "claude");
+            assert_eq!(missing.len(), CLAUDE_EVENTS.len());
+            assert!(dira_hook_commands(&s).is_empty());
+        }
+    }
+
+    /// `dira_hook_commands` must surface entries pointing at a *different*
+    /// binary — that is the moved/reinstalled-dira case, which the wired
+    /// predicate is blind to by construction.
+    #[test]
+    fn hook_commands_surface_a_stale_binary_and_both_config_shapes() {
+        let mut nested = json!({});
+        inject_nested_hooks(
+            &mut nested,
+            "/old/path/dira hook claude",
+            "x",
+            CLAUDE_EVENTS,
+            "*",
+        );
+        assert_eq!(
+            dira_hook_commands(&nested),
+            vec!["/old/path/dira hook claude"]
+        );
+
+        let cursor_cmd = "\"/Users/John Doe/.local/bin/dira\" hook cursor";
+        let mut cursor = json!({});
+        inject_cursor_hooks(&mut cursor, cursor_cmd, cursor_cmd);
+        assert_eq!(dira_hook_commands(&cursor), vec![cursor_cmd]);
+
+        // A non-dira hook someone else installed is not ours to report on.
+        let foreign =
+            json!({ "hooks": { "Stop": [ { "hooks": [ { "command": "make lint" } ] } ] } });
+        assert!(dira_hook_commands(&foreign).is_empty());
+    }
+
+    #[test]
+    fn hook_command_exe_inverts_quote_if_needed() {
+        assert_eq!(
+            hook_command_exe(CMD).as_deref(),
+            Some("/Users/John Doe/.local/bin/dira")
+        );
+        assert_eq!(
+            hook_command_exe("/usr/local/bin/dira hook claude").as_deref(),
+            Some("/usr/local/bin/dira")
+        );
+        assert_eq!(
+            hook_command_exe("dira hook claude").as_deref(),
+            Some("dira")
+        );
+        // Windows: `init` writes forward slashes (see `normalize_exe_path`).
+        assert_eq!(
+            hook_command_exe("\"C:/Program Files/dira/dira.exe\" hook claude").as_deref(),
+            Some("C:/Program Files/dira/dira.exe")
+        );
+        assert!(hook_command_exe("").is_none());
+        assert!(hook_command_exe("\"").is_none());
+    }
+
+    /// Round-trip through the real quoting helper, so a change to
+    /// `quote_if_needed` cannot silently break the reader.
+    #[test]
+    fn quote_then_split_round_trips_for_paths_with_spaces() {
+        for path in [
+            "/tmp/dira",
+            "/Users/John Doe/bin/dira",
+            "C:/Program Files/dira.exe",
+        ] {
+            let command = format!("{} hook claude", quote_if_needed(path));
+            assert_eq!(hook_command_exe(&command).as_deref(), Some(path));
+        }
     }
 }
 

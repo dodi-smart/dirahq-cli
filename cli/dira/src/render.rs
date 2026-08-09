@@ -190,6 +190,13 @@ pub fn print(resp: &Response) -> bool {
             }
             true
         }
+        // The capture probe never routes through the generic printer — it is
+        // driven directly by `doctor::capture`, which renders it as a check.
+        // Reaching here means a request was built somewhere else by mistake.
+        Response::CaptureProbe(_) => {
+            eprintln!("unexpected capture-probe response outside `dira doctor --probe`");
+            false
+        }
     }
 }
 

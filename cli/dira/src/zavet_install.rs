@@ -669,6 +669,96 @@ fn skew_line(runner: &dyn Runner, install_path: &str, dira_version: &str) -> Str
     }
 }
 
+// ---------------------------------------------------------------------------
+// Post-update plugin refresh — machine scope only
+// ---------------------------------------------------------------------------
+
+/// The outcome of [`refresh_plugin_with`].
+#[derive(Debug)]
+pub(crate) enum PluginRefresh {
+    /// `claude` isn't on `PATH`, or detection came back `NotInstalled`/`Unknown`
+    /// — nothing was run. **Never installs**: `dira update` refreshing an
+    /// already-installed plugin is one thing, it *installing* zavet on behalf
+    /// of a user who never asked for it is another, and this variant is the
+    /// guard that pins the line between them.
+    Skipped,
+    /// The marketplace + plugin update commands both succeeded; `from`/`to`
+    /// are the versions detected before and after.
+    Refreshed { from: String, to: String },
+    /// One of the `claude` commands failed, or re-detection afterward was
+    /// inconclusive. The reason is deliberately not surfaced to the user —
+    /// `dira update` has already succeeded by the time this runs, so the
+    /// fixed recovery line (`run `dira zavet install --update``) is all that
+    /// matters; kept here only so tests can assert on which branch fired.
+    #[allow(dead_code)]
+    Failed(String),
+}
+
+/// Machine scope only. Refreshes an already-installed zavet plugin after a
+/// successful `dira update`. Touches NO repo — no adapters, no git hooks, no
+/// cwd resolution — and never errors: `dira update` has already succeeded by
+/// the time this runs, so a plugin problem is a printed line, not an exit
+/// code.
+pub fn refresh_plugin_after_update() -> Option<String> {
+    let claude_present = resolve_claude_on_path().is_some();
+    let home = home_dir().ok()?;
+    match refresh_plugin_with(&SystemRunner, &home, claude_present) {
+        PluginRefresh::Skipped => None,
+        PluginRefresh::Refreshed { from, to } if from == to => {
+            Some(format!("zavet plugin: already current ({to})"))
+        }
+        PluginRefresh::Refreshed { from, to } => Some(format!(
+            "zavet plugin: refreshed {from} -> {to} (restart Claude Code to apply)"
+        )),
+        PluginRefresh::Failed(_) => {
+            Some("zavet plugin: refresh failed — run `dira zavet install --update`".to_string())
+        }
+    }
+}
+
+/// The testable core of [`refresh_plugin_after_update`]. Reuses [`detect`]
+/// (to decide whether there is anything to refresh, and to learn the
+/// installed scope) and [`run_or_print`] (real-run only — this is never
+/// invoked with `dry_run: true`) rather than reimplementing either.
+fn refresh_plugin_with(runner: &dyn Runner, home: &Path, claude_present: bool) -> PluginRefresh {
+    if !claude_present {
+        return PluginRefresh::Skipped;
+    }
+
+    let before = match detect(runner, home) {
+        Detection::Installed(info) => info,
+        Detection::NotInstalled | Detection::Unknown => return PluginRefresh::Skipped,
+    };
+    let from = before.version.clone();
+
+    if let Err(e) = run_or_print(
+        runner,
+        false,
+        "claude",
+        &["plugin", "marketplace", "update", MARKETPLACE_NAME],
+    ) {
+        return PluginRefresh::Failed(e.to_string());
+    }
+    if let Err(e) = run_or_print(
+        runner,
+        false,
+        "claude",
+        &["plugin", "update", PLUGIN_ID, "--scope", &before.scope],
+    ) {
+        return PluginRefresh::Failed(e.to_string());
+    }
+
+    match detect(runner, home) {
+        Detection::Installed(info) => PluginRefresh::Refreshed {
+            from,
+            to: info.version,
+        },
+        _ => PluginRefresh::Failed(
+            "re-detection after the plugin refresh was inconclusive".to_string(),
+        ),
+    }
+}
+
 /// Shared test double for [`Runner`], used by both this module's tests and
 /// `zavet_adapters`'s — split out so the two modules' tests script the exact
 /// same `(dir, prog, args) -> (exit_code, stdout, stderr)` contract instead
@@ -792,6 +882,145 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use test_support::FakeRunner;
+
+    // -- refresh_plugin_after_update (Packet D2, machine scope only) -----------
+
+    fn plugin_list_json(version: &str, scope: &str) -> String {
+        format!(
+            r#"[{{"id":"zavet@dirahq","version":"{version}","scope":"{scope}","enabled":true,"installPath":"/y"}}]"#
+        )
+    }
+
+    /// An update must never INSTALL a plugin the user never asked for. When
+    /// `claude plugin list --json` reports zavet absent, `refresh_plugin_with`
+    /// must be a pure no-op: no `plugin update` (nor `marketplace update`, nor
+    /// `plugin install`) may appear in the call log.
+    #[test]
+    fn refresh_plugin_after_update_is_noop_when_plugin_absent() {
+        let home = temp_home("refresh-absent");
+        let runner =
+            FakeRunner::default().returning("claude", &["plugin", "list", "--json"], 0, "[]");
+        let got = refresh_plugin_with(&runner, &home, true);
+        assert!(matches!(got, PluginRefresh::Skipped), "{got:?}");
+        assert!(
+            !runner
+                .call_log()
+                .iter()
+                .any(|(_, _, a)| a.contains(&"update".to_string())
+                    || a.contains(&"install".to_string())),
+            "no install/update call may be attempted when the plugin isn't present: {:?}",
+            runner.call_log()
+        );
+    }
+
+    /// Machine-scope-only guard: with the plugin present, the call log must
+    /// contain no entry whose args mention `adapters` or `hooks` — this
+    /// module's post-update refresh touches no repo at all.
+    #[test]
+    fn refresh_plugin_after_update_never_touches_a_repo() {
+        let home = temp_home("refresh-no-repo");
+        let runner = FakeRunner::default()
+            .returning(
+                "claude",
+                &["plugin", "list", "--json"],
+                0,
+                &plugin_list_json("1.2.0", "user"),
+            )
+            .returning(
+                "claude",
+                &["plugin", "marketplace", "update", MARKETPLACE_NAME],
+                0,
+                "",
+            )
+            .returning(
+                "claude",
+                &["plugin", "update", PLUGIN_ID, "--scope", "user"],
+                0,
+                "",
+            );
+        let got = refresh_plugin_with(&runner, &home, true);
+        assert!(matches!(got, PluginRefresh::Refreshed { .. }), "{got:?}");
+        assert!(
+            !runner.call_log().iter().any(|(_, _, a)| a
+                .iter()
+                .any(|s| s.contains("adapters") || s.contains("hooks"))),
+            "no repo-scope call may appear in the log: {:?}",
+            runner.call_log()
+        );
+    }
+
+    /// Call order: `marketplace update dirahq` must run before
+    /// `plugin update zavet@dirahq --scope <detected scope>`.
+    #[test]
+    fn refresh_plugin_after_update_runs_marketplace_and_plugin_update() {
+        let home = temp_home("refresh-order");
+        let runner = FakeRunner::default()
+            .returning(
+                "claude",
+                &["plugin", "list", "--json"],
+                0,
+                &plugin_list_json("1.2.0", "local"),
+            )
+            .returning(
+                "claude",
+                &["plugin", "marketplace", "update", MARKETPLACE_NAME],
+                0,
+                "",
+            )
+            .returning(
+                "claude",
+                &["plugin", "update", PLUGIN_ID, "--scope", "local"],
+                0,
+                "",
+            );
+        let got = refresh_plugin_with(&runner, &home, true);
+        assert!(matches!(got, PluginRefresh::Refreshed { .. }), "{got:?}");
+
+        let log = runner.call_log();
+        let marketplace_pos = log
+            .iter()
+            .position(|(_, prog, a)| {
+                prog == "claude"
+                    && a == &vec![
+                        "plugin".to_string(),
+                        "marketplace".to_string(),
+                        "update".to_string(),
+                        MARKETPLACE_NAME.to_string(),
+                    ]
+            })
+            .expect("marketplace update must have run");
+        let plugin_update_pos = log
+            .iter()
+            .position(|(_, prog, a)| {
+                prog == "claude"
+                    && a == &vec![
+                        "plugin".to_string(),
+                        "update".to_string(),
+                        PLUGIN_ID.to_string(),
+                        "--scope".to_string(),
+                        "local".to_string(),
+                    ]
+            })
+            .expect("plugin update must have run");
+        assert!(
+            marketplace_pos < plugin_update_pos,
+            "marketplace update must run before plugin update: {log:?}"
+        );
+    }
+
+    /// Not on `PATH` at all: skip before any detection is even attempted.
+    #[test]
+    fn refresh_plugin_after_update_noop_when_claude_absent() {
+        let home = temp_home("refresh-no-claude");
+        let runner = FakeRunner::default();
+        let got = refresh_plugin_with(&runner, &home, false);
+        assert!(matches!(got, PluginRefresh::Skipped), "{got:?}");
+        assert!(
+            runner.call_log().is_empty(),
+            "no detection call may be attempted when claude isn't on PATH: {:?}",
+            runner.call_log()
+        );
+    }
 
     /// Run a git command in `dir`, panicking on failure — test setup only,
     /// so `repo_gate` (via `dira_core::project::toplevel`) resolves a real

@@ -79,6 +79,8 @@ pub struct UpdateArgs {
     /// Install directory for the new binaries (default: alongside the
     /// running `dira`). Also settable via `DIRA_BIN_DIR`.
     pub bin_dir: Option<PathBuf>,
+    /// Do not refresh the zavet Claude Code plugin after updating dira.
+    pub no_zavet: bool,
 }
 
 /// An RAII scratch directory for the download/extract workspace, under
@@ -205,6 +207,16 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
                 "dira + dirad updated to {} and the daemon restarted",
                 resolved.version
             );
+            // Only after a genuinely successful swap-and-restart: a rolled-back
+            // machine (the `Err` arm below) must never come out of this with a
+            // bumped plugin, and `--no-restart`/`--check` never reach this arm
+            // at all (see `zavet_install::refresh_plugin_after_update`'s doc —
+            // machine scope only, no repo writes, never errors).
+            if !args.no_zavet {
+                if let Some(line) = crate::zavet_install::refresh_plugin_after_update() {
+                    println!("{line}");
+                }
+            }
             Ok(())
         }
         Err(e) => {

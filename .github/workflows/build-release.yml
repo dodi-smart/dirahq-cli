@@ -251,6 +251,11 @@ jobs:
         run: |
           gh release upload "${{ needs.resolve.outputs.tag }}" \
             contract/attestation.schema.json \
+            contract/presence.schema.json \
+            contract/rotate-key.schema.json \
+            contract/billing-summary.schema.json \
+            contract/knowledge.schema.json \
+            contract/responses.schema.json \
             contract/testdata/signing-vector.json \
             install.sh \
             install.ps1 \

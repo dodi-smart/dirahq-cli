@@ -821,6 +821,35 @@ pub struct KnowledgeAck {
     pub schema_version: String,
 }
 
+/// Emit-only root gathering every RESPONSE shape the cloud produces.
+///
+/// schemars walks from a root type, and every other root here is a *request*
+/// envelope — so a response type, which nothing requests, is reachable from no
+/// root and never gets a schema emitted. The cloud then hand-authors its
+/// counterpart with nothing to compare it against: exactly the gap that let the
+/// `grok` harness variant sit missing from the cloud's enum through several
+/// releases of green CI.
+///
+/// One root rather than four files because the four share a lifecycle and the
+/// consumer's vendor list is hardcoded in three places per artifact.
+///
+/// Never constructed, on either side. It exists so `emit-schema` has something
+/// to walk; the emitted `$defs` are what the cloud generates its types from.
+/// Content-free like every other type here (D-0001) — these are acks and error
+/// codes, and nothing prose-bearing may be added to any of them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ContractResponses {
+    /// `POST /api/v1/ingest`, on a 4xx.
+    pub ingest_error: IngestError,
+    /// `POST /api/v1/presence`, on a 2xx.
+    pub presence_ack: PresenceAck,
+    /// `POST /api/v1/knowledge`, on a 2xx.
+    pub knowledge_ack: KnowledgeAck,
+    /// `GET /api/v1/meta`.
+    pub server_meta: ServerMeta,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,6 +965,21 @@ mod tests {
         let back: ServerMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.schema_version, "1.2.0");
         assert_eq!(back.min_schema_version, "1.0.0");
+    }
+
+    // The emit root is only useful if it stays complete: a fifth response type
+    // added without a field here would be reachable from no root, get no
+    // schema, and leave the cloud hand-authoring it again — the exact gap
+    // `ContractResponses` was introduced to close, reopened silently.
+    #[test]
+    fn responses_schema_covers_every_response_type() {
+        let schema = serde_json::to_string(&schemars::schema_for!(ContractResponses)).unwrap();
+        for name in ["IngestError", "PresenceAck", "KnowledgeAck", "ServerMeta"] {
+            assert!(
+                schema.contains(&format!("\"{name}\"")),
+                "{name} is missing from responses.schema.json — add it to ContractResponses"
+            );
+        }
     }
 
     // Content-bearing terms that must never name a wire field. Matched against

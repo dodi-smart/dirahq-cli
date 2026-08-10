@@ -1,3 +1,29 @@
+## [0.4.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.3.0...v0.4.0) (2026-08-10)
+
+### ✨ Features
+
+* **cli:** add dira doctor — diagnose whether capture is actually working ([13c62b8](https://github.com/dodi-smart/dirahq-cli/commit/13c62b8debb5a95433338f80c54ebbf3a2d5e764)), closes [#76](https://github.com/dodi-smart/dirahq-cli/issues/76)
+* **cli:** carry the zavet plugin along on dira update ([cdbf2ed](https://github.com/dodi-smart/dirahq-cli/commit/cdbf2edacfb04796a08ccfea3b40c95815fcccc2)), closes [#98](https://github.com/dodi-smart/dirahq-cli/issues/98)
+* **cli:** refresh a repo's zavet adapters from dira zavet install ([9b3f201](https://github.com/dodi-smart/dirahq-cli/commit/9b3f201569110d78778ced8aa19cc9ee3a1f23de)), closes [#98](https://github.com/dodi-smart/dirahq-cli/issues/98)
+* **contract:** emit the response-only wire types ([ed99bd7](https://github.com/dodi-smart/dirahq-cli/commit/ed99bd79b8aedc9616f9d3e7901051acea5d5e75))
+
+### 🐛 Bug Fixes
+
+* **cli:** report the token backlog and disclose what device resync --from rewinds ([d26d3f6](https://github.com/dodi-smart/dirahq-cli/commit/d26d3f68b202917090518092c0ce91306ad187f9)), closes [#94](https://github.com/dodi-smart/dirahq-cli/issues/94)
+* **cli:** report unreadable ingest and knowledge bodies instead of defaulting ([ad78a8d](https://github.com/dodi-smart/dirahq-cli/commit/ad78a8dcad3a367d03bb5f75ed22c2272f3a9ae9)), closes [#104](https://github.com/dodi-smart/dirahq-cli/issues/104)
+* **cli:** resolve keychain entries through keyring-core, not the v1 wrapper ([4cd6639](https://github.com/dodi-smart/dirahq-cli/commit/4cd6639826c92ab0f2bef48b54b82ae3bd9f4fb2))
+* **contract:** cover non-ascii in the cross-language signing vector ([6431651](https://github.com/dodi-smart/dirahq-cli/commit/64316511d6c72c9eeb400ae879986d7c8121bcb7)), closes [#96](https://github.com/dodi-smart/dirahq-cli/issues/96)
+* **daemon:** log presence-ack contract drift instead of zeroing hints silently ([5d716db](https://github.com/dodi-smart/dirahq-cli/commit/5d716db2dbae9f7320f865958a5ba1c38e7e5d99)), closes [#104](https://github.com/dodi-smart/dirahq-cli/issues/104) [dodi-smart/dirahq-cloud#32](https://github.com/dodi-smart/dirahq-cloud/issues/32)
+* **daemon:** resolve token attribution per turn, not per trigger event ([bb99955](https://github.com/dodi-smart/dirahq-cli/commit/bb999559ee893ad44b51fb44f05229a337eb8edf)), closes [#93](https://github.com/dodi-smart/dirahq-cli/issues/93)
+
+### 📚 Documentation
+
+* **repo:** record the decisions behind the adapter gate and per-turn attribution ([099b307](https://github.com/dodi-smart/dirahq-cli/commit/099b307a3536de84452e18a09cc03a448e92ca43))
+
+### ✅ Tests
+
+* **cli:** make the writer panic-isolation test independent of the capture throttle ([6cfdae6](https://github.com/dodi-smart/dirahq-cli/commit/6cfdae669d38f2bd49645503aeb30bc1bac96132))
+
 ## [0.3.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.2.3...v0.3.0) (2026-08-07)
 
 ### ✨ Features

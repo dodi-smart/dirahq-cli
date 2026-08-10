@@ -4,6 +4,7 @@
 
 pub mod batch;
 pub mod billing;
+pub mod drift;
 pub mod handshake;
 pub mod health;
 pub mod knowledge;
@@ -16,6 +17,7 @@ pub use batch::{
 pub use billing::{
     parse_billing_summary_response, BillingSummary, CachedBillingSummary, META_BILLING_SUMMARY,
 };
+pub use drift::{body_head, warn_unreadable_body};
 pub use handshake::{parse_ingest_response, IngestResponse, SyncBlock};
 pub use health::{parse_sync_health, SyncHealth, META_SYNC_HEALTH};
 pub use ratelimit::{parse_retry_after_body, parse_retry_after_secs};

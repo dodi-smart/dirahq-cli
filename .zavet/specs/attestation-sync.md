@@ -122,6 +122,15 @@ single flush window (issue #40).
   is `#[serde(default)]`, so it cannot tell "absent" from "zero" and turned
   the live cloud's counter-free 202 into `accepted=0 duplicates=0` on every
   healthy flush (issue #72).
+- Every `parse_*_response` is tolerant but never silent. An empty body is
+  `Ok(default)` (back-compat with a cloud that acks with no payload); a
+  non-empty body that won't parse returns its `serde_json::Error`. Callers on a
+  2xx report it via `dira_core::sync::warn_unreadable_body` and continue on
+  defaults; callers parsing an *error* body fall back quietly, since a proxy's
+  HTML 502 is not contract drift. Before #104 all of these were
+  `unwrap_or_default()`, so an unreadable ack dropped `dataEpoch` — a cloud that
+  had reset its durable log was indistinguishable from one that never mentioned
+  an epoch, and the re-send never fired.
 
 ## Invariants
 

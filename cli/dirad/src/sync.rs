@@ -1019,7 +1019,10 @@ async fn flush(
     //    logged `accepted=0 duplicates=0` — on flushes that demonstrably landed.
     //    That read as "the cloud is silently dropping everything" and cost real
     //    time during an unrelated outage (issue #72).
-    let ack = dira_core::sync::parse_ingest_response(&last_body);
+    let ack = dira_core::sync::parse_ingest_response(&last_body).unwrap_or_else(|e| {
+        dira_core::sync::warn_unreadable_body("ingest_response", &e, &last_body);
+        Default::default()
+    });
     tracing::info!(
         events = events.len(),
         artifacts = artifact_rows.len(),
@@ -1069,7 +1072,14 @@ fn is_unsupported_schema(body: &str) -> bool {
 /// cursor blank, so the caller can gate its own cursor-advance logic on it.
 async fn apply_handshake(state: &AppState, body: &str) -> Result<bool, SyncError> {
     use dira_core::sync::META_CLOUD_WATERMARK;
-    let resp = dira_core::sync::parse_ingest_response(body);
+    // The consequential one. An unreadable ack here means no `dataEpoch` and no
+    // `syncedEventId`, so a cloud that HAS reset its durable log looks exactly
+    // like one that never mentioned an epoch and the re-send never fires. That
+    // must not be silent (#104) — the flush still proceeds on defaults.
+    let resp = dira_core::sync::parse_ingest_response(body).unwrap_or_else(|e| {
+        dira_core::sync::warn_unreadable_body("ingest_handshake", &e, body);
+        Default::default()
+    });
     let mut reset = false;
 
     if let Some(epoch) = resp.sync.data_epoch.as_deref() {
@@ -1318,13 +1328,13 @@ mod tests {
 
     /// A minimal single-event window for `flush` to have something to send.
     fn test_event(session: &str, at: time::OffsetDateTime) -> dira_core::model::RawEvent {
-        test_event_with_id(&ulid::Ulid::new().to_string(), session, at)
+        test_event_with_id(&ulid::Ulid::generate().to_string(), session, at)
     }
 
     /// Like [`test_event`] but with an explicit `id`. `events_between` orders
     /// rows by `id ASC` (lexicographic), so a multi-event test that needs the
     /// fetched order to match a specific `at` sequence must NOT rely on
-    /// [`ulid::Ulid::new`] — freshly-minted ULIDs in a tight loop can share a
+    /// [`ulid::Ulid::generate`] — freshly-minted ULIDs in a tight loop can share a
     /// millisecond and sort by their random tail instead of insertion order.
     /// Zero-padded decimal ids sort exactly in call order.
     fn test_event_with_id(
@@ -1748,6 +1758,7 @@ mod tests {
             output: 20,
             cache_read: 3000,
             cache_create: 40,
+            cwd: None,
         };
         state
             .store
@@ -1811,6 +1822,7 @@ mod tests {
             output: 1,
             cache_read: 0,
             cache_create: 0,
+            cwd: None,
         };
         state
             .store
@@ -1923,6 +1935,7 @@ mod tests {
                 output: 1,
                 cache_read: 0,
                 cache_create: 0,
+                cwd: None,
             };
             state
                 .store
@@ -2028,6 +2041,7 @@ mod tests {
                 output: 1,
                 cache_read: 0,
                 cache_create: 0,
+                cwd: None,
             };
             state
                 .store
@@ -2059,6 +2073,7 @@ mod tests {
             output: 1,
             cache_read: 0,
             cache_create: 0,
+            cwd: None,
         };
         state
             .store
@@ -3055,7 +3070,8 @@ mod tests {
     fn an_unreported_count_logs_as_unknown_not_zero() {
         let real_202 = dira_core::sync::parse_ingest_response(
             r#"{"status":"accepted","batchId":"01ABC","sync":{"syncedEventId":"01XYZ"}}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(
             count_or_unknown(real_202.accepted),
             "-",
@@ -3065,23 +3081,38 @@ mod tests {
 
         let with_counts = dira_core::sync::parse_ingest_response(
             r#"{"status":"accepted","accepted":7,"duplicates":2}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(count_or_unknown(with_counts.accepted), "7");
         assert_eq!(count_or_unknown(with_counts.duplicates), "2");
 
         // A genuine zero is reported as zero — the point is to distinguish it from
         // "unknown", not to stop printing zeros.
-        let genuine_zero = dira_core::sync::parse_ingest_response(r#"{"accepted":0}"#);
+        let genuine_zero = dira_core::sync::parse_ingest_response(r#"{"accepted":0}"#).unwrap();
         assert_eq!(count_or_unknown(genuine_zero.accepted), "0");
     }
 
     /// A 2xx must never be downgraded over a logging detail, whatever the body.
+    /// #104 splits *how* that tolerance is reached without changing the outcome:
+    /// an empty body parses clean, a garbage one reports an error the caller
+    /// warns about — and either way the count still renders as unknown.
     #[test]
     fn ack_parsing_tolerates_empty_and_garbage_bodies() {
-        for body in ["", "   ", "ok", "<html>502</html>"] {
-            let ack = dira_core::sync::parse_ingest_response(body);
-            assert_eq!(ack.accepted, None, "body {body:?}");
-            assert_eq!(count_or_unknown(ack.accepted), "-");
+        for body in ["", "   "] {
+            let ack = dira_core::sync::parse_ingest_response(body)
+                .unwrap_or_else(|e| panic!("an empty body must stay OK: {body:?}: {e}"));
+            assert_eq!(count_or_unknown(ack.accepted), "-", "body {body:?}");
+        }
+        for body in ["ok", "<html>502</html>"] {
+            let parsed = dira_core::sync::parse_ingest_response(body);
+            assert!(
+                parsed.is_err(),
+                "garbage must be reported, not swallowed: {body:?}"
+            );
+            // The caller's fallback (warn + default) still leaves the flush going
+            // and the count honestly unknown.
+            let ack = parsed.unwrap_or_default();
+            assert_eq!(count_or_unknown(ack.accepted), "-", "body {body:?}");
         }
     }
 

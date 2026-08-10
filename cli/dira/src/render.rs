@@ -91,6 +91,35 @@ fn bar(frac: f64, width: usize) -> String {
 }
 
 /// Print a response, returning a non-zero-worthy bool on error responses.
+/// The generic `ResyncQueued` summary (`dira device resync` prints its own,
+/// richer one). Pure, so the disclosure wording is pinned by tests rather than
+/// only reachable through stdout: a `--from` rewind moves ONLY the event cursor,
+/// and a user who is not told that will assume the token backlog moved too.
+fn resync_fallback_lines(pending: u64, pending_tokens: u64, from: Option<&str>) -> Vec<String> {
+    let mut lines = Vec::new();
+    match from {
+        Some(id) => {
+            lines.push(format!(
+                "resync queued from {id} — {pending} event(s) will re-sync"
+            ));
+            lines.push(
+                "only the event cursor moved — artifacts and token usage are \
+                 untouched; run `dira device resync` (no --from) to re-send those too"
+                    .to_string(),
+            );
+        }
+        None => lines.push(format!(
+            "resync queued from the beginning — {pending} event(s) will re-sync"
+        )),
+    }
+    if pending_tokens > 0 {
+        lines.push(format!(
+            "{pending_tokens} token usage row(s) will re-sync too"
+        ));
+    }
+    lines
+}
+
 pub fn print(resp: &Response) -> bool {
     match resp {
         Response::Ok => {
@@ -145,12 +174,13 @@ pub fn print(resp: &Response) -> bool {
             true
         }
         // `dira device resync` prints its own summary; this is a generic fallback.
-        Response::ResyncQueued { pending, from } => {
-            match from {
-                Some(id) => println!("resync queued from {id} — {pending} event(s) will re-sync"),
-                None => {
-                    println!("resync queued from the beginning — {pending} event(s) will re-sync")
-                }
+        Response::ResyncQueued {
+            pending,
+            pending_tokens,
+            from,
+        } => {
+            for line in resync_fallback_lines(*pending, *pending_tokens, from.as_deref()) {
+                println!("{line}");
             }
             true
         }
@@ -189,6 +219,13 @@ pub fn print(resp: &Response) -> bool {
                 m => println!("zavet forced {m} for {repo}"),
             }
             true
+        }
+        // The capture probe never routes through the generic printer — it is
+        // driven directly by `doctor::capture`, which renders it as a check.
+        // Reaching here means a request was built somewhere else by mistake.
+        Response::CaptureProbe(_) => {
+            eprintln!("unexpected capture-probe response outside `dira doctor --probe`");
+            false
         }
     }
 }
@@ -923,18 +960,11 @@ pub fn print_status(s: &StatusView, detailed: bool) {
         );
     }
 
-    // Writer health (WP-B7): only surfaced when there's something to say — a
-    // healthy writer (no panics, no stalls, not wedged) prints nothing extra.
-    // Omitted entirely for an older daemon (`writer_health: None`, skew-safe).
-    if let Some(h) = s.writer_health {
-        if h.panics > 0 || h.stalls > 0 || h.wedged {
-            let mut line = format!("writer: {} panic(s) caught", h.panics);
-            if h.stalls > 0 {
-                line.push_str(&format!(", {} stall(s) flagged", h.stalls));
-            }
-            if h.wedged {
-                line.push_str(", currently WEDGED — restart the daemon");
-            }
+    // Writer health (WP-B7, extended by issue #93): only surfaced when there's
+    // something to say — a fully healthy writer prints nothing extra. Omitted
+    // entirely for an older daemon (`writer_health: None`, skew-safe).
+    if let Some(h) = &s.writer_health {
+        if let Some(line) = writer_health_line(h) {
             println!("\n{}", theme::paint(&line, Role::Negative));
         }
     }
@@ -948,6 +978,34 @@ pub fn print_status(s: &StatusView, detailed: bool) {
             println!("\n{}", theme::paint(&line, Role::Negative));
         }
     }
+}
+
+/// Build the `writer: …` status line for a [`WriterHealthView`], or `None`
+/// when there's nothing worth surfacing. Pure (no printing), mirroring
+/// [`sync_health_line`], so the gate is unit-testable.
+///
+/// Extended by issue #93: `unattributed_token_rows` renders on its own even
+/// with zero panics/stalls and not wedged — a healthy writer can still be
+/// silently losing compute to attribution failures, and D-0026 makes that
+/// worth a line every time it's nonzero, not just alongside a panic.
+fn writer_health_line(h: &dira_core::protocol::WriterHealthView) -> Option<String> {
+    if h.panics == 0 && h.stalls == 0 && !h.wedged && h.unattributed_token_rows == 0 {
+        return None;
+    }
+    let mut line = format!("writer: {} panic(s) caught", h.panics);
+    if h.stalls > 0 {
+        line.push_str(&format!(", {} stall(s) flagged", h.stalls));
+    }
+    if h.unattributed_token_rows > 0 {
+        line.push_str(&format!(
+            ", {} token turn(s) with no repo — that usage is not counted",
+            h.unattributed_token_rows
+        ));
+    }
+    if h.wedged {
+        line.push_str(", currently WEDGED — restart the daemon");
+    }
+    Some(line)
 }
 
 /// Build the `sync: …` status line for a [`SyncHealthView`], or `None` when
@@ -1479,7 +1537,75 @@ mod tests {
         );
     }
 
-    use dira_core::protocol::SyncHealthView;
+    use dira_core::protocol::{SyncHealthView, WriterHealthView};
+
+    /// A nonzero `unattributed_token_rows` must render even with an otherwise
+    /// spotless writer — issue #93's whole point is that a healthy-looking
+    /// writer can still be silently losing compute.
+    #[test]
+    fn writer_health_line_surfaces_unattributed_token_rows() {
+        let h = WriterHealthView {
+            panics: 0,
+            stalls: 0,
+            idle_secs: Some(2),
+            wedged: false,
+            unattributed_token_rows: 142,
+        };
+        assert_eq!(
+            writer_health_line(&h),
+            Some(
+                "writer: 0 panic(s) caught, 142 token turn(s) with no repo — that usage is not counted"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn writer_health_line_is_silent_when_everything_is_clean() {
+        let h = WriterHealthView {
+            panics: 0,
+            stalls: 0,
+            idle_secs: Some(2),
+            wedged: false,
+            unattributed_token_rows: 0,
+        };
+        assert_eq!(writer_health_line(&h), None);
+    }
+
+    /// Issue #94: the generic fallback must carry the SAME disclosure as
+    /// `dira device resync`'s own summary. A user told only "cursor rewound"
+    /// reasonably assumes every stream rewound — the one thing `--from` does
+    /// not do.
+    #[test]
+    fn resync_fallback_discloses_that_only_the_event_cursor_moved() {
+        let lines = resync_fallback_lines(3, 0, Some("01EVENTID"));
+        let joined = lines.join("\n");
+        assert!(joined.contains("01EVENTID"), "{joined}");
+        assert!(
+            joined.contains("only the event cursor moved"),
+            "a --from rewind must say what it did NOT rewind: {joined}"
+        );
+        assert!(
+            joined.contains("dira device resync"),
+            "and name the command that does re-send everything: {joined}"
+        );
+    }
+
+    #[test]
+    fn resync_fallback_reports_the_token_backlog_only_when_nonzero() {
+        let full = resync_fallback_lines(2, 48_601, None).join("\n");
+        assert!(full.contains("48601 token usage row(s)"), "{full}");
+        assert!(
+            !full.contains("only the event cursor moved"),
+            "a full rewind has nothing to disclaim: {full}"
+        );
+
+        let quiet = resync_fallback_lines(2, 0, None).join("\n");
+        assert!(
+            !quiet.contains("token usage row"),
+            "no backlog means no token line: {quiet}"
+        );
+    }
 
     fn sync_health(kind: Option<&str>, consecutive_failures: u32) -> SyncHealthView {
         SyncHealthView {

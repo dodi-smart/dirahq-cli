@@ -70,13 +70,16 @@ pub struct InstallArgs {
     pub update: bool,
     /// Print the exact `claude` invocations without running them.
     pub dry_run: bool,
+    /// Do not refresh this repo's zavet adapters, even when they are stale.
+    pub no_adapters: bool,
 }
 
 /// `dira zavet install`.
 pub fn install(args: InstallArgs) -> Result<()> {
     let home = home_dir()?;
     let claude_present = resolve_claude_on_path().is_some();
-    install_with(&args, &SystemRunner, &home, claude_present)
+    let cwd = std::env::current_dir().unwrap_or_default();
+    install_with(&args, &SystemRunner, &home, claude_present, &cwd)
 }
 
 /// The plugin summary line for `dira zavet status`. Best-effort and
@@ -100,6 +103,36 @@ pub fn status_line() -> Option<String> {
     }
 }
 
+/// The repo-scope adapter/git-hook lines for `dira zavet status`. Resolves
+/// the plugin root the same way [`status_line`] does, then delegates to
+/// [`crate::zavet_adapters::status_lines`] in read-only [`AdapterMode::CheckOnly`]
+/// mode — `dira zavet status` never writes. Empty when `claude` isn't on
+/// `PATH` or detection is inconclusive (mirrors `status_line`'s own
+/// best-effort contract), so a machine without Claude Code installed sees no
+/// new lines at all.
+///
+/// [`AdapterMode::CheckOnly`]: crate::zavet_adapters::AdapterMode::CheckOnly
+pub fn adapter_status_lines(cwd: &Path) -> Vec<String> {
+    let Some(_) = resolve_claude_on_path() else {
+        return Vec::new();
+    };
+    let Ok(home) = home_dir() else {
+        return Vec::new();
+    };
+    match detect(&SystemRunner, &home) {
+        Detection::Installed(info) => {
+            let root = resolve_plugin_root(&home, &info.install_path);
+            crate::zavet_adapters::status_lines(
+                &SystemRunner,
+                &root,
+                cwd,
+                crate::zavet_adapters::AdapterMode::CheckOnly,
+            )
+        }
+        Detection::NotInstalled | Detection::Unknown => Vec::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runner — the same shell-out-and-mock pattern as `daemon::Runner`, so
 // detection + install are unit-testable without touching a real `claude`
@@ -107,11 +140,23 @@ pub fn status_line() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// A probe for an external command's presence/exit status/stdout.
-pub trait Runner {
+pub(crate) trait Runner {
     /// Run `prog args…` and return its `Output`, or `None` if the command
     /// could not even be spawned — mirrors `Command::spawn` failing with
     /// `NotFound`.
     fn run(&self, prog: &str, args: &[&str]) -> Option<Output>;
+
+    /// Like [`Runner::run`], but pinned to `dir`. `zavet_adapters` uses this
+    /// exclusively: `zavet adapters` writes into whatever directory the
+    /// process's cwd is, so every repo-scope call MUST be pinned rather than
+    /// inheriting this process's own cwd. Defaults to delegating to `run`
+    /// (ignoring `dir`) so `zavet_install`'s own machine-scope `claude` calls
+    /// — which have no repo to pin to — and every existing `FakeRunner` test
+    /// double are unaffected.
+    fn run_in(&self, dir: &Path, prog: &str, args: &[&str]) -> Option<Output> {
+        let _ = dir;
+        self.run(prog, args)
+    }
 }
 
 struct SystemRunner;
@@ -124,6 +169,10 @@ impl Runner for SystemRunner {
         // spawned `.bat`/`.cmd` targets via `cmd.exe` with correctly escaped
         // arguments since the "BatBadBut" fix, so this is safe as-is.
         Command::new(prog).args(args).output().ok()
+    }
+
+    fn run_in(&self, dir: &Path, prog: &str, args: &[&str]) -> Option<Output> {
+        Command::new(prog).args(args).current_dir(dir).output().ok()
     }
 }
 
@@ -368,6 +417,7 @@ fn install_with(
     runner: &dyn Runner,
     home: &Path,
     claude_present: bool,
+    cwd: &Path,
 ) -> Result<()> {
     if !claude_present {
         anyhow::bail!(NO_CLAUDE_RECIPE);
@@ -378,33 +428,50 @@ fn install_with(
         Detection::Installed(info) if !args.update => {
             println!("zavet@dirahq is already installed — no-op (pass --update to refresh)");
             report(&info, runner, home);
+            // Read-only no-op: CheckOnly, never Refresh — this arm makes no
+            // writes of any kind, and adapters must be no exception.
+            if !args.no_adapters {
+                let root = resolve_plugin_root(home, &info.install_path);
+                for line in crate::zavet_adapters::status_lines(
+                    runner,
+                    &root,
+                    cwd,
+                    crate::zavet_adapters::AdapterMode::CheckOnly,
+                ) {
+                    println!("{line}");
+                }
+            }
             Ok(())
         }
         Detection::Installed(info) => {
             run_or_print(
                 runner,
                 args.dry_run,
+                "claude",
                 &["plugin", "marketplace", "update", MARKETPLACE_NAME],
             )?;
             run_or_print(
                 runner,
                 args.dry_run,
+                "claude",
                 &["plugin", "update", PLUGIN_ID, "--scope", &info.scope],
             )?;
-            finish(args, runner, home)
+            finish(args, runner, home, cwd)
         }
         Detection::NotInstalled => {
             run_or_print(
                 runner,
                 args.dry_run,
+                "claude",
                 &["plugin", "marketplace", "add", MARKETPLACE_REPO],
             )?;
             run_or_print(
                 runner,
                 args.dry_run,
+                "claude",
                 &["plugin", "install", PLUGIN_ID, "--scope", &args.scope],
             )?;
-            finish(args, runner, home)
+            finish(args, runner, home, cwd)
         }
         Detection::Unknown => {
             println!(
@@ -414,27 +481,64 @@ fn install_with(
             run_or_print(
                 runner,
                 args.dry_run,
+                "claude",
                 &["plugin", "marketplace", "add", MARKETPLACE_REPO],
             )?;
             run_or_print(
                 runner,
                 args.dry_run,
+                "claude",
                 &["plugin", "install", PLUGIN_ID, "--scope", &args.scope],
             )?;
-            finish(args, runner, home)
+            finish(args, runner, home, cwd)
         }
     }
 }
 
 /// After a real (non-dry-run) install/update: re-detect so the report
 /// reflects the freshly-written state, then remind the user to restart.
-fn finish(args: &InstallArgs, runner: &dyn Runner, home: &Path) -> Result<()> {
+///
+/// Adapters are resolved against this RE-detected post-update plugin root
+/// (not whatever was installed before), so a fresh 1.3.0 install/update is
+/// the binary that actually generates the artifacts — not a stale root left
+/// over from before the update ran.
+fn finish(args: &InstallArgs, runner: &dyn Runner, home: &Path, cwd: &Path) -> Result<()> {
     if args.dry_run {
         println!("(dry run — nothing was changed)");
+        // Nothing was actually installed/updated in dry-run, so this can
+        // only plan against a plugin that was ALREADY installed (the
+        // `--update --dry-run` case). A fresh not-yet-installed plugin has
+        // no root to probe, so this is skipped rather than guessed.
+        if !args.no_adapters {
+            if let Detection::Installed(info) = detect(runner, home) {
+                let root = resolve_plugin_root(home, &info.install_path);
+                for line in crate::zavet_adapters::status_lines(
+                    runner,
+                    &root,
+                    cwd,
+                    crate::zavet_adapters::AdapterMode::Plan,
+                ) {
+                    println!("{line}");
+                }
+            }
+        }
         return Ok(());
     }
     match detect(runner, home) {
-        Detection::Installed(info) => report(&info, runner, home),
+        Detection::Installed(info) => {
+            report(&info, runner, home);
+            if !args.no_adapters {
+                let root = resolve_plugin_root(home, &info.install_path);
+                for line in crate::zavet_adapters::status_lines(
+                    runner,
+                    &root,
+                    cwd,
+                    crate::zavet_adapters::AdapterMode::Refresh,
+                ) {
+                    println!("{line}");
+                }
+            }
+        }
         _ => println!(
             "ran the `claude` commands above, but re-detection came back inconclusive — \
              run `dira zavet status` to confirm"
@@ -444,17 +548,20 @@ fn finish(args: &InstallArgs, runner: &dyn Runner, home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Print (dry-run) or run (real) one `claude` subcommand. Real runs echo the
+/// Print (dry-run) or run (real) one `prog` subcommand. Real runs echo the
 /// command before executing it, matching the dry-run's own line, so the two
-/// modes read identically apart from the `[dry-run]` prefix.
-fn run_or_print(runner: &dyn Runner, dry_run: bool, args: &[&str]) -> Result<()> {
-    let line = command_line(args);
+/// modes read identically apart from the `[dry-run]` prefix. Every existing
+/// call site is `claude`; `prog` exists so `zavet_adapters` can render
+/// `[dry-run] <zavetbin> adapters` through the same line-formatting rule
+/// rather than duplicating it.
+fn run_or_print(runner: &dyn Runner, dry_run: bool, prog: &str, args: &[&str]) -> Result<()> {
+    let line = command_line(prog, args);
     if dry_run {
         println!("[dry-run] {line}");
         return Ok(());
     }
     println!("{line}");
-    match runner.run("claude", args) {
+    match runner.run(prog, args) {
         Some(out) if out.status.success() => Ok(()),
         Some(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -468,12 +575,12 @@ fn run_or_print(runner: &dyn Runner, dry_run: bool, args: &[&str]) -> Result<()>
                 }
             );
         }
-        None => anyhow::bail!("failed to run `{line}` — is `claude` still on PATH?"),
+        None => anyhow::bail!("failed to run `{line}` — is `{prog}` still on PATH?"),
     }
 }
 
-fn command_line(args: &[&str]) -> String {
-    std::iter::once("claude")
+pub(crate) fn command_line(prog: &str, args: &[&str]) -> String {
+    std::iter::once(prog)
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ")
@@ -505,6 +612,13 @@ fn report(info: &InstalledInfo, runner: &dyn Runner, home: &Path) {
 #[derive(Debug, Deserialize)]
 struct ZavetVersionInfo {
     min_dira: String,
+    /// Unused by `skew_line` itself (which only cares about `min_dira`), but
+    /// keeping this field means `zavet_adapters`'s own `VersionInfo` and this
+    /// struct parse the identical payload shape rather than silently
+    /// tolerating drift between the two deserializers.
+    #[serde(default)]
+    #[allow(dead_code)]
+    version: String,
 }
 
 /// `<installPath>/bin/zavet version --json`, compared against this dira
@@ -555,10 +669,106 @@ fn skew_line(runner: &dyn Runner, install_path: &str, dira_version: &str) -> Str
     }
 }
 
+// ---------------------------------------------------------------------------
+// Post-update plugin refresh — machine scope only
+// ---------------------------------------------------------------------------
+
+/// The outcome of [`refresh_plugin_with`].
+#[derive(Debug)]
+pub(crate) enum PluginRefresh {
+    /// `claude` isn't on `PATH`, or detection came back `NotInstalled`/`Unknown`
+    /// — nothing was run. **Never installs**: `dira update` refreshing an
+    /// already-installed plugin is one thing, it *installing* zavet on behalf
+    /// of a user who never asked for it is another, and this variant is the
+    /// guard that pins the line between them.
+    Skipped,
+    /// The marketplace + plugin update commands both succeeded; `from`/`to`
+    /// are the versions detected before and after.
+    Refreshed { from: String, to: String },
+    /// One of the `claude` commands failed, or re-detection afterward was
+    /// inconclusive. The reason is deliberately not surfaced to the user —
+    /// `dira update` has already succeeded by the time this runs, so the
+    /// fixed recovery line (`run `dira zavet install --update``) is all that
+    /// matters; kept here only so tests can assert on which branch fired.
+    #[allow(dead_code)]
+    Failed(String),
+}
+
+/// Machine scope only. Refreshes an already-installed zavet plugin after a
+/// successful `dira update`. Touches NO repo — no adapters, no git hooks, no
+/// cwd resolution — and never errors: `dira update` has already succeeded by
+/// the time this runs, so a plugin problem is a printed line, not an exit
+/// code.
+pub fn refresh_plugin_after_update() -> Option<String> {
+    let claude_present = resolve_claude_on_path().is_some();
+    let home = home_dir().ok()?;
+    match refresh_plugin_with(&SystemRunner, &home, claude_present) {
+        PluginRefresh::Skipped => None,
+        PluginRefresh::Refreshed { from, to } if from == to => {
+            Some(format!("zavet plugin: already current ({to})"))
+        }
+        PluginRefresh::Refreshed { from, to } => Some(format!(
+            "zavet plugin: refreshed {from} -> {to} (restart Claude Code to apply)"
+        )),
+        PluginRefresh::Failed(_) => {
+            Some("zavet plugin: refresh failed — run `dira zavet install --update`".to_string())
+        }
+    }
+}
+
+/// The testable core of [`refresh_plugin_after_update`]. Reuses [`detect`]
+/// (to decide whether there is anything to refresh, and to learn the
+/// installed scope) and [`run_or_print`] (real-run only — this is never
+/// invoked with `dry_run: true`) rather than reimplementing either.
+fn refresh_plugin_with(runner: &dyn Runner, home: &Path, claude_present: bool) -> PluginRefresh {
+    if !claude_present {
+        return PluginRefresh::Skipped;
+    }
+
+    let before = match detect(runner, home) {
+        Detection::Installed(info) => info,
+        Detection::NotInstalled | Detection::Unknown => return PluginRefresh::Skipped,
+    };
+    let from = before.version.clone();
+
+    if let Err(e) = run_or_print(
+        runner,
+        false,
+        "claude",
+        &["plugin", "marketplace", "update", MARKETPLACE_NAME],
+    ) {
+        return PluginRefresh::Failed(e.to_string());
+    }
+    if let Err(e) = run_or_print(
+        runner,
+        false,
+        "claude",
+        &["plugin", "update", PLUGIN_ID, "--scope", &before.scope],
+    ) {
+        return PluginRefresh::Failed(e.to_string());
+    }
+
+    match detect(runner, home) {
+        Detection::Installed(info) => PluginRefresh::Refreshed {
+            from,
+            to: info.version,
+        },
+        _ => PluginRefresh::Failed(
+            "re-detection after the plugin refresh was inconclusive".to_string(),
+        ),
+    }
+}
+
+/// Shared test double for [`Runner`], used by both this module's tests and
+/// `zavet_adapters`'s — split out so the two modules' tests script the exact
+/// same `(dir, prog, args) -> (exit_code, stdout, stderr)` contract instead
+/// of drifting apart.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::process::ExitStatus;
+pub(crate) mod test_support {
+    use super::Runner;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::process::{ExitStatus, Output};
 
     /// Build a synthetic exit status from a plain exit code. `ExitStatusExt`
     /// is platform-specific (`from_raw` takes `i32` on unix, encoding the
@@ -577,38 +787,260 @@ mod tests {
         ExitStatus::from_raw(code as u32)
     }
 
-    /// A scripted [`Runner`]: `key(prog, args) -> (exit_code, stdout, stderr)`.
+    /// One scripted/logged call: the pinned directory (empty for a plain
+    /// `.run(...)`), the program, and its args.
+    type CallKey = (PathBuf, String, Vec<String>);
+    /// `(exit_code, stdout, stderr)`.
+    type CallResponse = (i32, String, String);
+
+    /// A scripted [`Runner`]: `(dir, prog, args) -> (exit_code, stdout, stderr)`.
     /// A missing key means the command wasn't stubbed and behaves like
     /// `Command::spawn` failing to find it — mirrors `daemon::tests::FakeRunner`.
+    /// `run` (no dir) and `run_in` share the same key space, keyed under the
+    /// empty path for `run` — so a test that only calls [`FakeRunner::returning`]
+    /// (never `returning_in`) behaves exactly as it always did.
     #[derive(Default)]
-    struct FakeRunner {
-        responses: HashMap<String, (i32, String, String)>,
+    pub(crate) struct FakeRunner {
+        responses: HashMap<CallKey, CallResponse>,
+        call_log: std::cell::RefCell<Vec<CallKey>>,
+    }
+
+    fn key(dir: &Path, prog: &str, args: &[&str]) -> CallKey {
+        (
+            dir.to_path_buf(),
+            prog.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     impl FakeRunner {
-        fn returning(mut self, prog: &str, args: &[&str], code: i32, stdout: &str) -> Self {
-            self.responses
-                .insert(key(prog, args), (code, stdout.to_string(), String::new()));
+        /// Stub a machine-scope call (no `dir` — matches a plain `.run(...)`).
+        pub(crate) fn returning(self, prog: &str, args: &[&str], code: i32, stdout: &str) -> Self {
+            self.returning_in(Path::new(""), prog, args, code, stdout)
+        }
+
+        /// Stub a repo-scope call pinned to `dir` (matches `.run_in(dir, ...)`).
+        pub(crate) fn returning_in(
+            mut self,
+            dir: &Path,
+            prog: &str,
+            args: &[&str],
+            code: i32,
+            stdout: &str,
+        ) -> Self {
+            self.responses.insert(
+                key(dir, prog, args),
+                (code, stdout.to_string(), String::new()),
+            );
             self
         }
-    }
 
-    fn key(prog: &str, args: &[&str]) -> String {
-        std::iter::once(prog)
-            .chain(args.iter().copied())
-            .collect::<Vec<_>>()
-            .join(" ")
+        /// Like [`Self::returning_in`], but for a failing invocation where the
+        /// interesting payload is on stderr rather than stdout.
+        pub(crate) fn returning_in_failing(
+            mut self,
+            dir: &Path,
+            prog: &str,
+            args: &[&str],
+            code: i32,
+            stderr: &str,
+        ) -> Self {
+            self.responses.insert(
+                key(dir, prog, args),
+                (code, String::new(), stderr.to_string()),
+            );
+            self
+        }
+
+        /// Every call attempted, in order — assertions use this to prove a
+        /// command was (or, more often, was NOT) invoked at all, independent
+        /// of whether it happened to be stubbed.
+        pub(crate) fn call_log(&self) -> Vec<CallKey> {
+            self.call_log.borrow().clone()
+        }
     }
 
     impl Runner for FakeRunner {
         fn run(&self, prog: &str, args: &[&str]) -> Option<Output> {
-            let (code, stdout, stderr) = self.responses.get(&key(prog, args))?;
+            self.run_in(Path::new(""), prog, args)
+        }
+
+        fn run_in(&self, dir: &Path, prog: &str, args: &[&str]) -> Option<Output> {
+            let k = key(dir, prog, args);
+            self.call_log.borrow_mut().push(k.clone());
+            let (code, stdout, stderr) = self.responses.get(&k)?;
             Some(Output {
                 status: exit_status(*code),
                 stdout: stdout.as_bytes().to_vec(),
                 stderr: stderr.as_bytes().to_vec(),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::FakeRunner;
+
+    // -- refresh_plugin_after_update (Packet D2, machine scope only) -----------
+
+    fn plugin_list_json(version: &str, scope: &str) -> String {
+        format!(
+            r#"[{{"id":"zavet@dirahq","version":"{version}","scope":"{scope}","enabled":true,"installPath":"/y"}}]"#
+        )
+    }
+
+    /// An update must never INSTALL a plugin the user never asked for. When
+    /// `claude plugin list --json` reports zavet absent, `refresh_plugin_with`
+    /// must be a pure no-op: no `plugin update` (nor `marketplace update`, nor
+    /// `plugin install`) may appear in the call log.
+    #[test]
+    fn refresh_plugin_after_update_is_noop_when_plugin_absent() {
+        let home = temp_home("refresh-absent");
+        let runner =
+            FakeRunner::default().returning("claude", &["plugin", "list", "--json"], 0, "[]");
+        let got = refresh_plugin_with(&runner, &home, true);
+        assert!(matches!(got, PluginRefresh::Skipped), "{got:?}");
+        assert!(
+            !runner
+                .call_log()
+                .iter()
+                .any(|(_, _, a)| a.contains(&"update".to_string())
+                    || a.contains(&"install".to_string())),
+            "no install/update call may be attempted when the plugin isn't present: {:?}",
+            runner.call_log()
+        );
+    }
+
+    /// Machine-scope-only guard: with the plugin present, the call log must
+    /// contain no entry whose args mention `adapters` or `hooks` — this
+    /// module's post-update refresh touches no repo at all.
+    #[test]
+    fn refresh_plugin_after_update_never_touches_a_repo() {
+        let home = temp_home("refresh-no-repo");
+        let runner = FakeRunner::default()
+            .returning(
+                "claude",
+                &["plugin", "list", "--json"],
+                0,
+                &plugin_list_json("1.2.0", "user"),
+            )
+            .returning(
+                "claude",
+                &["plugin", "marketplace", "update", MARKETPLACE_NAME],
+                0,
+                "",
+            )
+            .returning(
+                "claude",
+                &["plugin", "update", PLUGIN_ID, "--scope", "user"],
+                0,
+                "",
+            );
+        let got = refresh_plugin_with(&runner, &home, true);
+        assert!(matches!(got, PluginRefresh::Refreshed { .. }), "{got:?}");
+        assert!(
+            !runner.call_log().iter().any(|(_, _, a)| a
+                .iter()
+                .any(|s| s.contains("adapters") || s.contains("hooks"))),
+            "no repo-scope call may appear in the log: {:?}",
+            runner.call_log()
+        );
+    }
+
+    /// Call order: `marketplace update dirahq` must run before
+    /// `plugin update zavet@dirahq --scope <detected scope>`.
+    #[test]
+    fn refresh_plugin_after_update_runs_marketplace_and_plugin_update() {
+        let home = temp_home("refresh-order");
+        let runner = FakeRunner::default()
+            .returning(
+                "claude",
+                &["plugin", "list", "--json"],
+                0,
+                &plugin_list_json("1.2.0", "local"),
+            )
+            .returning(
+                "claude",
+                &["plugin", "marketplace", "update", MARKETPLACE_NAME],
+                0,
+                "",
+            )
+            .returning(
+                "claude",
+                &["plugin", "update", PLUGIN_ID, "--scope", "local"],
+                0,
+                "",
+            );
+        let got = refresh_plugin_with(&runner, &home, true);
+        assert!(matches!(got, PluginRefresh::Refreshed { .. }), "{got:?}");
+
+        let log = runner.call_log();
+        let marketplace_pos = log
+            .iter()
+            .position(|(_, prog, a)| {
+                prog == "claude"
+                    && a == &vec![
+                        "plugin".to_string(),
+                        "marketplace".to_string(),
+                        "update".to_string(),
+                        MARKETPLACE_NAME.to_string(),
+                    ]
+            })
+            .expect("marketplace update must have run");
+        let plugin_update_pos = log
+            .iter()
+            .position(|(_, prog, a)| {
+                prog == "claude"
+                    && a == &vec![
+                        "plugin".to_string(),
+                        "update".to_string(),
+                        PLUGIN_ID.to_string(),
+                        "--scope".to_string(),
+                        "local".to_string(),
+                    ]
+            })
+            .expect("plugin update must have run");
+        assert!(
+            marketplace_pos < plugin_update_pos,
+            "marketplace update must run before plugin update: {log:?}"
+        );
+    }
+
+    /// Not on `PATH` at all: skip before any detection is even attempted.
+    #[test]
+    fn refresh_plugin_after_update_noop_when_claude_absent() {
+        let home = temp_home("refresh-no-claude");
+        let runner = FakeRunner::default();
+        let got = refresh_plugin_with(&runner, &home, false);
+        assert!(matches!(got, PluginRefresh::Skipped), "{got:?}");
+        assert!(
+            runner.call_log().is_empty(),
+            "no detection call may be attempted when claude isn't on PATH: {:?}",
+            runner.call_log()
+        );
+    }
+
+    /// Run a git command in `dir`, panicking on failure — test setup only,
+    /// so `repo_gate` (via `dira_core::project::toplevel`) resolves a real
+    /// toplevel instead of falling into `RepoGate::NotGit`.
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            status.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
     }
 
     fn temp_home(tag: &str) -> PathBuf {
@@ -947,55 +1379,89 @@ mod tests {
     // would race) — [`resolve_on_path_in`]'s own tests above cover the PATH
     // scan itself.
 
+    /// A plain non-git temp dir: `repo_gate` resolves it to `NotGit`, so any
+    /// adapter probing this drives short-circuits before touching zavet at
+    /// all — the safe default for tests that aren't specifically exercising
+    /// the adapters refresh.
+    fn non_git_cwd() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     #[test]
     fn install_dry_run_not_installed_only_prints_planned_commands() {
         let home = temp_home("dry-run-not-installed");
+        let cwd = non_git_cwd();
         let runner =
             FakeRunner::default().returning("claude", &["plugin", "list", "--json"], 0, "[]");
         let args = InstallArgs {
             scope: "user".into(),
             update: false,
             dry_run: true,
+            no_adapters: false,
         };
         // Only `plugin list --json` is stubbed; `marketplace add` / `install`
         // are deliberately NOT stubbed, so if `install_with` ever tried to
         // actually run them in dry-run mode, `FakeRunner` would return `None`
         // and `run_or_print` would bail — the test passing at all proves
         // those commands were only printed, never run.
-        assert!(install_with(&args, &runner, &home, true).is_ok());
+        assert!(install_with(&args, &runner, &home, true, cwd.path()).is_ok());
     }
 
     #[test]
     fn install_already_installed_no_update_is_pure_readonly_noop() {
         let home = temp_home("noop-installed");
-        let runner = FakeRunner::default().returning(
-            "claude",
-            &["plugin", "list", "--json"],
-            0,
-            r#"[{"id":"zavet@dirahq","version":"0.1.0","scope":"user","enabled":true,"installPath":"/y"}]"#,
-        );
+        let cwd = tempfile::tempdir().unwrap();
+        run_git(cwd.path(), &["init", "-q"]);
+        std::fs::create_dir_all(cwd.path().join(".zavet")).unwrap();
+        let runner = FakeRunner::default()
+            .returning(
+                "claude",
+                &["plugin", "list", "--json"],
+                0,
+                r#"[{"id":"zavet@dirahq","version":"0.1.0","scope":"user","enabled":true,"installPath":"/y"}]"#,
+            )
+            .returning_in(
+                Path::new("/y"),
+                "/y/bin/zavet",
+                &["version", "--json"],
+                0,
+                r#"{"v":1,"plugin":"zavet","version":"1.3.0","emit_schema":1,"min_dira":"0.1.0"}"#,
+            )
+            .returning_in(Path::new("/y"), "/y/bin/zavet", &["adapters", "--check"], 1, "");
         let args = InstallArgs {
             scope: "user".into(),
             update: false,
             dry_run: false,
+            no_adapters: false,
         };
         // No `marketplace`/`install`/`update` command is stubbed at all — a
         // no-op path that tried to run one would bail with "failed to run",
-        // so success here proves nothing beyond the initial read-only
-        // `plugin list --json` was invoked.
-        assert!(install_with(&args, &runner, &home, true).is_ok());
+        // so success here proves nothing beyond read-only detection/checks
+        // ran. `adapters --check` reports stale, but this is the read-only
+        // no-op arm (CheckOnly) — a bare `adapters` write must never happen.
+        assert!(install_with(&args, &runner, &home, true, cwd.path()).is_ok());
+        assert!(
+            !runner
+                .call_log()
+                .iter()
+                .any(|(_, _, a)| a == &vec!["adapters".to_string()]),
+            "bare `adapters` must be absent from the call log: {:?}",
+            runner.call_log()
+        );
     }
 
     #[test]
     fn install_bails_with_manual_recipe_when_claude_absent_from_path() {
         let home = temp_home("no-claude");
+        let cwd = non_git_cwd();
         let runner = FakeRunner::default();
         let args = InstallArgs {
             scope: "user".into(),
             update: false,
             dry_run: false,
+            no_adapters: false,
         };
-        let err = install_with(&args, &runner, &home, false).unwrap_err();
+        let err = install_with(&args, &runner, &home, false, cwd.path()).unwrap_err();
         assert!(err
             .to_string()
             .contains("/plugin marketplace add dodi-smart/dirahq-zavet"));
@@ -1005,20 +1471,23 @@ mod tests {
     #[test]
     fn install_rejects_unknown_scope() {
         let home = temp_home("bad-scope");
+        let cwd = non_git_cwd();
         let runner =
             FakeRunner::default().returning("claude", &["plugin", "list", "--json"], 0, "[]");
         let args = InstallArgs {
             scope: "global".into(),
             update: false,
             dry_run: false,
+            no_adapters: false,
         };
-        let err = install_with(&args, &runner, &home, true).unwrap_err();
+        let err = install_with(&args, &runner, &home, true, cwd.path()).unwrap_err();
         assert!(err.to_string().contains("unknown --scope"));
     }
 
     #[test]
     fn install_dry_run_update_prints_marketplace_and_plugin_update_only() {
         let home = temp_home("dry-run-update");
+        let cwd = non_git_cwd();
         let runner = FakeRunner::default().returning(
             "claude",
             &["plugin", "list", "--json"],
@@ -1029,16 +1498,61 @@ mod tests {
             scope: "user".into(),
             update: true,
             dry_run: true,
+            no_adapters: false,
         };
         // `marketplace update` / `plugin update` are deliberately not
         // stubbed — same "would bail if actually run" proof as the
-        // not-installed dry-run test above.
-        assert!(install_with(&args, &runner, &home, true).is_ok());
+        // not-installed dry-run test above. `cwd` is a non-git dir, so the
+        // adapters Plan step short-circuits at `RepoGate::NotGit` too.
+        assert!(install_with(&args, &runner, &home, true, cwd.path()).is_ok());
+    }
+
+    /// `--update --dry-run` against an ALREADY-installed plugin: `finish`'s
+    /// dry-run branch re-detects (finding it installed) and must plan the
+    /// adapters refresh — without ever running it.
+    #[test]
+    fn install_dry_run_update_prints_planned_adapters_invocation() {
+        let home = temp_home("dry-run-update-adapters");
+        let cwd = tempfile::tempdir().unwrap();
+        run_git(cwd.path(), &["init", "-q"]);
+        std::fs::create_dir_all(cwd.path().join(".zavet")).unwrap();
+        let runner = FakeRunner::default()
+            .returning(
+                "claude",
+                &["plugin", "list", "--json"],
+                0,
+                r#"[{"id":"zavet@dirahq","version":"0.1.0","scope":"local","enabled":true,"installPath":"/y"}]"#,
+            )
+            .returning_in(
+                Path::new("/y"),
+                "/y/bin/zavet",
+                &["version", "--json"],
+                0,
+                r#"{"v":1,"plugin":"zavet","version":"1.3.0","emit_schema":1,"min_dira":"0.1.0"}"#,
+            );
+        // `adapters --check` / `adapters` / `hooks --check` deliberately NOT
+        // stubbed: Plan mode must return before any of them is attempted.
+        let args = InstallArgs {
+            scope: "user".into(),
+            update: true,
+            dry_run: true,
+            no_adapters: false,
+        };
+        assert!(install_with(&args, &runner, &home, true, cwd.path()).is_ok());
+        assert!(
+            !runner
+                .call_log()
+                .iter()
+                .any(|(_, _, a)| a.first().map(String::as_str) == Some("adapters")),
+            "Plan mode must not run adapters/adapters --check: {:?}",
+            runner.call_log()
+        );
     }
 
     #[test]
     fn install_unknown_detection_falls_through_to_install_commands() {
         let home = temp_home("unknown-detection");
+        let cwd = non_git_cwd();
         // `claude plugin list --json` not stubbed (simulates it failing to
         // run), and no `installed_plugins.json` fallback file exists either
         // -> `Detection::Unknown`, which should drive the same
@@ -1048,7 +1562,8 @@ mod tests {
             scope: "user".into(),
             update: false,
             dry_run: true,
+            no_adapters: false,
         };
-        assert!(install_with(&args, &runner, &home, true).is_ok());
+        assert!(install_with(&args, &runner, &home, true, cwd.path()).is_ok());
     }
 }

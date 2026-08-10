@@ -1,10 +1,10 @@
 ---
 title: Daemon startup and ingress lifecycle
-version: 5
+version: 6
 origin: session
 verified: false
 confidence: high
-date: 2026-08-04
+date: 2026-08-09
 paths:
   - cli/dirad/src/lib.rs
   - cli/dirad/src/control.rs
@@ -123,6 +123,16 @@ the interactive user entirely — a silent, total capture outage.
 
 ## Invariants
 
+- `resync --from <id>` rewinds ONLY the event cursor; the artifact and token
+  rowid cursors deliberately stay put (D-0018/D-0020), and the response says so.
+  A rewind that under-reports what it moved is the same class of defect as one
+  that moves the wrong thing.
+- `ResyncQueued` reports the event backlog and the token backlog as separate
+  numbers. They are never folded together — one counter spanning two streams is
+  worse than the under-count it would replace.
+- A failed backlog count is logged, never collapsed to a bare `0`: silently
+  reporting "nothing pending" right after a user asked for a rewind is
+  indistinguishable from success.
 - The control socket binds first and an ingress failure never costs it
   (D-0009). It is the surface every client and supervision probe depends on.
 - The control socket path is never unlinked without first proving nothing

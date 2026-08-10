@@ -48,7 +48,7 @@ async fn wait_for_degraded(state: &AppState, want_some: bool) -> Option<String> 
 /// collide — which is exactly what happened when these tests first ran in
 /// parallel.
 fn tmp_sock() -> PathBuf {
-    let uniq = &Ulid::new().to_string()[16..26];
+    let uniq = &Ulid::generate().to_string()[16..26];
     #[cfg(unix)]
     {
         let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());

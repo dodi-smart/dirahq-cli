@@ -82,6 +82,31 @@ pub fn normalize(hook: &ClaudeHook) -> Option<Normalized> {
 mod tests {
     use super::*;
 
+    /// `dira doctor --probe` sends a synthetic payload through this exact
+    /// mapping. If a rename here stopped it normalizing, the probe would report
+    /// "the daemon never stored the event" on every healthy machine — a
+    /// diagnostic that always says broken is worse than no diagnostic.
+    ///
+    /// The specific properties the probe design depends on:
+    /// - `UserPrompt` is a *human signal*, so the writer never coalesces it
+    ///   (only `PostTool` coalesces) and it is never pruned as degenerate.
+    /// - no `transcript_path`, so token capture is never entered and the probe
+    ///   cannot touch `token_usage`.
+    #[test]
+    fn the_capture_probe_payload_still_normalizes() {
+        let session_id = format!("{}01JQ", dira_core::model::PROBE_SESSION_PREFIX);
+        let payload = dira_core::model::probe_hook_payload(&session_id, "/tmp");
+        let (n, harness) =
+            crate::normalize_for("claude", payload).expect("the probe payload must normalize");
+        assert_eq!(harness, dira_contract::Harness::ClaudeCode);
+        assert_eq!(n.session_id, session_id);
+        assert_eq!(n.kind, EventKind::UserPrompt);
+        assert_eq!(n.cwd.as_deref(), Some("/tmp"));
+        assert!(n.transcript_path.is_none());
+        assert!(n.tool.is_none());
+        assert!(dira_core::model::is_probe_session(&n.session_id));
+    }
+
     #[test]
     fn maps_user_prompt() {
         let hook: ClaudeHook = serde_json::from_str(

@@ -370,7 +370,11 @@ async fn post_chunks(
             });
         }
         if !status.is_success() {
-            let parsed = parse_knowledge_response(&body);
+            // Quiet fallback on purpose: an ERROR body that isn't our JSON is
+            // ordinary (a proxy's HTML, a bare string), not contract drift. The
+            // empty `error` code then falls through to the `_` arm below, which
+            // carries the raw body into the message — so nothing is lost.
+            let parsed = parse_knowledge_response(&body).unwrap_or_default();
             return Err(match parsed.error.as_str() {
                 "unknown_device" => KError::ReLinkRequired,
                 "bad_signature" => KError::SignatureRejected,
@@ -381,8 +385,13 @@ async fn post_chunks(
             });
         }
 
-        // 2xx — epoch handling first, then advance cursors.
-        let parsed = parse_knowledge_response(&body);
+        // 2xx — epoch handling first, then advance cursors. Unlike the error
+        // arm above, an unreadable body here IS drift: it drops the `dataEpoch`
+        // the reset handshake rides on (#104).
+        let parsed = parse_knowledge_response(&body).unwrap_or_else(|e| {
+            dira_core::sync::warn_unreadable_body("knowledge_response", &e, &body);
+            Default::default()
+        });
         if let Some(epoch) = parsed.sync.data_epoch.as_deref() {
             if crate::sync::note_data_epoch(state, epoch)
                 .await

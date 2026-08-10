@@ -314,10 +314,18 @@ pub struct KnowledgeResponse {
     pub sync: KnowledgeSyncBlock,
 }
 
-/// Parse a knowledge response body. Tolerant: missing/empty/non-JSON bodies
-/// yield all-default.
-pub fn parse_knowledge_response(body: &str) -> KnowledgeResponse {
-    serde_json::from_str(body).unwrap_or_default()
+/// Parse a knowledge response body.
+///
+/// An empty body stays `Ok(default)`; a non-empty one that won't parse returns
+/// its error so the caller can decide. On a 2xx that is drift worth warning
+/// about — an all-default response drops the `dataEpoch` the reset handshake
+/// rides on. On an error body it usually isn't, and the caller falls back
+/// quietly. See [`super::drift`] (#104).
+pub fn parse_knowledge_response(body: &str) -> Result<KnowledgeResponse, serde_json::Error> {
+    if body.trim().is_empty() {
+        return Ok(KnowledgeResponse::default());
+    }
+    serde_json::from_str(body)
 }
 
 #[cfg(test)]
@@ -472,13 +480,30 @@ mod tests {
         let r = parse_knowledge_response(
             r#"{"status":"accepted","batchId":"01K","accepted":3,"duplicates":1,
                 "sync":{"knowledgeSyncedId":"01X","dataEpoch":"ep-2"}}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(r.status, "accepted");
         assert_eq!(r.accepted, 3);
         assert_eq!(r.sync.data_epoch.as_deref(), Some("ep-2"));
-        let empty = parse_knowledge_response("");
+        let empty = parse_knowledge_response("").expect("an empty body stays OK");
         assert!(empty.error.is_empty());
-        let err = parse_knowledge_response(r#"{"error":"content_not_allowed"}"#);
+        let err = parse_knowledge_response(r#"{"error":"content_not_allowed"}"#).unwrap();
         assert_eq!(err.error, "content_not_allowed");
+    }
+
+    /// #104: a non-empty body the contract can't read reports its error rather
+    /// than collapsing to all-default. The 2xx caller warns on it; the error-body
+    /// caller deliberately falls back quietly (a proxy's HTML is not drift).
+    #[test]
+    fn a_drifted_knowledge_body_reports_an_error() {
+        assert!(parse_knowledge_response(r#"{"accepted":"three"}"#).is_err());
+        assert!(parse_knowledge_response("<html>502 Bad Gateway</html>").is_err());
+        assert!(
+            parse_knowledge_response("<html>502</html>")
+                .unwrap_or_default()
+                .error
+                .is_empty(),
+            "the error-body caller's quiet fallback still yields a usable default"
+        );
     }
 }

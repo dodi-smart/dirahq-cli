@@ -109,6 +109,62 @@ pub enum Request {
     /// control protocol — distinct from the cloud wire contract under
     /// `/contract`, which this does not touch.
     Shutdown,
+    /// Drive `dira doctor --probe`'s end-to-end capture probe.
+    ///
+    /// Local control protocol only — like [`Self::Shutdown`], this does not
+    /// touch the cloud wire contract under `/contract`, so `just contract`
+    /// output is unchanged.
+    ///
+    /// Two phases over one variant because the daemon must mint and arm the
+    /// reserved session id *before* the CLI spawns the hook child: the CLI
+    /// never chooses a probe id, and the landing watch is registered before the
+    /// row can exist.
+    ///
+    /// The daemon deliberately does **not** spawn the child itself. It may be
+    /// the elevated process, and a child it forks would inherit that token and
+    /// open the elevated control channel happily — so the probe would pass on
+    /// exactly the machine the bug is on. The spawning process must be
+    /// `dira doctor`, running under the user's own ordinary token.
+    CaptureProbe { phase: ProbePhase },
+}
+
+/// Which half of the capture probe a [`Request::CaptureProbe`] drives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum ProbePhase {
+    /// Mint a reserved session id, register a landing watch, start the TTL.
+    Arm,
+    /// Wait up to `wait_ms` for the row, then delete every row for
+    /// `session_id` regardless of the outcome, and disarm.
+    Verify { session_id: String, wait_ms: u64 },
+}
+
+/// The daemon's half of the capture probe.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaptureProbeView {
+    /// `Arm`: the reserved session id the CLI must put in the payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// `Verify`: did a row actually reach the store?
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<bool>,
+    /// `Verify`: milliseconds from the start of the wait to the row landing,
+    /// or to the deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waited_ms: Option<u64>,
+    /// `Verify`: rows removed by the reap. 1 on success, 0 otherwise; anything
+    /// higher would mean something else wrote under the reserved prefix.
+    #[serde(default)]
+    pub deleted: u64,
+    /// Is the *daemon* elevated? A probe that passes while this is true and the
+    /// doctor process is not is worth saying out loud: it works today only
+    /// because both sides happen to match.
+    #[serde(default)]
+    pub daemon_elevated: bool,
+    /// The daemon's `control_channel_warning`, repeated here so the probe can
+    /// report it without a second round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_channel_warning: Option<String>,
 }
 
 /// Which manual session(s) to stop.
@@ -168,7 +224,16 @@ pub enum Response {
     Nuked { events: u64, tokens: u64 },
     /// `ResyncCursor`: the cursor was rewound and a flush was triggered; `pending`
     /// is how many events will now re-sync, from `from` (None = the beginning).
-    ResyncQueued { pending: u64, from: Option<String> },
+    /// `pending_tokens` is the token-usage backlog the rewind re-sends — its own
+    /// number, never folded into `pending`: conflating events and token rows in one
+    /// counter is worse than the under-count it replaces. Always 0 for a `--from`
+    /// rewind, which leaves the token cursor put by design (D-0018/D-0020).
+    ResyncQueued {
+        pending: u64,
+        #[serde(default)]
+        pending_tokens: u64,
+        from: Option<String>,
+    },
     /// `DaemonInfo`: the running daemon's build + runtime info.
     DaemonInfo {
         /// Daemon binary version (`CARGO_PKG_VERSION`).
@@ -242,6 +307,11 @@ pub enum Response {
     ZavetSpec(Box<ZavetSpecWhyView>),
     /// `ZavetSetMode`: the applied override (`on`/`off`) or `clear`.
     ZavetModeSet { repo: String, mode: String },
+    /// `CaptureProbe`. Boxed like `Status`/`Zavet*` so the small arms stay small.
+    ///
+    /// Same new-variant skew posture as `ZavetSpec`, and harmless here: only a
+    /// CLI new enough to send `CaptureProbe` can ever receive this.
+    CaptureProbe(Box<CaptureProbeView>),
 }
 
 /// A live or recent session as shown by `status` / `sessions`.
@@ -471,6 +541,12 @@ pub struct WriterHealthView {
     /// True when the writer currently looks wedged (no progress past the
     /// stall threshold while messages are backed up).
     pub wedged: bool,
+    /// Token turns stored with no repo since daemon start. Repo-less compute is
+    /// neither counted nor shown (D-0026), so a nonzero count is usage that has
+    /// gone invisible — an operator signal, not an outage. `0` from an older
+    /// daemon (issue #93).
+    #[serde(default)]
+    pub unattributed_token_rows: u64,
 }
 
 /// The sync task's self-reported health, attached to `status` (WP-B9). Mirrors
@@ -942,6 +1018,7 @@ mod tests {
                 stalls: 0,
                 idle_secs: Some(5),
                 wedged: false,
+                unattributed_token_rows: 142,
             }),
             sync_health: Some(SyncHealthView {
                 last_attempt_at: Some("2026-07-09T10:00:00Z".into()),
@@ -962,7 +1039,17 @@ mod tests {
         assert_eq!(back.tokens.unwrap().total_tokens, 2_060_000);
         assert_eq!(back.billing.unwrap().currency, "€");
         assert_eq!(back.writer_health.unwrap().panics, 2);
+        assert_eq!(back.writer_health.unwrap().unattributed_token_rows, 142);
         assert_eq!(back.sync_health.unwrap().flush_attempts, 10);
+    }
+
+    /// An older daemon's `WriterHealthView` predates issue #93 and omits
+    /// `unattributed_token_rows` entirely — it must deserialize to `0`, not fail.
+    #[test]
+    fn writer_health_unattributed_token_rows_defaults_zero_from_older_daemon() {
+        let json = r#"{"panics":1,"stalls":0,"idle_secs":null,"wedged":false}"#;
+        let v: WriterHealthView = serde_json::from_str(json).unwrap();
+        assert_eq!(v.unattributed_token_rows, 0);
     }
 
     #[test]

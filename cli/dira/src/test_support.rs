@@ -124,8 +124,8 @@ impl MockCloud {
 /// default, so `identity::promote_pending_key`'s keychain write in these
 /// tests never touches (or blocks on) the real OS keychain. Mirrors
 /// `dira_core::identity::tests::use_mock_keychain` exactly (see its doc
-/// comment for why the one-time `keyring::Entry::new` primer + per-test reset
-/// are both needed).
+/// comment for why the one-time platform-store primer + per-test reset are
+/// both needed).
 ///
 /// The mock store is process-global (a single shared table, not one per
 /// `Entry`), so every test that calls this MUST also hold [`keychain_lock`]
@@ -137,7 +137,7 @@ impl MockCloud {
 pub fn use_mock_keychain() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let _ = keyring::Entry::new("dira-test-init", "dira-test-init");
+        let _ = keyring::Entry::store_status();
     });
     keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
 }

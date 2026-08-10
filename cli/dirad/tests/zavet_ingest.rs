@@ -53,9 +53,9 @@ fn guard_event(cwd: &Path, kind: &str) -> serde_json::Value {
 
 /// Put one live agent session for `repo` into the registry.
 fn open_session(state: &AppState, repo: &str) -> String {
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     let ev = RawEvent {
-        id: Ulid::new().to_string(),
+        id: Ulid::generate().to_string(),
         at: OffsetDateTime::now_utc(),
         session_id: session_id.clone(),
         harness: Harness::ClaudeCode,

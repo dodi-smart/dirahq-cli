@@ -960,6 +960,7 @@ pub fn est_cost(model: &str, input: u64, output: u64, cache_read: u64, cache_cre
         output,
         cache_read,
         cache_create,
+        cwd: None, // capture-time provenance only; irrelevant to a cost estimate
     };
     turn.est_cost_usd()
 }

@@ -33,7 +33,7 @@ async fn test_state() -> (AppState, tokio::sync::mpsc::Receiver<EventMsg>) {
 /// cwd and wouldn't). The timestamp is explicit so accrual is deterministic.
 fn manual_tick_with_repo(session: &str, at: OffsetDateTime) -> RawEvent {
     RawEvent {
-        id: Ulid::new().to_string(),
+        id: Ulid::generate().to_string(),
         at,
         session_id: session.to_string(),
         harness: Harness::Manual,
@@ -128,20 +128,26 @@ async fn slow_git_capture_does_not_stall_timer_accrual() {
 /// keep accruing subsequent messages.
 ///
 /// The panic is injected via the same `capture_fn` seam as the slow-git test
-/// above. It fires on the *first* commit-bearing event (`ManualStart`, which
-/// carries a repo) and, because of the per-repo capture throttle, never again
-/// for the same project within the test's real-time window — so exactly one
-/// panic is expected. Because the writer only calls `capture_fn` *after* the
-/// triggering event is durably appended and folded into the registry (see the
-/// accounting-ordering invariant documented on `writer::process_message`),
-/// this also proves that a panic in the best-effort tail of processing can't
-/// unwind the accounting-critical section that already ran for that event.
+/// above, and the seam panics exactly ONCE — on the first commit-bearing event
+/// (`ManualStart`, which carries a repo) — so "exactly one panic" is a property
+/// of the fake, not of wall-clock luck. (The writer's per-repo capture throttle
+/// would normally suppress the later ticks' captures too, but it is a 5s
+/// *real-time* window: on a slow runner the poll loop below can outlive it and
+/// a second capture fires, which used to fail this assertion spuriously.)
+/// Because the writer only calls `capture_fn` *after* the triggering event is
+/// durably appended and folded into the registry (see the accounting-ordering
+/// invariant documented on `writer::process_message`), this also proves that a
+/// panic in the best-effort tail of processing can't unwind the
+/// accounting-critical section that already ran for that event.
 #[tokio::test]
 async fn panicking_message_is_caught_and_writer_keeps_accruing() {
     let (state, rx) = test_state().await;
 
     fn panicking_capture(_state: &AppState, _cwd: &str, _canonical: &str) {
-        panic!("simulated panic in commit capture");
+        static PANICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !PANICKED.swap(true, Ordering::SeqCst) {
+            panic!("simulated panic in commit capture");
+        }
     }
 
     let writer_state = state.clone();
@@ -268,6 +274,7 @@ async fn status_carries_token_totals_and_cached_billing() {
         output: 2_000,
         cache_read: 3_000,
         cache_create: 4_000,
+        cwd: None,
     };
     state
         .store
@@ -346,7 +353,7 @@ async fn rpc(stream: &mut dira_ipc::Stream, req: &Request) -> Response {
 /// uniquely-named pipe on windows (the pipe namespace is flat and global, so
 /// uniqueness comes from the name, and nothing is created on disk).
 fn test_endpoint(tag: &str) -> std::path::PathBuf {
-    let unique = &Ulid::new().to_string()[..10];
+    let unique = &Ulid::generate().to_string()[..10];
     #[cfg(unix)]
     {
         let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());

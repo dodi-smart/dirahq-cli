@@ -148,7 +148,7 @@ mod tests {
 
     fn queued_event() -> EventMsg {
         EventMsg::Raw(Box::new(dira_core::model::RawEvent {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             at: time::OffsetDateTime::now_utc(),
             session_id: "s1".to_string(),
             harness: dira_contract::Harness::Manual,

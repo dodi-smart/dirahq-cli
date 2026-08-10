@@ -26,7 +26,7 @@ async fn test_state() -> AppState {
 
 fn ev(session: &str, kind: EventKind, at: OffsetDateTime) -> RawEvent {
     RawEvent {
-        id: Ulid::new().to_string(),
+        id: Ulid::generate().to_string(),
         at,
         session_id: session.to_string(),
         harness: Harness::ClaudeCode,
@@ -73,6 +73,7 @@ async fn zavet_why_answers_knowledge_and_cost() {
         output: 2000,
         cache_read: 0,
         cache_create: 0,
+        cwd: None,
     };
     state
         .store

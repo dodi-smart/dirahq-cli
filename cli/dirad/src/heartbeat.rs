@@ -557,7 +557,13 @@ async fn beat(
                 *last_sent_sessions = sessions_json;
                 *last_sent_at = Some(Instant::now());
                 let body = resp.text().await.unwrap_or_default();
-                let ack = parse_presence_ack(&body);
+                let ack = parse_presence_ack(&body).unwrap_or_else(|e| {
+                    // Still tolerant — the beat counts and pacing falls back to
+                    // the default ack. It just no longer does so silently
+                    // (#104). Same beat-rate warn as the non-2xx arm below.
+                    dira_core::sync::warn_unreadable_body("presence_ack", &e, &body);
+                    PresenceAck::default()
+                });
                 stash_hints(state, &ack);
                 tracing::debug!(
                     sessions = session_count,
@@ -608,14 +614,17 @@ async fn beat(
     }
 }
 
-/// Parse a 2xx presence response body into a typed [`PresenceAck`]. Tolerant:
-/// an empty body or one the current schema can't fully read both degrade to a
-/// default ack, so presence never errors over a logging/hint detail.
-fn parse_presence_ack(body: &str) -> PresenceAck {
+/// Parse a 2xx presence response body into a typed [`PresenceAck`].
+///
+/// An empty body stays `Ok` and means "default ack" — back-compat with a cloud
+/// that answers 200 with no payload, never drift. A *non-empty* body the schema
+/// can't read is the drift case: it zeroes every pacing hint, so the error goes
+/// back to the caller to log rather than being swallowed (#104).
+fn parse_presence_ack(body: &str) -> Result<PresenceAck, serde_json::Error> {
     if body.trim().is_empty() {
-        return PresenceAck::default();
+        return Ok(PresenceAck::default());
     }
-    serde_json::from_str(body).unwrap_or_default()
+    serde_json::from_str(body)
 }
 
 /// Stash the cloud's pacing hints into shared atomics for the future adaptive
@@ -840,6 +849,95 @@ mod tests {
                 .next_beat_hint_secs
                 .load(Ordering::Relaxed),
             21
+        );
+    }
+
+    /// #104: an empty 2xx body is back-compat, not drift — it must parse into a
+    /// default ack without reporting an error the caller would then warn about.
+    #[test]
+    fn an_empty_presence_ack_body_is_not_drift() {
+        for body in ["", "   ", "\n\t "] {
+            let ack = parse_presence_ack(body).expect("an empty body stays OK");
+            assert_eq!(ack.ttl_secs, 0);
+            assert_eq!(ack.next_beat_hint_secs, None);
+            assert!(ack.server_time.is_empty());
+        }
+    }
+
+    /// The happy path still parses, including the optional hint. Fields the ack
+    /// doesn't know (`unknownField`) are additive evolution, not drift — serde
+    /// ignores them and the known fields must survive intact.
+    #[test]
+    fn a_conforming_presence_ack_parses_with_its_hint() {
+        let ack = parse_presence_ack(
+            r#"{"serverTime":"2026-08-10T00:00:00Z","ttlSecs":75,"nextBeatHintSecs":30,"unknownField":true}"#,
+        )
+        .expect("a conforming ack must parse");
+        assert_eq!(ack.ttl_secs, 75);
+        assert_eq!(ack.next_beat_hint_secs, Some(30));
+        assert_eq!(ack.server_time, "2026-08-10T00:00:00Z");
+    }
+
+    /// #104: a NON-empty body the contract can't read used to vanish into
+    /// `unwrap_or_default()`, so a drifted or non-conforming cloud silently
+    /// produced `ttl_secs = 0` / no hint. It must now surface as an error the
+    /// caller can log — a wrongly-typed field, and a body that isn't the ack at
+    /// all (a proxy's HTML answered with 200 is the realistic shape).
+    #[test]
+    fn a_drifted_presence_ack_body_reports_an_error() {
+        for body in [
+            r#"{"ttlSecs":"75"}"#,          // type drift: string where u64 is due
+            r#"{"nextBeatHintSecs":[30]}"#, // shape drift
+            "<html>502 Bad Gateway</html>", // not JSON at all
+            "null",                         // JSON, but not an object
+        ] {
+            assert!(
+                parse_presence_ack(body).is_err(),
+                "non-empty unparseable body must not degrade silently: {body}"
+            );
+        }
+    }
+
+    /// #104: the daemon stays tolerant — a drifted 200 body still counts as a
+    /// sent beat and leaves the pacing hints at their defaults rather than
+    /// erroring the tick. The change is that it is now *logged*, not silent.
+    #[tokio::test]
+    async fn beat_survives_a_drifted_ack_body_with_default_hints() {
+        let cloud = MockCloud::start(&["/api/v1/presence"]).await;
+        cloud.push("/api/v1/presence", MockResp::ok(r#"{"ttlSecs":"nope"}"#));
+        let (state, _keychain) = linked_state(&cloud).await;
+        // Poison the hints first so "default" is an observable outcome rather
+        // than the value they already happened to hold.
+        state.presence_hints.ttl_secs.store(600, Ordering::Relaxed);
+        state
+            .presence_hints
+            .next_beat_hint_secs
+            .store(60, Ordering::Relaxed);
+
+        let mut last_sent_sessions = None;
+        let mut last_sent_at = None;
+        let mut last_any_active = false;
+        let mut last_nonempty_at = OffsetDateTime::now_utc();
+        let mut last_deep_idle = false;
+
+        let result = beat(
+            &state,
+            &mut last_sent_sessions,
+            &mut last_sent_at,
+            &mut last_any_active,
+            &mut last_nonempty_at,
+            &mut last_deep_idle,
+        )
+        .await;
+
+        assert_eq!(result, BeatResult::Sent, "drift must not fail the beat");
+        assert_eq!(state.presence_hints.ttl_secs.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            state
+                .presence_hints
+                .next_beat_hint_secs
+                .load(Ordering::Relaxed),
+            0
         );
     }
 

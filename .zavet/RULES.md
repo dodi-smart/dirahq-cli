@@ -22,3 +22,11 @@ agent context at session start — keep it short and non-negotiable.
   (user-only DACL + medium integrity label) — in `bind` **and** in the accept
   loop, or connection #2 silently loses it. Never report `ERROR_ACCESS_DENIED`
   as "daemon not running". See D-0016.
+- `dira doctor` diagnoses and never acts: no `--fix`, and a check whose inputs
+  are missing reports `skip`, never `fail`. Exit codes 0/1/2 are a contract.
+  See DIRASH-0022.
+- The capture probe's session id is minted by the daemon under the reserved
+  `dira-probe-` prefix and admitted only while its arm is live; every `Store`
+  read filters that prefix, and the daemon never spawns the hook child — a
+  child it forked would inherit an elevated token and certify the very bug the
+  probe exists to catch. See DIRASH-0023.

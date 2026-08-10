@@ -17,8 +17,9 @@ labels: bug
 - Steps to reproduce:
 
 **Output**
-(`dira status`, `dira doctor` if available, daemon logs, the failing command's stderr —
-paste as text, not a screenshot)
+(`dira status`, `dira doctor --json`, daemon logs, the failing command's stderr —
+paste as text, not a screenshot. If the bug is about capture not working, run
+`dira doctor --probe` and include that too.)
 
 **Does this involve captured data?**
 Please don't paste prompt text, file contents, or diffs. If the bug is that dira captured

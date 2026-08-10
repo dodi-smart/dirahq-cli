@@ -15,7 +15,7 @@ use ulid::Ulid;
 pub const TICK_SECS: i64 = 60;
 
 fn new_id() -> String {
-    Ulid::new().to_string()
+    Ulid::generate().to_string()
 }
 
 /// Short, user-facing handle for a session id (its ULID tail).

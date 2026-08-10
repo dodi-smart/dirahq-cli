@@ -122,6 +122,13 @@ pub struct AppState {
     /// `http_ingress_error` — D-0009: a daemon that cannot do its job must never
     /// look plainly healthy.
     pub control_channel_warning: Arc<Mutex<Option<String>>>,
+    /// The single in-flight `dira doctor --probe` capture probe, or `None`.
+    ///
+    /// A `std::sync::Mutex` like `sessions`/`repo_dirs`: every hold is a field
+    /// read or a swap with no `await` inside, and it is taken via
+    /// `control::lock_recover` so a poisoned lock degrades to "stale but
+    /// serving" rather than killing the control surface.
+    pub probe: Arc<Mutex<Option<crate::probe::ProbeSlot>>>,
 }
 
 impl AppState {
@@ -222,6 +229,11 @@ pub struct ProgressTracker {
     flush_attempts: AtomicU64,
     flush_successes: AtomicU64,
     flush_failures: AtomicU64,
+    /// Token turns stored with `project = NULL` since daemon start (issue #93).
+    /// Under D-0026, repo-less compute is neither counted nor shown, so a
+    /// nonzero value is usage that has gone invisible — an operator signal, not
+    /// itself an outage (mirrors `writer_panics`).
+    unattributed_token_rows: AtomicU64,
 }
 
 impl Default for ProgressTracker {
@@ -235,6 +247,7 @@ impl Default for ProgressTracker {
             flush_attempts: AtomicU64::new(0),
             flush_successes: AtomicU64::new(0),
             flush_failures: AtomicU64::new(0),
+            unattributed_token_rows: AtomicU64::new(0),
         }
     }
 }
@@ -295,6 +308,14 @@ impl ProgressTracker {
     /// Total times the watchdog has observed the writer stalled since daemon start.
     pub fn writer_stalls(&self) -> u64 {
         self.writer_stalls.load(Ordering::Relaxed)
+    }
+    /// Record that `n` token turns were stored with no project this capture pass.
+    pub fn mark_unattributed_token_rows(&self, n: u64) {
+        self.unattributed_token_rows.fetch_add(n, Ordering::Relaxed);
+    }
+    /// Total token turns stored with no project since daemon start.
+    pub fn unattributed_token_rows(&self) -> u64 {
+        self.unattributed_token_rows.load(Ordering::Relaxed)
     }
     /// Record that the sync task attempted a flush (WP-B9).
     pub fn mark_flush_attempt(&self) {
@@ -500,6 +521,17 @@ impl SessionRegistry {
     /// (`Config::idle()`); see [`LiveSession`] for why the incremental sum equals
     /// the one-shot accounting scan.
     pub fn observe(&mut self, ev: &RawEvent, idle: Duration) {
+        // A `dira doctor --probe` row is a transport test, not a session, and
+        // the registry is not backed by SQL — `partial_rollups` ships straight
+        // from here and `build_session_views` renders from here, so the store's
+        // prefix filters cannot reach either. Refusing it at the single entry
+        // point covers both the writer's live fold and hydrate's replay.
+        //
+        // The writer already returns early for probe rows; this is the guard
+        // that makes the property hold rather than depend on that.
+        if dira_core::model::is_probe_session(&ev.session_id) {
+            return;
+        }
         let kind = match ev.kind {
             EventKind::ManualStart | EventKind::ManualStop | EventKind::ManualTick => {
                 SessionKind::Manual
@@ -757,6 +789,15 @@ impl SessionRegistry {
             Some(_) => None, // more than one active session for this repo
             None => Some(first.session_id.clone()),
         }
+    }
+
+    /// This session's sticky project, if the registry has seen one. The
+    /// last-known-good fallback for token attribution (issue #93): `observe`
+    /// sets `project` first-non-null and never clears it, so this is the
+    /// registry's best answer even when the session's LATEST event carries no
+    /// project (or none at all, as in a session the registry hasn't hydrated).
+    pub fn project_for(&self, session_id: &str) -> Option<String> {
+        self.sessions.get(session_id)?.project.clone()
     }
 
     /// Resolve a stop selector to the session ids to close.

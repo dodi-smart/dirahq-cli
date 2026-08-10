@@ -5,6 +5,7 @@ mod client;
 mod config_cmd;
 mod daemon;
 mod device;
+mod doctor;
 mod duration;
 mod format;
 mod hook_health;
@@ -15,6 +16,7 @@ mod test_support;
 mod theme;
 mod tui;
 mod update;
+mod zavet_adapters;
 mod zavet_install;
 
 use anyhow::Result;
@@ -22,7 +24,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use dira_core::protocol::{ReportScope, Request, Response, StopSelector};
 use dira_core::Config;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Help styling — ANSI-16 only, deliberately: clap renders help before we can
 /// probe `COLORTERM`, and theme.rs's own ANSI fallback maps Engaged→cyan and
@@ -374,6 +376,44 @@ Examples:
   dira version               CLI + daemon build, wire schema, uptime — and a
                              warning when the CLI and daemon builds differ")]
     Version,
+    /// Diagnose whether capture is actually working.
+    #[command(
+        long_about = "\
+Run every diagnostic dira has and say, in one place, whether agent activity is
+actually being captured: daemon reachability (including a daemon that is
+running and refusing you), hook wiring, the local store, and cloud sync.
+
+Exit codes are a contract — 0 all clear, 1 at least one warning, 2 at least
+one failure — so an install script can tell \"works, could be better\" from
+\"capture is broken\".
+
+Checks whose inputs can't be gathered report `skipped`, never a failure: one
+dead daemon should produce one red line, not five.
+
+doctor reports; it never repairs. Every remedy is a command you should run
+knowingly.",
+        after_help = "\
+Examples:
+  dira doctor                           the full report
+  dira doctor --json                    one JSON object — for scripts and bug reports
+  dira doctor --check daemon.reachable  just that check (repeatable)
+  dira doctor --verbose                 also show skipped checks and their detail"
+    )]
+    Doctor {
+        /// Machine-readable output: one JSON object on stdout, nothing else.
+        #[arg(long)]
+        json: bool,
+        /// Run only these checks (repeatable).
+        #[arg(long = "check", value_name = "ID")]
+        checks: Vec<String>,
+        /// Also show skipped checks and each check's structured detail.
+        #[arg(long, short)]
+        verbose: bool,
+        /// Run the end-to-end capture probe: inject a synthetic hook through the
+        /// command your harness config actually invokes, and verify a row lands.
+        #[arg(long)]
+        probe: bool,
+    },
     /// Update dira to the latest release (resolve, verify, atomic swap, restart).
     #[command(
         long_about = "\
@@ -386,14 +426,19 @@ verify its sha256 against the published checksum, and atomically swap both
 and exits 0 in every non-error case, including offline, so it's safe to run
 speculatively (it also refreshes the cache behind the passive update
 notice). `--version` allows downgrading to any published release, not only
-upgrading to a newer one.",
+upgrading to a newer one.
+
+After a successful swap-and-restart, an already-installed zavet Claude Code
+plugin is also refreshed (marketplace + plugin update, machine scope only —
+never writes to a repo). Pass --no-zavet to skip that.",
         after_help = "\
 Examples:
   dira update --check               is a newer release available?
   dira update                       update to the latest release, restart the daemon
   dira update --channel prerelease  opt into a prerelease build
   dira update --version 0.2.0       pin to (or downgrade to) an exact version
-  dira update --no-restart          swap the binaries, leave the running daemon alone"
+  dira update --no-restart          swap the binaries, leave the running daemon alone
+  dira update --no-zavet            skip the post-update zavet plugin refresh"
     )]
     Update {
         /// Resolve only — report what's available, change nothing.
@@ -414,6 +459,9 @@ Examples:
         /// Install directory for the new binaries (default: alongside the running `dira`).
         #[arg(long, value_name = "DIR", env = "DIRA_BIN_DIR")]
         bin_dir: Option<PathBuf>,
+        /// Do not refresh the zavet Claude Code plugin after updating dira.
+        #[arg(long)]
+        no_zavet: bool,
     },
     /// Zavet knowledge module: what the tracked time produced, and why.
     #[command(
@@ -511,13 +559,23 @@ falling back to Claude Code's own installed_plugins.json) so a repeat run
 is a clean no-op instead of a duplicate install. Reports the installed
 version, scope, install path, and an advisory skew line comparing this dira
 build against the plugin's declared minimum — advisory only, never a hard
-error, since each product works fully without the other.",
+error, since each product works fully without the other.
+
+Also refreshes this repo's cross-harness adapters (AGENTS.md, .grok/, the
+vendored .zavet/bin/zavet copy, git hooks scaffolding) as a best-effort
+tail step — but ONLY when cwd resolves to a git toplevel carrying `.zavet/`
+AND the installed zavet reports `adapters --check` as stale AND that zavet
+is 1.3.0 or newer (older builds have no `adapters` subcommand at all).
+`--no-adapters` skips this even when it would otherwise apply. Git hooks are
+never installed by dira — `core.hooksPath` is reported, not touched.",
         after_help = "\
 Examples:
   dira zavet install                 install at user scope (the default)
   dira zavet install --scope project
   dira zavet install --update        already installed: refresh it
-  dira zavet install --dry-run       print the exact `claude` invocations only"
+  dira zavet install --dry-run       print the exact `claude` invocations only
+  dira zavet install --update --no-adapters
+                                      refresh the plugin but skip this repo's adapters"
     )]
     Install {
         /// Installation scope passed to `claude plugin install` (default: user).
@@ -529,6 +587,9 @@ Examples:
         /// Print the exact `claude` invocations without running them.
         #[arg(long)]
         dry_run: bool,
+        /// Do not refresh this repo's zavet adapters, even when they are stale.
+        #[arg(long)]
+        no_adapters: bool,
     },
 }
 
@@ -617,6 +678,22 @@ Examples:
     Restart,
 }
 
+/// Whether a `dira zavet status` invocation is about the directory the process
+/// is standing in, and so may carry the repo-scoped adapter/githook lines.
+///
+/// `--project <name>` names a REMOTE project with no relationship to cwd, so
+/// reporting this checkout's adapter staleness under it would be a plain lie.
+/// Pure, so the suppression rule is pinned by a test rather than by reading the
+/// dispatch site.
+fn zavet_status_is_cwd_scoped(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Zavet {
+            action: ZavetAction::Status { project: None }
+        }
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -681,7 +758,17 @@ async fn main() -> Result<()> {
                 ConfigAction::Path => config_cmd::path(),
             };
         }
-        Command::Hook { harness } => return forward_hook(&config, harness).await,
+        Command::Hook { harness } => {
+            let probe = hook_probe_mode();
+            let outcome = forward_hook(&config, harness, probe).await;
+            // The harness contract is unchanged: a hook always exits 0 and
+            // never writes stdout. Probe mode is the one exception, and only a
+            // process `dira doctor` spawned itself can be in it.
+            if probe && outcome == HookOutcome::Failed {
+                std::process::exit(HOOK_PROBE_FAILURE_EXIT);
+            }
+            return Ok(());
+        }
         Command::Zavet {
             action: ZavetAction::Emit,
         } => return forward_zavet_event(&config).await,
@@ -691,12 +778,14 @@ async fn main() -> Result<()> {
                     scope,
                     update,
                     dry_run,
+                    no_adapters,
                 },
         } => {
             return zavet_install::install(zavet_install::InstallArgs {
                 scope: scope.clone(),
                 update: *update,
                 dry_run: *dry_run,
+                no_adapters: *no_adapters,
             });
         }
         Command::Nuke { yes } => return nuke(&config, *yes).await,
@@ -706,6 +795,31 @@ async fn main() -> Result<()> {
             update::notice::maybe_print(&config);
             return Ok(());
         }
+        Command::Doctor {
+            json,
+            checks,
+            verbose,
+            probe,
+        } => {
+            let code = doctor::run(
+                &config,
+                doctor::Args {
+                    json: *json,
+                    verbose: *verbose,
+                    probe: *probe,
+                    only: checks.clone(),
+                },
+            )
+            .await;
+            // Neither of the usual trailers runs here: `hook.breadcrumb` is
+            // already a check, and in --json mode stdout must carry exactly one
+            // object. The update notice is stderr-and-TTY-gated anyway, but
+            // skipping it keeps the contract explicit.
+            if !*json {
+                update::notice::maybe_print(&config);
+            }
+            std::process::exit(code);
+        }
         Command::Update {
             check,
             version,
@@ -713,6 +827,7 @@ async fn main() -> Result<()> {
             force,
             no_restart,
             bin_dir,
+            no_zavet,
         } => {
             return update::run(
                 &config,
@@ -723,6 +838,7 @@ async fn main() -> Result<()> {
                     force: *force,
                     no_restart: *no_restart,
                     bin_dir: bin_dir.clone(),
+                    no_zavet: *no_zavet,
                 },
             )
             .await;
@@ -773,6 +889,14 @@ async fn main() -> Result<()> {
             action: ZavetAction::Status { .. }
         }
     );
+    // `--project` names a REMOTE project with no necessary relationship to
+    // `cwd` — reporting this cwd's adapter staleness against it would be a
+    // lie, so the adapter lines are cwd-scoped and print only when the
+    // status is genuinely about the directory the process is standing in.
+    // Cloned (not moved) here because `cwd` itself is consumed piecemeal by
+    // the `req` match below.
+    let zavet_status_cwd_scoped = zavet_status_is_cwd_scoped(&cli.command);
+    let cwd_for_adapter_status = cwd.clone();
 
     // Commands that talk to the daemon.
     let req = match cli.command {
@@ -884,6 +1008,7 @@ async fn main() -> Result<()> {
         | Command::Nuke { .. }
         | Command::Completions { .. }
         | Command::Version
+        | Command::Doctor { .. }
         | Command::Update { .. } => unreachable!(),
     };
 
@@ -892,6 +1017,15 @@ async fn main() -> Result<()> {
     if is_zavet_status {
         if let Some(line) = zavet_install::status_line() {
             println!("{line}");
+        }
+        // Only for `dira zavet status` with no `--project` — see
+        // `zavet_status_cwd_scoped`'s doc comment above.
+        if zavet_status_cwd_scoped {
+            if let Some(cwd) = cwd_for_adapter_status {
+                for line in zavet_install::adapter_status_lines(Path::new(&cwd)) {
+                    println!("{line}");
+                }
+            }
         }
     }
     if !ok {
@@ -930,18 +1064,21 @@ const HOOK_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 async fn forward_stdin(
     config: &Config,
     label: &str,
+    probe: bool,
     wrap: impl FnOnce(serde_json::Value) -> Request,
-) -> Result<()> {
+) -> HookOutcome {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-        note_hook_failure(label, &format!("could not read the hook payload: {e}"));
-        return Ok(());
+        return note_hook_failure(
+            label,
+            probe,
+            &format!("could not read the hook payload: {e}"),
+        );
     }
     let payload: serde_json::Value = match serde_json::from_str(&buf) {
         Ok(v) => v,
         Err(e) => {
-            note_hook_failure(label, &format!("hook payload was not JSON: {e}"));
-            return Ok(());
+            return note_hook_failure(label, probe, &format!("hook payload was not JSON: {e}"))
         }
     };
     let req = wrap(payload);
@@ -954,24 +1091,71 @@ async fn forward_stdin(
         // A `Response::Error` is the daemon answering — an unknown harness or an
         // unaccounted event kind is a *semantic* non-result, not a transport
         // failure, and stays silent by design.
-        Ok(Ok(_)) => hook_health::record_success(),
-        Ok(Err(e)) => note_hook_failure(label, &e.to_string()),
-        Err(_) => note_hook_failure(label, "timed out reaching dirad"),
+        Ok(Ok(_)) => {
+            if !probe {
+                hook_health::record_success();
+            }
+            HookOutcome::Delivered
+        }
+        Ok(Err(e)) => note_hook_failure(label, probe, &e.to_string()),
+        Err(_) => note_hook_failure(label, probe, "timed out reaching dirad"),
     }
-    Ok(())
 }
 
-fn note_hook_failure(label: &str, reason: &str) {
-    hook_health::record_failure(label, reason);
+/// Whether this hook shim was spawned by `dira doctor --probe`.
+///
+/// Flips exactly two things, and nothing else about the harness contract:
+///
+/// 1. A **transport** failure exits non-zero instead of 0, so the probe can
+///    distinguish "the hook never reached the daemon" (the elevated-channel
+///    bug) from "the daemon acked it and dropped it" (a saturated queue).
+///    Those have completely different remedies and the row-landed signal alone
+///    cannot tell them apart.
+/// 2. `hook_health` is not touched at all. This is not cosmetic: without it a
+///    probe failure would write the probe's own error into the breadcrumb
+///    `dira status` reads, and — worse — a probe SUCCESS would call
+///    `record_success()` and clear a genuine failure counter the user still
+///    needs to see. A diagnostic must never overwrite the evidence.
+///
+/// Read ONCE, at the `dira hook` call site, and passed down explicitly — never
+/// consulted from inside the shared stdin plumbing. `dira zavet emit` goes
+/// through the same helper, and an ambient `DIRA_HOOK_PROBE` must not silently
+/// suppress its bookkeeping too.
+///
+/// No harness sets this; the only process that does is one `dira doctor`
+/// spawned itself with a pipe on its stdin.
+fn hook_probe_mode() -> bool {
+    std::env::var("DIRA_HOOK_PROBE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether a hook payload reached the daemon.
+#[derive(Debug, PartialEq, Eq)]
+enum HookOutcome {
+    Delivered,
+    /// A transport failure — the daemon was never reached.
+    Failed,
+}
+
+/// Exit code a probe-mode hook uses to report a transport failure.
+///
+/// Distinct from 1 (a generic error) and 2 (clap usage) so the probe can tell
+/// its own signal from an unrelated failure.
+const HOOK_PROBE_FAILURE_EXIT: i32 = 3;
+
+fn note_hook_failure(label: &str, probe: bool, reason: &str) -> HookOutcome {
+    if !probe {
+        hook_health::record_failure(label, reason);
+    }
     if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
         eprintln!("dira hook {label}: {reason}");
     }
+    HookOutcome::Failed
 }
 
 /// Forward a harness hook payload from stdin to the daemon.
-async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
+async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcome {
     let owned = harness.to_string();
-    forward_stdin(config, harness, move |payload| Request::IngestHook {
+    forward_stdin(config, harness, probe, move |payload| Request::IngestHook {
         harness: owned,
         payload,
     })
@@ -980,7 +1164,12 @@ async fn forward_hook(config: &Config, harness: &str) -> Result<()> {
 
 /// Forward a zavet guard event from stdin to the daemon.
 async fn forward_zavet_event(config: &Config) -> Result<()> {
-    forward_stdin(config, "zavet", |payload| Request::IngestZavet { payload }).await
+    // Never probe mode: this shim is not the one `dira doctor` drives.
+    forward_stdin(config, "zavet", false, |payload| Request::IngestZavet {
+        payload,
+    })
+    .await;
+    Ok(())
 }
 
 /// Print the CLI version (and wire schema), then best-effort query the running
@@ -990,52 +1179,42 @@ async fn print_version(config: &Config) -> Result<()> {
     let cli = env!("CARGO_PKG_VERSION");
     println!("dira    {cli}  (schema {})", dira_contract::SCHEMA_VERSION);
 
-    match client::send(&config.socket_path, &Request::DaemonInfo).await {
-        Ok(Response::DaemonInfo {
-            version,
-            schema_version,
-            pid,
-            uptime_seconds,
-            http_ingress_error,
-            control_channel_warning,
-            db_path,
-            storage_warning,
-        }) => {
+    let probe = daemon::probe(config).await;
+    match &probe.info {
+        Some(info) => {
             println!(
-                "dirad   {version}  (schema {schema_version}, pid {pid}, up {})",
-                format::hms(uptime_seconds as i64)
+                "dirad   {}  (schema {}, pid {}, up {})",
+                info.version,
+                info.schema_version,
+                info.pid,
+                format::hms(info.uptime_seconds as i64)
             );
-            if let Some(reason) = http_ingress_error {
+            if let Some(reason) = &info.http_ingress_error {
                 println!("warning: daemon is DEGRADED — {reason}");
             }
             // Distinct from DEGRADED on purpose: an elevated-but-reachable daemon
             // captures fine, so it gets an advisory rather than the word reserved
             // for "captures nothing".
-            if let Some(reason) = control_channel_warning {
+            if let Some(reason) = &info.control_channel_warning {
                 println!("note: {reason}");
             }
-            if let Some(reason) = storage_warning {
+            if let Some(reason) = &info.storage_warning {
                 println!("warning: {reason}");
             }
             // Only the comparison can see this — see `store_divergence_line`.
-            if let Some(line) = daemon::store_divergence_line(&config.db_path, db_path.as_deref()) {
+            if let Some(line) =
+                daemon::store_divergence_line(&config.db_path, info.db_path.as_deref())
+            {
                 println!("{line}");
             }
-            if version != cli {
-                println!(
-                    "warning: CLI ({cli}) and daemon ({version}) differ — restart the daemon \
-                     (`dira daemon stop && dira daemon start`) so they match"
-                );
+            if let Some(line) = daemon::version_skew_line(cli, &info.version) {
+                println!("{line}");
             }
         }
-        Ok(_) => println!("dirad   (unexpected daemon response)"),
-        Err(_) => println!(
+        _ if probe.unexpected => println!("dirad   (unexpected daemon response)"),
+        _ => println!(
             "{}",
-            daemon::version_not_running_message(
-                daemon::legacy_daemon_socket_default(config)
-                    .await
-                    .as_deref()
-            )
+            daemon::version_not_running_message(probe.legacy.as_deref())
         ),
     }
     Ok(())
@@ -1046,20 +1225,10 @@ async fn print_version(config: &Config) -> Result<()> {
 /// pick a restart strategy, surfaced here so a user can tell why a bare `kill`
 /// isn't enough before reaching for `restart`.
 async fn print_supervision(config: &Config) {
-    let label = match daemon::detect_supervision(config).await {
-        daemon::Supervision::Launchd => "launchd".to_string(),
-        daemon::Supervision::SystemdUser => "systemd --user".to_string(),
-        daemon::Supervision::ScheduledTask => "scheduled task".to_string(),
-        daemon::Supervision::Pidfile(pid) => format!("pidfile (pid {pid})"),
-        daemon::Supervision::Socket(pid) => format!("unmanaged (pid {pid}, no pidfile)"),
-        daemon::Supervision::LegacySocket { pid, sock } => format!(
-            "pre-upgrade daemon on legacy socket {} (pid {})",
-            sock.display(),
-            pid.map_or("unknown".into(), |p| p.to_string())
-        ),
-        daemon::Supervision::NotRunning => return,
-    };
-    println!("supervised by: {label}");
+    let supervision = daemon::detect_supervision(config).await;
+    if let Some(label) = daemon::supervision_label(&supervision) {
+        println!("supervised by: {label}");
+    }
 }
 
 /// Wipe all local statistics via the daemon (so its live-session registry is
@@ -1110,6 +1279,28 @@ mod tests {
     #[test]
     fn clap_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// Issue #98: the repo-scoped adapter lines may only ride a status that is
+    /// genuinely about cwd. `--project` names a remote project, so claiming
+    /// THIS checkout's adapter staleness under it would be a lie.
+    #[test]
+    fn adapter_status_lines_are_suppressed_under_an_explicit_project() {
+        let bare = Cli::parse_from(["dira", "zavet", "status"]);
+        assert!(
+            zavet_status_is_cwd_scoped(&bare.command),
+            "a bare `dira zavet status` is about the cwd"
+        );
+
+        let named = Cli::parse_from(["dira", "zavet", "status", "--project", "acme/api"]);
+        assert!(
+            !zavet_status_is_cwd_scoped(&named.command),
+            "--project names a remote project with no relationship to cwd"
+        );
+
+        // Any other command never carries them either.
+        let other = Cli::parse_from(["dira", "status"]);
+        assert!(!zavet_status_is_cwd_scoped(&other.command));
     }
 
     /// Every subcommand ships a long help; the flagship ones ship examples.

@@ -1,10 +1,10 @@
 ---
 title: Attestation sync and session rollups
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
-date: 2026-08-04
+date: 2026-08-09
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
@@ -12,7 +12,7 @@ paths:
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025]
 ---
 
 ## Overview
@@ -122,9 +122,27 @@ single flush window (issue #40).
   is `#[serde(default)]`, so it cannot tell "absent" from "zero" and turned
   the live cloud's counter-free 202 into `accepted=0 duplicates=0` on every
   healthy flush (issue #72).
+- Every `parse_*_response` is tolerant but never silent. An empty body is
+  `Ok(default)` (back-compat with a cloud that acks with no payload); a
+  non-empty body that won't parse returns its `serde_json::Error`. Callers on a
+  2xx report it via `dira_core::sync::warn_unreadable_body` and continue on
+  defaults; callers parsing an *error* body fall back quietly, since a proxy's
+  HTML 502 is not contract drift. Before #104 all of these were
+  `unwrap_or_default()`, so an unreadable ack dropped `dataEpoch` — a cloud that
+  had reset its durable log was indistinguishable from one that never mentioned
+  an epoch, and the re-send never fired.
 
 ## Invariants
 
+- A token turn's repo comes from that turn's own `cwd`, not from the event that
+  triggered the capture pass (DIRASH-0025). Attribution is per turn because one
+  unresolved `Stop` would otherwise mark every turn since the last watermark
+  repo-less, and repo-less compute is invisible rather than merely unlabelled.
+- A row is written with no project only when the turn's cwd, the triggering
+  event, and the session's sticky project are all unavailable — and every such
+  row is counted and warned, never silently dropped.
+- `TokenTurn.cwd` is capture-time provenance only. It never reaches the
+  `token_usage` table, the contract, or the wire.
 - Nothing content-bearing crosses the wire — rollups are metadata only
   (D-0001); the flush path performs no foreground network I/O outside the
   sync task (D-0006).

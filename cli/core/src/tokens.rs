@@ -23,6 +23,13 @@ pub struct TokenTurn {
     pub output: u64,
     pub cache_read: u64,
     pub cache_create: u64,
+    /// The working directory the harness recorded ON THIS LINE (Claude Code writes
+    /// `cwd` on every `type:"assistant"` line). Capture-time provenance only —
+    /// resolved to a project by the daemon, never persisted or synced. `None` for
+    /// harnesses whose transcript has no per-line cwd (grok's ACP envelopes carry
+    /// it only in the session path, and decoding that encoding is unverified).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl TokenTurn {
@@ -145,6 +152,15 @@ pub fn parse_transcript_usage(jsonl: &str) -> Vec<TokenTurn> {
             .unwrap_or("unknown")
             .to_string();
         let u = |k: &str| usage.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        // Per-turn cwd (issue #93): Claude Code stamps every assistant line with
+        // the cwd it was written from, so this is the turn's OWN provenance, not
+        // the cwd of whichever event later triggers the capture pass. An empty
+        // string is treated the same as absent — never a meaningful cwd.
+        let cwd = v
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         out.push(TokenTurn {
             id,
             at,
@@ -153,6 +169,7 @@ pub fn parse_transcript_usage(jsonl: &str) -> Vec<TokenTurn> {
             output: u("output_tokens"),
             cache_read: u("cache_read_input_tokens"),
             cache_create: u("cache_creation_input_tokens"),
+            cwd,
         });
     }
     out
@@ -246,6 +263,11 @@ pub fn parse_grok_updates_usage(jsonl: &str) -> Vec<TokenTurn> {
                     output: u64_of(m, "outputTokens"),
                     cache_read,
                     cache_create: 0,
+                    // Grok's cwd lives only in the session PATH
+                    // (`~/.grok/sessions/<encoded-cwd>/<id>/updates.jsonl`), not in
+                    // any per-line field. Decoding that encoding is unverified
+                    // guesswork (issue #93) — pinned to `None` until it's real.
+                    cwd: None,
                 });
             }
         } else {
@@ -259,6 +281,7 @@ pub fn parse_grok_updates_usage(jsonl: &str) -> Vec<TokenTurn> {
                 output: u64_of(usage, "outputTokens"),
                 cache_read,
                 cache_create: 0,
+                cwd: None, // see the model_usage branch above
             });
         }
     }
@@ -290,6 +313,31 @@ not-json
         assert_eq!(turns[1].model, "claude-sonnet-4-6");
     }
 
+    /// Issue #93: the transcript's own per-line `cwd` must be parsed, absent
+    /// and empty-string both collapse to `None`, and everything else on the
+    /// line is unaffected by whether `cwd` is present.
+    #[test]
+    fn per_turn_cwd_is_parsed_absent_and_empty_both_yield_none() {
+        let sample = r#"
+{"type":"assistant","uuid":"with-cwd","timestamp":"2026-06-27T15:18:07.732Z","cwd":"/Users/dev/api","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"assistant","uuid":"no-cwd","timestamp":"2026-06-27T15:18:08Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"assistant","uuid":"empty-cwd","timestamp":"2026-06-27T15:18:09Z","cwd":"","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+"#;
+        let turns = parse_transcript_usage(sample);
+        assert_eq!(turns.len(), 3);
+        let by_id: std::collections::HashMap<&str, &TokenTurn> =
+            turns.iter().map(|t| (t.id.as_str(), t)).collect();
+        assert_eq!(by_id["with-cwd"].cwd.as_deref(), Some("/Users/dev/api"));
+        assert_eq!(by_id["no-cwd"].cwd, None);
+        assert_eq!(
+            by_id["empty-cwd"].cwd, None,
+            "an empty string is never a meaningful cwd"
+        );
+        // Other fields are unaffected by the presence/absence of `cwd`.
+        assert_eq!(by_id["with-cwd"].output, 10);
+        assert_eq!(by_id["no-cwd"].output, 10);
+    }
+
     #[test]
     fn opus_cost_uses_opus_pricing() {
         let t = TokenTurn {
@@ -300,6 +348,7 @@ not-json
             output: 1_000_000,
             cache_read: 0,
             cache_create: 0,
+            cwd: None,
         };
         // 1M input @ $5 + 1M output @ $25 = $30.
         assert!((t.est_cost_usd() - 30.0).abs() < 1e-9);
@@ -406,6 +455,7 @@ not-json
             output: 0,
             cache_read: 1_000_000,
             cache_create: 1_000_000,
+            cwd: None,
         };
         // 1M cache_read @ $0.5 + 1M cache_write @ $6.25 = $6.75.
         // cache_read dominates real usage (1.24B of 1.32B tokens in one observed
@@ -446,6 +496,12 @@ not-json
         assert_eq!(turns[1].input, 5000 - 1000);
         assert_eq!(turns[1].output, 300);
         assert_eq!(turns[1].cache_read, 1000);
+
+        // Issue #93: grok's cwd lives only in the session PATH, never a per-line
+        // field, so every turn is pinned to `None` rather than guessing at a
+        // decoding that's unverified.
+        assert_eq!(turns[0].cwd, None);
+        assert_eq!(turns[1].cwd, None);
     }
 
     #[test]
@@ -498,6 +554,7 @@ not-json
             output: 0,
             cache_read: 1_000_000,
             cache_create: 0,
+            cwd: None,
         };
         // 1M cache_read @ $0.75 = $0.75.
         assert!((t.est_cost_usd() - 0.75).abs() < 1e-9);

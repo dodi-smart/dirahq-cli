@@ -561,11 +561,7 @@ async fn beat(
                     // Still tolerant — the beat counts and pacing falls back to
                     // the default ack. It just no longer does so silently
                     // (#104). Same beat-rate warn as the non-2xx arm below.
-                    tracing::warn!(
-                        error = %e,
-                        body = %body_snippet(&body),
-                        "heartbeat: presence ack did not parse — pacing hints fall back to defaults (cloud/contract drift?)"
-                    );
+                    dira_core::sync::warn_unreadable_body("presence_ack", &e, &body);
                     PresenceAck::default()
                 });
                 stash_hints(state, &ack);
@@ -629,20 +625,6 @@ fn parse_presence_ack(body: &str) -> Result<PresenceAck, serde_json::Error> {
         return Ok(PresenceAck::default());
     }
     serde_json::from_str(body)
-}
-
-/// Cap a response body for logging. Acks are metadata-only and tiny; a body big
-/// enough to need this is already off-contract, so a head is all we want.
-fn body_snippet(body: &str) -> String {
-    const MAX: usize = 200;
-    let trimmed = body.trim();
-    let mut chars = trimmed.chars();
-    let head: String = chars.by_ref().take(MAX).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
-    }
 }
 
 /// Stash the cloud's pacing hints into shared atomics for the future adaptive
@@ -957,16 +939,6 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
-    }
-
-    /// The logged body is capped and never splits a multi-byte character.
-    #[test]
-    fn body_snippet_truncates_on_a_char_boundary() {
-        assert_eq!(body_snippet("  {\"a\":1}  "), "{\"a\":1}");
-        let long = "é".repeat(500);
-        let snip = body_snippet(&long);
-        assert!(snip.ends_with('…'));
-        assert_eq!(snip.chars().count(), 201);
     }
 
     /// Property: whatever `base` jitter draws, the clamped cadence never reaches

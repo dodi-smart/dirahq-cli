@@ -49,5 +49,15 @@ fn main() -> std::io::Result<()> {
     std::fs::write(&knowledge_out, knowledge_json + "\n")?;
     eprintln!("wrote {}", knowledge_out.display());
 
+    // The RESPONSE side. Every root above is a request envelope, so schemars —
+    // which walks from a root — never reaches a type the cloud only ever
+    // produces. `ContractResponses` exists purely to be that root: without it
+    // the cloud hand-authors each ack with nothing to diff against.
+    let responses = schemars::schema_for!(dira_contract::ContractResponses);
+    let responses_json = serde_json::to_string_pretty(&responses).expect("schema serializes");
+    let responses_out = dir.join("responses.schema.json");
+    std::fs::write(&responses_out, responses_json + "\n")?;
+    eprintln!("wrote {}", responses_out.display());
+
     Ok(())
 }

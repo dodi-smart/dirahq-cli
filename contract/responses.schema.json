@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContractResponses",
+  "description": "Emit-only root gathering every RESPONSE shape the cloud produces.\n\nschemars walks from a root type, and every other root here is a *request*\nenvelope — so a response type, which nothing requests, is reachable from no\nroot and never gets a schema emitted. The cloud then hand-authors its\ncounterpart with nothing to compare it against: exactly the gap that let the\n`grok` harness variant sit missing from the cloud's enum through several\nreleases of green CI.\n\nOne root rather than four files because the four share a lifecycle and the\nconsumer's vendor list is hardcoded in three places per artifact.\n\nNever constructed, on either side. It exists so `emit-schema` has something\nto walk; the emitted `$defs` are what the cloud generates its types from.\nContent-free like every other type here (D-0001) — these are acks and error\ncodes, and nothing prose-bearing may be added to any of them.",
+  "type": "object",
+  "properties": {
+    "ingestError": {
+      "description": "`POST /api/v1/ingest`, on a 4xx.",
+      "$ref": "#/$defs/IngestError"
+    },
+    "knowledgeAck": {
+      "description": "`POST /api/v1/knowledge`, on a 2xx.",
+      "$ref": "#/$defs/KnowledgeAck"
+    },
+    "presenceAck": {
+      "description": "`POST /api/v1/presence`, on a 2xx.",
+      "$ref": "#/$defs/PresenceAck"
+    },
+    "serverMeta": {
+      "description": "`GET /api/v1/meta`.",
+      "$ref": "#/$defs/ServerMeta"
+    }
+  },
+  "required": [
+    "ingestError",
+    "presenceAck",
+    "knowledgeAck",
+    "serverMeta"
+  ],
+  "$defs": {
+    "IngestError": {
+      "description": "A typed ingest error body, returned with a 4xx on `POST /api/v1/ingest`.\n\nReplaces the brittle substring match on the response text: `error ==\n\"unknown_device\"` means the device isn't linked cloud-side and needs a\nre-link. New error codes can be added without breaking the producer.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "description": "A stable machine code, e.g. `\"unknown_device\"`.",
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "KnowledgeAck": {
+      "description": "The cloud's typed response to a successful `POST /api/v1/knowledge`.\nTolerant: an empty body deserializes with defaults.",
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "description": "Count of newly-accepted items in this batch.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "duplicates": {
+          "description": "Count of items the cloud already had (idempotent duplicates).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "schemaVersion": {
+          "description": "The contract version the cloud processed under. Empty when unknown.",
+          "type": "string",
+          "default": ""
+        },
+        "serverTime": {
+          "description": "RFC 3339 timestamp the cloud processed the batch. Empty when unknown.",
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "PresenceAck": {
+      "description": "The cloud's typed response to a successful `POST /api/v1/presence`.\n\nReturned on a 2xx. `ttl_secs` is the TTL the cloud will actually honor for\nthis device (it may clamp the device's requested `presence_ttl_secs`), and\n`next_beat_hint_secs` is an optional adaptive-cadence hint the daemon can use\nto pace future beats (Phase 6). Tolerant of an empty/absent body for\nback-compat with an older cloud.",
+      "type": "object",
+      "properties": {
+        "nextBeatHintSecs": {
+          "description": "Optional hint: how many seconds the daemon should wait before the next\nbeat. `None` = the daemon keeps its configured cadence.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "serverTime": {
+          "description": "RFC 3339 timestamp the cloud processed the beat. Empty when unknown.",
+          "type": "string",
+          "default": ""
+        },
+        "ttlSecs": {
+          "description": "The TTL the cloud honors for this device, in seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        }
+      }
+    },
+    "ServerMeta": {
+      "description": "The cloud's advertised contract-version range, from `GET /api/v1/meta`.\n\nLets the daemon perform a best-effort startup handshake: if our\n[`SCHEMA_VERSION`] falls outside `[min_schema_version, schema_version]`, the\ndaemon logs a clear warning (non-fatal). Evolution is additive within a major,\nso a mismatch is usually a heads-up, not a hard stop.",
+      "type": "object",
+      "properties": {
+        "minSchemaVersion": {
+          "description": "The oldest contract version the cloud still accepts, e.g. `\"1.0.0\"`.",
+          "type": "string",
+          "default": ""
+        },
+        "schemaVersion": {
+          "description": "The newest contract version the cloud supports, e.g. `\"1.2.0\"`.",
+          "type": "string",
+          "default": ""
+        }
+      }
+    }
+  }
+}

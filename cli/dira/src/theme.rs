@@ -129,11 +129,184 @@ pub fn style(role: Role) -> Style {
 /// once. When false, [`paint`] is a no-op, so piped/redirected `dira status`
 /// output stays byte-for-byte identical to the uncoloured layout.
 pub fn stdout_color() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_COLOR.with(std::cell::Cell::get) {
+        return forced;
+    }
     static C: OnceLock<bool> = OnceLock::new();
     *C.get_or_init(|| {
         use std::io::IsTerminal;
         std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
     })
+}
+
+// Test-only colour override, so a renderer can be exercised WITH SGR bytes.
+//
+// Under `cargo test` stdout is never a TTY, so `paint` is a no-op and every
+// width assertion runs against zero escape bytes — which means a renderer that
+// measures painted text passes the whole suite and then collapses in a real
+// terminal. That happened once. Forcing colour on is the only way to make those
+// assertions able to fail for the reason they exist.
+//
+// Thread-local, not global: libtest runs each test on its own thread, so a test
+// that forces colour cannot disturb one asserting on plain output.
+#[cfg(test)]
+thread_local! {
+    static FORCE_COLOR: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force [`stdout_color`] for the current test thread; `None` restores the probe.
+#[cfg(test)]
+pub fn force_color(v: Option<bool>) {
+    FORCE_COLOR.with(|c| c.set(v));
+}
+
+/// The non-ASCII glyphs the renderers use, and their ASCII stand-ins.
+///
+/// Separate from [`stdout_color`] on purpose: a terminal that cannot draw `⚠`
+/// is not the same terminal as one the user piped to a file, and conflating
+/// them would strip colour from a capable console or leave mojibake on an
+/// incapable one. The two probes are independent.
+/// Every stand-in that lands in a padded column is exactly one display cell
+/// wide, because the layouts pad around them. `check` and `ellipsis` are the
+/// two exceptions — both only ever appear inside width-measured segments.
+pub struct Glyphs {
+    /// Separator between dotted metadata parts, and `doctor`'s skip mark.
+    pub dot: &'static str,
+    /// Verified / current.
+    pub check: &'static str,
+    /// Unverified — a hypothesis nobody confirmed.
+    pub open: &'static str,
+    /// Needs attention.
+    pub warn: &'static str,
+    /// Truncation ellipsis.
+    pub ellipsis: &'static str,
+    /// Human engaged time, and `doctor`'s pass mark.
+    pub bullet: &'static str,
+    /// Agent time / decisions.
+    pub diamond: &'static str,
+    /// Compute — hollow on purpose: an estimate, not measured time.
+    pub diamond_hollow: &'static str,
+    /// Commit trailers.
+    pub square: &'static str,
+    /// `doctor`'s warn mark. Distinct from [`Glyphs::warn`]: `doctor` uses four
+    /// distinct SHAPES so a piped report stays readable without colour.
+    pub triangle: &'static str,
+    /// `doctor`'s fail mark.
+    pub cross: &'static str,
+    /// Leads a remedy line; width-1 so the gutter stays aligned.
+    pub arrow: &'static str,
+    /// Pending sync, in the live dashboard.
+    pub up: &'static str,
+    /// Filled cell of a proportional bar.
+    pub bar_fill: &'static str,
+    /// Empty cell of a proportional bar.
+    pub bar_empty: &'static str,
+    /// The parallelism multiplier sign.
+    pub times: &'static str,
+    /// Em dash used as a table decoration (NOT prose punctuation).
+    pub dash: &'static str,
+}
+
+const UNICODE_GLYPHS: Glyphs = Glyphs {
+    dot: "·",
+    check: "✓",
+    open: "○",
+    warn: "⚠",
+    ellipsis: "…",
+    bullet: "●",
+    diamond: "◆",
+    diamond_hollow: "◇",
+    square: "▪",
+    triangle: "▲",
+    cross: "✕",
+    arrow: "→",
+    up: "⇡",
+    bar_fill: "█",
+    bar_empty: "░",
+    times: "×",
+    dash: "—",
+};
+
+const ASCII_GLYPHS: Glyphs = Glyphs {
+    dot: "-",
+    check: "ok",
+    open: "?",
+    warn: "!",
+    ellipsis: "...",
+    // Distinct shapes, not just distinct colours: the whole point of the
+    // fallback is a console that may also be rendering without colour.
+    bullet: "*",
+    diamond: "+",
+    diamond_hollow: "~",
+    square: ":",
+    triangle: "!",
+    cross: "x",
+    arrow: ">",
+    up: "^",
+    bar_fill: "#",
+    bar_empty: ".",
+    times: "x",
+    dash: "-",
+};
+
+/// The glyph set for this terminal. ASCII when `DIRA_ASCII` is set to anything
+/// other than `0`, or when a Windows console is on a non-UTF-8 code page —
+/// legacy `conhost` on a CP-1251/CP-437 machine renders `·` as garbage, which
+/// is exactly the setup that produced the unreadable field screenshots.
+pub fn glyphs() -> &'static Glyphs {
+    static G: OnceLock<bool> = OnceLock::new();
+    if *G.get_or_init(ascii_glyphs) {
+        &ASCII_GLYPHS
+    } else {
+        &UNICODE_GLYPHS
+    }
+}
+
+/// The one-time probe behind [`glyphs`].
+///
+/// Both platform arms are tail expressions rather than early returns — an
+/// arm that ends in `return` is `needless_return` on the platform where it is
+/// the last statement, and that only fails on the platform CI compiles it for.
+fn ascii_glyphs() -> bool {
+    if std::env::var("DIRA_ASCII").is_ok_and(|v| v != "0") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // 65001 is CP_UTF8; anything else cannot render the glyph set.
+        // SAFETY: a pure getter over console state, no arguments.
+        unsafe { windows_sys::Win32::System::Console::GetConsoleOutputCP() != 65001 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Ask a Windows console to interpret ANSI escapes.
+///
+/// Windows Terminal does this already; legacy `conhost` does not, and without
+/// it every `paint` leaks raw `\x1b[38;2;…m` into the output. Best-effort — a
+/// console that refuses the mode just keeps its old behaviour, and the failure
+/// is indistinguishable from the pre-existing one. No-op off Windows.
+pub fn enable_ansi() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+            STD_OUTPUT_HANDLE,
+        };
+        // SAFETY: standard handle round-trip; every pointer is a local, and a
+        // failed call is reported by the return value rather than by writing.
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode = 0u32;
+            if GetConsoleMode(h, &mut mode) != 0 {
+                SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
 }
 
 /// Wrap `text` in an SGR colour for `role`, for the plain `dira status`
@@ -163,6 +336,64 @@ fn paint_with(text: &str, role: Role, enabled: bool, truecolor: bool) -> String 
 
 #[cfg(test)]
 mod tests {
+    /// Every ASCII stand-in must actually be ASCII — the whole point is a
+    /// console that cannot encode anything else. A new glyph added to the
+    /// Unicode set and copied verbatim into the ASCII one would otherwise ship
+    /// mojibake to exactly the users the fallback exists for.
+    #[test]
+    fn ascii_glyphs_are_ascii() {
+        let g = &super::ASCII_GLYPHS;
+        for (name, v) in [
+            ("dot", g.dot),
+            ("check", g.check),
+            ("open", g.open),
+            ("warn", g.warn),
+            ("ellipsis", g.ellipsis),
+            ("bullet", g.bullet),
+            ("diamond", g.diamond),
+            ("diamond_hollow", g.diamond_hollow),
+            ("square", g.square),
+            ("triangle", g.triangle),
+            ("cross", g.cross),
+            ("arrow", g.arrow),
+            ("up", g.up),
+            ("bar_fill", g.bar_fill),
+            ("bar_empty", g.bar_empty),
+            ("times", g.times),
+            ("dash", g.dash),
+        ] {
+            assert!(v.is_ascii(), "{name} = {v:?} is not ASCII");
+            assert!(!v.is_empty(), "{name} is empty");
+        }
+    }
+
+    /// Glyphs that land in a padded column must be one cell wide, or every row
+    /// carrying one shifts relative to the rows that do not. `check` and
+    /// `ellipsis` are exempt: both only appear inside width-measured segments.
+    #[test]
+    fn column_glyphs_are_one_cell_wide() {
+        for set in [&super::UNICODE_GLYPHS, &super::ASCII_GLYPHS] {
+            for (name, v) in [
+                ("dot", set.dot),
+                ("bullet", set.bullet),
+                ("diamond", set.diamond),
+                ("diamond_hollow", set.diamond_hollow),
+                ("square", set.square),
+                ("triangle", set.triangle),
+                ("cross", set.cross),
+                ("arrow", set.arrow),
+                ("bar_fill", set.bar_fill),
+                ("bar_empty", set.bar_empty),
+            ] {
+                assert_eq!(
+                    crate::format::display_width(v),
+                    1,
+                    "{name} = {v:?} is not one cell wide"
+                );
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

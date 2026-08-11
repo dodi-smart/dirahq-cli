@@ -524,11 +524,36 @@ Examples:
         topic: Vec<String>,
         #[arg(long)]
         project: Option<String>,
+        /// One JSON object instead of the rendered view.
+        #[arg(long)]
+        json: bool,
     },
     /// List the captured decisions for this repo.
+    #[command(after_help = "\
+Records are grouped by what the working tree says about them:
+
+  ACTIVE / SUPERSEDED  the record's file is on the checked-out branch
+  OFF BRANCH           captured, but its file is not in this tree — it was
+                       recorded on another branch. Never deleted: decision ids
+                       are minted repo-wide, so the row has to stay.
+  UNCAPTURED           the file is on disk but dira has not captured it. Capture
+                       reads git, not the working tree, so an uncommitted record
+                       is invisible until it is committed.
+
+Presence needs a working directory to resolve; with --project from elsewhere the
+groups collapse to a single list rather than guessing.")]
     Decisions {
         #[arg(long)]
         project: Option<String>,
+        /// Spell out every guard glob under its decision.
+        #[arg(long)]
+        guards: bool,
+        /// Only records whose file is on the checked-out branch.
+        #[arg(long)]
+        branch: bool,
+        /// One JSON object instead of the rendered view.
+        #[arg(long)]
+        json: bool,
     },
     /// Force zavet ON for this repo (overrides the global modules.zavet knob).
     Enable {
@@ -696,6 +721,9 @@ fn zavet_status_is_cwd_scoped(command: &Command) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything prints: legacy Windows consoles need to be told to
+    // interpret ANSI escapes, or every painted line leaks its SGR bytes.
+    theme::enable_ansi();
     let cli = Cli::parse();
     let config = Config::load().map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let cwd = std::env::current_dir()
@@ -897,6 +925,27 @@ async fn main() -> Result<()> {
     // the `req` match below.
     let zavet_status_cwd_scoped = zavet_status_is_cwd_scoped(&cli.command);
     let cwd_for_adapter_status = cwd.clone();
+    // Presentation flags on the zavet list views. Read by reference for the
+    // same reason as above: the `req` match below consumes `cli.command`. Kept
+    // as two independent bindings — layout and output format are unrelated, and
+    // pairing them means a third subcommand wanting `--json` has to edit a
+    // match that also carries row widths.
+    let zavet_json = matches!(
+        &cli.command,
+        Command::Zavet {
+            action: ZavetAction::Decisions { json: true, .. }
+                | ZavetAction::Wiki { json: true, .. }
+        }
+    );
+    let row_opts = match &cli.command {
+        Command::Zavet {
+            action: ZavetAction::Decisions { guards, branch, .. },
+        } => render::RowOpts {
+            guards: *guards,
+            branch_only: *branch,
+        },
+        _ => render::RowOpts::default(),
+    };
 
     // Commands that talk to the daemon.
     let req = match cli.command {
@@ -972,12 +1021,14 @@ async fn main() -> Result<()> {
                 cwd,
                 repo: project,
             },
-            ZavetAction::Wiki { topic, project } => Request::ZavetWiki {
+            ZavetAction::Wiki { topic, project, .. } => Request::ZavetWiki {
                 topic: Some(topic.join(" ")).filter(|t| !t.trim().is_empty()),
                 cwd,
                 repo: project,
             },
-            ZavetAction::Decisions { project } => Request::ZavetDecisions { cwd, repo: project },
+            ZavetAction::Decisions { project, .. } => {
+                Request::ZavetDecisions { cwd, repo: project }
+            }
             ZavetAction::Enable { project } => Request::ZavetSetMode {
                 cwd,
                 repo: project,
@@ -1013,7 +1064,11 @@ async fn main() -> Result<()> {
     };
 
     let resp = client::send(&config.socket_path, &req).await?;
-    let ok = render::print(&resp);
+    let ok = if zavet_json {
+        render::print_json(&resp)
+    } else {
+        render::print_with(&resp, row_opts)
+    };
     if is_zavet_status {
         if let Some(line) = zavet_install::status_line() {
             println!("{line}");

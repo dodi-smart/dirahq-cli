@@ -1016,6 +1016,7 @@ dependencies = [
  "tokio",
  "toml_edit 0.25.13+spec-1.1.0",
  "ulid",
+ "unicode-width",
  "windows-sys 0.61.2",
  "zip",
 ]

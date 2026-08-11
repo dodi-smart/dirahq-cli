@@ -56,6 +56,10 @@ clap_mangen = "0.3"
 # the version is pinned to match ratatui's own crossterm to avoid two copies.
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
+# Column widths for the aligned plain-text tables. Right-aligned columns have to
+# be measured in display cells, not chars — already resolved in Cargo.lock as a
+# ratatui dependency, so this adds no crate.
+unicode-width = "0.2"
 # `StreamExt::next` for crossterm's async `EventStream`; no executor pulled in.
 futures-util = { version = "0.3", default-features = false }
 # `FutureExt::catch_unwind` for the writer's per-message panic isolation

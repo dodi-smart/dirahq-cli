@@ -431,7 +431,11 @@ fn apply_json_settings(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
-    println!("wired {label} hooks → {}", path.display());
+    println!(
+        "wired {label} hooks {} {}",
+        crate::theme::glyphs().arrow,
+        path.display()
+    );
     println!("hook command: {command}");
     println!("start the daemon with `dira daemon start`, then work as usual.");
     Ok(())
@@ -498,7 +502,11 @@ pub async fn run_opencode(config: &Config, print_only: bool) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("dira.js");
     std::fs::write(&path, plugin)?;
-    println!("wrote OpenCode forwarder plugin → {}", path.display());
+    println!(
+        "wrote OpenCode forwarder plugin {} {}",
+        crate::theme::glyphs().arrow,
+        path.display()
+    );
     println!("posts to {url}/hooks/opencode");
     println!("start the daemon with `dira daemon start`, then work as usual.");
     Ok(())

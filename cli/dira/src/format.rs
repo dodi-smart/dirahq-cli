@@ -5,6 +5,7 @@
 
 use crate::theme::Role;
 use dira_core::protocol::BillingView;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Format seconds as `1h 30m` / `12m 05s` / `45s`. Negatives clamp to zero.
 pub fn hms(seconds: i64) -> String {
@@ -54,20 +55,65 @@ pub fn kind_label(k: dira_contract::SessionKind) -> &'static str {
     }
 }
 
-/// Truncate `s` to at most `max` display columns, appending `…` when clipped.
-/// `max == 0` yields an empty string; `max == 1` yields just the ellipsis when
-/// the input is longer. Operates on `char`s (good enough for ASCII-ish labels).
-pub fn truncate(s: &str, max: usize) -> String {
+/// How many terminal columns `s` occupies.
+///
+/// Character counts are wrong for a right-aligned column: one CJK ideograph is
+/// two columns, a combining mark is zero, and either one skews an alignment
+/// computed from `chars().count()`.
+pub fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Truncate `s` to at most `max` display columns, appending the ellipsis glyph
+/// when clipped.
+///
+/// The only truncation in the CLI. It replaced a char-counting variant that
+/// also hardcoded `…`: two functions with near-identical names and divergent
+/// semantics meant a call site could silently pick the wrong one, and the
+/// hardcoded ellipsis leaked a non-ASCII glyph into `DIRA_ASCII` output.
+///
+/// The result never exceeds `max` columns, including the ellipsis, and never
+/// splits a wide character in half.
+pub fn truncate_cols(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    let count = s.chars().count();
-    if count <= max {
+    if display_width(s) <= max {
         return s.to_string();
     }
-    let keep = max.saturating_sub(1);
-    let head: String = s.chars().take(keep).collect();
-    format!("{head}…")
+    let ell = crate::theme::glyphs().ellipsis;
+    let budget = max.saturating_sub(display_width(ell));
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push_str(ell);
+    out
+}
+
+/// Pad `s` on the right to `width` display columns. Use before painting — SGR
+/// bytes have zero width, so padding a coloured string miscounts.
+pub fn pad_cols(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    format!("{s}{}", " ".repeat(width - w))
+}
+
+/// Pad `s` on the left to `width` display columns (right-alignment).
+pub fn pad_left_cols(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    format!("{}{s}", " ".repeat(width - w))
 }
 
 /// Compact token count with 3 significant digits: `982`, `45.2K`, `2.06M`,
@@ -168,7 +214,7 @@ pub fn billing_line(b: &BillingView) -> Vec<(String, Role)> {
             format!("{} billable", hours_compact(b.billable_hours)),
             Role::Engaged,
         ),
-        (" → ".to_string(), Role::Muted),
+        (format!(" {} ", crate::theme::glyphs().arrow), Role::Muted),
         (money(&b.currency, b.unbilled_amount), Role::Ink),
         (
             format!(" unbilled, {}", period_label(&b.period)),
@@ -197,7 +243,8 @@ pub fn bar(value: i64, max: i64, width: usize) -> String {
     }
     .min(width);
     let empty = width - filled;
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+    let g = crate::theme::glyphs();
+    format!("{}{}", g.bar_fill.repeat(filled), g.bar_empty.repeat(empty))
 }
 
 #[cfg(test)]
@@ -236,11 +283,11 @@ mod tests {
 
     #[test]
     fn truncate_clips_with_ellipsis() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello", 5), "hello");
-        assert_eq!(truncate("hello", 4), "hel…");
-        assert_eq!(truncate("hello", 1), "…");
-        assert_eq!(truncate("hello", 0), "");
+        assert_eq!(truncate_cols("hello", 10), "hello");
+        assert_eq!(truncate_cols("hello", 5), "hello");
+        assert_eq!(truncate_cols("hello", 4), "hel…");
+        assert_eq!(truncate_cols("hello", 1), "…");
+        assert_eq!(truncate_cols("hello", 0), "");
     }
 
     #[test]

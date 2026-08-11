@@ -10,8 +10,9 @@ use crate::control::lock_recover;
 use crate::state::AppState;
 use dira_core::config::ZavetMode;
 use dira_core::protocol::{
-    Response, ZavetCheckView, ZavetDecisionView, ZavetGuardStatView, ZavetSpecView,
-    ZavetSpecWhyView, ZavetStatusView, ZavetWhyView,
+    Response, ZavetCheckView, ZavetDecisionView, ZavetDecisionsView, ZavetGuardStatView,
+    ZavetPresence, ZavetSpecView, ZavetSpecWhyView, ZavetStatusView, ZavetUncapturedView,
+    ZavetWhyView,
 };
 use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
 pub use dira_core::zavet::{
@@ -50,6 +51,200 @@ pub fn read_config(repo_root: &Path) -> ZavetConfig {
         .unwrap_or_default()
 }
 
+/// What one git probe of the working tree tells us about a repo's records.
+///
+/// Produced by [`working_tree_probe`] — one `spawn_blocking`, one resolved
+/// toplevel, so every field describes the SAME tree. Splitting these across
+/// tasks let a checkout land between them and produce a view that mixed two
+/// branches, which is precisely what DIRASH-0026 forbids.
+#[derive(Default)]
+pub struct TreeProbe {
+    /// The checked-out branch; `None` on a detached HEAD or with no workdir.
+    pub branch: Option<String>,
+    /// Record paths present in `HEAD`'s tree. `None` means *unknown* — no
+    /// workdir, no HEAD, or git failed — and callers must render nothing
+    /// rather than guessing.
+    pub in_head: Option<std::collections::HashSet<String>>,
+    /// Records on disk the store has never captured.
+    pub uncaptured: Vec<ZavetUncapturedView>,
+}
+
+/// Which record kinds a probe should look for on disk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kinds {
+    Decisions,
+    Both,
+}
+
+/// Record files in the working tree that the store has no row for.
+///
+/// Files are matched against the store by id/slug, not by path, so a record
+/// renamed since capture is not reported as a new one. A file whose path is
+/// already known is skipped before it is read — in the steady state that is
+/// every record, which keeps this to a directory listing rather than N parses.
+///
+/// Filenames are classified with the same [`dira_core::zavet::is_decision_path`]
+/// / [`is_spec_path`] predicates the capture path uses, so "what counts as a
+/// record" cannot drift between capture and this report. A file that matches
+/// but does not parse still comes back, with `None` for the id — "there is a
+/// file here dira cannot read" is exactly the state worth surfacing.
+///
+/// Read-only: DIRASH-0024 gates repo-scope *writes* on a cwd check.
+fn scan_uncaptured(
+    root: &Path,
+    cfg: &ZavetConfig,
+    kinds: Kinds,
+    captured_keys: &std::collections::HashSet<String>,
+    captured_paths: &std::collections::HashSet<String>,
+    in_head: &std::collections::HashSet<String>,
+) -> Vec<ZavetUncapturedView> {
+    let mut out: Vec<ZavetUncapturedView> = Vec::new();
+    let dirs: &[&str] = match kinds {
+        Kinds::Decisions => &[dira_core::zavet::DECISIONS_DIR],
+        Kinds::Both => &[dira_core::zavet::DECISIONS_DIR, dira_core::zavet::SPECS_DIR],
+    };
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let rel = format!("{dir}{}", entry.file_name().to_string_lossy());
+            let is_spec = dira_core::zavet::is_spec_path(&rel);
+            if !is_spec && !dira_core::zavet::is_decision_path(&rel) {
+                continue;
+            }
+            // Already captured under this exact path: nothing to read.
+            if captured_paths.contains(&rel) {
+                continue;
+            }
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let (id, title) = if is_spec {
+                match dira_core::zavet::parse_spec(&text, &rel, cfg) {
+                    Some(s) => (Some(s.slug), s.title),
+                    None => (None, None),
+                }
+            } else {
+                match dira_core::zavet::parse_decision(&text, &rel, cfg) {
+                    Some(d) => (Some(d.id), d.title),
+                    None => (None, None),
+                }
+            };
+            if id.as_deref().is_some_and(|i| captured_keys.contains(i)) {
+                continue;
+            }
+            out.push(ZavetUncapturedView {
+                kind: if is_spec { "spec" } else { "decision" }.to_string(),
+                // Committed but absent from the store means the daemon has not
+                // walked that commit yet; absent from HEAD means it was never
+                // committed. Different remedies, so they stay distinct.
+                reason: if in_head.contains(&rel) {
+                    "awaiting sweep"
+                } else {
+                    "uncommitted"
+                }
+                .to_string(),
+                id,
+                title,
+                path: rel,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// Everything the list views need to know about the working tree, in one
+/// blocking task: the branch, which record paths `HEAD` carries, and which
+/// records on disk were never captured.
+///
+/// `root` arrives already resolved by [`repo_root`]: `toplevel()` shells out to
+/// git, and the probes used to pay for it once each.
+async fn working_tree_probe(
+    root: Option<PathBuf>,
+    cfg: ZavetConfig,
+    kinds: Kinds,
+    captured: Vec<(String, String)>,
+) -> TreeProbe {
+    let Some(root) = root else {
+        return TreeProbe::default();
+    };
+    tokio::task::spawn_blocking(move || {
+        let branch = dira_core::project::current_branch(&root);
+        // `None` = no HEAD (an unborn branch) or not a repo. That makes
+        // *presence* unknown — never guessed — but it does NOT make the
+        // on-disk scan unknown: the files are still right there. Bailing out
+        // here would report zero uncaptured records in a freshly-`git init`ed
+        // repo, which is the very case this feature exists to catch (the first
+        // decision of a project is written before the first commit).
+        //
+        // With no HEAD, nothing is committed, so an empty set is the truthful
+        // input and every record correctly reports `uncommitted`.
+        let in_head = dira_core::project::ls_tree_paths(
+            &root,
+            &[dira_core::zavet::DECISIONS_DIR, dira_core::zavet::SPECS_DIR],
+        );
+        let keys = captured.iter().map(|(_, k)| k.clone()).collect();
+        let paths = captured.iter().map(|(p, _)| p.clone()).collect();
+        let uncaptured = scan_uncaptured(
+            &root,
+            &cfg,
+            kinds,
+            &keys,
+            &paths,
+            in_head
+                .as_ref()
+                .unwrap_or(&std::collections::HashSet::new()),
+        );
+        TreeProbe {
+            branch,
+            in_head,
+            uncaptured,
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Resolve the repo toplevel once, off the async path.
+///
+/// Every git probe in a query needs it, and each used to shell out for its own
+/// copy. Resolving here also guarantees they all describe the same tree.
+async fn repo_root(workdir: Option<PathBuf>) -> Option<PathBuf> {
+    let dir = workdir?;
+    tokio::task::spawn_blocking(move || dira_core::project::toplevel(&dir).unwrap_or(dir))
+        .await
+        .ok()
+}
+
+/// Presence for one record path, or `None` when the probe could not look.
+fn presence_of(
+    in_head: Option<&std::collections::HashSet<String>>,
+    path: &str,
+) -> Option<ZavetPresence> {
+    in_head.map(|h| {
+        if h.contains(path) {
+            ZavetPresence::OnBranch
+        } else {
+            ZavetPresence::OffBranch
+        }
+    })
+}
+
+/// Attach each decision's guard-event tallies from one batched query.
+async fn attach_guard_stats(state: &AppState, repo: &str, decisions: &mut [ZavetDecisionView]) {
+    let mut stats = state
+        .store
+        .zavet_guard_event_stats_by_decision(repo)
+        .await
+        .unwrap_or_default();
+    for d in decisions {
+        if let Some(s) = stats.remove(&d.id) {
+            d.guard_stats = guard_stat_views(s);
+        }
+    }
+}
+
+/// Resolve a payload cwd to `(canonical repo, .zavet/ exists, id config)` off
 /// Resolve a payload cwd to `(canonical repo, .zavet/ exists, id config)` off
 /// the async path — `project::resolve` shells out to git.
 async fn resolve_repo(cwd: String) -> (Option<String>, bool, ZavetConfig) {
@@ -170,6 +365,7 @@ fn spec_view(s: &ZavetSpecRow, stale_commits: Option<u64>) -> ZavetSpecView {
         created_at: s.created_at.clone(),
         source_session: s.source_session.clone(),
         stale_commits,
+        presence: None,
     }
 }
 
@@ -194,15 +390,14 @@ fn staleness_input(s: &ZavetSpecRow) -> (Option<String>, Vec<String>) {
 /// paths stay `None`/`Some(0)` as appropriate; no workdir means every spec
 /// reports `None` (unknown).
 async fn spec_staleness(
-    workdir: Option<PathBuf>,
+    root: Option<PathBuf>,
     inputs: Vec<(Option<String>, Vec<String>)>,
 ) -> Vec<Option<u64>> {
     let n = inputs.len();
-    let Some(dir) = workdir else {
+    let Some(root) = root else {
         return vec![None; n];
     };
     tokio::task::spawn_blocking(move || {
-        let root = dira_core::project::toplevel(&dir).unwrap_or(dir);
         inputs
             .iter()
             .map(|(last, paths)| {
@@ -240,6 +435,10 @@ fn decision_view(d: &ZavetDecisionRow) -> ZavetDecisionView {
         verified: d.verified,
         corrected_by: d.corrected_by.clone(),
         checks: d.checks.iter().map(check_view).collect(),
+        // Both are batch-computed by the callers that have a repo to ask —
+        // `why` reports them its own way and leaves these empty.
+        presence: None,
+        guard_stats: Vec::new(),
     }
 }
 
@@ -415,18 +614,41 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
 
 /// `Request::ZavetDecisions`.
 pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, _, _) = match query_repo(repo, cwd).await {
+    let (repo, _, cfg) = match query_repo(repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match state.store.zavet_decisions_list(&repo).await {
-        Ok(rows) => Response::ZavetDecisions {
-            decisions: rows.iter().map(decision_view).collect(),
-        },
-        Err(e) => Response::Error {
-            message: format!("zavet decisions failed: {e}"),
-        },
+    let rows = match state.store.zavet_decisions_list(&repo).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Response::Error {
+                message: format!("zavet decisions failed: {e}"),
+            }
+        }
+    };
+    let mut decisions: Vec<ZavetDecisionView> = rows.iter().map(decision_view).collect();
+    attach_guard_stats(state, &repo, &mut decisions).await;
+    let probe = working_tree_probe(
+        repo_root(repo_workdir(state, &repo, cwd.as_deref())).await,
+        cfg,
+        // A spec on disk is not a decision — this view reports only its kind,
+        // and scanning `.zavet/specs/` here would parse every spec to discard it.
+        Kinds::Decisions,
+        decisions
+            .iter()
+            .map(|d| (d.path.clone(), d.id.clone()))
+            .collect(),
+    )
+    .await;
+    for d in &mut decisions {
+        d.presence = presence_of(probe.in_head.as_ref(), &d.path);
     }
+    Response::ZavetDecisions(Box::new(ZavetDecisionsView {
+        repo,
+        branch: probe.branch,
+        decisions,
+        uncaptured: probe.uncaptured,
+    }))
 }
 
 /// `Request::ZavetWiki` — the browsable knowledge base: an overview without a
@@ -437,7 +659,7 @@ pub async fn wiki(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _, _) = match query_repo(repo, cwd.clone()).await {
+    let (repo, _, cfg) = match query_repo(repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -476,22 +698,45 @@ pub async fn wiki(
         .zavet_recent_trailers(&repo, 5)
         .await
         .unwrap_or_default();
-    let (active, superseded): (Vec<_>, Vec<_>) = decisions
-        .iter()
-        .map(decision_view)
-        .partition(|d| d.status.as_deref().unwrap_or("active") == "active");
+    // One working directory for every git probe, so staleness, branch and
+    // presence can never describe two different trees.
+    let root = repo_root(repo_workdir(state, &repo, cwd.as_deref())).await;
     let staleness = spec_staleness(
-        repo_workdir(state, &repo, cwd.as_deref()),
+        root.clone(),
         spec_rows.iter().map(staleness_input).collect(),
     )
     .await;
-    let specs = spec_rows
+    let mut decisions: Vec<ZavetDecisionView> = decisions.iter().map(decision_view).collect();
+    let mut specs: Vec<ZavetSpecView> = spec_rows
         .iter()
         .zip(staleness)
         .map(|(s, stale)| spec_view(s, stale))
         .collect();
+    attach_guard_stats(state, &repo, &mut decisions).await;
+    let probe = working_tree_probe(
+        root,
+        cfg,
+        Kinds::Both,
+        decisions
+            .iter()
+            .map(|d| (d.path.clone(), d.id.clone()))
+            .chain(specs.iter().map(|s| (s.path.clone(), s.slug.clone())))
+            .collect(),
+    )
+    .await;
+    // Looked up by path, so neither list's order is part of the contract.
+    for d in &mut decisions {
+        d.presence = presence_of(probe.in_head.as_ref(), &d.path);
+    }
+    for s in &mut specs {
+        s.presence = presence_of(probe.in_head.as_ref(), &s.path);
+    }
+    let (active, superseded): (Vec<_>, Vec<_>) = decisions
+        .into_iter()
+        .partition(|d| d.status.as_deref().unwrap_or("active") == "active");
     Response::ZavetWiki(Box::new(dira_core::protocol::ZavetWikiView {
         repo,
+        branch: probe.branch,
         decisions_total: counts.decisions_total,
         trailers: counts.trailers,
         guard_events: counts.guard_events,
@@ -500,6 +745,7 @@ pub async fn wiki(
         superseded,
         specs,
         recent,
+        uncaptured: probe.uncaptured,
     }))
 }
 

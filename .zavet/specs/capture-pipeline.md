@@ -1,15 +1,16 @@
 ---
 title: Zavet capture pipeline
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
-date: 2026-08-07
+date: 2026-08-10
 paths:
   - cli/dirad/src/capture.rs
+  - cli/dirad/src/zavet.rs
   - cli/core/src/zavet.rs
   - cli/core/src/project.rs
-decisions: [D-0001, DIRASH-0027]
+decisions: [D-0001, DIRASH-0027, DIRASH-0028]
 ---
 
 ## Overview
@@ -47,6 +48,17 @@ commit poll — no filesystem watcher, no extra daemon.
   spec's identity). Uppercase is load-bearing rather than cosmetic: the old
   `D-` literal excluded stray files for free, and a case-insensitive shape
   would let `notes-2024.md` read as a record.
+- That first-sight window is bounded AND followed by a baseline write, so a
+  clone whose `.zavet/` history predates the window indexes almost nothing and
+  no later sweep revisits it — `zavet sync` included, since it honors the same
+  baseline. `dira zavet reindex` is the explicit recovery: full history scoped
+  to a `.zavet/` pathspec for decisions and specs, a separately bounded pass
+  for trailers (`--all-trailers` lifts it), driving the same sweep. It skips
+  records whose content hash and path both already match, collapses each record
+  to its first and last sighting, attributes to no session, and never writes
+  `repo_baseline` — so a repeat run writes nothing and pushes nothing. This is
+  the deeper backfill DIRASH-0027 anticipates, not a `force` flag on sync.
+  See DIRASH-0028.
 - Spec staleness is never materialized: it is computed at query time as
   `git log <last_commit>..HEAD -- :(glob)<path>…` over the spec's declared
   paths, in the repo dir the daemon last observed (else the caller's cwd;
@@ -108,12 +120,12 @@ commit poll — no filesystem watcher, no extra daemon.
   every later upsert: provenance points at the commit that INTRODUCED the
   record.
 - The knowledge sweep shares the walk's blocking budget and never touches the
-  accounting hot path.
+  accounting hot path. The reindex path is the one exception and earns it by
+  being user-initiated and off the poll: it takes no capture timeout, and it
+  still drives the same sweep rather than a second parser (DIRASH-0028).
 
 ## Open Questions
 
-- Should huge backfills (>15-commit first sight) sweep older knowledge too,
-  or is the bounded window acceptable long-term?
 - A dangling `corrected-by` is knowable here (the target may simply not be
   captured yet) but is only reported by the plugin's `zavet check`. Whether
   dira should surface it too — and how it would tell "not captured yet" from

@@ -472,7 +472,12 @@ append-only markdown with guard globs, and commits carry Why:/Refs: trailers.
 The daemon captures those alongside its ordinary git polling and correlates
 them with sessions, so every decision has both recall and a time cost.
 Activation: modules.zavet knob (auto = repos with .zavet/), overridable per
-repo with enable/disable.",
+repo with enable/disable.
+
+Recall reads the local index, not the files on disk, and ordinary capture only
+sweeps recent commits the first time it sees a repo — so a fresh clone needs
+one `dira zavet reindex` to pull in the history that predates it. `status`
+reports when that gap exists.",
         after_help = "\
 Examples:
   dira zavet status          is zavet active here? capture health
@@ -480,6 +485,7 @@ Examples:
   dira zavet wiki            decisions + living specs, staleness badges
   dira zavet decisions       every captured decision in this repo
   dira zavet sync            capture committed records now, don't wait
+  dira zavet reindex         index history older than the first sweep (per clone)
   dira zavet enable          force-on for this repo (beats the global knob)"
     )]
     Zavet {
@@ -491,6 +497,14 @@ Examples:
 #[derive(Subcommand)]
 enum ZavetAction {
     /// Activation + capture health for this repo.
+    #[command(after_help = "\
+Reports whether zavet is active and why, and how much has been captured.
+Reports only; never writes. For which specific records are missing, and what
+to run about each, see `dira zavet decisions`.
+
+Examples:
+  dira zavet status          this repo, resolved from cwd
+  dira zavet status --project github.com/org/repo")]
     Status {
         /// Canonical repo (e.g. github.com/org/repo); default: resolve from cwd.
         #[arg(long)]
@@ -557,6 +571,7 @@ Records are grouped by what the working tree says about them:
 Presence needs a working directory to resolve; with --project from elsewhere the
 groups collapse to a single list rather than guessing.")]
     Decisions {
+        /// Canonical repo (e.g. github.com/org/repo); default: resolve from cwd.
         #[arg(long)]
         project: Option<String>,
         /// Spell out every guard glob under its decision.
@@ -570,19 +585,66 @@ groups collapse to a single list rather than guessing.")]
         json: bool,
     },
     /// Force zavet ON for this repo (overrides the global modules.zavet knob).
+    #[command(after_help = "\
+Sets a per-repo override that beats the global `modules.zavet` knob, so a repo
+with no .zavet/ directory still captures trailers. Persisted by the daemon,
+not written into the repo. `reset` clears it.
+
+Examples:
+  dira zavet enable
+  dira zavet enable --project github.com/org/repo")]
     Enable {
+        /// Canonical repo (e.g. github.com/org/repo); default: resolve from cwd.
         #[arg(long)]
         project: Option<String>,
     },
     /// Force zavet OFF for this repo.
+    #[command(after_help = "\
+Sets a per-repo override that beats the global knob, so a repo carrying
+.zavet/ is left alone. Existing captured knowledge is kept, not deleted —
+`reset` restores the knob's own verdict.
+
+Examples:
+  dira zavet disable
+  dira zavet disable --project github.com/org/repo")]
     Disable {
+        /// Canonical repo (e.g. github.com/org/repo); default: resolve from cwd.
         #[arg(long)]
         project: Option<String>,
     },
     /// Clear the per-repo override (fall back to the global knob).
+    #[command(after_help = "\
+Removes whatever `enable`/`disable` set, returning this repo to the global
+`modules.zavet` knob — which in `auto` means active iff the repo carries a
+.zavet/ directory. Clears the override only; captured knowledge is untouched.
+
+Examples:
+  dira zavet reset
+  dira zavet reset --project github.com/org/repo")]
     Reset {
+        /// Canonical repo (e.g. github.com/org/repo); default: resolve from cwd.
         #[arg(long)]
         project: Option<String>,
+    },
+    /// Rebuild this repo's knowledge index from git history.
+    #[command(after_help = "\
+Normal capture only sweeps the most recent commits the first time it sees a
+repo, so a fresh clone can hold every decision on disk and almost none in the
+index — which is what `why`, `wiki` and `decisions` read. Run this once after
+cloning a repo that already carries a `.zavet/` history.
+
+Safe to repeat: records whose content is unchanged are skipped, so a second
+run writes nothing.
+
+Examples:
+  dira zavet reindex                 full .zavet/ history; recent commit trailers
+  dira zavet reindex --all-trailers  also scan trailers across all history")]
+    Reindex {
+        /// Scan commit trailers across all history instead of the recent
+        /// window. Slower: unlike decisions and specs, trailers are not
+        /// confined to `.zavet/`, so this walks every commit.
+        #[arg(long)]
+        all_trailers: bool,
     },
     /// Emit shim: read one guard-event JSON on stdin and forward it to the
     /// daemon (fire-and-forget; always exits 0). Wired by the zavet plugin.
@@ -635,6 +697,20 @@ Examples:
 #[derive(Subcommand)]
 enum DeviceAction {
     /// Claim a link code and bind this device to the cloud.
+    #[command(
+        long_about = "\
+Claim a one-time link code from the cloud's Connections page and bind this
+device to your workspace. The cloud assigns the device identity — it is never
+chosen here — and this device's Ed25519 public key is registered with it, so
+every later batch is signed and attributable. Until a device is linked,
+capture still runs locally; nothing syncs.",
+        after_help = "\
+Examples:
+  dira device link           prompts for the code
+  dira device link --code ABC123 --label \"work laptop\"
+
+The label is only a human name in the cloud UI; it defaults to the hostname."
+    )]
     Link {
         /// The one-time code from the cloud Connections page (prompted if omitted).
         #[arg(long)]
@@ -644,10 +720,42 @@ enum DeviceAction {
         label: Option<String>,
     },
     /// Show whether this device is linked, the cloud URL, and the sync backlog.
+    #[command(after_help = "\
+Reports the link state, the cloud this device talks to, and how many captured
+events are still waiting to be sent. A growing backlog with a linked device
+usually means the daemon can't reach the cloud — `dira doctor` diagnoses it.
+
+Examples:
+  dira device status")]
     Status,
     /// Rotate this device's signing key (new keypair, signed by the old key).
+    #[command(
+        long_about = "\
+Generate a new signing keypair and register it with the cloud, authenticated
+by the key it replaces. Crash-safe and resumable: the new key is persisted as
+pending before any network call, and the swap itself is a single atomic
+compare-and-set cloud-side, so at every instant exactly one of the two keys is
+live. Interrupting this is safe — re-run it and it resumes rather than
+generating a second key.
+
+Rotation does not change the device identity, and it never invalidates work
+already synced.",
+        after_help = "\
+Examples:
+  dira device rotate-key"
+    )]
     RotateKey,
     /// Locally unlink this device (clears the device id; keeps the signing key).
+    #[command(after_help = "\
+Clears the cloud device id locally so nothing syncs. Local capture continues
+and the signing key is kept, so re-linking later reuses the same key. Warns
+and asks first when events are still awaiting sync — those will not be sent.
+
+This is a LOCAL action: it does not revoke the device cloud-side.
+
+Examples:
+  dira device unlink
+  dira device unlink --yes   no prompt, even with an unsynced backlog")]
     Unlink {
         /// Skip the confirmation prompt even when events are unsynced.
         #[arg(long)]
@@ -655,6 +763,15 @@ enum DeviceAction {
     },
     /// Rewind the sync cursor and re-send events to the cloud (manual recovery).
     /// Safe — the cloud dedups, so a re-send never double-counts.
+    #[command(after_help = "\
+Manual recovery for a cloud that is missing work this device already sent.
+Rewinding re-sends; it never double-counts, because the cloud dedups on event
+id. Rewinding to the beginning can mean a long drain, which the daemon paces.
+
+Examples:
+  dira device resync         re-send everything from the beginning
+  dira device resync --from 01J8XK…
+                             re-send only from that event id onward")]
     Resync {
         /// Rewind to this event id instead of the beginning (full re-send default).
         #[arg(long)]
@@ -685,21 +802,72 @@ Examples:
         value: String,
     },
     /// Print the path of the config.toml `set` writes to.
+    #[command(after_help = "\
+Prints the one file `dira config set` writes. It is the file's path, not the
+effective configuration — env vars and defaults also feed `get`, and the file
+need not exist yet.
+
+Examples:
+  dira config path")]
     Path,
 }
 
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Start the daemon (spawns dirad, tracked by a pidfile).
+    #[command(after_help = "\
+The ad-hoc alternative to `install`: runs until stopped or the machine
+reboots. Starting a second daemon is refused — the control socket is the
+single-instance guard.
+
+Examples:
+  dira daemon start")]
     Start,
     /// Stop the daemon.
+    #[command(after_help = "\
+Stops the daemon this machine's pidfile points at — i.e. one started by
+`dira daemon start`. With no pidfile it says so and does nothing, which is the
+case for a service-managed daemon: stop that with `uninstall`, or through
+launchd/systemd directly.
+
+Examples:
+  dira daemon stop")]
     Stop,
     /// Show whether the daemon is up (exit 0 if any daemon is running — even
     /// a pre-upgrade one; 1 if none).
+    #[command(after_help = "\
+Exit 0 if any daemon answers, 1 if none does. A daemon running under a
+different user or an elevated token can refuse this connection and still be
+reported as down — `dira doctor` is what distinguishes those.
+
+Examples:
+  dira daemon status")]
     Status,
     /// Install an OS service (launchd/systemd-user/scheduled task) so it survives reboots.
+    #[command(
+        long_about = "\
+Register the daemon with this machine's own service manager — launchd on
+macOS, systemd --user on Linux, a scheduled task on Windows — so it starts on
+login and restarts if it crashes. This is the recommended way to run dirad;
+`start` is the ad-hoc alternative that dies with the session.
+
+Stop a bare `start`ed daemon (`dira daemon stop`) before installing: the
+control socket is a single-instance guard, so the service copy cannot bind
+while it holds the socket.",
+        after_help = "\
+Examples:
+  dira daemon install"
+    )]
     Install,
     /// Remove the OS service `install` set up (binaries and data are untouched).
+    #[command(after_help = "\
+Deregisters the service so the daemon no longer starts on login. It does not
+stop a bare `start`ed daemon — that is `stop`'s job. Nothing is deleted: the
+dira binaries, the config, and every captured event stay exactly where they
+are (`dira nuke` is what clears data).
+
+Examples:
+  dira daemon uninstall")]
     Uninstall,
     /// Restart the daemon, however it's currently supervised.
     #[command(
@@ -1076,6 +1244,8 @@ async fn main() -> Result<()> {
                 repo: project,
                 mode: "clear".into(),
             },
+            // No `--project`: the walk reads git history off a working tree.
+            ZavetAction::Reindex { all_trailers } => Request::ZavetReindex { cwd, all_trailers },
             // handled client-side above
             ZavetAction::Emit => unreachable!(),
             ZavetAction::Install { .. } => unreachable!(),

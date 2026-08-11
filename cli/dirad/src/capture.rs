@@ -98,18 +98,51 @@ struct GitWalk {
     specs: Vec<ZavetSpecAt>,
 }
 
+/// The trailer half of a sweep, on its own.
+///
+/// One batched `git log --no-walk` for the whole commit set, and nothing else.
+/// [`zavet_sweep`]'s other half costs a `diff-tree` per commit plus a `show`
+/// and a `rev-parse` per touched record — worth it when decisions and specs are
+/// wanted, pure waste when only trailers are. Trailers ride arbitrary commits,
+/// so their window is the widest one anybody walks; running the record parser
+/// across it would spawn a subprocess per commit to discard every result.
+///
+/// This is not a second parser: decisions and specs are still parsed in exactly
+/// one place (see [`zavet_sweep`]). This is that function's first stage, reused.
+pub fn zavet_trailers(root: &Path, commits: &[project::CommitRef]) -> ZavetTrailers {
+    zavet_trailers_with(root, commits, &crate::zavet::read_config(root))
+}
+
+/// [`zavet_trailers`] with the id config already in hand, so a full sweep does
+/// not read `.zavet/config` twice.
+fn zavet_trailers_with(
+    root: &Path,
+    commits: &[project::CommitRef],
+    cfg: &crate::zavet::ZavetConfig,
+) -> ZavetTrailers {
+    let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
+    project::commit_trailers(root, &shas)
+        .into_iter()
+        .map(|(sha, raw)| (sha, dira_core::zavet::normalize_trailers(&raw, cfg)))
+        .filter(|(_, ts)| !ts.is_empty())
+        .collect()
+}
+
+/// Per-sha trailer sets, as both the sweep and the reindex carry them.
+pub type ZavetTrailers = Vec<(String, Vec<dira_core::store::ZavetTrailer>)>;
+
 /// A decision record as of one commit, ready to upsert.
-struct ZavetDecisionAt {
-    sha: String,
-    authored_at: Option<String>,
-    cap: dira_core::store::ZavetDecisionCapture,
+pub struct ZavetDecisionAt {
+    pub sha: String,
+    pub authored_at: Option<String>,
+    pub cap: dira_core::store::ZavetDecisionCapture,
 }
 
 /// A living spec as of one commit, ready to upsert.
-struct ZavetSpecAt {
-    sha: String,
-    authored_at: Option<String>,
-    cap: dira_core::store::ZavetSpecCapture,
+pub struct ZavetSpecAt {
+    pub sha: String,
+    pub authored_at: Option<String>,
+    pub cap: dira_core::store::ZavetSpecCapture,
 }
 
 /// Run the blocking git walk for a repo: resolve HEAD, and (unless HEAD is
@@ -143,7 +176,14 @@ fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWa
         crate::zavet::zavet_dir_exists(project::toplevel(root).as_deref().unwrap_or(root)),
     );
     let sweep = if zavet_active && !commits.is_empty() {
-        zavet_sweep(root, &commits)
+        let refs: Vec<project::CommitRef> = commits
+            .iter()
+            .map(|c| project::CommitRef {
+                sha: c.sha.clone(),
+                authored_at: c.authored_at.clone(),
+            })
+            .collect();
+        zavet_sweep(root, &refs)
     } else {
         ZavetSweep::default()
     };
@@ -168,10 +208,10 @@ struct ZavetGate {
 
 /// What one zavet sweep of a commit range yields.
 #[derive(Default)]
-struct ZavetSweep {
-    trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
-    decisions: Vec<ZavetDecisionAt>,
-    specs: Vec<ZavetSpecAt>,
+pub struct ZavetSweep {
+    pub trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
+    pub decisions: Vec<ZavetDecisionAt>,
+    pub specs: Vec<ZavetSpecAt>,
 }
 
 /// The zavet portion of a walk: batched trailer parse over the walked shas,
@@ -179,18 +219,18 @@ struct ZavetSweep {
 /// `.zavet/specs/*.md` blob touched by each commit. All plain
 /// `git log`/`diff-tree`/`show` subprocess calls — shares the walk's blocking
 /// budget.
-fn zavet_sweep(root: &Path, commits: &[CapturedCommit]) -> ZavetSweep {
+///
+/// Takes bare [`CommitRef`](project::CommitRef)s rather than full
+/// [`CapturedCommit`]s so `dira zavet reindex` can drive the same parser over a
+/// pathspec-scoped history walk. There must only ever be one implementation of
+/// this parsing — two would drift, and a reindex that disagrees with the ambient
+/// poll is worse than the under-indexing it exists to fix.
+pub fn zavet_sweep(root: &Path, commits: &[project::CommitRef]) -> ZavetSweep {
     // One config read per sweep. Read from the WORKING TREE, not from each
     // historical blob: retired prefixes stay in `prefix-aliases`, so the
     // current config is what resolves an id minted under an older one.
     let cfg = crate::zavet::read_config(root);
-    let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
-    let trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)> =
-        project::commit_trailers(root, &shas)
-            .into_iter()
-            .map(|(sha, raw)| (sha, dira_core::zavet::normalize_trailers(&raw, &cfg)))
-            .filter(|(_, ts)| !ts.is_empty())
-            .collect();
+    let trailers = zavet_trailers_with(root, commits, &cfg);
 
     let mut decisions = Vec::new();
     let mut specs = Vec::new();

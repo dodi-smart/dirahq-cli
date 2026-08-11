@@ -19,6 +19,7 @@ pub use dira_core::zavet::{
     canonical_decision_id, parse_config, parse_guard_event, GuardEventV1, ZavetConfig, CONFIG_PATH,
     ZAVET_DIR,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -244,20 +245,41 @@ async fn attach_guard_stats(state: &AppState, repo: &str, decisions: &mut [Zavet
     }
 }
 
-/// Resolve a payload cwd to `(canonical repo, .zavet/ exists, id config)` off
-/// Resolve a payload cwd to `(canonical repo, .zavet/ exists, id config)` off
-/// the async path — `project::resolve` shells out to git.
-async fn resolve_repo(cwd: String) -> (Option<String>, bool, ZavetConfig) {
+/// What one cwd resolves to, off the async path — `project::resolve` shells
+/// out to git.
+#[derive(Default)]
+struct ResolvedRepo {
+    repo: Option<String>,
+    /// The git toplevel, kept rather than discarded: callers that need to read
+    /// the working tree would otherwise re-run `git rev-parse --show-toplevel`
+    /// for a path this already computed.
+    top: Option<PathBuf>,
+    dir_exists: bool,
+    cfg: ZavetConfig,
+}
+
+async fn resolve_repo(cwd: String) -> ResolvedRepo {
     tokio::task::spawn_blocking(move || {
         let dir = PathBuf::from(cwd);
         let top = dira_core::project::toplevel(&dir);
-        let repo = dira_core::project::resolve(&dir).project;
-        let dir_exists = top.as_deref().map(zavet_dir_exists).unwrap_or(false);
-        let cfg = top.as_deref().map(read_config).unwrap_or_default();
-        (repo, dir_exists, cfg)
+        ResolvedRepo {
+            repo: dira_core::project::resolve(&dir).project,
+            dir_exists: top.as_deref().map(zavet_dir_exists).unwrap_or(false),
+            cfg: top.as_deref().map(read_config).unwrap_or_default(),
+            top,
+        }
     })
     .await
-    .unwrap_or((None, false, ZavetConfig::default()))
+    .unwrap_or_default()
+}
+
+/// The directory a request is about: the caller's `cwd`, else the daemon's own.
+fn caller_dir(cwd: Option<String>) -> String {
+    cwd.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    })
 }
 
 /// Whether zavet is active for `repo`, per the standard precedence.
@@ -275,7 +297,8 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
         tracing::debug!("zavet: dropped malformed guard event");
         return Response::Ok; // the shim is fire-and-forget; nothing to say
     };
-    let (repo, dir_exists, cfg) = resolve_repo(ev.cwd.clone()).await;
+    let r = resolve_repo(ev.cwd.clone()).await;
+    let (repo, dir_exists, cfg) = (r.repo, r.dir_exists, r.cfg);
     // The id arrives with its prefix normalized but its digits as written —
     // parse_guard_event runs before `cwd` is resolved, so this is the first
     // point that knows the repo's padding width. Without it a hand-authored
@@ -323,7 +346,12 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
 
 /// Repo resolution ladder for the query commands: explicit repo wins, else
 /// resolve from `cwd` (or the daemon's own cwd). Also reports whether the
-/// resolved toplevel carries `.zavet/` when a directory was available.
+/// resolved toplevel carries `.zavet/` when a directory was available, and the
+/// toplevel itself for callers that need to read the working tree.
+///
+/// An explicit `--project` names a repo we are not standing in, so it yields no
+/// toplevel and no config — callers fall back to the defaults, and anything
+/// needing the working tree reports absent evidence rather than guessing.
 async fn query_repo(
     state: &AppState,
     repo: Option<String>,
@@ -347,14 +375,9 @@ async fn query_repo(
         };
         return Ok((r, None, cfg));
     }
-    let dir = cwd.unwrap_or_else(|| {
-        std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string())
-    });
-    let (repo, dir_exists, cfg) = resolve_repo(dir).await;
-    match repo {
-        Some(r) => Ok((r, Some(dir_exists), cfg)),
+    let r = resolve_repo(caller_dir(cwd)).await;
+    match r.repo {
+        Some(repo) => Ok((repo, Some(r.dir_exists), r.cfg)),
         None => Err(Response::Error {
             message: "not inside a repo with a recognizable remote; pass --project".into(),
         }),
@@ -832,6 +855,264 @@ pub async fn wiki(
     }))
 }
 
+/// Default bound on the reindex trailer pass.
+///
+/// Unlike decisions and specs — whose walk is pathspec-scoped to `.zavet/` and
+/// therefore cheap at full depth — trailers ride arbitrary feature commits, so
+/// their walk is whole-history by nature. `--all-trailers` lifts this.
+const REINDEX_TRAILER_LIMIT: usize = 1000;
+
+/// The pathspec that makes a full-history decision/spec walk affordable: git
+/// returns only commits that touched these, not the whole log.
+const REINDEX_PATHS: [&str; 2] = [".zavet/decisions", ".zavet/specs"];
+
+/// `Request::ZavetReindex` (`dira zavet reindex`) — rebuild the knowledge index
+/// for the repo the caller is standing in, from full `.zavet/`-scoped history.
+///
+/// Exists because the ambient poll bounds a repo's first-sight walk to
+/// `COMMIT_BACKFILL_LIMIT` commits and then sets the baseline, so history older
+/// than that window is never revisited. A fresh clone therefore holds every
+/// record on disk and almost none in the index, and every query path reads the
+/// index. This is the only way back.
+///
+/// Deliberately NOT on the ambient path, and deliberately not touching
+/// `repo_baseline`: commit/artifact capture keeps its own bound, and this
+/// command is knowledge-only.
+pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) -> Response {
+    // Unlike the query commands there is no `--project` ladder: this walk needs
+    // a working tree, and a repo we are not standing in has none.
+    let r = resolve_repo(caller_dir(cwd)).await;
+    let (Some(top), Some(repo)) = (r.top, r.repo) else {
+        return Response::Error {
+            message: "not inside a git repo with a recognizable remote — \
+                      run `dira zavet reindex` from the repo you want indexed"
+                .into(),
+        };
+    };
+
+    if !active_for(state, &repo, r.dir_exists).await {
+        // Report honestly rather than walking anyway: an inactive repo has
+        // nothing to index, and a silent zero would read like an empty repo.
+        return Response::ZavetReindex(Box::new(dira_core::protocol::ZavetReindexView {
+            repo,
+            active: false,
+            ..Default::default()
+        }));
+    }
+
+    // The whole blocking git portion, in one hop. No CAPTURE_TIMEOUT here: that
+    // budget exists to keep the ambient poll from stalling the writer, and this
+    // request is user-initiated, off the hot path, and allowed to take seconds.
+    // The accept loop spawns per connection, so a slow walk blocks nobody.
+    let trailer_limit = (!all_trailers).then_some(REINDEX_TRAILER_LIMIT);
+    let walk = {
+        let top = top.clone();
+        tokio::task::spawn_blocking(move || {
+            let records = dira_core::project::log_commit_refs(&top, &REINDEX_PATHS, None);
+            let trailer_commits = dira_core::project::log_commit_refs(&top, &[], trailer_limit);
+            let sweep = crate::capture::zavet_sweep(&top, &records);
+            // Trailers only — the record parser costs a subprocess per commit
+            // and this window is the wide one, so running it here would spawn
+            // one per commit purely to discard the result.
+            let trailers = crate::capture::zavet_trailers(&top, &trailer_commits);
+            (records.len(), trailer_commits.len(), sweep, trailers)
+        })
+        .await
+    };
+    let (commits_scanned, trailer_commits_scanned, sweep, trailers) = match walk {
+        Ok(v) => v,
+        Err(e) => {
+            return Response::Error {
+                message: format!("zavet reindex walk failed: {e}"),
+            }
+        }
+    };
+
+    // Content-hash short-circuit. Every upsert bumps `touched_seq`, which is the
+    // knowledge-sync cursor — without this, each reindex would re-stamp every
+    // row and re-push the entire knowledge set. With it, a second run on an
+    // unchanged repo writes nothing and pushes nothing.
+    //
+    // Keyed on `(content_hash, path)`, not the hash alone: `path` and a spec's
+    // `slug` are derived from the FILENAME, so a pure `git mv` leaves the blob
+    // — and its oid — identical while the stored path goes stale. Hash-only
+    // would skip exactly that record and never correct it.
+    let known_decisions: HashMap<String, Stored> = state
+        .store
+        .zavet_decisions_list(&repo)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| (d.id, (d.content_hash, d.path)))
+        .collect();
+    let known_specs: HashMap<String, Stored> = state
+        .store
+        .zavet_specs_list(&repo)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.slug, (s.content_hash, s.path)))
+        .collect();
+
+    let mut view = dira_core::protocol::ZavetReindexView {
+        repo: repo.clone(),
+        active: true,
+        commits_scanned: commits_scanned as u64,
+        trailer_commits_scanned: trailer_commits_scanned as u64,
+        trailers_bounded: !all_trailers,
+        ..Default::default()
+    };
+
+    // No session attribution: a reindex replays other people's history, and
+    // stamping it with whatever session happens to be open here would invent
+    // provenance. The ambient path attributes because it captures live work.
+    for group in collapse(&sweep.decisions, |d| d.cap.id.as_str()) {
+        let newest = group.newest;
+        let stored = known_decisions.get(&newest.cap.id);
+        if unchanged(stored, &newest.cap.content_hash, &newest.cap.path) {
+            view.decisions_skipped += 1;
+            continue;
+        }
+        let mut ok = true;
+        for w in group.writes(stored.is_some()) {
+            if let Err(e) = state
+                .store
+                .zavet_upsert_decision(&repo, &w.cap, &w.sha, w.authored_at.as_deref(), None)
+                .await
+            {
+                tracing::warn!("zavet reindex decision {} failed: {e}", w.cap.id);
+                ok = false;
+                // Stop at the first failure: the writes are ordered oldest then
+                // newest, so continuing past a failed one can leave the row
+                // holding a historical revision. Better to leave it untouched
+                // and let the next run redo it from the top.
+                break;
+            }
+        }
+        if ok {
+            view.decisions_indexed += 1;
+        }
+    }
+    for group in collapse(&sweep.specs, |s| s.cap.slug.as_str()) {
+        let newest = group.newest;
+        let stored = known_specs.get(&newest.cap.slug);
+        if unchanged(stored, &newest.cap.content_hash, &newest.cap.path) {
+            view.specs_skipped += 1;
+            continue;
+        }
+        let mut ok = true;
+        for w in group.writes(stored.is_some()) {
+            if let Err(e) = state
+                .store
+                .zavet_upsert_spec(&repo, &w.cap, &w.sha, w.authored_at.as_deref(), None)
+                .await
+            {
+                tracing::warn!("zavet reindex spec {} failed: {e}", w.cap.slug);
+                ok = false;
+                break; // see the decision loop
+            }
+        }
+        if ok {
+            view.specs_indexed += 1;
+        }
+    }
+    // Trailers are keyed `(sha, seq)` and inserted OR IGNORE, so re-recording a
+    // sha already present is already a no-op — no hash check needed.
+    for (sha, ts) in &trailers {
+        match state
+            .store
+            .zavet_record_trailers(Some(&repo), sha, ts)
+            .await
+        {
+            Ok(()) => view.trailer_commits_recorded += 1,
+            Err(e) => tracing::warn!("zavet reindex trailers for {sha} failed: {e}"),
+        }
+    }
+
+    if view.decisions_indexed > 0 || view.specs_indexed > 0 || view.trailer_commits_recorded > 0 {
+        let _ = state.knowledge_sync.trigger.try_send(());
+    }
+    tracing::info!(
+        repo = %repo,
+        decisions = view.decisions_indexed,
+        specs = view.specs_indexed,
+        "zavet reindex complete"
+    );
+    Response::ZavetReindex(Box::new(view))
+}
+
+/// One record's oldest and newest appearance across the walked history.
+struct Touches<'a, T> {
+    oldest: &'a T,
+    newest: &'a T,
+}
+
+impl<'a, T> Touches<'a, T> {
+    /// The upserts that actually need to happen.
+    ///
+    /// Intermediate touches are dropped: the store preserves first-sight fields
+    /// on conflict and overwrites the living ones, so replaying every edit of a
+    /// record lands in exactly the same row as replaying just its first and
+    /// last. Dropping them is also what makes a second reindex a no-op — a
+    /// middle revision's content hash never matches the stored (latest) one, so
+    /// replaying it would re-stamp `touched_seq` on every run and re-push the
+    /// whole knowledge set.
+    ///
+    /// A record already in the store keeps its first sight from whenever it was
+    /// first captured, so only the newest is written.
+    fn writes(&self, known: bool) -> Vec<&'a T> {
+        if known || std::ptr::eq(self.oldest, self.newest) {
+            vec![self.newest]
+        } else {
+            // Oldest first: it establishes `first_commit`/`created_at`, which
+            // the newest then conflicts with and preserves.
+            vec![self.oldest, self.newest]
+        }
+    }
+}
+
+/// Group a sweep's per-commit records by identity, preserving first/last sight.
+///
+/// The sweep emits one entry per (commit, record) pair, so a decision edited
+/// five times appears five times. Callers want one result per record — both to
+/// report honest counts and to avoid the redundant writes described in
+/// [`Touches::writes`].
+fn collapse<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> &'a str) -> Vec<Touches<'a, T>> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut out: Vec<Touches<'a, T>> = Vec::new();
+    for item in items {
+        match seen.get(key(item)) {
+            // The sweep walks oldest-first, so a later sighting is the newest.
+            Some(&i) => out[i].newest = item,
+            None => {
+                seen.insert(key(item), out.len());
+                out.push(Touches {
+                    oldest: item,
+                    newest: item,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// A stored record's identity for the skip check: its content hash and the
+/// path it was captured from.
+type Stored = (Option<String>, String);
+
+/// Whether a record already in the store matches the one just parsed.
+///
+/// A missing stored row, or either hash being absent, counts as changed — an
+/// unknown hash must never be read as "already current", or the record that
+/// most needs indexing is the one silently skipped. The path must match too:
+/// a renamed file keeps its blob oid, and `path`/`slug` come from the filename.
+fn unchanged(stored: Option<&Stored>, fresh: &Option<String>, fresh_path: &str) -> bool {
+    match (stored, fresh) {
+        (Some((Some(a), p)), Some(b)) => a == b && p == fresh_path,
+        _ => false,
+    }
+}
+
 /// `Request::ZavetSetMode` (`dira zavet enable|disable`).
 pub async fn set_mode(
     state: &AppState,
@@ -1198,5 +1479,109 @@ mod tests {
         assert!(!zavet_dir_exists(tmp.path()));
         std::fs::create_dir(tmp.path().join(ZAVET_DIR)).unwrap();
         assert!(zavet_dir_exists(tmp.path()));
+    }
+
+    /// `(id, content_hash)` standing in for a swept record.
+    fn rec(id: &str, hash: &str) -> (String, String) {
+        (id.to_string(), hash.to_string())
+    }
+
+    #[test]
+    fn collapse_groups_by_identity_keeping_first_and_last_sight() {
+        // Sweep order is oldest-first, interleaved across records.
+        let items = [
+            rec("D-0001", "h1"),
+            rec("D-0002", "h2"),
+            rec("D-0001", "h1b"),
+            rec("D-0001", "h1c"),
+        ];
+        let groups = collapse(&items, |(id, _)| id.as_str());
+        assert_eq!(groups.len(), 2, "one group per distinct record");
+        // Encounter order is preserved, so counts and logs stay stable.
+        assert_eq!(groups[0].oldest.1, "h1");
+        assert_eq!(groups[0].newest.1, "h1c");
+        assert_eq!(groups[1].oldest.1, "h2");
+        assert_eq!(groups[1].newest.1, "h2");
+    }
+
+    /// Intermediate revisions must never be replayed: the store preserves
+    /// first-sight fields and overwrites the living ones, so writing the middle
+    /// of a record's history changes nothing except `touched_seq` — which is the
+    /// knowledge-sync cursor, and would re-push everything on every reindex.
+    #[test]
+    fn writes_skip_intermediate_revisions() {
+        let items = [
+            rec("D-0001", "h1"),
+            rec("D-0001", "h2"),
+            rec("D-0001", "h3"),
+        ];
+        let groups = collapse(&items, |(id, _)| id.as_str());
+        let writes = groups[0].writes(false);
+        assert_eq!(writes.len(), 2, "oldest for provenance, newest for content");
+        assert_eq!(writes[0].1, "h1");
+        assert_eq!(writes[1].1, "h3");
+    }
+
+    /// A record already in the store keeps the provenance it was first captured
+    /// with, so re-establishing first sight is both pointless and a lie.
+    #[test]
+    fn a_known_record_only_writes_its_newest() {
+        let items = [rec("D-0001", "h1"), rec("D-0001", "h2")];
+        let groups = collapse(&items, |(id, _)| id.as_str());
+        let writes = groups[0].writes(true);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1, "h2");
+    }
+
+    #[test]
+    fn a_single_sighting_writes_once() {
+        let items = [rec("D-0001", "h1")];
+        let groups = collapse(&items, |(id, _)| id.as_str());
+        assert_eq!(groups[0].writes(false).len(), 1);
+    }
+
+    /// The skip check gates every write, so "unknown" must never read as
+    /// "current" — otherwise the record most in need of indexing is the one
+    /// silently passed over.
+    #[test]
+    fn only_two_present_and_equal_hashes_count_as_unchanged() {
+        const P: &str = ".zavet/decisions/D-0001-x.md";
+        let stored = |h: Option<&str>| (h.map(String::from), P.to_string());
+        let h = Some("abc".to_string());
+
+        assert!(unchanged(Some(&stored(Some("abc"))), &h, P));
+        assert!(!unchanged(
+            Some(&stored(Some("abc"))),
+            &Some("def".into()),
+            P
+        ));
+        assert!(!unchanged(None, &h, P), "absent from the store");
+        assert!(
+            !unchanged(Some(&stored(None)), &h, P),
+            "stored row has no hash"
+        );
+        assert!(
+            !unchanged(Some(&stored(Some("abc"))), &None, P),
+            "fresh parse has no hash"
+        );
+        assert!(
+            !unchanged(Some(&stored(None)), &None, P),
+            "neither side has one"
+        );
+    }
+
+    /// A `git mv` with no content edit keeps the blob oid, so a hash-only check
+    /// would skip the one record whose stored `path`/`slug` just went stale.
+    #[test]
+    fn a_renamed_record_is_not_unchanged() {
+        let stored = (
+            Some("abc".to_string()),
+            ".zavet/decisions/D-0001-old-slug.md".to_string(),
+        );
+        assert!(!unchanged(
+            Some(&stored),
+            &Some("abc".into()),
+            ".zavet/decisions/D-0001-new-slug.md"
+        ));
     }
 }

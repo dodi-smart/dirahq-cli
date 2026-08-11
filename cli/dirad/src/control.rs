@@ -133,6 +133,9 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
         Request::ZavetSetMode { cwd, repo, mode } => {
             crate::zavet::set_mode(state, cwd, repo, mode).await
         }
+        Request::ZavetReindex { cwd, all_trailers } => {
+            crate::zavet::reindex(state, cwd, all_trailers).await
+        }
         // The actual `state.shutdown.notify_one()` happens in `handle_conn`,
         // AFTER this `Ok` is written to the client — see its doc comment for
         // why the ordering matters and `dispatch` doesn't touch `shutdown`

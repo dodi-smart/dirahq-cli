@@ -107,6 +107,27 @@ pub enum Request {
         cwd: Option<String>,
         repo: Option<String>,
     },
+    /// Rebuild a repo's knowledge index from git history (`dira zavet reindex`).
+    ///
+    /// The ambient poll only sweeps `COMMIT_BACKFILL_LIMIT` commits on a repo's
+    /// first sight and then records a baseline, so a fresh clone indexes only
+    /// the decisions and specs that fall in that window, and no later sweep
+    /// revisits the rest. This walks the full `.zavet/`-scoped history instead.
+    /// Explicit and user-initiated — never the ambient path. `all_trailers`
+    /// lifts the bound on the (unscoped, therefore costlier) trailer pass.
+    ///
+    /// Distinct from [`Self::ZavetSync`], which runs the same bounded capture
+    /// the ticker does, just sooner: sync cannot reach behind the baseline,
+    /// which is precisely what this exists for.
+    ///
+    /// Takes no `repo`, unlike its sibling `Zavet*` queries: this one reads git
+    /// history off a working tree, so a repo the caller is not standing in has
+    /// nothing to walk. The daemon resolves both the toplevel and the canonical
+    /// repo from `cwd`.
+    ZavetReindex {
+        cwd: Option<String>,
+        all_trailers: bool,
+    },
     /// Set or clear the per-repo zavet override (`dira zavet enable|disable`).
     /// `mode` is `on`, `off`, or `clear`.
     ZavetSetMode {
@@ -327,6 +348,10 @@ pub enum Response {
     /// `ZavetSync` can receive it, and an older daemon answers with an error
     /// the CLI reports as version skew rather than as a failure.
     ZavetSync(Box<ZavetSyncView>),
+    /// `ZavetReindex`: what the walk saw and what it actually wrote. Same
+    /// new-variant skew posture as `ZavetSpec` — only a CLI new enough to send
+    /// `ZavetReindex` can receive it.
+    ZavetReindex(Box<ZavetReindexView>),
     /// `CaptureProbe`. Boxed like `Status`/`Zavet*` so the small arms stay small.
     ///
     /// Same new-variant skew posture as `ZavetSpec`, and harmless here: only a
@@ -655,6 +680,27 @@ pub struct ZavetStatusView {
     pub guard_events: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guard_stats: Vec<ZavetGuardStatView>,
+}
+
+/// What one `dira zavet reindex` walk saw and what it actually wrote.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetReindexView {
+    pub repo: String,
+    /// False when the repo is not zavet-active — nothing was walked.
+    pub active: bool,
+    /// Commits returned by the `.zavet/`-scoped history walk.
+    pub commits_scanned: u64,
+    /// Commits returned by the trailer walk, and whether its bound was lifted.
+    pub trailer_commits_scanned: u64,
+    pub trailers_bounded: bool,
+    /// Records the walk parsed, split by what the store actually did. `skipped`
+    /// counts records whose content hash already matched — the measure of the
+    /// command being idempotent rather than re-stamping every row.
+    pub decisions_indexed: u64,
+    pub decisions_skipped: u64,
+    pub specs_indexed: u64,
+    pub specs_skipped: u64,
+    pub trailer_commits_recorded: u64,
 }
 
 /// Per-kind guard-event tallies with the honest unattributed count.

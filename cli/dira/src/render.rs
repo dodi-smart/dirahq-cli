@@ -12,8 +12,8 @@ use crate::format::{
 use crate::theme::{self, Role};
 use dira_core::protocol::{
     any_engaged, LiveState, Response, SessionView, StatusView, ZavetCheckView, ZavetDecisionView,
-    ZavetDecisionsView, ZavetGuardStatView, ZavetPresence, ZavetSpecView, ZavetStatusView,
-    ZavetSyncView, ZavetUncapturedView, ZavetWhyView,
+    ZavetDecisionsView, ZavetGuardStatView, ZavetPresence, ZavetReindexView, ZavetSpecView,
+    ZavetStatusView, ZavetSyncView, ZavetUncapturedView, ZavetWhyView,
 };
 use dira_core::report::Report;
 use time::OffsetDateTime;
@@ -267,6 +267,10 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
                 "clear" => println!("zavet override cleared for {repo} (follows modules.zavet)"),
                 m => println!("zavet forced {m} for {repo}"),
             }
+            true
+        }
+        Response::ZavetReindex(v) => {
+            print_zavet_reindex(v);
             true
         }
         // The capture probe never routes through the generic printer — it is
@@ -657,12 +661,23 @@ fn section_head(title: &str, count: usize, note: Option<&str>, cols: usize) -> V
 /// committing: an `awaiting sweep` record IS committed, and telling its author
 /// to commit it sends them at a fix that cannot work. Pure so the pairing is
 /// pinned by a test.
+///
+/// `sync` is named first because it is the common case — a record committed
+/// moments ago, ahead of the baseline, which one sweep picks up. It cannot help
+/// a record BEHIND the baseline (a fresh clone's older history), and from here
+/// the two are indistinguishable: both are "in HEAD, not captured". So the
+/// hint names `reindex` as the fallback rather than leaving a user to re-run a
+/// sync that will never do anything (DIRASH-0028).
 fn uncaptured_hint(rows: &[ZavetUncapturedView]) -> &'static str {
     let uncommitted = rows.iter().any(|u| u.reason == "uncommitted");
     let awaiting = rows.iter().any(|u| u.reason == "awaiting sweep");
     match (uncommitted, awaiting) {
-        (true, true) => "on disk, not captured — commit them, then `dira zavet sync`",
-        (false, true) => "committed, not yet swept — run `dira zavet sync`",
+        (true, true) => {
+            "on disk, not captured — commit them, then `dira zavet sync` (or `reindex`)"
+        }
+        (false, true) => {
+            "committed, not yet swept — run `dira zavet sync`, or `reindex` if it stays"
+        }
         // Includes the empty case, which never reaches a caller.
         _ => "on disk, not captured — dira reads git, so commit them",
     }
@@ -1053,13 +1068,24 @@ fn print_zavet_status(v: &ZavetStatusView) {
             Role::Engaged,
         ),
     ];
+    print_metric_rows(&rows);
+}
+
+/// The zavet metric block: `glyph label  value   note`, values right-aligned to
+/// the widest one so the note column starts at a single x across every row.
+///
+/// Shared by every zavet screen that shows one — the alignment rules are layout,
+/// not content, and two copies would drift the first time either is tweaked.
+/// Glyphs are `&str` because the palette resolves them per terminal
+/// (`theme::glyphs`), and the ASCII fallbacks are not all one char.
+fn print_metric_rows(rows: &[(&str, &str, String, String, Role)]) {
     let value_w = rows.iter().map(|r| r.2.chars().count()).max().unwrap_or(0);
     for (glyph, label, value, note, role) in rows {
         println!(
             "{} {}   {}",
-            theme::paint(&format!("{glyph} {label:<10}"), role),
+            theme::paint(&format!("{glyph} {label:<10}"), *role),
             theme::paint(&format!("{value:>value_w$}"), Role::Ink),
-            theme::paint(&note, Role::Muted),
+            theme::paint(note, Role::Muted),
         );
     }
 }
@@ -1070,6 +1096,68 @@ fn print_zavet_decisions(v: &ZavetDecisionsView, opts: RowOpts) {
     {
         println!("{line}");
     }
+}
+
+/// `dira zavet reindex` — what the walk saw and what it wrote.
+fn print_zavet_reindex(v: &ZavetReindexView) {
+    if !v.active {
+        println!(
+            "{} {}",
+            theme::paint("zavet inactive", Role::Faint),
+            theme::paint(&v.repo, Role::Muted),
+        );
+        println!(
+            "{}",
+            theme::paint(
+                "  nothing indexed — enable with `dira zavet enable`",
+                Role::Muted
+            ),
+        );
+        return;
+    }
+    println!(
+        "{} {} {}",
+        theme::paint("zavet reindex", Role::Knowledge),
+        theme::paint("·", Role::Muted),
+        theme::paint(&v.repo, Role::Ink),
+    );
+    println!();
+    let g = theme::glyphs();
+    let rows: [(&str, &str, String, String, Role); 3] = [
+        (
+            g.diamond,
+            "decisions",
+            v.decisions_indexed.to_string(),
+            format!("{} unchanged", v.decisions_skipped),
+            Role::Knowledge,
+        ),
+        (
+            g.diamond_hollow,
+            "specs",
+            v.specs_indexed.to_string(),
+            format!("{} unchanged", v.specs_skipped),
+            Role::Knowledge,
+        ),
+        (
+            g.square,
+            "trailers",
+            v.trailer_commits_recorded.to_string(),
+            format!(
+                "commits carrying them, of {} scanned",
+                v.trailer_commits_scanned
+            ),
+            Role::Ink,
+        ),
+    ];
+    print_metric_rows(&rows);
+    println!();
+    let mut notes = vec![format!("{} commits touched .zavet/", v.commits_scanned)];
+    if v.trailers_bounded {
+        // Say what was NOT covered rather than letting a bounded scan read as
+        // exhaustive — the whole bug being fixed here was a silent bound.
+        notes.push("trailer scan bounded — `--all-trailers` for full history".to_string());
+    }
+    println!("{}", dots(&notes));
 }
 
 /// Render `dira zavet why`: the knowledge first, then evidence, then cost.
@@ -2161,6 +2249,29 @@ mod tests {
             uncaptured_row("awaiting sweep"),
         ]);
         assert!(both.contains("commit them") && both.contains("dira zavet sync"));
+    }
+
+    /// `sync` honors the capture baseline, so it can never pick up a record
+    /// from history BEHIND that baseline — a fresh clone's whole back catalogue.
+    /// From the uncaptured probe those are indistinguishable from a
+    /// just-committed record, so every hint that names `sync` must also name
+    /// the command that works when it doesn't, or the user re-runs a no-op
+    /// forever (DIRASH-0028).
+    #[test]
+    fn every_sync_hint_offers_reindex_as_the_fallback() {
+        for rows in [
+            vec![uncaptured_row("awaiting sweep")],
+            vec![
+                uncaptured_row("uncommitted"),
+                uncaptured_row("awaiting sweep"),
+            ],
+        ] {
+            let hint = uncaptured_hint(&rows);
+            assert!(
+                hint.contains("reindex"),
+                "a hint naming sync must name its fallback: {hint}"
+            );
+        }
     }
 
     #[test]

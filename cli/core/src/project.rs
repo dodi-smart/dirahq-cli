@@ -481,6 +481,54 @@ pub fn current_branch(root: &Path) -> Option<String> {
     }
 }
 
+/// One commit as the knowledge sweep needs it: its sha and authored timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRef {
+    pub sha: String,
+    pub authored_at: Option<String>,
+}
+
+/// Walk `git log` for shas + authored timestamps only, newest first, optionally
+/// restricted to a pathspec.
+///
+/// Deliberately *not* [`log_commits`]: that one runs `--shortstat` and then a
+/// `git diff-tree | git patch-id` subprocess pair per commit, which over full
+/// history is hundreds of process spawns for fields the knowledge sweep never
+/// reads. `limit` of `None` means unbounded — safe precisely because callers
+/// pair it with a pathspec (`.zavet/`), which is what keeps "all of history"
+/// down to the handful of commits that touched those paths.
+pub fn log_commit_refs(root: &Path, paths: &[&str], limit: Option<usize>) -> Vec<CommitRef> {
+    let limit_arg = limit.map(|n| format!("-{n}"));
+    let mut args: Vec<&str> = vec!["log", "--no-color", "--pretty=format:%H%x1f%aI"];
+    if let Some(l) = limit_arg.as_deref() {
+        args.push(l);
+    }
+    if !paths.is_empty() {
+        args.push("--");
+        args.extend_from_slice(paths);
+    }
+    let Some(out) = git(root, &args) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let sha = parts.next()?.trim();
+            if sha.is_empty() {
+                return None;
+            }
+            Some(CommitRef {
+                sha: sha.to_string(),
+                authored_at: parts
+                    .next()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            })
+        })
+        .collect()
+}
+
 /// Walk `git log` at `root` and return the captured commits, newest first.
 ///
 /// `range` is `None` for a bounded backfill (the most recent `limit` commits on
@@ -698,7 +746,8 @@ pub fn canonicalize_remote(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_remote, first_commit_date, knowledge_activity, paths_touched_since_days,
+        canonicalize_remote, first_commit_date, knowledge_activity, log_commit_refs,
+        paths_touched_since_days,
     };
 
     #[test]
@@ -1264,6 +1313,97 @@ mod tests {
         // A plain (non-git) directory must never panic — all-None.
         let dir = temp_repo_dir("nonrepo");
         assert_eq!(session_signals(&dir), SessionSignals::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repo whose history interleaves `.zavet/` commits with ordinary ones,
+    /// so a pathspec walk has something to actually filter out.
+    fn init_repo_with_zavet(tag: &str) -> std::path::PathBuf {
+        let root = temp_repo_dir(tag);
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        run_git(&root, &["config", "user.email", "t@example.com"]);
+        run_git(&root, &["config", "user.name", "T"]);
+        std::fs::create_dir_all(root.join(".zavet/decisions")).unwrap();
+
+        write(&root, "code.rs", "fn main() {}\n");
+        run_git(&root, &["add", "."]);
+        run_git_at(
+            &root,
+            &["commit", "-q", "-m", "feat"],
+            "2026-01-01T00:00:00Z",
+        );
+
+        write(&root, ".zavet/decisions/D-0001-x.md", "one\n");
+        run_git(&root, &["add", "."]);
+        run_git_at(
+            &root,
+            &["commit", "-q", "-m", "decide"],
+            "2026-01-02T00:00:00Z",
+        );
+
+        write(&root, "other.rs", "// more\n");
+        run_git(&root, &["add", "."]);
+        run_git_at(
+            &root,
+            &["commit", "-q", "-m", "more"],
+            "2026-01-03T00:00:00Z",
+        );
+
+        write(&root, ".zavet/decisions/D-0001-x.md", "one, revised\n");
+        run_git(&root, &["add", "."]);
+        run_git_at(
+            &root,
+            &["commit", "-q", "-m", "revise"],
+            "2026-01-04T00:00:00Z",
+        );
+        root
+    }
+
+    /// The pathspec is what makes an unbounded reindex walk affordable: without
+    /// it "all of history" means every commit, with it only the handful that
+    /// touched `.zavet/`.
+    #[test]
+    fn log_commit_refs_honours_the_pathspec() {
+        let root = init_repo_with_zavet("refspath");
+        assert_eq!(log_commit_refs(&root, &[], None).len(), 4);
+
+        let scoped = log_commit_refs(&root, &[".zavet/decisions"], None);
+        assert_eq!(scoped.len(), 2, "only the two decision commits");
+        // Newest first, and the authored dates come back parsed.
+        assert!(scoped[0]
+            .authored_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-01-04"));
+        assert!(scoped[1]
+            .authored_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-01-02"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn log_commit_refs_honours_the_limit() {
+        let root = init_repo_with_zavet("refslimit");
+        assert_eq!(log_commit_refs(&root, &[], Some(2)).len(), 2);
+        assert_eq!(log_commit_refs(&root, &[], None).len(), 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pathspec matching nothing is an empty walk, not an unfiltered one —
+    /// the failure mode that would silently reindex all of history.
+    #[test]
+    fn log_commit_refs_empty_for_an_unmatched_pathspec() {
+        let root = init_repo_with_zavet("refsnone");
+        assert!(log_commit_refs(&root, &[".zavet/specs"], None).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn log_commit_refs_none_outside_a_repo() {
+        let dir = temp_repo_dir("refsnonrepo");
+        assert!(log_commit_refs(&dir, &[], None).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

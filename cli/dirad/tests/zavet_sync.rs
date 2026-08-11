@@ -84,30 +84,35 @@ async fn sync_at(state: &AppState, cwd: &str) -> Box<ZavetSyncView> {
 async fn sync_sweeps_and_registers_a_repo_the_daemon_has_never_seen() {
     let state = test_state().await;
     let repo = setup_repo();
-    let cwd = repo.path().display().to_string();
+    // Run it from a SUBDIRECTORY: the registered dir must be the repo root, or
+    // the ticker inherits a path that `knowledge_sync`'s `.zavet/` probe and
+    // its cwd-relative pathspecs cannot resolve from.
+    let sub = repo.path().join("src/capture");
+    std::fs::create_dir_all(&sub).unwrap();
 
     assert!(
         dirad::control::lock_recover_map(&state.repo_dirs).is_empty(),
         "a fresh daemon knows no repos"
     );
 
-    let v = sync_at(&state, &cwd).await;
+    let v = sync_at(&state, &sub.display().to_string()).await;
     assert!(v.registered, "first sync registers the repo");
     assert!(v.active);
     assert_eq!(v.decisions_captured, 1, "and sweeps it in the same call");
     assert_eq!(v.decisions_total, 1);
 
-    // The registered dir is the repo TOPLEVEL, not the raw cwd: sync resolves
-    // it once and hands the ticker a root rather than whatever subdirectory
-    // the caller happened to be standing in.
-    let toplevel = std::fs::canonicalize(repo.path()).unwrap();
-    assert_eq!(
-        dirad::control::lock_recover_map(&state.repo_dirs)
-            .get(CANONICAL)
-            .map(std::path::PathBuf::from),
-        Some(toplevel),
-        "the idle ticker will now reach this repo"
+    // Asserted by shape rather than by string equality: git reports a toplevel
+    // as `C:/…` where `fs::canonicalize` yields `\\?\C:\…`, so comparing the
+    // two forms only ever tested which platform the suite is on.
+    let registered = dirad::control::lock_recover_map(&state.repo_dirs)
+        .get(CANONICAL)
+        .map(std::path::PathBuf::from)
+        .expect("the idle ticker will now reach this repo");
+    assert!(
+        registered.join(".zavet").is_dir(),
+        "registered {registered:?}, which is not the repo root"
     );
+    assert_ne!(registered, sub, "resolved upward from the caller's cwd");
 }
 
 /// Sync reuses the ordinary capture path rather than forcing a re-read, so an

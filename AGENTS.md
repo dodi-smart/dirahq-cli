@@ -81,6 +81,7 @@ agent context at session start — keep it short and non-negotiable.
 - distribution-and-update — Distribution and self-update (session, high)
 - doctor — Diagnostics — dira doctor and the capture probe (session, high)
 - harness-sources — Harness sources and hook ingestion (session, high)
+- knowledge-sync — Knowledge sync — the consent-gated second channel (session, medium)
 
 Capture bar: record non-obvious choices a future reader could not reconstruct — micro-decisions as commit trailers (Why:/Rejected:/Constraint:/Refs:), structural ones via /zavet:decide.
 Spec maintenance (do this as part of normal work, no command needed): when implementing or changing a feature, update its covering spec in .zavet/specs/ — or create one from .zavet/.spec-template.md (origin: session) for substantial new features — reference the decisions involved, and add a `Spec: <slug>` trailer to the commit.

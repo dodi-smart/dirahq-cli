@@ -1,10 +1,10 @@
 ---
 title: Zavet capture pipeline
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
-date: 2026-08-10
+date: 2026-08-11
 paths:
   - cli/dirad/src/capture.rs
   - cli/dirad/src/zavet.rs
@@ -106,6 +106,11 @@ commit poll — no filesystem watcher, no extra daemon.
   wholesale on each capture; links live on the spec side only.
 - Attribution: the unique active session for the repo or NULL — never
   guessed. Unattributed evidence is still counted and reported.
+- Every decision/spec upsert bumps `touched_seq`, which is the change signal
+  the knowledge channel reads. What happens to a captured record after this
+  point — cursors, tiers, the consent gate — is `knowledge-sync`'s spec, not
+  this one. The coupling matters in one direction only: a writer here that
+  re-stamps unchanged rows silently re-pushes the whole knowledge set.
 
 ## Invariants
 
@@ -126,6 +131,28 @@ commit poll — no filesystem watcher, no extra daemon.
 
 ## Open Questions
 
+- **Provenance cannot be repaired once wrong.** First-sight fields are excluded
+  from both upserts' `DO UPDATE SET`, so whichever row lands first owns
+  `first_commit`/`created_at` forever. On a fresh clone the bounded walk indexes
+  any record edited inside its window and stamps it with that recent commit;
+  `reindex` then finds the content already current and correctly skips it, so
+  the wrong introducing commit survives every subsequent run. Fixing it needs
+  the store to accept an explicit first-seen pair, which is a change to the
+  upsert contract that the ambient path shares.
+- **Nothing reconciles the index against HEAD.** Capture only ever inserts, and
+  a full-history walk can re-add a record whose file was later renamed or
+  deleted. DIRASH-0026 makes this *visible* (`off-branch`) rather than silent,
+  and deliberately never deletes a row, since ids are minted repo-wide. But
+  there is still no answer for a record that is genuinely gone rather than
+  merely on another branch, and the resurrected row inflates the totals a drift
+  figure would be computed from.
+- **`--all-trailers` has an argv ceiling.** `commit_trailers` passes one sha per
+  argument to a single `git log --no-walk`, so a large enough repo (order
+  25–50k commits, platform-dependent `ARG_MAX`) fails the spawn. `git()` maps
+  that to `None`, which becomes an empty trailer set — the command reports
+  success having recorded nothing. The default bound hides it; only the
+  documented escape hatch reaches it. Chunking the sha list, or feeding it via
+  `--stdin`, would remove the ceiling.
 - A dangling `corrected-by` is knowable here (the target may simply not be
   captured yet) but is only reported by the plugin's `zavet check`. Whether
   dira should surface it too — and how it would tell "not captured yet" from

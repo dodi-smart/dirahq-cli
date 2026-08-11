@@ -69,6 +69,8 @@ agent context at session start — keep it short and non-negotiable.
 - DIRASH-0023 — The capture probe rides a daemon-minted reserved session prefix, and the daemon never spawns the child (active)
 - DIRASH-0024 — Repo-scope zavet writes are gated on cwd, and dira never sets core.hooksPath (active)
 - DIRASH-0025 — Token attribution resolves per turn, and never writes NULL when a fallback exists (active)
+- DIRASH-0026 — Branch presence is a display state on the zavet list views, never a deletion (active)
+- DIRASH-0027 — zavet sync registers the repo and reuses the ordinary sweep, never forcing a re-read (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

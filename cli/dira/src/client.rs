@@ -107,6 +107,23 @@ pub async fn send_with_budget(
     }
 }
 
+/// Whether a `Response::Error` message means the resident daemon is older than
+/// this `dira` and does not know the request we just sent.
+///
+/// Adding a `Request` variant is the one protocol change that cannot degrade
+/// gracefully: an older `dirad` fails to deserialize the unknown tag and
+/// answers with serde's complaint, which reads like a bug in the CLI. The
+/// daemon wraps EVERY deserialization failure as `bad request: {e}`
+/// ([`crate`]'s counterpart in `control::handle_conn`), so both spellings have
+/// to count — they are the same event seen from different daemon versions.
+///
+/// String-sniffing is not a shortcut here, it is the only thing that can work:
+/// a typed signal would have to be emitted by the old daemon, which by
+/// definition does not have it.
+pub fn is_daemon_too_old(message: &str) -> bool {
+    message.contains("unknown variant") || message.starts_with("bad request")
+}
+
 /// The message for a response this build could not decode.
 ///
 /// Asks the daemon its version first — [`Request::DaemonInfo`] is deliberately

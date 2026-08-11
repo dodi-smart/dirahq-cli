@@ -172,7 +172,7 @@ async fn stage_of(config: &Config, facts: &super::Facts, ctx: &mut Ctx) -> Stage
         Ok(Response::CaptureProbe(v)) => *v,
         Ok(Response::Error { message }) => {
             // An older daemon fails to deserialize the unknown tag entirely.
-            return if message.contains("unknown variant") || message.starts_with("bad request") {
+            return if crate::client::is_daemon_too_old(&message) {
                 Stage::DaemonTooOld { reason: message }
             } else {
                 Stage::ArmRefused { reason: message }

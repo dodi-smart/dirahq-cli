@@ -93,6 +93,20 @@ pub enum Request {
         cwd: Option<String>,
         repo: Option<String>,
     },
+    /// Sweep one repo's knowledge NOW instead of waiting for the idle ticker
+    /// (`dira zavet sync`), and register its directory so the ticker keeps
+    /// sweeping it.
+    ///
+    /// Local control protocol only — like [`Self::Shutdown`], this does not
+    /// touch the cloud wire contract under `/contract`.
+    ///
+    /// This closes a latency hole, not a scope one: capture reads decision
+    /// records out of git objects, so a sync only picks up what is already
+    /// COMMITTED. Records on disk stay reported, never ingested.
+    ZavetSync {
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
     /// Set or clear the per-repo zavet override (`dira zavet enable|disable`).
     /// `mode` is `on`, `off`, or `clear`.
     ZavetSetMode {
@@ -307,6 +321,12 @@ pub enum Response {
     ZavetSpec(Box<ZavetSpecWhyView>),
     /// `ZavetSetMode`: the applied override (`on`/`off`) or `clear`.
     ZavetModeSet { repo: String, mode: String },
+    /// `ZavetSync`. Boxed like the other `Zavet*` views so the small arms stay
+    /// small. A new variant does not degrade across skew, which is harmless
+    /// here for the same reason as `ZavetSpec`: only a CLI new enough to send
+    /// `ZavetSync` can receive it, and an older daemon answers with an error
+    /// the CLI reports as version skew rather than as a failure.
+    ZavetSync(Box<ZavetSyncView>),
     /// `CaptureProbe`. Boxed like `Status`/`Zavet*` so the small arms stay small.
     ///
     /// Same new-variant skew posture as `ZavetSpec`, and harmless here: only a
@@ -701,6 +721,40 @@ pub struct ZavetDecisionsView {
     pub branch: Option<String>,
     pub decisions: Vec<ZavetDecisionView>,
     /// Records on disk with no store row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncaptured: Vec<ZavetUncapturedView>,
+}
+
+/// The result of one on-demand knowledge sweep (`dira zavet sync`).
+///
+/// The counts are a before/after delta around the ordinary capture path, not a
+/// separate ingest: sync reuses `capture_commits` rather than forcing a
+/// re-read, so "unchanged HEAD captures nothing" stays as true here as it is
+/// for the idle ticker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSyncView {
+    /// Canonical repo that was swept.
+    pub repo: String,
+    /// Whether zavet is active for it. An inactive repo is swept for commits
+    /// like any other but yields no knowledge — worth saying rather than
+    /// reporting a bare zero.
+    pub active: bool,
+    /// Net new decision rows this sweep added. A sweep that re-captured an
+    /// AMENDED record upserts in place and does not move this — the delta
+    /// counts records the store had never seen, not writes performed.
+    pub decisions_captured: u64,
+    /// Net new commit trailers this sweep added.
+    pub trailers_captured: u64,
+    /// Decisions in the store for this repo after the sweep.
+    pub decisions_total: u64,
+    /// Whether this sweep is what first gave the daemon a directory for the
+    /// repo. That set is empty after a restart and is otherwise filled only by
+    /// session registration and agent events, so a repo nobody has opened a
+    /// session in is never swept at all.
+    pub registered: bool,
+    /// Records still on disk with no store row after the sweep — the ones a
+    /// sweep structurally cannot help with, because capture reads git objects
+    /// and never the working tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uncaptured: Vec<ZavetUncapturedView>,
 }

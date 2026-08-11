@@ -9,7 +9,7 @@ paths:
   - cli/dirad/src/capture.rs
   - cli/core/src/zavet.rs
   - cli/core/src/project.rs
-decisions: [D-0001]
+decisions: [D-0001, DIRASH-0027]
 ---
 
 ## Overview
@@ -51,6 +51,14 @@ commit poll — no filesystem watcher, no extra daemon.
   `git log <last_commit>..HEAD -- :(glob)<path>…` over the spec's declared
   paths, in the repo dir the daemon last observed (else the caller's cwd;
   with neither it reads *unknown*, never guessed).
+
+- `dira zavet sync` (`Request::ZavetSync`) runs one sweep on demand and
+  registers the repo dir (DIRASH-0027). Both halves matter: the idle ticker only
+  visits repos in `repo_dirs`, which is empty after a daemon restart and is
+  otherwise filled only by session registration and agent events, so an unswept
+  repo had no user-side remedy at all. It reuses `capture_commits` rather than
+  forcing a re-read, so an unchanged HEAD stays a no-op here too, and it can
+  never pick up an uncommitted record.
 
 ## Interfaces & data
 

@@ -479,6 +479,7 @@ Examples:
   dira zavet why D-0042      the decision — and what it cost
   dira zavet wiki            decisions + living specs, staleness badges
   dira zavet decisions       every captured decision in this repo
+  dira zavet sync            capture committed records now, don't wait
   dira zavet enable          force-on for this repo (beats the global knob)"
     )]
     Zavet {
@@ -527,6 +528,19 @@ Examples:
         /// One JSON object instead of the rendered view.
         #[arg(long)]
         json: bool,
+    },
+    /// Capture this repo's knowledge now, without waiting for the daemon.
+    #[command(after_help = "\
+Captures COMMITTED records only — the sweep reads git objects, not your working
+tree. A record written but not committed is reported, never captured.
+
+Use it when you just committed a decision and do not want to wait for the
+daemon's next sweep (30s, or ~5min while idle), or when a repo has never been
+swept at all — the daemon only visits repos it has seen a session in, and that
+set is empty after a restart. Running this once registers the repo.")]
+    Sync {
+        #[arg(long)]
+        project: Option<String>,
     },
     /// List the captured decisions for this repo.
     #[command(after_help = "\
@@ -701,6 +715,23 @@ Examples:
   dira daemon restart        works for launchd, systemd --user, or a bare process"
     )]
     Restart,
+}
+
+/// Name the real cause when the resident daemon predates this `dira`, or
+/// `None` for an ordinary error.
+///
+/// Both binaries ship from one workspace, so the fix is always the same —
+/// restart the daemon. The predicate lives in `client` because
+/// `dira doctor --probe` answers the same question about `CaptureProbe`, and
+/// two copies of it had already drifted on what counts as skew.
+fn daemon_skew_hint(message: &str) -> Option<String> {
+    client::is_daemon_too_old(message).then(|| {
+        format!(
+            "this dira is newer than the running daemon, which does not know this command yet\n  \
+             restart it with `dira daemon restart` (or `dira update`) so both sides speak the same protocol\n  \
+             daemon said: {message}"
+        )
+    })
 }
 
 /// Whether a `dira zavet status` invocation is about the directory the process
@@ -1026,6 +1057,7 @@ async fn main() -> Result<()> {
                 cwd,
                 repo: project,
             },
+            ZavetAction::Sync { project } => Request::ZavetSync { cwd, repo: project },
             ZavetAction::Decisions { project, .. } => {
                 Request::ZavetDecisions { cwd, repo: project }
             }
@@ -1064,6 +1096,12 @@ async fn main() -> Result<()> {
     };
 
     let resp = client::send(&config.socket_path, &req).await?;
+    if let Response::Error { message } = &resp {
+        if let Some(hint) = daemon_skew_hint(message) {
+            eprintln!("{hint}");
+            std::process::exit(1);
+        }
+    }
     let ok = if zavet_json {
         render::print_json(&resp)
     } else {

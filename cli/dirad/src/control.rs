@@ -39,6 +39,28 @@ pub fn lock_recover_map<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     lock_recover(m)
 }
 
+/// Record the working directory the daemon has observed for `repo`, returning
+/// whether this is the FIRST directory it has ever had for that repo.
+///
+/// The single entry point for `state.repo_dirs`, which is shared
+/// infrastructure: the idle ticker sweeps exactly the repos in this map, so
+/// what goes in decides what gets captured at all. Three callers write it —
+/// manual session start, agent events carrying a cwd, and `zavet sync`.
+///
+/// The return value is deliberately "was absent", not "changed": the caller
+/// that reports it to a human means "this repo is now being swept", and the
+/// writers store different shapes for one checkout (a session's raw cwd,
+/// possibly a subdirectory, vs. the toplevel `zavet sync` resolves). A
+/// "changed" answer would fire on every alternation between them.
+///
+/// `dir` is whatever the caller had, and may be a SUBDIRECTORY of the repo
+/// rather than its toplevel; readers that need the root resolve it.
+pub fn register_repo_dir(state: &AppState, repo: &str, dir: &str) -> bool {
+    lock_recover_map(&state.repo_dirs)
+        .insert(repo.to_string(), dir.to_string())
+        .is_none()
+}
+
 /// Serve a single CLI connection.
 ///
 /// `Request::Shutdown` gets one piece of special handling here (everything
@@ -107,6 +129,7 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             crate::zavet::wiki(state, topic, cwd, repo).await
         }
         Request::ZavetDecisions { cwd, repo } => crate::zavet::decisions(state, cwd, repo).await,
+        Request::ZavetSync { cwd, repo } => crate::zavet::sync(state, cwd, repo).await,
         Request::ZavetSetMode { cwd, repo, mode } => {
             crate::zavet::set_mode(state, cwd, repo, mode).await
         }
@@ -306,7 +329,7 @@ async fn start(
     // Register the dira's working dir against its repo so the idle-ticker commit
     // poller can pick up commits made during a pure manual dira (no agent events).
     if let (Some(p), Some(dir)) = (project.as_deref(), cwd.as_deref()) {
-        lock_recover_map(&state.repo_dirs).insert(p.to_string(), dir.to_string());
+        register_repo_dir(state, p, dir);
     }
     let session_id = Ulid::generate().to_string();
     let handle = handle_of(&session_id);

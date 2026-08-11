@@ -377,8 +377,7 @@ async fn process_message(
     // returned, an agent paused, or a session/manual session closed). The
     // capture is spawned detached + time-boxed, so it never blocks this loop.
     if let (Some(cwd), Some(proj)) = (ev.cwd.as_deref(), ev.project.as_deref()) {
-        crate::control::lock_recover_map(&state.repo_dirs)
-            .insert(proj.to_string(), cwd.to_string());
+        crate::control::register_repo_dir(state, proj, cwd);
         if capture::captures_commits(ev.kind) && throttle.ready(proj) {
             capture_fn(state, cwd, proj);
         }

@@ -13,7 +13,7 @@ use crate::theme::{self, Role};
 use dira_core::protocol::{
     any_engaged, LiveState, Response, SessionView, StatusView, ZavetCheckView, ZavetDecisionView,
     ZavetDecisionsView, ZavetGuardStatView, ZavetPresence, ZavetSpecView, ZavetStatusView,
-    ZavetUncapturedView, ZavetWhyView,
+    ZavetSyncView, ZavetUncapturedView, ZavetWhyView,
 };
 use dira_core::report::Report;
 use time::OffsetDateTime;
@@ -152,6 +152,7 @@ pub fn print_json(resp: &Response) -> bool {
     match resp {
         Response::Error { .. } => print(resp),
         Response::ZavetDecisions(v) => emit(v),
+        Response::ZavetSync(v) => emit(v),
         Response::ZavetWiki(v) => emit(v),
         Response::ZavetStatus(v) => emit(v),
         Response::ZavetWhy(v) => emit(v),
@@ -232,6 +233,12 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
         }
         Response::ZavetWhy(v) => {
             print_zavet_why(v);
+            true
+        }
+        Response::ZavetSync(v) => {
+            for line in zavet_sync_lines(v, terminal_cols() as usize) {
+                println!("{line}");
+            }
             true
         }
         Response::ZavetDecisions(v) => {
@@ -644,6 +651,23 @@ fn section_head(title: &str, count: usize, note: Option<&str>, cols: usize) -> V
     out
 }
 
+/// The section hint for a set of uncaptured rows.
+///
+/// The rows carry two different reasons and only one of them is fixed by
+/// committing: an `awaiting sweep` record IS committed, and telling its author
+/// to commit it sends them at a fix that cannot work. Pure so the pairing is
+/// pinned by a test.
+fn uncaptured_hint(rows: &[ZavetUncapturedView]) -> &'static str {
+    let uncommitted = rows.iter().any(|u| u.reason == "uncommitted");
+    let awaiting = rows.iter().any(|u| u.reason == "awaiting sweep");
+    match (uncommitted, awaiting) {
+        (true, true) => "on disk, not captured — commit them, then `dira zavet sync`",
+        (false, true) => "committed, not yet swept — run `dira zavet sync`",
+        // Includes the empty case, which never reaches a caller.
+        _ => "on disk, not captured — dira reads git, so commit them",
+    }
+}
+
 /// The `UNCAPTURED` rows: records dira can see on disk but has never captured.
 ///
 /// This section exists because the alternative is silence. Capture reads git
@@ -658,7 +682,7 @@ fn uncaptured_lines(rows: &[ZavetUncapturedView], l: &ZavetLayout, cols: usize) 
     out.extend(section_head(
         "UNCAPTURED",
         rows.len(),
-        Some("on disk, not captured — dira reads git, so commit them"),
+        Some(uncaptured_hint(rows)),
         cols,
     ));
     // These rows carry a trailing reason that the decision layout knows nothing
@@ -687,6 +711,57 @@ fn uncaptured_lines(rows: &[ZavetUncapturedView], l: &ZavetLayout, cols: usize) 
             theme::paint(&u.reason, Role::Compute),
         ));
     }
+    out
+}
+
+/// `dira zavet sync` as lines — pure, like the other zavet views, so the
+/// wording is pinned by tests rather than reachable only through stdout.
+///
+/// The uncaptured section rides the shared [`uncaptured_lines`] renderer, and
+/// deliberately prints AFTER the counts: a sweep that captured nothing because
+/// the records were never committed must not read as "already up to date".
+fn zavet_sync_lines(v: &ZavetSyncView, cols: usize) -> Vec<String> {
+    let mut out = vec![format!(
+        "{} {} {}",
+        theme::paint("zavet sync", Role::Knowledge),
+        theme::paint(dot_glyph(), Role::Muted),
+        theme::paint(&v.repo, Role::Ink),
+    )];
+    let mut why = Vec::new();
+    if !v.active {
+        why.push("zavet inactive here — nothing to capture".to_string());
+    }
+    if v.registered {
+        why.push("repo registered — the daemon will keep sweeping it".to_string());
+    }
+    if !why.is_empty() {
+        out.push(dots(&why));
+    }
+    out.push(String::new());
+    if v.decisions_captured == 0 && v.trailers_captured == 0 {
+        out.push(theme::paint(
+            "already up to date · nothing new to capture",
+            Role::Muted,
+        ));
+    } else {
+        out.push(format!(
+            "{}   {}",
+            theme::paint(
+                &format!(
+                    "captured {} · {}",
+                    plural(v.decisions_captured, "decision"),
+                    plural(v.trailers_captured, "trailer"),
+                ),
+                Role::Engaged
+            ),
+            theme::paint(
+                &format!("{} total", plural(v.decisions_total, "decision")),
+                Role::Muted
+            ),
+        ));
+    }
+    let l = ZavetLayout::for_width(cols, id_width(std::iter::empty(), &v.uncaptured));
+    out.extend(uncaptured_lines(&v.uncaptured, &l, cols));
     out
 }
 
@@ -2057,6 +2132,36 @@ fn print_report(r: &Report, layout: &Layout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uncaptured_row(reason: &str) -> ZavetUncapturedView {
+        ZavetUncapturedView {
+            reason: reason.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// An `awaiting sweep` record is already committed, so the hint must not
+    /// tell its author to commit it — that is a fix which cannot work. Now that
+    /// `dira zavet sync` exists, there is a real remedy to name instead.
+    #[test]
+    fn the_uncaptured_hint_matches_the_reasons_present() {
+        let sync_only = uncaptured_hint(&[uncaptured_row("awaiting sweep")]);
+        assert!(sync_only.contains("dira zavet sync"));
+        assert!(
+            !sync_only.contains("commit them") && !sync_only.contains("commit it"),
+            "these are already committed; it must not ask for that: {sync_only}"
+        );
+
+        let commit_only = uncaptured_hint(&[uncaptured_row("uncommitted")]);
+        assert!(commit_only.contains("commit them"));
+        assert!(!commit_only.contains("dira zavet sync"));
+
+        let both = uncaptured_hint(&[
+            uncaptured_row("uncommitted"),
+            uncaptured_row("awaiting sweep"),
+        ]);
+        assert!(both.contains("commit them") && both.contains("dira zavet sync"));
+    }
 
     #[test]
     fn baseline_width_preserves_legacy_constants() {

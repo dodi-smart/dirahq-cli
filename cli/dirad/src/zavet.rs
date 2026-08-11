@@ -11,8 +11,8 @@ use crate::state::AppState;
 use dira_core::config::ZavetMode;
 use dira_core::protocol::{
     Response, ZavetCheckView, ZavetDecisionView, ZavetDecisionsView, ZavetGuardStatView,
-    ZavetPresence, ZavetSpecView, ZavetSpecWhyView, ZavetStatusView, ZavetUncapturedView,
-    ZavetWhyView,
+    ZavetPresence, ZavetSpecView, ZavetSpecWhyView, ZavetStatusView, ZavetSyncView,
+    ZavetUncapturedView, ZavetWhyView,
 };
 use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
 pub use dira_core::zavet::{
@@ -325,13 +325,27 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
 /// resolve from `cwd` (or the daemon's own cwd). Also reports whether the
 /// resolved toplevel carries `.zavet/` when a directory was available.
 async fn query_repo(
+    state: &AppState,
     repo: Option<String>,
     cwd: Option<String>,
 ) -> Result<(String, Option<bool>, ZavetConfig), Response> {
-    // An explicit --project names a repo we are not standing in, so there is
-    // no config to read; callers that need one fall back to the defaults.
+    // An explicit --project names a repo THIS PROCESS is not standing in — but
+    // the daemon may well remember a directory for it, and that repo's id
+    // conventions (`id-width`, the prefix set) still govern how a query id
+    // canonicalizes. Falling straight back to the defaults silently re-pads
+    // `CLOUD-42` to a width-4 `CLOUD-0042` for a repo that stores
+    // `CLOUD-00042`, so the lookup misses a record that is right there.
+    //
+    // `dir_exists` stays `None`: it answers the `auto` probe for the tree this
+    // process is standing in, and a named project is not that tree.
     if let Some(r) = repo {
-        return Ok((r, None, ZavetConfig::default()));
+        let cfg = match repo_root(known_dir(state, &r)).await {
+            Some(root) => tokio::task::spawn_blocking(move || read_config(&root))
+                .await
+                .unwrap_or_default(),
+            None => ZavetConfig::default(),
+        };
+        return Ok((r, None, cfg));
     }
     let dir = cwd.unwrap_or_else(|| {
         std::env::current_dir()
@@ -373,10 +387,18 @@ fn spec_view(s: &ZavetSpecRow, stale_commits: Option<u64>) -> ZavetSpecView {
 /// observed for it, else the caller's `cwd`. `None` means staleness stays
 /// unknown — never guessed.
 fn repo_workdir(state: &AppState, repo: &str, cwd: Option<&str>) -> Option<PathBuf> {
+    known_dir(state, repo).or_else(|| cwd.map(PathBuf::from))
+}
+
+/// The directory the daemon last observed for `repo`, if any.
+///
+/// Note what it holds: whatever the last writer put there — a cwd an event
+/// happened to carry (often a subdirectory), or the toplevel `zavet sync`
+/// resolved. Readers that need the root resolve it (see [`repo_root`]).
+fn known_dir(state: &AppState, repo: &str) -> Option<PathBuf> {
     crate::control::lock_recover_map(&state.repo_dirs)
         .get(repo)
         .map(PathBuf::from)
-        .or_else(|| cwd.map(PathBuf::from))
 }
 
 /// A spec's `(last_commit, paths)` — what [`spec_staleness`] needs to know.
@@ -582,7 +604,7 @@ fn guard_stat_views(stats: Vec<dira_core::store::ZavetGuardStat>) -> Vec<ZavetGu
 
 /// `Request::ZavetStatus`.
 pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, dir_exists, _) = match query_repo(repo, cwd).await {
+    let (repo, dir_exists, _) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -614,7 +636,7 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
 
 /// `Request::ZavetDecisions`.
 pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, _, cfg) = match query_repo(repo, cwd.clone()).await {
+    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -651,6 +673,67 @@ pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<Strin
     }))
 }
 
+/// `Request::ZavetSync` — sweep this repo's knowledge now instead of waiting
+/// for the idle ticker, and make sure the ticker keeps sweeping it.
+///
+/// Two holes, one command. The ticker only visits repos in `state.repo_dirs`
+/// (`lib.rs`'s `idle_ticker`), and that map is otherwise populated only by
+/// session registration and agent events — so it is EMPTY on a freshly
+/// restarted daemon, and a repo nobody has opened a session in is never swept
+/// at all. Registering here is therefore the fix, not a side effect. The sweep
+/// itself closes the ordinary 30 s / ~5 min latency.
+///
+/// Deliberately no `force`: this calls the same `capture_commits` the ticker
+/// does, so an unchanged HEAD stays a complete no-op. Forcing a re-read could
+/// only re-ingest blobs already stored, and could NOT pick up an uncommitted
+/// record — capture reads git objects, not the worktree (DIRASH-0026). Those
+/// stay reported through `uncaptured`.
+pub async fn sync(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
+    let (repo, dir_exists, cfg) = match query_repo(state, repo, cwd.clone()).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    // A sweep needs a real directory, not just a canonical name: `--project`
+    // alone can only work if the daemon already remembers a dir for it.
+    let Some(root) = repo_root(repo_workdir(state, &repo, cwd.as_deref())).await else {
+        return Response::Error {
+            message: format!(
+                "no working directory known for {repo}; run `dira zavet sync` from inside a checkout"
+            ),
+        };
+    };
+    let dir = root.display().to_string();
+
+    let registered = crate::control::register_repo_dir(state, &repo, &dir);
+
+    let before = state.store.zavet_counts(&repo).await.unwrap_or_default();
+    crate::capture::capture_commits(state, &dir, &repo).await;
+    let after = state.store.zavet_counts(&repo).await.unwrap_or_default();
+
+    let active = active_for(state, &repo, dir_exists.unwrap_or(false)).await;
+    // Probed AFTER the sweep, so the two halves of the output agree: a record
+    // this sweep just captured must not still read as uncaptured.
+    let captured = state
+        .store
+        .zavet_decisions_list(&repo)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| (d.path, d.id))
+        .collect();
+    let probe = working_tree_probe(Some(root), cfg, Kinds::Decisions, captured).await;
+
+    Response::ZavetSync(Box::new(ZavetSyncView {
+        repo,
+        active,
+        decisions_captured: after.decisions_total.saturating_sub(before.decisions_total),
+        trailers_captured: after.trailers.saturating_sub(before.trailers),
+        decisions_total: after.decisions_total,
+        registered,
+        uncaptured: probe.uncaptured,
+    }))
+}
+
 /// `Request::ZavetWiki` — the browsable knowledge base: an overview without a
 /// topic, ranked matches with one.
 pub async fn wiki(
@@ -659,7 +742,7 @@ pub async fn wiki(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _, cfg) = match query_repo(repo, cwd.clone()).await {
+    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -756,7 +839,7 @@ pub async fn set_mode(
     repo: Option<String>,
     mode: String,
 ) -> Response {
-    let (repo, _, _) = match query_repo(repo, cwd).await {
+    let (repo, _, _) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -787,7 +870,7 @@ pub async fn why(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _, cfg) = match query_repo(repo, cwd.clone()).await {
+    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };

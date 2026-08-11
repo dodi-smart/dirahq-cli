@@ -1068,7 +1068,9 @@ fn print_zavet_status(v: &ZavetStatusView) {
             Role::Engaged,
         ),
     ];
-    print_metric_rows(&rows);
+    for line in metric_rows(&rows) {
+        println!("{line}");
+    }
 }
 
 /// The zavet metric block: `glyph label  value   note`, values right-aligned to
@@ -1078,16 +1080,18 @@ fn print_zavet_status(v: &ZavetStatusView) {
 /// not content, and two copies would drift the first time either is tweaked.
 /// Glyphs are `&str` because the palette resolves them per terminal
 /// (`theme::glyphs`), and the ASCII fallbacks are not all one char.
-fn print_metric_rows(rows: &[(&str, &str, String, String, Role)]) {
+fn metric_rows(rows: &[(&str, &str, String, String, Role)]) -> Vec<String> {
     let value_w = rows.iter().map(|r| r.2.chars().count()).max().unwrap_or(0);
-    for (glyph, label, value, note, role) in rows {
-        println!(
-            "{} {}   {}",
-            theme::paint(&format!("{glyph} {label:<10}"), *role),
-            theme::paint(&format!("{value:>value_w$}"), Role::Ink),
-            theme::paint(note, Role::Muted),
-        );
-    }
+    rows.iter()
+        .map(|(glyph, label, value, note, role)| {
+            format!(
+                "{} {}   {}",
+                theme::paint(&format!("{glyph} {label:<10}"), *role),
+                theme::paint(&format!("{value:>value_w$}"), Role::Ink),
+                theme::paint(note, Role::Muted),
+            )
+        })
+        .collect()
 }
 
 /// Render `dira zavet decisions`.
@@ -1100,28 +1104,28 @@ fn print_zavet_decisions(v: &ZavetDecisionsView, opts: RowOpts) {
 
 /// `dira zavet reindex` — what the walk saw and what it wrote.
 fn print_zavet_reindex(v: &ZavetReindexView) {
-    if !v.active {
-        println!(
-            "{} {}",
-            theme::paint("zavet inactive", Role::Faint),
-            theme::paint(&v.repo, Role::Muted),
-        );
-        println!(
-            "{}",
-            theme::paint(
-                "  nothing indexed — enable with `dira zavet enable`",
-                Role::Muted
-            ),
-        );
-        return;
+    for line in zavet_reindex_lines(v) {
+        println!("{line}");
     }
-    println!(
+}
+
+/// [`print_zavet_reindex`] as lines — pure, like every other zavet view, so
+/// what the command claims about its own coverage is testable rather than
+/// reachable only through stdout.
+fn zavet_reindex_lines(v: &ZavetReindexView) -> Vec<String> {
+    let mut out = vec![format!(
         "{} {} {}",
         theme::paint("zavet reindex", Role::Knowledge),
-        theme::paint("·", Role::Muted),
+        theme::paint(dot_glyph(), Role::Muted),
         theme::paint(&v.repo, Role::Ink),
-    );
-    println!();
+    )];
+    if !v.active {
+        out.push(dots(
+            &["zavet inactive here — nothing to index".to_string()],
+        ));
+        return out;
+    }
+    out.push(String::new());
     let g = theme::glyphs();
     let rows: [(&str, &str, String, String, Role); 3] = [
         (
@@ -1149,15 +1153,16 @@ fn print_zavet_reindex(v: &ZavetReindexView) {
             Role::Ink,
         ),
     ];
-    print_metric_rows(&rows);
-    println!();
+    out.extend(metric_rows(&rows));
+    out.push(String::new());
     let mut notes = vec![format!("{} commits touched .zavet/", v.commits_scanned)];
     if v.trailers_bounded {
         // Say what was NOT covered rather than letting a bounded scan read as
         // exhaustive — the whole bug being fixed here was a silent bound.
         notes.push("trailer scan bounded — `--all-trailers` for full history".to_string());
     }
-    println!("{}", dots(&notes));
+    out.push(dots(&notes));
+    out
 }
 
 /// Render `dira zavet why`: the knowledge first, then evidence, then cost.
@@ -2249,6 +2254,40 @@ mod tests {
             uncaptured_row("awaiting sweep"),
         ]);
         assert!(both.contains("commit them") && both.contains("dira zavet sync"));
+    }
+
+    /// DIRASH-0028's closing directive is "if a walk is bounded, say so in the
+    /// output". The trailer pass is the bounded half, so the disclosure has to
+    /// be present when it applies and absent when it doesn't — otherwise a full
+    /// scan reads as partial, or worse, a partial one reads as exhaustive.
+    #[test]
+    fn a_bounded_trailer_scan_says_so_and_a_full_one_does_not() {
+        let view = |bounded: bool| ZavetReindexView {
+            repo: "github.com/acme/api".into(),
+            active: true,
+            trailers_bounded: bounded,
+            ..Default::default()
+        };
+        let bounded = zavet_reindex_lines(&view(true)).join("\n");
+        assert!(bounded.contains("--all-trailers"), "{bounded}");
+
+        let full = zavet_reindex_lines(&view(false)).join("\n");
+        assert!(!full.contains("bounded"), "{full}");
+        assert!(!full.contains("--all-trailers"), "{full}");
+    }
+
+    /// An inactive repo must not render a metric block of zeroes — that reads
+    /// as "indexed nothing because there is nothing", not "did not look".
+    #[test]
+    fn an_inactive_repo_reports_why_instead_of_zero_counts() {
+        let lines = zavet_reindex_lines(&ZavetReindexView {
+            repo: "github.com/acme/api".into(),
+            active: false,
+            ..Default::default()
+        });
+        let text = lines.join("\n");
+        assert!(text.contains("inactive"), "{text}");
+        assert!(!text.contains("decisions"), "no metric block: {text}");
     }
 
     /// `sync` honors the capture baseline, so it can never pick up a record

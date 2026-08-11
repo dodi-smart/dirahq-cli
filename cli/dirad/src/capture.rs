@@ -109,13 +109,10 @@ struct GitWalk {
 ///
 /// This is not a second parser: decisions and specs are still parsed in exactly
 /// one place (see [`zavet_sweep`]). This is that function's first stage, reused.
-pub fn zavet_trailers(root: &Path, commits: &[project::CommitRef]) -> ZavetTrailers {
-    zavet_trailers_with(root, commits, &crate::zavet::read_config(root))
-}
-
-/// [`zavet_trailers`] with the id config already in hand, so a full sweep does
-/// not read `.zavet/config` twice.
-fn zavet_trailers_with(
+///
+/// Takes the id config rather than reading it: every caller has already
+/// resolved one for this tree, and `.zavet/config` is a file read per call.
+pub fn zavet_trailers(
     root: &Path,
     commits: &[project::CommitRef],
     cfg: &crate::zavet::ZavetConfig,
@@ -230,7 +227,7 @@ pub fn zavet_sweep(root: &Path, commits: &[project::CommitRef]) -> ZavetSweep {
     // historical blob: retired prefixes stay in `prefix-aliases`, so the
     // current config is what resolves an id minted under an older one.
     let cfg = crate::zavet::read_config(root);
-    let trailers = zavet_trailers_with(root, commits, &cfg);
+    let trailers = zavet_trailers(root, commits, &cfg);
 
     let mut decisions = Vec::new();
     let mut specs = Vec::new();

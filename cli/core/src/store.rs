@@ -1103,6 +1103,49 @@ impl Store {
 
     /// All decisions for a repo (with guards), ordered by id. Guards come from
     /// one bulk query grouped in memory, not a per-decision lookup.
+    /// `(key, content_hash, path)` for every captured decision and spec in
+    /// `repo` — the identity a bulk re-ingest compares against, and nothing
+    /// else. Read-only: no cursor, no stream, nothing to blank in `nuke`.
+    ///
+    /// Deliberately not `zavet_decisions_list` + `zavet_specs_list`: those load
+    /// every `body_md` and run five further queries for guards, checks, spec
+    /// paths and spec links, all of which a hash comparison discards. On this
+    /// repo that is ~166 KB of record bodies read to produce ~4 KB of keys.
+    pub async fn zavet_record_identities(
+        &self,
+        repo: &str,
+    ) -> Result<(Vec<ZavetIdentity>, Vec<ZavetIdentity>), Error> {
+        let decisions = self
+            .zavet_identities(
+                "SELECT id AS key, content_hash, path FROM zavet_decisions WHERE repo = ?1",
+                repo,
+            )
+            .await?;
+        let specs = self
+            .zavet_identities(
+                "SELECT slug AS key, content_hash, path FROM zavet_specs WHERE repo = ?1",
+                repo,
+            )
+            .await?;
+        Ok((decisions, specs))
+    }
+
+    async fn zavet_identities(
+        &self,
+        sql: &'static str,
+        repo: &str,
+    ) -> Result<Vec<ZavetIdentity>, Error> {
+        let rows = sqlx::query(sql).bind(repo).fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| ZavetIdentity {
+                key: r.get::<String, _>("key"),
+                content_hash: r.get::<Option<String>, _>("content_hash"),
+                path: r.get::<String, _>("path"),
+            })
+            .collect())
+    }
+
     pub async fn zavet_decisions_list(&self, repo: &str) -> Result<Vec<ZavetDecisionRow>, Error> {
         let rows = sqlx::query(
             "SELECT repo, id, slug, title, status, path, supersedes, body_md,
@@ -2231,6 +2274,19 @@ pub struct ZavetSessionTotals {
     pub rollup_agent_seconds: i64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+/// A captured record's identity: what it is, what it held, and where it lived.
+///
+/// Both halves are load-bearing for a re-ingest's skip check. The hash alone
+/// misses a rename — `git mv` keeps the blob oid while `path` (and a spec's
+/// `slug`, which is its filename stem) goes stale.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetIdentity {
+    /// `zavet_decisions.id` or `zavet_specs.slug`.
+    pub key: String,
+    pub content_hash: Option<String>,
+    pub path: String,
 }
 
 /// Capture-health counters for a repo.

@@ -250,9 +250,9 @@ async fn attach_guard_stats(state: &AppState, repo: &str, decisions: &mut [Zavet
 #[derive(Default)]
 struct ResolvedRepo {
     repo: Option<String>,
-    /// The git toplevel, kept rather than discarded: callers that need to read
-    /// the working tree would otherwise re-run `git rev-parse --show-toplevel`
-    /// for a path this already computed.
+    /// The git toplevel, kept rather than discarded so `reindex` can walk the
+    /// working tree without a second `git rev-parse --show-toplevel` for a path
+    /// this already resolved.
     top: Option<PathBuf>,
     dir_exists: bool,
     cfg: ZavetConfig,
@@ -297,8 +297,12 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
         tracing::debug!("zavet: dropped malformed guard event");
         return Response::Ok; // the shim is fire-and-forget; nothing to say
     };
-    let r = resolve_repo(ev.cwd.clone()).await;
-    let (repo, dir_exists, cfg) = (r.repo, r.dir_exists, r.cfg);
+    let ResolvedRepo {
+        repo,
+        dir_exists,
+        cfg,
+        ..
+    } = resolve_repo(ev.cwd.clone()).await;
     // The id arrives with its prefix normalized but its digits as written —
     // parse_guard_event runs before `cwd` is resolved, so this is the first
     // point that knows the repo's padding width. Without it a hand-authored
@@ -346,12 +350,7 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
 
 /// Repo resolution ladder for the query commands: explicit repo wins, else
 /// resolve from `cwd` (or the daemon's own cwd). Also reports whether the
-/// resolved toplevel carries `.zavet/` when a directory was available, and the
-/// toplevel itself for callers that need to read the working tree.
-///
-/// An explicit `--project` names a repo we are not standing in, so it yields no
-/// toplevel and no config — callers fall back to the defaults, and anything
-/// needing the working tree reports absent evidence rather than guessing.
+/// resolved toplevel carries `.zavet/` when a directory was available.
 async fn query_repo(
     state: &AppState,
     repo: Option<String>,
@@ -905,20 +904,20 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
     // request is user-initiated, off the hot path, and allowed to take seconds.
     // The accept loop spawns per connection, so a slow walk blocks nobody.
     let trailer_limit = (!all_trailers).then_some(REINDEX_TRAILER_LIMIT);
-    let walk = {
-        let top = top.clone();
-        tokio::task::spawn_blocking(move || {
-            let records = dira_core::project::log_commit_refs(&top, &REINDEX_PATHS, None);
-            let trailer_commits = dira_core::project::log_commit_refs(&top, &[], trailer_limit);
-            let sweep = crate::capture::zavet_sweep(&top, &records);
-            // Trailers only — the record parser costs a subprocess per commit
-            // and this window is the wide one, so running it here would spawn
-            // one per commit purely to discard the result.
-            let trailers = crate::capture::zavet_trailers(&top, &trailer_commits);
-            (records.len(), trailer_commits.len(), sweep, trailers)
-        })
-        .await
-    };
+    // `cfg` comes from the resolve above rather than being re-read: it is a file
+    // read, and this tree's config was already loaded to get here.
+    let cfg = r.cfg;
+    let walk = tokio::task::spawn_blocking(move || {
+        let records = dira_core::project::log_commit_refs(&top, &REINDEX_PATHS, None);
+        let trailer_commits = dira_core::project::log_commit_refs(&top, &[], trailer_limit);
+        let sweep = crate::capture::zavet_sweep(&top, &records);
+        // Trailers only — the record parser costs a subprocess per commit and
+        // this window is the wide one, so running it here would spawn one per
+        // commit purely to discard the result.
+        let trailers = crate::capture::zavet_trailers(&top, &trailer_commits, &cfg);
+        (records.len(), trailer_commits.len(), sweep, trailers)
+    })
+    .await;
     let (commits_scanned, trailer_commits_scanned, sweep, trailers) = match walk {
         Ok(v) => v,
         Err(e) => {
@@ -937,22 +936,17 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
     // `slug` are derived from the FILENAME, so a pure `git mv` leaves the blob
     // — and its oid — identical while the stored path goes stale. Hash-only
     // would skip exactly that record and never correct it.
-    let known_decisions: HashMap<String, Stored> = state
+    let (known_decisions, known_specs) = state
         .store
-        .zavet_decisions_list(&repo)
+        .zavet_record_identities(&repo)
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|d| (d.id, (d.content_hash, d.path)))
-        .collect();
-    let known_specs: HashMap<String, Stored> = state
-        .store
-        .zavet_specs_list(&repo)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| (s.slug, (s.content_hash, s.path)))
-        .collect();
+        .unwrap_or_default();
+    let by_key = |rows: Vec<dira_core::store::ZavetIdentity>| -> HashMap<String, Stored> {
+        rows.into_iter()
+            .map(|r| (r.key, (r.content_hash, r.path)))
+            .collect()
+    };
+    let (known_decisions, known_specs) = (by_key(known_decisions), by_key(known_specs));
 
     let mut view = dira_core::protocol::ZavetReindexView {
         repo: repo.clone(),
@@ -1060,14 +1054,12 @@ impl<'a, T> Touches<'a, T> {
     ///
     /// A record already in the store keeps its first sight from whenever it was
     /// first captured, so only the newest is written.
-    fn writes(&self, known: bool) -> Vec<&'a T> {
-        if known || std::ptr::eq(self.oldest, self.newest) {
-            vec![self.newest]
-        } else {
-            // Oldest first: it establishes `first_commit`/`created_at`, which
-            // the newest then conflicts with and preserves.
-            vec![self.oldest, self.newest]
-        }
+    fn writes(&self, known: bool) -> impl Iterator<Item = &'a T> {
+        // Oldest first when it is a distinct, unseen record: it establishes
+        // `first_commit`/`created_at`, which the newest then conflicts with and
+        // preserves.
+        let first = (!known && !std::ptr::eq(self.oldest, self.newest)).then_some(self.oldest);
+        first.into_iter().chain(std::iter::once(self.newest))
     }
 }
 
@@ -1516,7 +1508,7 @@ mod tests {
             rec("D-0001", "h3"),
         ];
         let groups = collapse(&items, |(id, _)| id.as_str());
-        let writes = groups[0].writes(false);
+        let writes: Vec<_> = groups[0].writes(false).collect();
         assert_eq!(writes.len(), 2, "oldest for provenance, newest for content");
         assert_eq!(writes[0].1, "h1");
         assert_eq!(writes[1].1, "h3");
@@ -1528,7 +1520,7 @@ mod tests {
     fn a_known_record_only_writes_its_newest() {
         let items = [rec("D-0001", "h1"), rec("D-0001", "h2")];
         let groups = collapse(&items, |(id, _)| id.as_str());
-        let writes = groups[0].writes(true);
+        let writes: Vec<_> = groups[0].writes(true).collect();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].1, "h2");
     }
@@ -1537,7 +1529,7 @@ mod tests {
     fn a_single_sighting_writes_once() {
         let items = [rec("D-0001", "h1")];
         let groups = collapse(&items, |(id, _)| id.as_str());
-        assert_eq!(groups[0].writes(false).len(), 1);
+        assert_eq!(groups[0].writes(false).count(), 1);
     }
 
     /// The skip check gates every write, so "unknown" must never read as

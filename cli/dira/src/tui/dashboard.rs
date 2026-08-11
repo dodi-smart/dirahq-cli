@@ -3,7 +3,7 @@
 //! numbers lives here (and is unit-tested) so the draw code stays dumb.
 
 use crate::format::{
-    bar, billing_line, hms, parse_ts, project_label, repo_short, tokens_compact, truncate,
+    bar, billing_line, hms, parse_ts, project_label, repo_short, tokens_compact, truncate_cols,
     usd_approx,
 };
 use crate::theme::{self, Role};
@@ -259,7 +259,11 @@ fn draw_header(frame: &mut Frame, area: Rect, s: &StatusView) {
     if h.sync_pending > 0 {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
-            format!("⇡ {} pending sync", h.sync_pending),
+            format!(
+                "{} {} pending sync",
+                crate::theme::glyphs().up,
+                h.sync_pending
+            ),
             theme::style(Role::Compute),
         ));
     }
@@ -366,9 +370,9 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
     let rows = active.iter().map(|sess| {
         let (state, style) = state_label_style(sess);
         Row::new([
-            Cell::from(truncate(&sess.handle, 10)),
-            Cell::from(truncate(dira_sources::harness_id(sess.harness), 10)),
-            Cell::from(truncate(&project_label(&sess.project), project_w)),
+            Cell::from(truncate_cols(&sess.handle, 10)),
+            Cell::from(truncate_cols(dira_sources::harness_id(sess.harness), 10)),
+            Cell::from(truncate_cols(&project_label(&sess.project), project_w)),
             Cell::from(hms(sess.human_seconds)),
             Cell::from(hms(sess.agent_seconds)),
             Cell::from(state),
@@ -413,7 +417,11 @@ fn draw_lanes(frame: &mut Frame, area: Rect, s: &StatusView) {
             };
             Line::from(vec![
                 Span::styled(
-                    format!("{:<width$}", truncate(&l.label, label_w), width = label_w),
+                    format!(
+                        "{:<width$}",
+                        truncate_cols(&l.label, label_w),
+                        width = label_w
+                    ),
                     theme::style(role),
                 ),
                 Span::raw(" "),
@@ -453,7 +461,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
         .iter()
         .map(|p| {
             Row::new([
-                Cell::from(truncate(&project_label(&p.project), project_w)),
+                Cell::from(truncate_cols(&project_label(&p.project), project_w)),
                 Cell::from(hms(p.human_seconds)),
                 Cell::from(hms(p.agent_wall_seconds)),
             ])
@@ -492,7 +500,10 @@ fn draw_down_body(frame: &mut Frame, area: Rect, err: &str) {
         Line::from(Span::raw(
             "Start it with `dira daemon start`. Polling continues.",
         )),
-        Line::from(Span::styled(truncate(err, 80), theme::style(Role::Faint))),
+        Line::from(Span::styled(
+            truncate_cols(err, 80),
+            theme::style(Role::Faint),
+        )),
     ];
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }

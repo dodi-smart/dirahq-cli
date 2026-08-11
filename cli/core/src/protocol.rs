@@ -282,7 +282,7 @@ pub enum Response {
     /// `ZavetWhy`.
     ZavetWhy(Box<ZavetWhyView>),
     /// `ZavetDecisions`.
-    ZavetDecisions { decisions: Vec<ZavetDecisionView> },
+    ZavetDecisions(Box<ZavetDecisionsView>),
     /// `ZavetWhy` with an ambiguous free-text query: ranked matches instead
     /// of a single answer. Also `ZavetWiki` with a topic. `trailers` are
     /// matching orphan commit trailers — micro-decisions that never got a
@@ -645,6 +645,66 @@ pub struct ZavetGuardStatView {
     pub unattributed: u64,
 }
 
+/// Whether a captured record's file is on the branch the caller is standing on.
+///
+/// The store keys knowledge by repo alone, so a decision recorded on another
+/// branch keeps listing forever — correct for an append-only knowledge model
+/// (ids are minted repo-wide, and a row is never deleted), but it means the
+/// list cannot be read as "what governs the code in front of me" unless the
+/// distinction is shown. This is a *display* state computed per query; nothing
+/// in the store changes.
+///
+/// The absent case is deliberate and is spelled `Option::None` at every use
+/// site: with no working directory to ask git in (`--project <repo>` from
+/// elsewhere, or a daemon that has never seen the repo), presence is
+/// **unknown** and renders as nothing. It is never guessed — the same honesty
+/// rule [`ZavetSpecView::stale_commits`] follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ZavetPresence {
+    /// The record's path is in `HEAD`'s tree.
+    OnBranch,
+    /// Captured, but its path is not in `HEAD`'s tree — another branch's record.
+    OffBranch,
+}
+
+/// A record file found in the working tree that the store has never captured.
+///
+/// Capture reads decision records out of git objects, never the working tree,
+/// so a record written but not yet committed is invisible to every `dira zavet`
+/// query. Surfacing it as its own state is what keeps "I can see the file in my
+/// editor" and "dira does not list it" from reading as a bug.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetUncapturedView {
+    /// Parsed from the file's frontmatter; `None` when it does not parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Repo-relative path of the file on disk.
+    pub path: String,
+    /// `uncommitted` (not in `HEAD` either) or `awaiting sweep` (committed, but
+    /// the daemon has not walked that commit yet). The two need different
+    /// remedies, so they are not collapsed.
+    pub reason: String,
+    /// `decision` | `spec`.
+    pub kind: String,
+}
+
+/// `dira zavet decisions` — the captured decisions plus what the working tree
+/// says about them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetDecisionsView {
+    pub repo: String,
+    /// The checked-out branch, when a working directory was available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub decisions: Vec<ZavetDecisionView>,
+    /// Records on disk with no store row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncaptured: Vec<ZavetUncapturedView>,
+}
+
 /// One captured decision (list row; `zavet why` carries the body separately).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZavetDecisionView {
@@ -680,6 +740,13 @@ pub struct ZavetDecisionView {
     /// — which is a finding, not a pass.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<ZavetCheckView>,
+    /// Whether this record's file is on the caller's branch; `None` = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<ZavetPresence>,
+    /// Per-kind guard-event tallies for THIS decision — how often the guard
+    /// actually fired. Empty means no guard event was ever recorded against it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_stats: Vec<ZavetGuardStatView>,
 }
 
 /// One verification binding as shown by `why` / `wiki`.
@@ -760,6 +827,9 @@ pub struct ZavetSpecView {
     /// from git. `None` when no working directory was available to ask in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_commits: Option<u64>,
+    /// Whether this spec's file is on the caller's branch; `None` = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<ZavetPresence>,
 }
 
 /// One ranked spec hit for a free-text `why`/`wiki` query.
@@ -793,6 +863,9 @@ pub struct ZavetSpecRef {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZavetWikiView {
     pub repo: String,
+    /// The checked-out branch, when a working directory was available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub decisions_total: u64,
     pub trailers: u64,
     pub guard_events: u64,
@@ -808,6 +881,9 @@ pub struct ZavetWikiView {
     /// Latest captured trailers, newest first: `(sha, key, value)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent: Vec<(String, String, String)>,
+    /// Decision records and specs on disk with no store row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncaptured: Vec<ZavetUncapturedView>,
 }
 
 /// A commit linked to a decision.

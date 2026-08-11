@@ -5,6 +5,7 @@
 //! `https://github.com/Org/Repo` resolve to the same `github.com/org/repo`, so a
 //! repo is one identity regardless of clone URL.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -238,6 +239,31 @@ pub fn paths_touched_since_days(
         }
     }
     out_paths
+}
+
+/// The paths under `pathspecs` present in `HEAD`'s tree — what the checked-out
+/// branch actually carries.
+///
+/// `None` means *unknown*, never *empty*: no HEAD (an unborn branch), not a
+/// repo, or git failed. The distinction matters because callers render a
+/// "not on this branch" state, and an unknown must render nothing rather than
+/// marking every record absent. An existing HEAD whose tree holds none of the
+/// paths is `Some(empty)` — that genuinely is "the branch carries none".
+///
+/// Uses [`git_output`] rather than [`git`] so `ls-tree`'s own exit code carries
+/// the distinction: [`git`] maps empty stdout to `None`, which would otherwise
+/// force a second `rev-parse HEAD` subprocess just to tell the two cases apart.
+pub fn ls_tree_paths(root: &Path, pathspecs: &[&str]) -> Option<HashSet<String>> {
+    let mut args: Vec<&str> = vec!["ls-tree", "-r", "--name-only", "HEAD", "--"];
+    args.extend_from_slice(pathspecs);
+    let out = git_output(root, &args)?;
+    Some(
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// The content of `path` as of `sha` (`git show sha:path`).
@@ -605,6 +631,20 @@ fn git_command() -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+/// Run a git command in `dir`, returning trimmed stdout on success — including
+/// when that output is empty.
+///
+/// [`git`] collapses success-with-no-output into `None`, which is the right
+/// default for the value-returning probes but loses information for commands
+/// where "succeeded, matched nothing" is a real answer.
+fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = git_command().arg("-C").arg(dir).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Run a git command in `dir`, returning trimmed stdout on success.

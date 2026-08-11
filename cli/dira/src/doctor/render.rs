@@ -76,11 +76,12 @@ pub(crate) fn print_json(checks: &[Check], exit_code: i32) {
 /// and a report you cannot read once redirected is a report nobody attaches to
 /// an issue.
 fn mark(level: Level) -> (&'static str, Role) {
+    let g = theme::glyphs();
     match level {
-        Level::Ok => ("●", Role::Engaged),
-        Level::Warn => ("▲", Role::Compute),
-        Level::Fail => ("✕", Role::Negative),
-        Level::Skip => ("·", Role::Faint),
+        Level::Ok => (g.bullet, Role::Engaged),
+        Level::Warn => (g.triangle, Role::Compute),
+        Level::Fail => (g.cross, Role::Negative),
+        Level::Skip => (g.dot, Role::Faint),
     }
 }
 
@@ -121,7 +122,7 @@ pub(crate) fn print_human(checks: &[Check], verbose: bool, exit_code: i32) {
             for line in remedy.lines() {
                 println!(
                     "{gutter}{}",
-                    theme::paint(&format!("→ {line}"), Role::Muted)
+                    theme::paint(&format!("{} {line}", theme::glyphs().arrow), Role::Muted)
                 );
             }
         }

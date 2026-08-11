@@ -27,6 +27,7 @@ anyhow.workspace = true
 ulid.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+unicode-width.workspace = true
 futures-util.workspace = true
 toml_edit.workspace = true
 # `dira update` (WP-A3): sha256 artifact verification, hex digest comparison,
@@ -48,7 +49,12 @@ dunce.workspace = true
 zip = { version = "8", default-features = false, features = ["deflate"] }
 # `client::classify` matches ERROR_PIPE_BUSY by raw code so a busy pipe is never
 # reported as a dead daemon. Feature flag only; already a workspace dependency.
-windows-sys = { workspace = true, features = ["Win32_Foundation"] }
+# `Win32_System_Console` is what enables ANSI escapes on legacy conhost and
+# reads the console code page to pick the glyph set.
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_System_Console",
+] }
 
 [dev-dependencies]
 # `config_cmd`'s round-trip test re-layers a written config.toml the same way

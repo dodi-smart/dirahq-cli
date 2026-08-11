@@ -143,6 +143,11 @@ OOD; the Apache-2.0 license does not grant trademark rights.
 
 ## Notes
 
+- Output honours `NO_COLOR` (no SGR escapes) and `DIRA_ASCII=1` (no non-ASCII glyphs —
+  `*` `+` `~` for the metric marks, `#`/`.` for bars). They are independent: a console that
+  cannot draw `█` is not the same thing as a pipe. On Windows the ASCII set also turns on
+  automatically when the console code page is not UTF-8, and the CLI asks the console to
+  interpret ANSI escapes at startup so legacy `conhost` does not print them literally.
 - Rust is managed by `mise`; run cargo via `mise exec -- cargo …` if `mise` isn't shell-activated.
 - The accounting invariants (no double-count, idle-trim) are property-tested against random
   interleaved multi-session event streams — see `cli/core/src/accounting.rs`.

@@ -256,13 +256,44 @@ evidence still counts and is reported, so costs read as honest lower bounds.
   decisions, and `Spec:`-trailer commits. Both end in the **cost panel**:
   de-duplicated human seconds (same accounting as `dira report`),
   idle-trimmed agent seconds, and tokens per evidencing session, with totals.
-- `dira zavet wiki [topic]` — browse the knowledge base: active + superseded
-  decisions with verification badges, the SPECS section (origin + confidence
-  badges, `⚠ stale · N commits` vs `✓ current`, covered paths, linked
-  decisions), capture counts, and the recent-trailer chronicle; with a topic,
-  ranked matches.
-- `dira zavet decisions` — captured decisions for the repo.
+- `dira zavet wiki [topic]` — browse the knowledge base: an attention line
+  (uncaptured / off-branch / unverified / stale counts, shown only when
+  something needs a human), decisions grouped by branch presence, the SPECS
+  section (origin + confidence badges, `⚠ stale · N commits` vs `✓ current`,
+  path and decision counts), and the recent-trailer chronicle; with a topic,
+  ranked matches. Sections cap at ten rows and point at `dira zavet
+  decisions` — it is an overview, not the list. `--json` emits the view as
+  one object.
+- `dira zavet decisions` — captured decisions for the repo, one row each:
+  id, title, guard count, guard activity, age. `--guards` spells out the
+  globs (wrapped under the title, never run off the edge), `--branch`
+  narrows to the checked-out branch, `--json` emits the view.
 - `dira zavet enable|disable|reset` — the per-repo override.
+
+### Branch presence (what the list is scoped to)
+
+The store keys knowledge by repo alone — decision ids are minted repo-wide,
+and records are append-only — so a decision recorded on another branch keeps
+listing forever. Both list views therefore report what the **working tree**
+says about each record, without ever removing a row:
+
+| group | meaning | remedy |
+|---|---|---|
+| `ACTIVE` / `SUPERSEDED` | the record's file is in `HEAD`'s tree | — |
+| `OFF BRANCH` | captured, but its file is not in this tree | none needed; it governs another branch |
+| `UNCAPTURED · uncommitted` | on disk, not in `HEAD` | commit it |
+| `UNCAPTURED · awaiting sweep` | committed, but the daemon has not walked that commit yet | wait for the next sweep (30 s active) |
+
+`UNCAPTURED` exists because **capture reads git objects, never the working
+tree** (`.zavet/config` is the single exception). A record written by
+`/zavet:decide` and not yet committed is invisible to every query, and
+without this section it is invisible *silently* — which reads as dira having
+lost it.
+
+Presence needs a working directory to resolve. With `--project <repo>` from
+somewhere else, or on a repo the daemon has never seen a session in, presence
+is **unknown** and the groups collapse to one plain list — it is never
+guessed, the same rule spec staleness follows.
 
 Records with `origin: reverse-engineered` / `verified: false` (the
 `/zavet:backfill` output) render as amber *unverified — hypothesis* badges

@@ -1629,6 +1629,40 @@ impl Store {
             .collect())
     }
 
+    /// Guard-event tallies for every decision in a repo at once, keyed by
+    /// decision id.
+    ///
+    /// The list views need activity for N decisions; calling
+    /// [`Store::zavet_guard_event_stats`] per row would be N queries for what
+    /// one `GROUP BY` answers. Covered by `idx_zavet_guard_events_decision`.
+    /// Decisions with no events are absent from the map — the caller renders
+    /// nothing, which is the honest reading of "no guard has fired here".
+    pub async fn zavet_guard_event_stats_by_decision(
+        &self,
+        repo: &str,
+    ) -> Result<HashMap<String, Vec<ZavetGuardStat>>, Error> {
+        let rows = sqlx::query(
+            "SELECT decision_id, kind, COUNT(*) AS total,
+                    SUM(CASE WHEN session_id IS NULL THEN 1 ELSE 0 END) AS unattributed
+             FROM zavet_guard_events WHERE repo = ?1
+             GROUP BY decision_id, kind ORDER BY decision_id, kind",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: HashMap<String, Vec<ZavetGuardStat>> = HashMap::new();
+        for r in &rows {
+            out.entry(r.get("decision_id"))
+                .or_default()
+                .push(ZavetGuardStat {
+                    kind: r.get("kind"),
+                    total: r.get::<i64, _>("total") as u64,
+                    unattributed: r.get::<i64, _>("unattributed") as u64,
+                });
+        }
+        Ok(out)
+    }
+
     /// One session's compacted-history and token contributions: the daily-rollup
     /// sums (data whose raw events may already be pruned) plus the live
     /// `token_usage` sums. Raw-event time for the recent window is computed by

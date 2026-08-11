@@ -637,8 +637,7 @@ Safe to repeat: records whose content is unchanged are skipped, so a second
 run writes nothing.
 
 Examples:
-  dira zavet reindex                 full .zavet/ history; recent commit trailers
-  dira zavet reindex --all-trailers  also scan trailers across all history")]
+  dira zavet reindex         full .zavet/ history; recent commit trailers")]
     Reindex {
         /// Scan commit trailers across all history instead of the recent
         /// window. Slower: unlike decisions and specs, trailers are not
@@ -707,15 +706,13 @@ capture still runs locally; nothing syncs.",
         after_help = "\
 Examples:
   dira device link           prompts for the code
-  dira device link --code ABC123 --label \"work laptop\"
-
-The label is only a human name in the cloud UI; it defaults to the hostname."
+  dira device link --code ABC123 --label \"work laptop\""
     )]
     Link {
         /// The one-time code from the cloud Connections page (prompted if omitted).
         #[arg(long)]
         code: Option<String>,
-        /// A human label for this device (defaults to the hostname).
+        /// A name for this device in the cloud UI (defaults to the hostname).
         #[arg(long)]
         label: Option<String>,
     },
@@ -723,14 +720,10 @@ The label is only a human name in the cloud UI; it defaults to the hostname."
     #[command(after_help = "\
 Reports the link state, the cloud this device talks to, and how many captured
 events are still waiting to be sent. A growing backlog with a linked device
-usually means the daemon can't reach the cloud — `dira doctor` diagnoses it.
-
-Examples:
-  dira device status")]
+usually means the daemon can't reach the cloud — `dira doctor` diagnoses it.")]
     Status,
     /// Rotate this device's signing key (new keypair, signed by the old key).
-    #[command(
-        long_about = "\
+    #[command(long_about = "\
 Generate a new signing keypair and register it with the cloud, authenticated
 by the key it replaces. Crash-safe and resumable: the new key is persisted as
 pending before any network call, and the swap itself is a single atomic
@@ -739,11 +732,7 @@ live. Interrupting this is safe — re-run it and it resumes rather than
 generating a second key.
 
 Rotation does not change the device identity, and it never invalidates work
-already synced.",
-        after_help = "\
-Examples:
-  dira device rotate-key"
-    )]
+already synced.")]
     RotateKey,
     /// Locally unlink this device (clears the device id; keeps the signing key).
     #[command(after_help = "\
@@ -805,10 +794,7 @@ Examples:
     #[command(after_help = "\
 Prints the one file `dira config set` writes. It is the file's path, not the
 effective configuration — env vars and defaults also feed `get`, and the file
-need not exist yet.
-
-Examples:
-  dira config path")]
+need not exist yet.")]
     Path,
 }
 
@@ -818,34 +804,24 @@ enum DaemonAction {
     #[command(after_help = "\
 The ad-hoc alternative to `install`: runs until stopped or the machine
 reboots. Starting a second daemon is refused — the control socket is the
-single-instance guard.
-
-Examples:
-  dira daemon start")]
+single-instance guard.")]
     Start,
     /// Stop the daemon.
     #[command(after_help = "\
 Stops the daemon this machine's pidfile points at — i.e. one started by
 `dira daemon start`. With no pidfile it says so and does nothing, which is the
 case for a service-managed daemon: stop that with `uninstall`, or through
-launchd/systemd directly.
-
-Examples:
-  dira daemon stop")]
+launchd/systemd directly.")]
     Stop,
     /// Show whether the daemon is up (exit 0 if any daemon is running — even
     /// a pre-upgrade one; 1 if none).
     #[command(after_help = "\
 Exit 0 if any daemon answers, 1 if none does. A daemon running under a
 different user or an elevated token can refuse this connection and still be
-reported as down — `dira doctor` is what distinguishes those.
-
-Examples:
-  dira daemon status")]
+reported as down — `dira doctor` is what distinguishes those.")]
     Status,
     /// Install an OS service (launchd/systemd-user/scheduled task) so it survives reboots.
-    #[command(
-        long_about = "\
+    #[command(long_about = "\
 Register the daemon with this machine's own service manager — launchd on
 macOS, systemd --user on Linux, a scheduled task on Windows — so it starts on
 login and restarts if it crashes. This is the recommended way to run dirad;
@@ -853,21 +829,14 @@ login and restarts if it crashes. This is the recommended way to run dirad;
 
 Stop a bare `start`ed daemon (`dira daemon stop`) before installing: the
 control socket is a single-instance guard, so the service copy cannot bind
-while it holds the socket.",
-        after_help = "\
-Examples:
-  dira daemon install"
-    )]
+while it holds the socket.")]
     Install,
     /// Remove the OS service `install` set up (binaries and data are untouched).
     #[command(after_help = "\
 Deregisters the service so the daemon no longer starts on login. It does not
 stop a bare `start`ed daemon — that is `stop`'s job. Nothing is deleted: the
 dira binaries, the config, and every captured event stay exactly where they
-are (`dira nuke` is what clears data).
-
-Examples:
-  dira daemon uninstall")]
+are (`dira nuke` is what clears data).")]
     Uninstall,
     /// Restart the daemon, however it's currently supervised.
     #[command(

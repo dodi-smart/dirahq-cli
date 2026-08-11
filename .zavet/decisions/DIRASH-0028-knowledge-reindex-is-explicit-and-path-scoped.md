@@ -88,6 +88,19 @@ without collapsing, *every* run would re-push.
   recent commits, knowledge wants all of `.zavet/`.
 - **Reindex automatically on first sight** — same timeout problem, and it turns
   an explicit recovery into ambient behavior that fires on every new repo.
+- **A second, knowledge-specific watermark that the poll walks backwards** —
+  the strongest alternative, and NOT refuted by the timeout argument above: a
+  `zavet_baseline` recording how far back the `.zavet/`-scoped walk has reached,
+  advanced a bounded number of commits per tick, converges on its own, stays
+  inside `CAPTURE_TIMEOUT`, and terminates (the scoped walk is small and
+  finite). DIRASH-0027 blesses exactly this shape — "a change to the capture
+  window with its own decision". It is rejected here only on sequencing, not on
+  merit: this command is the smaller change, it is the one a user can run today
+  on a clone that is already wrong, and a converging poll still wants a manual
+  trigger for the trailer half, which has no pathspec to bound it. If the
+  watermark is built, this command should become its escape hatch rather than
+  the primary remedy — and `uncaptured_hint` should stop naming two commands
+  (see below).
 - **Read the working tree instead of git history** — cheap, but it has no
   `first_commit`, no `created_at`, and no trailers. Provenance is most of what
   `why` answers with; an index that knows *what* was decided but not *when* or
@@ -131,3 +144,23 @@ without collapsing, *every* run would re-push.
   watermark and its own bound.
 - If a walk is bounded, say so in the output. A silent bound is the bug this
   record exists for.
+
+## Known weaknesses
+
+Recorded because a reader deserves them next to the decision, not only in the
+spec's Open Questions:
+
+- **The hint names two commands.** `uncaptured_hint` tells a user to run
+  `sync`, "or `reindex` if it stays". That hedge exists because the renderer
+  cannot tell a record ahead of the baseline from one behind it — but the
+  daemon can (compare `repo_baseline` against HEAD, or test ancestry of the
+  record's introducing commit) and should, as a third `reason` value in
+  `ZavetUncapturedView`. DIRASH-0026's design is one remedy per reason; this is
+  that principle failing at the last inch.
+- **`writes()` can publish an old revision.** For a record not yet stored, the
+  oldest sighting is written first and the newest second. Between those two
+  awaits the row holds the introducing commit's body, and the knowledge channel
+  debounces at 3 s — a flush landing in that window ships the old body as
+  current. Harmless in practice (the next flush corrects it) but it is a real
+  window, and it disappears if the store accepts an explicit first-seen pair
+  instead.

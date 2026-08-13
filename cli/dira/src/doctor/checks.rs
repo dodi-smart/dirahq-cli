@@ -316,7 +316,15 @@ pub(crate) fn hooks_config(wiring: &[HarnessWiring]) -> Check {
             ID,
             "no harness hooks are configured — nothing is capturing agent activity",
         )
-        .remedy("dira init  (or: dira init gemini|cursor|codex|opencode|grok)");
+        // A machine with nothing wired is a machine that hasn't been set up,
+        // so the remedy is the setup command rather than the six-way `dira
+        // init` menu it used to print — that menu asked the user to already
+        // know which harnesses they run, which is exactly what `onboard`
+        // detects for them. Still a prescription, never an action: doctor
+        // prints this and stops (DIRASH-0022). The partial-wiring remedy
+        // below keeps naming the specific harness, because there the answer
+        // is already known.
+        .remedy("dira onboard");
     }
 
     let partial: Vec<&HarnessWiring> = wiring
@@ -892,7 +900,9 @@ pub(crate) mod tests {
     fn no_harness_config_warns_rather_than_fails() {
         let c = hooks_config(&[]);
         assert_eq!(c.level, Level::Warn);
-        assert!(c.remedy.expect("advice").contains("dira init"));
+        // Nothing wired means nothing has been set up, so the advice is the
+        // setup command — the user has no way to answer "which harness?" yet.
+        assert!(c.remedy.expect("advice").contains("dira onboard"));
     }
 
     #[test]

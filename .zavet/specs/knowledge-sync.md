@@ -8,7 +8,7 @@ date: 2026-08-11
 paths:
   - cli/core/src/sync/knowledge.rs
   - cli/dirad/src/knowledge_sync.rs
-decisions: [D-0001, D-0020, DIRASH-0028]
+decisions: [D-0001, D-0020, DIRASH-0028, DIRASH-0030]
 ---
 
 ## Overview
@@ -28,6 +28,18 @@ code rather than recorded as it was built.
 - Nothing runs unless `[sync] knowledge` is `metadata` or `full`. The default
   is **`off`**, and the cloud independently enforces the workspace's tier — two
   consents, either of which alone ships nothing.
+- **How the tier gets set.** `dira config set sync.knowledge off|metadata|full`,
+  or `DIRA_SYNC__KNOWLEDGE`. The knob was absent from `config_cmd`'s `KNOBS`
+  table until DIRASH-0030, so the only routes in were hand-editing
+  `config.toml` or the env var — which made a consent prompt impossible to
+  offer honestly.
+- **Where consent is asked.** `dira onboard`'s knowledge step, in a prompt of
+  its own that names what `full` sends (record bodies, trailer values, guard
+  check commands), defaulting to `full` and declining to `metadata`. It is
+  never bundled into device linking or billing consent, and the resulting tier
+  is restated in the summary on every path including `--yes`. That prompt is
+  the only consent UX this channel has: the tier appears in no status or
+  doctor view (DIRASH-0030).
 - Same debounce/backstop shape as attestation sync, at a slower cadence:
   3 s debounce, 120 s backstop. Knowledge moves at commit speed, not event
   speed. Triggers are lossy `try_send` nudges; the backstop covers a miss.
@@ -84,6 +96,12 @@ code rather than recorded as it was built.
   (D-0001).
 - Content requires BOTH consents. A producer at `full` against a workspace that
   has not opted in ships metadata, never content.
+- Consent for content is obtained by an explicit question that names the
+  content, never as a side effect of another step. Any change to what `full`
+  transmits changes `steps::KNOWLEDGE_DISCLOSURE` in the same commit.
+- A tier set on an unlinked machine is reported as pending, never as active:
+  the flush is gated on a cloud URL and a linked device, so the setting is
+  recorded and inert until then.
 - A cursor advances only after the cloud acknowledges the chunk carrying it.
 - This channel never touches `AttestationBatch`, and no type under `/contract`
   used by it may carry a content-named field that the wire denylist would

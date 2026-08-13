@@ -12,7 +12,7 @@ paths:
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0021, DIRASH-0024]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0021, DIRASH-0024, DIRASH-0029]
 ---
 
 ## Overview
@@ -37,6 +37,22 @@ both executables and restarts whatever is supervising the daemon.
   (D-0003), dev-install refusal (D-0004), user-scope PATH via
   `[Environment]::SetEnvironmentVariable` (never `setx`), default bin dir
   `%USERPROFILE%\.local\bin`.
+- **The service handoff.** Neither installer registers a launchd/systemd agent
+  or a scheduled task silently. When a terminal exists, both *ask*, and install
+  it on yes. install.sh reads `/dev/tty` rather than stdin — under
+  `curl … | sh` stdin is the script being read, which is why the script used to
+  claim it could not ask at all; install.ps1 gates on
+  `[Console]::IsInputRedirected`/`IsOutputRedirected` and its own `$Host.UI`.
+  With no terminal, or under `--no-interactive`/`-NoInteractive`, the
+  historical hands-off behaviour is unchanged. install.ps1's Administrator
+  branch keeps precedence and never prompts: a service installed from an
+  elevated shell is the broken setup that branch exists to warn about
+  (DIRASH-0029).
+- **Next steps are one command.** Both installers end on `dira onboard`. The
+  previous three-line block (`--version` / `daemon start` / `status`) omitted
+  `dira init`, so following it produced a daemon that captured nothing, and it
+  recommended `daemon start`, which takes the control socket and blocks the
+  `daemon install` the user actually wanted (D-0009).
 - Both installers make the same best-effort `dira daemon` calls around the
   swap (`status`, `stop`, `restart`, `uninstall`) and ignore their failures.
   install.sh neutralises them with `|| true`; install.ps1 routes every one
@@ -174,6 +190,11 @@ both executables and restarts whatever is supervising the daemon.
   an update with a bumped plugin.
 - An update never *installs* a plugin the user never asked for. Absent or
   inconclusive detection is a silent no-op.
+- The installers prompt only where a terminal exists, and a non-interactive
+  run is byte-for-byte the behaviour that shipped before the prompt existed.
+  In `install.sh`'s `_can_prompt`, `2>/dev/null` must precede `>/dev/tty`:
+  redirections apply left to right, so the other order prints
+  `/dev/tty: Device not configured` on every CI run.
 - Checksum verification is mandatory and has no override flag. An
   unverifiable download is a pipeline bug, not a user decision.
 - The binary being replaced is never opened for writing — only renamed onto

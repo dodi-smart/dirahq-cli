@@ -43,6 +43,9 @@
 .PARAMETER NoDaemon
     Never start, restart, or install the daemon -- even if one is already running.
 
+.PARAMETER NoInteractive
+    Never prompt, even when a console is attached. Same as DIRA_NO_INTERACTIVE=1.
+
 .PARAMETER Force
     Overwrite a dev-build symlink; skip the -Uninstall confirmation.
 
@@ -105,6 +108,7 @@ param(
     [switch]$Daemon,
     [switch]$Service,
     [switch]$NoDaemon,
+    [switch]$NoInteractive,
     [switch]$Force,
     [switch]$Uninstall,
     [Alias('h')]
@@ -139,6 +143,33 @@ function Test-Elevated {
             [Security.Principal.WindowsBuiltInRole]::Administrator)
     } catch {
         # Fail open: never block an install on a failed probe.
+        return $false
+    }
+}
+
+# Whether we may ask the user a question: a console has to exist to show it and
+# to answer it, and -NoInteractive/DIRA_NO_INTERACTIVE opts out.
+#
+# The unix twin tests /dev/tty; the Windows equivalent is "is either standard
+# stream redirected". Both ends matter. Redirected input means Read-Host would
+# consume piped data (or hit EOF and throw); redirected output means the
+# question is written somewhere nobody is looking, leaving the run apparently
+# hung on an invisible prompt.
+#
+# `$Host.UI` is additionally probed because a non-interactive host (an ISE-less
+# runspace, some CI PowerShell hosts) can have unredirected streams and still
+# have no working Read-Host.
+function Test-CanPrompt {
+    param([switch]$NoInteractive)
+    if ($NoInteractive) { return $false }
+    try {
+        if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return $false }
+        if ($null -eq $Host -or $null -eq $Host.UI) { return $false }
+        return $true
+    } catch {
+        # Fail closed, unlike Test-Elevated: a failed probe here means we do not
+        # know whether anyone can answer, and hanging an unattended install on a
+        # prompt is worse than skipping an optional step.
         return $false
     }
 }
@@ -231,6 +262,7 @@ FLAGS:
     -Service                  Also register dirad as a scheduled task (dira daemon install)
     -NoDaemon                  Never start, restart, or install the daemon -- even if
                                 one is already running
+    -NoInteractive              Never prompt, even on a console
     -Force                      Overwrite a dev-build symlink; skip the -Uninstall
                                   confirmation
     -Uninstall                    Remove dira + dirad (never touches config or data --
@@ -249,6 +281,7 @@ ENVIRONMENT:
                                              (GH_TOKEN wins if both are set)
     DIRA_START_DAEMON                        Same as -Daemon        (set to 1)
     DIRA_INSTALL_SERVICE                       Same as -Service        (set to 1)
+    DIRA_NO_INTERACTIVE                          Same as -NoInteractive (set to 1)
     DIRA_DEBUG                                   Verbose debug output on stderr (set to 1)
 
     Flags always beat their matching environment variable.
@@ -868,6 +901,7 @@ function Invoke-Main {
         [switch]$Daemon,
         [switch]$Service,
         [switch]$NoDaemon,
+        [switch]$NoInteractive,
         [switch]$Force,
         [switch]$Uninstall,
         [switch]$Help
@@ -889,6 +923,7 @@ function Invoke-Main {
 
     $startDaemon = $Daemon.IsPresent -or ($env:DIRA_START_DAEMON -eq '1')
     $installService = $Service.IsPresent -or ($env:DIRA_INSTALL_SERVICE -eq '1')
+    $noInteractive = $NoInteractive.IsPresent -or ($env:DIRA_NO_INTERACTIVE -eq '1')
     $script:DiraDebug = if ($env:DIRA_DEBUG -eq '1') { '1' } else { '0' }
 
     # 3. bin dir -- %USERPROFILE%\.local\bin is the Windows peer convention (Claude Code
@@ -1038,23 +1073,43 @@ function Invoke-Main {
                 if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'install')) -ne 0) {
                     Write-Warn "could not install the dirad service automatically -- run '$installedDira daemon install' yourself"
                 }
+            } elseif (Test-CanPrompt -NoInteractive:$noInteractive) {
+                # Registering a scheduled task is a persistent system change, so it is
+                # still never done silently -- but "irm | iex has no usable stdin" was
+                # only half true. `iex` consumes the *downloaded script* as text; the
+                # console's own input is untouched, which is what Read-Host reads.
+                # No console (CI, a redirected pipe, -NoInteractive) keeps the
+                # historical hands-off behaviour exactly as it was.
+                #
+                # Note this arm is unreachable when elevated: the Administrator branch
+                # above returns before here, and it must keep precedence. Prompting to
+                # install a service from an elevated shell would offer to create
+                # exactly the broken setup that branch exists to prevent.
+                $answer = Read-Host 'Install dirad as a logon task so it survives reboots? [Y/n]'
+                if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^(y|yes)$') {
+                    Write-Info "installing the dirad service..."
+                    if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'install')) -ne 0) {
+                        Write-Warn "could not install the dirad service automatically -- run '$installedDira daemon install' yourself"
+                    }
+                } else {
+                    Write-Info "skipping the service -- run '$installedDira daemon install' whenever you want it"
+                }
             }
         }
 
-        # 15. PATH hint + next steps. No interactive prompt here: registering a scheduled
-        # task is a persistent system change, and `irm | iex` has no usable stdin to ask
-        # with anyway.
+        # 15. PATH hint + next steps. One command, because the previous three-line block
+        # omitted `dira init` and so left anyone who followed it with a running daemon
+        # that captured nothing. It also recommended `daemon start`, which takes the
+        # control pipe and blocks the `daemon install` above.
         Add-UserPath -Dir $resolvedBinDir
         Write-Info "`nNext steps:"
-        Write-Info "  $installedDira --version"
-        Write-Info "  $installedDira daemon start"
-        Write-Info "  $installedDira status"
+        Write-Info "  $installedDira onboard     wire your harnesses, link this device, verify capture"
     } finally {
         Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
-Invoke-Main -Version $Version -Channel $Channel -Prerelease:$Prerelease -BinDir $BinDir -Target $Target -Daemon:$Daemon -Service:$Service -NoDaemon:$NoDaemon -Force:$Force -Uninstall:$Uninstall -Help:$Help
+Invoke-Main -Version $Version -Channel $Channel -Prerelease:$Prerelease -BinDir $BinDir -Target $Target -Daemon:$Daemon -Service:$Service -NoDaemon:$NoDaemon -NoInteractive:$NoInteractive -Force:$Force -Uninstall:$Uninstall -Help:$Help
 # Make the contract stated at the top of this file literally true for every
 # caller: a run that reached here did not throw, so it succeeded, and it must
 # leave $LASTEXITCODE at 0 -- not merely "at 0 or untouched". `Invoke-BestEffort`

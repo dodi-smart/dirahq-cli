@@ -48,6 +48,7 @@ universal macOS binary and the statically-linked musl binaries make both unneces
 | `--daemon` | `DIRA_START_DAEMON=1` | off — start `dirad` after installing |
 | `--service` | `DIRA_INSTALL_SERVICE=1` | off — also run `dira daemon install` (launchd/systemd-user) |
 | `--no-daemon` | — | off — never start, restart, or install the daemon, even if one is already running |
+| `--no-interactive` | `DIRA_NO_INTERACTIVE=1` | off — never prompt, even on a terminal |
 | `--force` | — | off — overwrite a `just install` dev symlink; skip the `--uninstall` confirmation |
 | `--uninstall` | — | off — remove `dira` + `dirad` (never config or data; see [Uninstalling](#uninstalling)) |
 | `-h`, `--help` | — | show usage and exit |
@@ -66,6 +67,7 @@ universal macOS binary and the statically-linked musl binaries make both unneces
 | `GITHUB_TOKEN` / `GH_TOKEN` | Bearer token for the authenticated-asset path — raises GitHub's 60/hr-per-IP anonymous rate limit; `GH_TOKEN` wins if both are set | unset — unauthenticated public path |
 | `DIRA_START_DAEMON` | Same as `--daemon` (set to `1`) | `0` |
 | `DIRA_INSTALL_SERVICE` | Same as `--service` (set to `1`) | `0` |
+| `DIRA_NO_INTERACTIVE` | Same as `--no-interactive` (set to `1`) | `0` |
 | `DIRA_ALLOW_ROOT` | Silence the "running as root" warning (set to `1`) | `0` |
 | `DIRA_DEBUG` | Verbose debug output on stderr (set to `1`) | `0` |
 
@@ -338,8 +340,12 @@ move backwards deliberately, or `--channel prerelease` to keep following prerele
 
 - **Do** verify a sha256 checksum before installing anything, unconditionally.
 - **Do not** edit any dotfile — PATH hints are printed, never applied.
-- **Do not** install a launchd/systemd-user service unless you pass `--service` (or ask
-  `dira daemon install` directly).
+- **Do not** install a launchd/systemd-user service unless you pass `--service`, ask
+  `dira daemon install` directly, or **answer yes to the prompt**. On a terminal the
+  installer asks whether to register the service; with no terminal (CI, a pipe,
+  `--no-interactive`) it never asks and never installs one. The question is read from
+  `/dev/tty`, not stdin — under `curl … | sh` stdin is the script itself, which is why
+  the installer used to claim it could not ask at all.
 - **Do not** phone home anywhere beyond GitHub (`api.github.com`, or your `DIRA_API_URL`
   override, plus the release-asset host) to resolve and download a release.
 - **Do not** touch config, local capture data, or the device's cloud link, ever — only

@@ -1828,7 +1828,7 @@ pub fn print_status(s: &StatusView, detailed: bool) {
     // something to say — a fully healthy writer prints nothing extra. Omitted
     // entirely for an older daemon (`writer_health: None`, skew-safe).
     if let Some(h) = &s.writer_health {
-        if let Some(line) = writer_health_line(h) {
+        if let Some(line) = writer_health_line(h, detailed) {
             println!("\n{}", theme::paint(&line, Role::Negative));
         }
     }
@@ -1848,19 +1848,23 @@ pub fn print_status(s: &StatusView, detailed: bool) {
 /// when there's nothing worth surfacing. Pure (no printing), mirroring
 /// [`sync_health_line`], so the gate is unit-testable.
 ///
-/// Extended by issue #93: `unattributed_token_rows` renders on its own even
-/// with zero panics/stalls and not wedged — a healthy writer can still be
-/// silently losing compute to attribution failures, and D-0026 makes that
-/// worth a line every time it's nonzero, not just alongside a panic.
-fn writer_health_line(h: &dira_core::protocol::WriterHealthView) -> Option<String> {
-    if h.panics == 0 && h.stalls == 0 && !h.wedged && h.unattributed_token_rows == 0 {
+/// `unattributed_token_rows` (issue #93) is `detailed`-only. It is NOT a
+/// fault: every turn a harness runs outside a repo lands here, so on a normal
+/// machine it climbs into the hundreds within a day and would put a permanent
+/// red line under an entirely healthy `dira status` — the same failure mode
+/// `sync_health_line` avoids for a never-linked device. Under `--detailed` it
+/// still renders on its own (zero panics/stalls, not wedged), because that is
+/// where an operator goes to ask why the compute total looks low.
+fn writer_health_line(h: &dira_core::protocol::WriterHealthView, detailed: bool) -> Option<String> {
+    let show_unattributed = detailed && h.unattributed_token_rows > 0;
+    if h.panics == 0 && h.stalls == 0 && !h.wedged && !show_unattributed {
         return None;
     }
     let mut line = format!("writer: {} panic(s) caught", h.panics);
     if h.stalls > 0 {
         line.push_str(&format!(", {} stall(s) flagged", h.stalls));
     }
-    if h.unattributed_token_rows > 0 {
+    if show_unattributed {
         line.push_str(&format!(
             ", {} token turn(s) with no repo — that usage is not counted",
             h.unattributed_token_rows
@@ -2507,11 +2511,11 @@ mod tests {
 
     use dira_core::protocol::{SyncHealthView, WriterHealthView};
 
-    /// A nonzero `unattributed_token_rows` must render even with an otherwise
-    /// spotless writer — issue #93's whole point is that a healthy-looking
-    /// writer can still be silently losing compute.
+    /// Under `--detailed`, a nonzero `unattributed_token_rows` renders even
+    /// with an otherwise spotless writer — issue #93's whole point is that a
+    /// healthy-looking writer can still be silently losing compute.
     #[test]
-    fn writer_health_line_surfaces_unattributed_token_rows() {
+    fn writer_health_line_surfaces_unattributed_token_rows_when_detailed() {
         let h = WriterHealthView {
             panics: 0,
             stalls: 0,
@@ -2520,11 +2524,43 @@ mod tests {
             unattributed_token_rows: 142,
         };
         assert_eq!(
-            writer_health_line(&h),
+            writer_health_line(&h, true),
             Some(
                 "writer: 0 panic(s) caught, 142 token turn(s) with no repo — that usage is not counted"
                     .to_string()
             )
+        );
+    }
+
+    /// …and stays out of the default view entirely. Repo-less turns are
+    /// routine, so surfacing them there marks a healthy writer as unhealthy on
+    /// every single invocation.
+    #[test]
+    fn writer_health_line_hides_unattributed_token_rows_by_default() {
+        let h = WriterHealthView {
+            panics: 0,
+            stalls: 0,
+            idle_secs: Some(2),
+            wedged: false,
+            unattributed_token_rows: 671,
+        };
+        assert_eq!(writer_health_line(&h, false), None);
+    }
+
+    /// A real fault still prints in the default view — and without the
+    /// repo-less clause riding along.
+    #[test]
+    fn writer_health_line_reports_a_real_fault_without_the_unattributed_clause() {
+        let h = WriterHealthView {
+            panics: 2,
+            stalls: 0,
+            idle_secs: Some(2),
+            wedged: false,
+            unattributed_token_rows: 671,
+        };
+        assert_eq!(
+            writer_health_line(&h, false),
+            Some("writer: 2 panic(s) caught".to_string())
         );
     }
 
@@ -2537,7 +2573,8 @@ mod tests {
             wedged: false,
             unattributed_token_rows: 0,
         };
-        assert_eq!(writer_health_line(&h), None);
+        assert_eq!(writer_health_line(&h, false), None);
+        assert_eq!(writer_health_line(&h, true), None);
     }
 
     /// Issue #94: the generic fallback must carry the SAME disclosure as

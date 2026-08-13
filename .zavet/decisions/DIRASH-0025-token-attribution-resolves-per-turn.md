@@ -82,8 +82,13 @@ a pass over hundreds of turns sharing one cwd performs a single git shell-out.
 - Never attribute a batch of turns from a single event's project. If you add a
   harness, give its turns their own `cwd` or accept the fallback chain.
 - Never write `project = NULL` where a fallback rung is available, and never
-  drop the unattributed counter/warn — an invisible turn must stay visible to
-  the operator even when it cannot be attributed.
+  drop the unattributed counter — an invisible turn must stay visible to the
+  operator even when it cannot be attributed. Visibility is the **aggregate**:
+  `ProgressTracker` plus `dira status --detailed`. It is deliberately NOT a
+  per-occurrence `warn` or a line on the default `dira status`: repo-less turns
+  are routine (any harness run outside a repo), so both put a permanent
+  fault-shaped signal on a healthy daemon and trained the reader to ignore it.
+  Keep the per-occurrence log at `debug`.
 - Do not make `ProjectCache` cache failures indefinitely, and do not move
   `branch` into it: branch is volatile and is re-resolved live per event.
 - Do not add `cwd` to `token_usage`, the contract, or any synced payload.

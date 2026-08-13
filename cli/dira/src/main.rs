@@ -970,17 +970,23 @@ async fn main() -> Result<()> {
             // step runs, rather than five steps in.
             let mut ids = Vec::new();
             for h in harness {
-                match dira_sources::canonical_harness_id(h) {
+                // Validated against what `init::wire` can actually wire, not
+                // against the alias table — the latter also resolves
+                // `generic`, which has no config to write, so accepting it
+                // here would defer the failure to step 2 of a run that has
+                // already changed the machine.
+                match dira_sources::canonical_harness_id(h).filter(|id| init::is_wirable(id)) {
                     Some(id) => ids.push(id.to_string()),
                     None => anyhow::bail!(
-                        "unknown harness '{h}' (expected: claude, codex, gemini, cursor, opencode, grok)"
+                        "unknown harness '{h}' (expected: {})",
+                        init::WIRABLE.join(", ")
                     ),
                 }
             }
-            let knowledge = match knowledge {
-                Some(raw) => onboard::Knowledge::Explicit(onboard::parse_knowledge(raw)?),
-                None => onboard::Knowledge::Ask,
-            };
+            let knowledge = knowledge
+                .as_deref()
+                .map(onboard::parse_knowledge)
+                .transpose()?;
             return onboard::run(
                 &config,
                 onboard::Options {
@@ -1008,17 +1014,15 @@ async fn main() -> Result<()> {
             // starting from `{}` is a defensible (if blunt) answer. `dira
             // onboard` passes `Refuse` instead — it touches files nobody
             // named.
-            let wired = match dira_sources::canonical_harness_id(id) {
-                Some("claude") => init::run(*global, *print, init::OnUnparseable::Overwrite),
-                Some("codex") => init::run_codex(*print),
-                Some("gemini") => init::run_gemini(*global, *print, init::OnUnparseable::Overwrite),
-                Some("cursor") => init::run_cursor(*global, *print, init::OnUnparseable::Overwrite),
-                Some("opencode") => init::run_opencode(&config, *print).await,
-                Some("grok") => init::run_grok(*global, *print, init::OnUnparseable::Overwrite),
-                _ => Err(anyhow::anyhow!(
-                    "unknown harness '{id}' (expected: claude, codex, gemini, cursor, opencode, grok)"
-                )),
-            };
+            let canonical = dira_sources::canonical_harness_id(id).unwrap_or(id);
+            let wired = init::wire(
+                canonical,
+                &config,
+                *global,
+                *print,
+                init::OnUnparseable::Overwrite,
+            )
+            .await;
             // Printing moved out of `init` so `dira onboard` can wire several
             // harnesses and report once; `dira init`'s own output is unchanged.
             return wired.map(|w| w.print());

@@ -52,22 +52,34 @@ debug_log() {
   fi
 }
 
-# _confirm <prompt> -- reads y/N from /dev/tty, never from stdin (stdin *is*
-# the script itself under `curl | sh`). When stdout isn't a terminal there is
-# nobody to ask, so we proceed rather than hang a non-interactive install.
+# _confirm <prompt> [default] [notty] -- ask a yes/no question.
+#
+# Reads from /dev/tty, never from stdin: under `curl | sh` stdin *is* the
+# script being read, so testing or reading it is meaningless. /dev/tty is the
+# controlling terminal however stdin is plumbed.
+#
+# `default` (yes|no, default no) answers a bare Enter. `notty` (yes|no,
+# default yes) answers when there is no terminal, no readable /dev/tty, or
+# --no-interactive was passed -- and it is deliberately a separate knob,
+# because the two questions want opposite fallbacks: a scripted
+# `--uninstall` must proceed unattended, while a service install must never
+# happen unattended.
 _confirm() {
-  local prompt="$1" reply
-  if ! _is_tty; then
-    return 0
+  local prompt="$1" default="${2:-no}" notty="${3:-yes}" reply
+  if [ "${no_interactive:-0}" = "1" ] || ! _is_tty || [ ! -r /dev/tty ]; then
+    [ "$notty" = "yes" ]
+    return $?
   fi
-  printf '%s [y/N] ' "$prompt" >&2
-  if [ -r /dev/tty ]; then
-    read -r reply <"/dev/tty" || reply=""
+  if [ "$default" = "yes" ]; then
+    printf '%s [Y/n] ' "$prompt" >&2
   else
-    reply=""
+    printf '%s [y/N] ' "$prompt" >&2
   fi
+  read -r reply <"/dev/tty" || reply=""
   case "$reply" in
   y | Y | yes | YES) return 0 ;;
+  n | N | no | NO) return 1 ;;
+  "") [ "$default" = "yes" ] ;;
   *) return 1 ;;
   esac
 }
@@ -939,24 +951,16 @@ main() {
     if [ "$install_service" = "1" ]; then
       info "installing the dirad service..."
       "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
-    elif _can_prompt; then
-      # Installing a launchd/systemd agent is a persistent system change, so
-      # it is still never done silently. But the old rationale for not asking
-      # -- "curl | sh has no usable stdin" -- was only half true: stdin is the
-      # script, and /dev/tty is the terminal, which is exactly what it is for.
-      # So when a terminal exists we ask; when it does not (CI, a pipe,
-      # --no-interactive), the historical hands-off behaviour is unchanged.
-      printf 'Install dirad as a login service so it survives reboots? [Y/n] ' >/dev/tty
-      read -r _answer </dev/tty || _answer=""
-      case "$_answer" in
-      "" | y | Y | yes | Yes | YES)
-        info "installing the dirad service..."
-        "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
-        ;;
-      *)
-        info "skipping the service -- run '$bin_dir/dira daemon install' whenever you want it"
-        ;;
-      esac
+    # Installing a launchd/systemd agent is a persistent system change, so it
+    # is still never done silently. But the old rationale for not asking --
+    # "curl | sh has no usable stdin" -- was only half true, and /dev/tty is
+    # exactly the escape hatch for it. Default yes on a terminal, no without
+    # one, so CI keeps the historical hands-off behaviour.
+    elif _confirm "Install dirad as a login service so it survives reboots?" yes no; then
+      info "installing the dirad service..."
+      "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
+    else
+      debug_log "skipping the dirad service"
     fi
   fi
 
@@ -970,25 +974,6 @@ main() {
 Next steps:
   $bin_dir/dira onboard     wire your harnesses, link this device, verify capture
 EOF
-}
-
-# Whether we may ask the user a question: a terminal has to exist to show it
-# and to answer it, and --no-interactive/DIRA_NO_INTERACTIVE opts out.
-#
-# /dev/tty rather than stdin on purpose. Under `curl -fsSL … | sh` stdin IS
-# the script being read, so testing it would always say "not interactive";
-# /dev/tty is the controlling terminal regardless of how stdin is plumbed.
-# Redirecting into `:` tests openability without consuming anything.
-#
-# `2>/dev/null` comes FIRST, and that ordering is load-bearing: redirections
-# are applied left to right, so with `>/dev/tty 2>/dev/null` the shell reports
-# "/dev/tty: Device not configured" on the still-attached stderr before the
-# suppression takes effect. Every non-tty run -- i.e. every CI job -- would
-# print an error that looks like a failed install.
-_can_prompt() {
-  [ "$no_interactive" != "1" ] || return 1
-  : 2>/dev/null >/dev/tty || return 1
-  return 0
 }
 
 main "$@"

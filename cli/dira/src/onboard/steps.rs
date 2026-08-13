@@ -7,7 +7,7 @@
 
 use super::detect::State;
 use super::prompt::Ui;
-use super::{Knowledge, Options, StepOutcome};
+use super::{Options, StepOutcome};
 use crate::init::{self, OnUnparseable};
 use dira_core::config::KnowledgeSyncMode;
 use dira_core::Config;
@@ -83,15 +83,7 @@ pub(crate) async fn harnesses(
         // user never named individually, so silently discarding an
         // unparseable config would be a surprise in a way it isn't for `dira
         // init`, where the user typed that exact path.
-        let res = match id {
-            "claude" => init::run(true, false, OnUnparseable::Refuse),
-            "gemini" => init::run_gemini(true, false, OnUnparseable::Refuse),
-            "cursor" => init::run_cursor(true, false, OnUnparseable::Refuse),
-            "grok" => init::run_grok(true, false, OnUnparseable::Refuse),
-            "codex" => init::run_codex(false),
-            "opencode" => init::run_opencode(config, false).await,
-            other => Err(anyhow::anyhow!("unknown harness `{other}`")),
-        };
+        let res = init::wire(id, config, true, false, OnUnparseable::Refuse).await;
 
         let outcome = match res {
             Ok(w) if w.path.is_none() => {
@@ -235,8 +227,8 @@ pub(crate) fn knowledge(
     ui: &mut dyn Ui,
 ) -> StepOutcome {
     let want = match opts.knowledge {
-        Knowledge::Explicit(tier) => tier,
-        Knowledge::Ask => {
+        Some(tier) => tier,
+        None => {
             ui.say(KNOWLEDGE_DISCLOSURE);
             if ui.confirm("Send full knowledge content to your workspace?", true) {
                 KnowledgeSyncMode::Full
@@ -254,7 +246,7 @@ pub(crate) fn knowledge(
     // the TOML here, so there is exactly one place that decides what a valid
     // tier is.
     match crate::config_cmd::set_quiet(config, "sync.knowledge", want.as_str()) {
-        Ok(()) => {
+        Ok(_) => {
             let mut msg = format!("knowledge sync set to `{}`", want.as_str());
             if !state.device_linked {
                 // Honest rather than encouraging: the daemon's flush is gated
@@ -348,7 +340,14 @@ pub(crate) fn zavet_repo(
             "scaffolding needs a POSIX shell — run `/zavet:init` inside Claude Code instead".into(),
         );
     }
-    let Some(plugin_root) = crate::zavet_install::plugin_root() else {
+    // Offline first: the plugin install that just ran in `zavet_plugin`
+    // wrote `installed_plugins.json`, so the cheap read answers on the common
+    // path. Falling back to the spawning probe only when it cannot — each
+    // `claude` invocation is a Node startup, ~0.5-2s in the middle of an
+    // interactive wizard, and the previous step already paid for one.
+    let Some(plugin_root) =
+        crate::zavet_install::plugin_root_offline().or_else(crate::zavet_install::plugin_root)
+    else {
         return StepOutcome::Skipped(
             "zavet plugin not detected yet — restart Claude Code, then run `/zavet:init`".into(),
         );
@@ -444,7 +443,7 @@ mod tests {
     fn an_explicit_tier_skips_the_prompt() {
         let mut ui = ScriptedUi::new();
         let opts = Options {
-            knowledge: Knowledge::Explicit(KnowledgeSyncMode::Metadata),
+            knowledge: Some(KnowledgeSyncMode::Metadata),
             ..Options::default()
         };
         let _ = knowledge(&cfg(), &state(), &opts, &mut ui);
@@ -487,7 +486,7 @@ mod tests {
             &cfg(),
             &st,
             &Options {
-                knowledge: Knowledge::Explicit(KnowledgeSyncMode::Full),
+                knowledge: Some(KnowledgeSyncMode::Full),
                 ..Options::default()
             },
             &mut ui,

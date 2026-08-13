@@ -110,8 +110,12 @@ gated on the link. See DIRASH-0030.
 - `onboard::prompt::Ui` — `confirm` / `line` / `say`. Three impls:
   `Interactive`, `Auto` (flags), `ScriptedUi` (tests, records what was asked).
 - `onboard::detect::State` — everything step 1 learned; steps never re-probe.
-- `init::Wired` — what one harness's wiring did; `init::OnUnparseable` — the
-  corrupt-config policy (`Overwrite` for `dira init`, `Refuse` for onboard).
+- `init::wire` — the single per-harness dispatch, shared with `dira init`;
+  `init::WIRABLE`/`is_wirable` — what it accepts (deliberately narrower than
+  `canonical_harness_id`, which also resolves `generic`).
+- `init::Wired` — what one harness's wiring did, with `Kind` deciding the
+  report wording; `init::OnUnparseable` — the corrupt-config policy
+  (`Overwrite` for `dira init`, `Refuse` for onboard).
 - `which::on_path` — shared with `zavet_install`'s `claude` probe.
 - `config_cmd::set_quiet` — `set` without the report, same validation.
 
@@ -123,6 +127,8 @@ gated on the link. See DIRASH-0030.
 - `--print` leaves the filesystem byte-identical.
 - Without a terminal and without `--yes`, nothing is changed.
 - Onboarding never sets `core.hooksPath`.
+- A harness accepted by `--harness` is one `init::wire` can actually wire, so
+  a bad id fails before any step runs rather than mid-run.
 - The knowledge tier is restated in the summary on every path.
 
 ## Open Questions

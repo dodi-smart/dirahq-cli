@@ -228,15 +228,40 @@ fn render_scalar(key: &str, v: &serde_json::Value) -> String {
 
 /// `dira config set <key> <value>` — validate then persist to `config.toml`.
 pub fn set(config: &Config, key: &str, raw: &str) -> Result<()> {
-    let Some(knob) = knob(key) else {
+    // The unknown-key error is richer here than in `set_quiet`: an
+    // interactive user gets the whole settable-key listing, which would be
+    // noise inside `dira onboard`'s per-step summary.
+    if knob(key).is_none() {
         let known = KNOBS
             .iter()
             .map(|k| format!("  {} — {}", k.key, k.help))
             .collect::<Vec<_>>()
             .join("\n");
         bail!("`{key}` is not settable. settable keys:\n{known}");
-    };
+    }
+    let path = set_quiet(config, key, raw)?;
 
+    println!("set {key} = {raw}");
+    println!("wrote {}", path.display());
+    println!("note: restart the daemon for daemon-side changes to take effect (`dira daemon stop` then `dira daemon start`)");
+    Ok(())
+}
+
+/// Validate and persist one knob, returning the file written.
+///
+/// The whole write path lives here and [`set`] delegates to it, so exactly one
+/// place resolves the config path, preserves the existing document, and writes
+/// it back — a future change (an atomic temp+rename, say) cannot land in one
+/// copy and miss the other.
+///
+/// `dira onboard` calls this directly because it renders its own per-step
+/// summary, and the loose "set … / wrote … / note: restart" block would
+/// interleave badly with it. Per DIRASH-0030 the knowledge tier is written
+/// through here and never by editing TOML in place.
+pub(crate) fn set_quiet(config: &Config, key: &str, raw: &str) -> Result<PathBuf> {
+    let Some(knob) = knob(key) else {
+        bail!("`{key}` is not settable");
+    };
     // Parse + validate the new value, computing the cross-field invariant against
     // the *currently resolved* config so e.g. coalesce stays under idle.
     let item = parse_and_validate(config, knob, raw)?;
@@ -255,37 +280,7 @@ pub fn set(config: &Config, key: &str, raw: &str) -> Result<()> {
         .with_context(|| format!("parse existing {}", path.display()))?;
     assign(&mut doc, key, item);
     std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
-
-    println!("set {key} = {raw}");
-    println!("wrote {}", path.display());
-    println!("note: restart the daemon for daemon-side changes to take effect (`dira daemon stop` then `dira daemon start`)");
-    Ok(())
-}
-
-/// [`set`] without the three-line report.
-///
-/// `dira onboard` renders its own per-step summary, so the loose "set … /
-/// wrote … / note: restart" block would interleave badly with it. Validation,
-/// the knob table, and the write itself are the same code path — only the
-/// printing differs, so there is no second place that decides what a valid
-/// value is.
-pub(crate) fn set_quiet(config: &Config, key: &str, raw: &str) -> Result<()> {
-    let Some(knob) = knob(key) else {
-        bail!("`{key}` is not settable");
-    };
-    let item = parse_and_validate(config, knob, raw)?;
-
-    let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create config dir {}", parent.display()))?;
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: DocumentMut = existing
-        .parse()
-        .with_context(|| format!("parse existing {}", path.display()))?;
-    assign(&mut doc, key, item);
-    std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))
+    Ok(path)
 }
 
 /// Write `item` at `key` in the document, where a dotted key (`modules.zavet`)

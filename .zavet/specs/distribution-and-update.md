@@ -64,9 +64,10 @@ both executables and restarts whatever is supervising the daemon.
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
   is safe in a script.
-- Every network step is bounded and retried. The artifact download makes up to
-  4 attempts on a 500ms-seeded ladder capped at 4s, retrying transport
-  failures, timeouts, 5xx and 429 (honouring `Retry-After`, itself capped);
+- Every network step is time-bounded; the artifact download is also retried.
+  The download makes up to 4 attempts on a 500ms-seeded ladder capped at 4s,
+  retrying transport failures, timeouts, 5xx and 429 (honouring `Retry-After`,
+  itself capped);
   a 4xx is **never** retried, because it is deterministic — the 404 keeps its
   "asset not found on that release" wording and fails on the first attempt.
   Timeouts are per-request rather than client-wide (a small JSON API response
@@ -76,8 +77,13 @@ both executables and restarts whatever is supervising the daemon.
   that did not, so a single mid-stream abort — routine on a lossy or
   TLS-inspecting corporate link — failed the whole update. This is not
   platform-specific: it fails identically on macOS, Linux and Windows.
-  *Known gap:* the body is buffered whole (`resp.bytes()`), so a retry re-pulls
-  the entire archive rather than resuming with a `Range` request.
+  The `.sha256` companion rides the same ladder with a per-attempt timeout
+  sized to ~100 bytes rather than to the archive, so a stall there costs
+  seconds, not minutes.
+  *Known gaps:* the body is buffered whole (`resp.bytes()`), so a retry
+  re-pulls the entire archive rather than resuming with a `Range` request; and
+  `resolve::gh_get` — the first of the two network hops — is bounded by a
+  timeout but not retried, so a transient abort there still fails the update.
 - A failed `dira update` is recorded, not just returned. The passive notice's
   cache carries a consecutive-failure count next to the resolve half, and after
   2 failures the notice escalates from "run `dira update`" to naming how many

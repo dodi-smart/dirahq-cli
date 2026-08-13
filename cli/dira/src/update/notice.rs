@@ -59,12 +59,12 @@ struct Cache {
     ///
     /// Written by `update::run` (the command), never by [`maybe_print`] — the
     /// foreground notice path stays read-only and network-free per D-0006.
+    ///
+    /// Only the count is persisted, not the last error: the escalated notice
+    /// tells the user to re-run `dira update` to see why, which prints the
+    /// real, current error rather than a stale one from a previous release.
     #[serde(default)]
     update_failures: u32,
-    /// The last failed `dira update`'s error, kept so the escalated notice can
-    /// point at something concrete.
-    #[serde(default)]
-    update_error: Option<String>,
 }
 
 /// Consecutive failures before the notice stops repeating an unqualified "run
@@ -231,71 +231,49 @@ fn write_cache(path: &Path, cache: &Cache) {
     }
 }
 
+/// Read-modify-write the cache through `edit`. One place to decide what a
+/// missing path or an unreadable file means (both: start from the default and
+/// carry on — this is disposable derived state), so the three callers below
+/// can't drift apart on that policy.
+fn edit_cache(edit: impl FnOnce(&mut Cache)) {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    let mut cache = read_cache(&path).unwrap_or_default();
+    edit(&mut cache);
+    write_cache(&path, &cache);
+}
+
 /// Refresh the *resolve* half of the cache after `dira update --check`,
-/// preserving the update-failure half. Best-effort, like every write here.
+/// preserving the update-failure half: a successful resolve says nothing about
+/// whether installing works.
 pub(super) fn record_check(
     checked_at: i64,
     latest: Option<&str>,
     channel: &str,
     error: Option<&str>,
 ) {
-    let Some(path) = cache_path() else {
-        return;
-    };
-    let prior = read_cache(&path).unwrap_or_default();
-    write_cache(
-        &path,
-        &Cache {
-            checked_at,
-            latest: latest.map(str::to_string),
-            channel: Some(channel.to_string()),
-            error: error.map(str::to_string),
-            // A successful resolve says nothing about whether installing works.
-            ..prior
-        },
-    );
+    edit_cache(|c| {
+        c.checked_at = checked_at;
+        c.latest = latest.map(str::to_string);
+        c.channel = Some(channel.to_string());
+        c.error = error.map(str::to_string);
+    });
 }
 
 /// Record that a `dira update` attempt failed, incrementing the consecutive
 /// count without disturbing `checked_at`/`latest` — the resolve half is still
 /// accurate, and expiring it here would cost the user a background refresh for
 /// no reason.
-pub(super) fn record_update_failure(error: &str) {
-    let Some(path) = cache_path() else {
-        return;
-    };
-    let prior = read_cache(&path).unwrap_or_default();
-    write_cache(
-        &path,
-        &Cache {
-            update_failures: prior.update_failures.saturating_add(1),
-            update_error: Some(error.to_string()),
-            ..prior
-        },
-    );
+pub(super) fn record_update_failure() {
+    edit_cache(|c| c.update_failures = c.update_failures.saturating_add(1));
 }
 
 /// Clear the failure count after a successful `dira update`. Called even
 /// though the new binary's version makes the notice fall silent anyway: the
 /// count must not survive to haunt the *next* upgrade cycle.
 pub(super) fn clear_update_failures() {
-    let Some(path) = cache_path() else {
-        return;
-    };
-    let Some(prior) = read_cache(&path) else {
-        return;
-    };
-    if prior.update_failures == 0 && prior.update_error.is_none() {
-        return;
-    }
-    write_cache(
-        &path,
-        &Cache {
-            update_failures: 0,
-            update_error: None,
-            ..prior
-        },
-    );
+    edit_cache(|c| c.update_failures = 0);
 }
 
 /// Write a `checked_at` sentinel (no `latest`/`error` yet) *before* spawning,
@@ -316,7 +294,6 @@ fn write_sentinel(path: &Path, now: i64, prior: &Cache) {
             channel: None,
             error: None,
             update_failures: prior.update_failures,
-            update_error: prior.update_error.clone(),
         },
     );
 }
@@ -396,7 +373,6 @@ mod tests {
     fn cache_with_failures(latest: &str, n: u32) -> Cache {
         Cache {
             update_failures: n,
-            update_error: Some("connection closed before message completed".to_string()),
             ..cache(1_770_000_000, Some(latest), None)
         }
     }

@@ -104,6 +104,8 @@ FLAGS:
     --service                Also install dirad as a launchd/systemd-user service
     --no-daemon              Never start, restart, or install the daemon -- even if
                               one is already running
+    --no-interactive          Never prompt, even on a terminal (implies the historical
+                              hands-off daemon behaviour unless --daemon/--service given)
     --force                  Overwrite a `just install` dev symlink; skip the
                               --uninstall confirmation
     --uninstall              Remove dira + dirad (never touches config or data --
@@ -122,6 +124,7 @@ ENVIRONMENT:
                                         (GH_TOKEN wins if both are set)
     DIRA_START_DAEMON                   Same as --daemon        (set to 1)
     DIRA_INSTALL_SERVICE                 Same as --service        (set to 1)
+    DIRA_NO_INTERACTIVE                   Same as --no-interactive (set to 1)
     DIRA_ALLOW_ROOT                       Silence the "running as root" warning (set to 1)
     DIRA_DEBUG                             Verbose debug output on stderr (set to 1)
 
@@ -711,6 +714,8 @@ main() {
   debug=0
   [ "${DIRA_DEBUG:-0}" = "1" ] && debug=1
   no_daemon=0
+  no_interactive=0
+  [ "${DIRA_NO_INTERACTIVE:-0}" = "1" ] && no_interactive=1
   force=0
   uninstall_flag=0
 
@@ -767,6 +772,10 @@ main() {
       ;;
     --no-daemon)
       no_daemon=1
+      shift
+      ;;
+    --no-interactive)
+      no_interactive=1
       shift
       ;;
     --force)
@@ -930,20 +939,56 @@ main() {
     if [ "$install_service" = "1" ]; then
       info "installing the dirad service..."
       "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
+    elif _can_prompt; then
+      # Installing a launchd/systemd agent is a persistent system change, so
+      # it is still never done silently. But the old rationale for not asking
+      # -- "curl | sh has no usable stdin" -- was only half true: stdin is the
+      # script, and /dev/tty is the terminal, which is exactly what it is for.
+      # So when a terminal exists we ask; when it does not (CI, a pipe,
+      # --no-interactive), the historical hands-off behaviour is unchanged.
+      printf 'Install dirad as a login service so it survives reboots? [Y/n] ' >/dev/tty
+      read -r _answer </dev/tty || _answer=""
+      case "$_answer" in
+      "" | y | Y | yes | Yes | YES)
+        info "installing the dirad service..."
+        "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
+        ;;
+      *)
+        info "skipping the service -- run '$bin_dir/dira daemon install' whenever you want it"
+        ;;
+      esac
     fi
   fi
 
-  # 15. PATH hint + next steps. No interactive prompt here: installing a
-  # launchd/systemd agent is a persistent system change, and `curl | sh`
-  # has no usable stdin to ask with anyway.
+  # 15. PATH hint + next steps. One command, because the previous three-line
+  # block omitted `dira init` and so left anyone who followed it with a
+  # running daemon that captured nothing. It also recommended `daemon start`,
+  # which takes the control socket and blocks the `daemon install` above.
   _path_hint "$bin_dir"
   cat <<EOF
 
 Next steps:
-  $bin_dir/dira --version
-  $bin_dir/dira daemon start
-  $bin_dir/dira status
+  $bin_dir/dira onboard     wire your harnesses, link this device, verify capture
 EOF
+}
+
+# Whether we may ask the user a question: a terminal has to exist to show it
+# and to answer it, and --no-interactive/DIRA_NO_INTERACTIVE opts out.
+#
+# /dev/tty rather than stdin on purpose. Under `curl -fsSL … | sh` stdin IS
+# the script being read, so testing it would always say "not interactive";
+# /dev/tty is the controlling terminal regardless of how stdin is plumbed.
+# Redirecting into `:` tests openability without consuming anything.
+#
+# `2>/dev/null` comes FIRST, and that ordering is load-bearing: redirections
+# are applied left to right, so with `>/dev/tty 2>/dev/null` the shell reports
+# "/dev/tty: Device not configured" on the still-attached stderr before the
+# suppression takes effect. Every non-tty run -- i.e. every CI job -- would
+# print an error that looks like a failed install.
+_can_prompt() {
+  [ "$no_interactive" != "1" ] || return 1
+  : 2>/dev/null >/dev/tty || return 1
+  return 0
 }
 
 main "$@"

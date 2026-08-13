@@ -30,3 +30,9 @@ agent context at session start — keep it short and non-negotiable.
   read filters that prefix, and the daemon never spawns the hook child — a
   child it forked would inherit an elevated token and certify the very bug the
   probe exists to catch. See DIRASH-0023.
+- `dira onboard` steps never abort the run (`StepOutcome`, not `?`), and its
+  detection pass never writes or spawns anything that writes — `--print` must
+  leave the filesystem byte-identical. See DIRASH-0029.
+- Knowledge-content consent is asked by its own prompt naming what it sends,
+  never implied by device linking or billing. Changing what `full` transmits
+  changes `KNOWLEDGE_DISCLOSURE` in the same commit. See DIRASH-0030.

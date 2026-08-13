@@ -50,7 +50,6 @@
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -133,6 +132,58 @@ pub fn adapter_status_lines(cwd: &Path) -> Vec<String> {
     }
 }
 
+/// The installed plugin's root directory, or `None` when `claude` isn't on
+/// `PATH` or detection is inconclusive.
+///
+/// Exists for `dira onboard`, whose zavet step needs the plugin's own
+/// `bin/zavet` to scaffold a repo. Deliberately routed through the same
+/// [`detect`] + [`resolve_plugin_root`] pair every other caller uses rather
+/// than letting onboard guess a path: the marketplace can be
+/// directory-sourced, in which case the reported install path is not where
+/// the binary actually lives.
+///
+/// Returns the *plugin root*, never a repo's vendored `.zavet/bin/zavet` —
+/// DIRASH-0024 is explicit that asking the vendored copy about itself asks a
+/// stale tool whether it is stale.
+pub(crate) fn plugin_root() -> Option<String> {
+    resolve_claude_on_path()?;
+    let home = home_dir().ok()?;
+    match detect(&SystemRunner, &home) {
+        Detection::Installed(info) => Some(resolve_plugin_root(&home, &info.install_path)),
+        Detection::NotInstalled | Detection::Unknown => None,
+    }
+}
+
+/// [`plugin_root`] without spawning anything — reads `installed_plugins.json`
+/// directly and never invokes `claude`.
+///
+/// `dira onboard`'s detection pass uses this instead of [`plugin_root`]
+/// because running `claude` is not free of side effects: it bootstraps
+/// `~/.claude.json` and a backup directory on first invocation. That makes a
+/// spawning probe a *write*, which would break `dira onboard --print`'s
+/// promise to change nothing — a promise the whole dry-run mode rests on.
+///
+/// The cost is a weaker signal: `None` here means "not installed, or the
+/// registry file is absent/unreadable/a schema this build doesn't know". That
+/// is the safe direction. The only consumer treats `None` as "offer to
+/// install", and `dira zavet install` performs its own authoritative,
+/// `claude`-backed detection before doing anything — so a false `None` costs
+/// one no-op command, never a wrong write.
+pub(crate) fn plugin_root_offline() -> Option<String> {
+    let home = home_dir().ok()?;
+    match detect_from_installed_plugins_json(&home)? {
+        Detection::Installed(info) => Some(resolve_plugin_root(&home, &info.install_path)),
+        Detection::NotInstalled | Detection::Unknown => None,
+    }
+}
+
+/// Whether `claude` is on `PATH` — the precondition for every plugin
+/// operation. Re-exported for `dira onboard`'s detection pass, which reports
+/// it rather than acting on it.
+pub(crate) fn claude_present() -> bool {
+    resolve_claude_on_path().is_some()
+}
+
 // ---------------------------------------------------------------------------
 // Runner — the same shell-out-and-mock pattern as `daemon::Runner`, so
 // detection + install are unit-testable without touching a real `claude`
@@ -159,7 +210,7 @@ pub(crate) trait Runner {
     }
 }
 
-struct SystemRunner;
+pub(crate) struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, prog: &str, args: &[&str]) -> Option<Output> {
@@ -334,58 +385,15 @@ fn marketplace_directory_location(home: &Path) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// PATH resolution for `claude` — no `which`-style crate dependency; every
-// dep this module needs (`serde`, `serde_json`, `semver`) is already a
-// direct dep of `cli/dira`.
+// PATH resolution for `claude`. The mechanics live in [`crate::which`] — it
+// is shared with `dira onboard`'s harness probe, which needs exactly the
+// same unix/windows split. The stakes differ though: here a missing
+// `claude` is a hard bail (nothing safe to shell out to), there it only
+// pre-selects a checkbox.
 // ---------------------------------------------------------------------------
 
 fn resolve_claude_on_path() -> Option<PathBuf> {
-    resolve_on_path_in("claude", std::env::var_os("PATH")?.as_os_str())
-}
-
-fn resolve_on_path_in(prog: &str, path_var: &OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path_var).find_map(|dir| resolve_candidate_in_dir(&dir, prog))
-}
-
-/// unix: `dir/prog` is directly runnable or it isn't — no extension games.
-#[cfg(not(windows))]
-fn resolve_candidate_in_dir(dir: &Path, prog: &str) -> Option<PathBuf> {
-    let candidate = dir.join(prog);
-    is_executable_file(&candidate).then_some(candidate)
-}
-
-/// Windows has no executable bit and (unlike unix) usually doesn't ship
-/// `prog` as a bare extensionless file — npm installs `claude` as a
-/// `claude.cmd` shim, for example. Try the bare name first (covers a real
-/// `.exe`), then each extension `PATHEXT` lists, falling back to the
-/// documented Windows default order when the var is unset or empty.
-#[cfg(windows)]
-fn resolve_candidate_in_dir(dir: &Path, prog: &str) -> Option<PathBuf> {
-    let bare = dir.join(prog);
-    if is_executable_file(&bare) {
-        return Some(bare);
-    }
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    pathext
-        .split(';')
-        .filter(|ext| !ext.is_empty())
-        .find_map(|ext| {
-            let candidate = dir.join(format!("{prog}{ext}"));
-            is_executable_file(&candidate).then_some(candidate)
-        })
-}
-
-#[cfg(unix)]
-fn is_executable_file(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(p: &Path) -> bool {
-    p.is_file()
+    crate::which::on_path("claude")
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -1146,67 +1154,9 @@ mod tests {
         );
     }
 
-    fn fake_bin_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dira-zavet-install-bin-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[cfg(unix)]
-    fn write_executable(path: &Path, contents: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, contents).unwrap();
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).unwrap();
-    }
-
-    // Windows has no executable bit, and `is_executable_file`'s non-unix
-    // stub is just `is_file()` — so unconditionally writing the file already
-    // makes it "executable" by that stub. Needed only so this test module
-    // compiles and runs on windows CI (used unconditionally below, not
-    // behind a unix-only test).
-    #[cfg(windows)]
-    fn write_executable(path: &Path, contents: &str) {
-        std::fs::write(path, contents).unwrap();
-    }
-
-    // -- resolve_on_path_in ---------------------------------------------------
-
-    #[test]
-    fn resolve_on_path_finds_executable_file() {
-        let dir = fake_bin_dir("found");
-        write_executable(&dir.join("claude"), "#!/bin/sh\n");
-        let path_var = std::ffi::OsString::from(dir.display().to_string());
-        let got = resolve_on_path_in("claude", &path_var);
-        assert_eq!(got, Some(dir.join("claude")));
-    }
-
-    /// Unix-only by design: the exec-bit is the discriminator here, and windows
-    /// has no such bit — `is_executable_file`'s non-unix arm is deliberately
-    /// just `is_file()`, so a bare non-executable file DOES resolve there.
-    #[cfg(unix)]
-    #[test]
-    fn resolve_on_path_none_when_not_executable() {
-        let dir = fake_bin_dir("not-exec");
-        std::fs::write(dir.join("claude"), "#!/bin/sh\n").unwrap();
-        let path_var = std::ffi::OsString::from(dir.display().to_string());
-        assert_eq!(resolve_on_path_in("claude", &path_var), None);
-    }
-
-    #[test]
-    fn resolve_on_path_none_when_absent() {
-        let dir = fake_bin_dir("absent");
-        let path_var = std::ffi::OsString::from(dir.display().to_string());
-        assert_eq!(resolve_on_path_in("claude", &path_var), None);
-    }
+    // PATH resolution itself — and the fake-bin-dir fixtures it needed — now
+    // lives in `crate::which`, tested there. This module only consumes it via
+    // `resolve_claude_on_path`.
 
     // -- detect ---------------------------------------------------------------
 

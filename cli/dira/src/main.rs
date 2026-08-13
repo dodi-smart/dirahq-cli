@@ -10,12 +10,14 @@ mod duration;
 mod format;
 mod hook_health;
 mod init;
+mod onboard;
 mod render;
 #[cfg(test)]
 mod test_support;
 mod theme;
 mod tui;
 mod update;
+mod which;
 mod zavet_adapters;
 mod zavet_install;
 
@@ -69,10 +71,15 @@ fn long_version() -> &'static str {
     styles = HELP_STYLES,
     after_help = "\
 Getting started:
-  dira init             wire Claude Code hooks (also: codex, gemini, cursor, opencode, grok)
-  dira daemon start     start the resident tracker daemon
+  dira onboard          set this machine up end to end — start here
   dira status           today's summary — engaged, agent, compute, unbilled
+
+Or step by step, if you'd rather do it yourself:
+  dira init             wire Claude Code hooks (also: codex, gemini, cursor, opencode, grok)
+  dira daemon install   run the tracker daemon as a login service
   dira device link      link this device to the cloud for sync + billables
+  dira zavet install    add the knowledge layer
+  dira doctor           check whether capture is actually working
 
 Run `dira help <command>` for details and examples of each command."
 )]
@@ -83,6 +90,56 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Set this machine up end to end: harnesses, daemon service, cloud link, zavet.
+    #[command(
+        long_about = "\
+One command from a fresh install to actually capturing. Runs six steps in
+dependency order, each idempotent and skippable, and is safe to re-run — a
+second run reports what is already done and picks up the rest.
+
+  1. detect     which harnesses, daemon, and repo this machine already has
+  2. harnesses  wire every detected harness in one pass (no more one `init` each)
+  3. daemon     install dirad as a login service so it survives reboots
+  4. device     link this device to the cloud (skippable — local capture works
+                unlinked; only sync and billables need it)
+  5. zavet      install the knowledge plugin, scaffold this repo's .zavet/,
+                and set the knowledge sync tier
+  6. verify     tell you what is still open
+
+Nothing here aborts on failure: a step that cannot run says why, and the
+summary collects what is left. `dira init`, `dira daemon install`, `dira
+device link` and `dira zavet install` all remain available individually —
+this command is a guided path through them, not a replacement.",
+        after_help = "\
+Examples:
+  dira onboard                     the guided flow
+  dira onboard --yes               accept every default, no prompts (CI)
+  dira onboard --print             show the plan, change nothing
+  dira onboard --harness claude --harness codex
+                                   wire exactly these, skipping detection
+  dira onboard --knowledge metadata
+                                   set up everything, but never send record bodies"
+    )]
+    Onboard {
+        /// Accept every default without prompting (implies knowledge=full).
+        #[arg(long)]
+        yes: bool,
+        /// Show what would happen and exit without changing anything.
+        #[arg(long)]
+        print: bool,
+        /// Don't register the daemon with this machine's service manager.
+        #[arg(long)]
+        no_service: bool,
+        /// Don't install zavet or scaffold this repo's knowledge layer.
+        #[arg(long)]
+        no_zavet: bool,
+        /// Wire exactly this harness, bypassing detection. Repeatable.
+        #[arg(long, value_name = "HARNESS")]
+        harness: Vec<String>,
+        /// Knowledge sync tier: off, metadata, or full. Skips the consent prompt.
+        #[arg(long, value_name = "TIER")]
+        knowledge: Option<String>,
+    },
     /// Today's summary: engaged / agent / compute + the unbilled value.
     #[command(
         long_about = "\
@@ -901,6 +958,42 @@ async fn main() -> Result<()> {
 
     // Commands handled entirely client-side.
     match &cli.command {
+        Command::Onboard {
+            yes,
+            print,
+            no_service,
+            no_zavet,
+            harness,
+            knowledge,
+        } => {
+            // Resolve harness aliases up front so a typo fails before any
+            // step runs, rather than five steps in.
+            let mut ids = Vec::new();
+            for h in harness {
+                match dira_sources::canonical_harness_id(h) {
+                    Some(id) => ids.push(id.to_string()),
+                    None => anyhow::bail!(
+                        "unknown harness '{h}' (expected: claude, codex, gemini, cursor, opencode, grok)"
+                    ),
+                }
+            }
+            let knowledge = match knowledge {
+                Some(raw) => onboard::Knowledge::Explicit(onboard::parse_knowledge(raw)?),
+                None => onboard::Knowledge::Ask,
+            };
+            return onboard::run(
+                &config,
+                onboard::Options {
+                    yes: *yes,
+                    print: *print,
+                    no_service: *no_service,
+                    no_zavet: *no_zavet,
+                    harness: ids,
+                    knowledge,
+                },
+            )
+            .await;
+        }
         Command::Init {
             harness,
             global,
@@ -909,17 +1002,26 @@ async fn main() -> Result<()> {
             let id = harness.as_deref().unwrap_or("claude");
             // Alias spelling lives in the sources crate so it can't drift from
             // what the hook dispatch accepts.
-            return match dira_sources::canonical_harness_id(id) {
-                Some("claude") => init::run(*global, *print),
+            //
+            // `Overwrite` preserves this command's long-standing behaviour on
+            // an unparseable config: the user named this exact file, so
+            // starting from `{}` is a defensible (if blunt) answer. `dira
+            // onboard` passes `Refuse` instead — it touches files nobody
+            // named.
+            let wired = match dira_sources::canonical_harness_id(id) {
+                Some("claude") => init::run(*global, *print, init::OnUnparseable::Overwrite),
                 Some("codex") => init::run_codex(*print),
-                Some("gemini") => init::run_gemini(*global, *print),
-                Some("cursor") => init::run_cursor(*global, *print),
+                Some("gemini") => init::run_gemini(*global, *print, init::OnUnparseable::Overwrite),
+                Some("cursor") => init::run_cursor(*global, *print, init::OnUnparseable::Overwrite),
                 Some("opencode") => init::run_opencode(&config, *print).await,
-                Some("grok") => init::run_grok(*global, *print),
+                Some("grok") => init::run_grok(*global, *print, init::OnUnparseable::Overwrite),
                 _ => Err(anyhow::anyhow!(
                     "unknown harness '{id}' (expected: claude, codex, gemini, cursor, opencode, grok)"
                 )),
             };
+            // Printing moved out of `init` so `dira onboard` can wire several
+            // harnesses and report once; `dira init`'s own output is unchanged.
+            return wired.map(|w| w.print());
         }
         Command::Watch { interval } => {
             return tui::run(&config, std::time::Duration::from_millis(*interval)).await;
@@ -1118,6 +1220,8 @@ async fn main() -> Result<()> {
 
     // Commands that talk to the daemon.
     let req = match cli.command {
+        // Returned above, in the client-side block.
+        Command::Onboard { .. } => unreachable!("onboard is handled client-side"),
         Command::Sessions => Request::Sessions,
         Command::Start {
             project,

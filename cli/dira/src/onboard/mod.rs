@@ -69,17 +69,8 @@ impl StepOutcome {
     }
 }
 
-/// How the knowledge tier was decided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Knowledge {
-    /// Ask, defaulting to `full`.
-    Ask,
-    /// `--knowledge <tier>` (or `--yes`, which resolves to `full`).
-    Explicit(KnowledgeSyncMode),
-}
-
 /// A parsed `dira onboard` invocation, independent of clap.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Options {
     /// Accept every default without asking.
     pub yes: bool,
@@ -89,18 +80,24 @@ pub(crate) struct Options {
     pub no_zavet: bool,
     /// Wire exactly these, bypassing detection.
     pub harness: Vec<String>,
-    pub knowledge: Knowledge,
+    /// The tier from `--knowledge`. `None` means ask.
+    pub knowledge: Option<KnowledgeSyncMode>,
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            yes: false,
-            print: false,
-            no_service: false,
-            no_zavet: false,
-            harness: Vec::new(),
-            knowledge: Knowledge::Ask,
+impl Options {
+    /// Fold `--yes` into the tier before any step runs.
+    ///
+    /// A method rather than three lines inline in [`run`] so the rule is
+    /// reachable from a test — inline, it was asserted only by tests that
+    /// pasted a copy of it, and deleting it from `run` left them green.
+    ///
+    /// `--yes` means "accept every default", and the prompt's default is
+    /// `full`; resolving it here rather than in the step is what lets
+    /// `--print --yes` state the tier it would set. An explicit
+    /// `--knowledge` always wins.
+    pub fn resolve_defaults(&mut self) {
+        if self.yes && self.knowledge.is_none() {
+            self.knowledge = Some(KnowledgeSyncMode::Full);
         }
     }
 }
@@ -110,13 +107,7 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let state = detect::run(config, &cwd).await;
 
-    // `--yes` resolves the tier to the same value the prompt defaults to.
-    // Encoding it here rather than inside the step keeps one answer to "what
-    // does --yes do", and the summary still restates the tier either way, so
-    // a non-interactive run never leaves the user unaware of it.
-    if opts.yes && opts.knowledge == Knowledge::Ask {
-        opts.knowledge = Knowledge::Explicit(KnowledgeSyncMode::Full);
-    }
+    opts.resolve_defaults();
 
     if opts.print {
         print_plan(&state, &opts);
@@ -135,7 +126,7 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
     }
 
     let mut ui: Box<dyn Ui> = if opts.yes {
-        Box::new(Auto { narrate: true })
+        Box::new(Auto)
     } else {
         Box::new(Interactive)
     };
@@ -174,7 +165,7 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
     ));
 
     print_summary(&results);
-    print_open_items(config, &state, &results).await;
+    print_open_items(&state, &results);
     Ok(())
 }
 
@@ -229,8 +220,8 @@ fn print_plan(state: &detect::State, opts: &Options) {
     }
 
     let tier = match opts.knowledge {
-        Knowledge::Explicit(t) => t.as_str(),
-        Knowledge::Ask => "full (after asking)",
+        Some(t) => t.as_str(),
+        None => "full (after asking)",
     };
     println!("  · set knowledge sync to {tier}");
     println!("\nNothing was changed.");
@@ -252,11 +243,7 @@ fn print_summary(results: &[(String, StepOutcome)]) {
 /// The closing block: what is still open, in the order it should be dealt
 /// with. Only genuinely-open items appear — a run with nothing outstanding
 /// ends on the summary.
-async fn print_open_items(
-    config: &Config,
-    state: &detect::State,
-    results: &[(String, StepOutcome)],
-) {
+fn print_open_items(state: &detect::State, results: &[(String, StepOutcome)]) {
     let mut open: Vec<String> = Vec::new();
 
     let failed: Vec<&str> = results
@@ -321,7 +308,6 @@ async fn print_open_items(
         }
     }
 
-    let _ = config;
     println!("\nverify anytime with `dira doctor` (add --probe to prove capture end to end).");
 }
 
@@ -340,21 +326,6 @@ pub(crate) fn parse_knowledge(raw: &str) -> Result<KnowledgeSyncMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::Supervision;
-    use detect::State;
-
-    fn state() -> State {
-        State {
-            harnesses: Vec::new(),
-            supervision: Supervision::NotRunning,
-            repo_root: None,
-            has_zavet_dir: false,
-            claude_present: false,
-            zavet_installed: false,
-            device_linked: false,
-            knowledge: KnowledgeSyncMode::Off,
-        }
-    }
 
     #[test]
     fn knowledge_parses_the_three_tiers_and_rejects_others() {
@@ -383,21 +354,19 @@ mod tests {
     }
 
     /// `--yes` must resolve to a concrete tier before any step runs, so the
-    /// summary can restate it. Left as `Ask`, a non-interactive run would
-    /// silently take the prompt default with nothing shown.
+    /// summary can restate it. Calls the real rule — asserting on a copy
+    /// pasted into the test body let `run()` lose the line and stay green.
     #[test]
     fn yes_resolves_the_knowledge_tier_up_front() {
         let mut opts = Options {
             yes: true,
             ..Options::default()
         };
-        assert_eq!(opts.knowledge, Knowledge::Ask);
-        if opts.yes && opts.knowledge == Knowledge::Ask {
-            opts.knowledge = Knowledge::Explicit(KnowledgeSyncMode::Full);
-        }
+        assert_eq!(opts.knowledge, None, "unset before resolution");
+        opts.resolve_defaults();
         assert_eq!(
             opts.knowledge,
-            Knowledge::Explicit(KnowledgeSyncMode::Full),
+            Some(KnowledgeSyncMode::Full),
             "--yes must mean full, and must say so"
         );
     }
@@ -407,25 +376,18 @@ mod tests {
     fn an_explicit_tier_is_not_overridden_by_yes() {
         let mut opts = Options {
             yes: true,
-            knowledge: Knowledge::Explicit(KnowledgeSyncMode::Off),
+            knowledge: Some(KnowledgeSyncMode::Off),
             ..Options::default()
         };
-        if opts.yes && opts.knowledge == Knowledge::Ask {
-            opts.knowledge = Knowledge::Explicit(KnowledgeSyncMode::Full);
-        }
-        assert_eq!(opts.knowledge, Knowledge::Explicit(KnowledgeSyncMode::Off));
+        opts.resolve_defaults();
+        assert_eq!(opts.knowledge, Some(KnowledgeSyncMode::Off));
     }
 
-    /// `--print` must never claim it did anything.
+    /// Without `--yes` the tier stays unset, so the step asks.
     #[test]
-    fn the_plan_says_nothing_changed() {
-        // Rendering goes to stdout; this asserts the shape of the decision
-        // rather than capturing output — the runner returns before any step.
-        let opts = Options {
-            print: true,
-            ..Options::default()
-        };
-        assert!(opts.print);
-        assert!(state().wirable().is_empty());
+    fn without_yes_the_tier_is_left_to_the_prompt() {
+        let mut opts = Options::default();
+        opts.resolve_defaults();
+        assert_eq!(opts.knowledge, None);
     }
 }

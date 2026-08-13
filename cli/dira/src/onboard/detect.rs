@@ -5,6 +5,7 @@
 //! cost of a false negative is one keystroke, never a wrong write.
 
 use crate::daemon::Supervision;
+use crate::zavet_adapters::RepoGate;
 use std::path::{Path, PathBuf};
 
 /// The six harnesses `dira init` can wire, in the order the wizard shows
@@ -190,12 +191,14 @@ pub(crate) fn harnesses(home: &Path) -> Vec<Harness> {
 /// the adapter gate about what "this repo" means, or it could scaffold one
 /// directory and refresh adapters in another.
 pub(crate) fn repo(cwd: &Path) -> (Option<PathBuf>, bool) {
-    match dira_core::project::toplevel(cwd) {
-        Some(root) => {
-            let has = root.join(dira_core::zavet::ZAVET_DIR).is_dir();
-            (Some(root), has)
-        }
-        None => (None, false),
+    // Calls the adapter gate rather than re-deriving it. The two MUST agree —
+    // scaffolding one directory while refreshing adapters in another is the
+    // failure DIRASH-0024 exists to prevent — and a shared call enforces that
+    // where a comment only asserted it.
+    match crate::zavet_adapters::gate_from_toplevel(dira_core::project::toplevel(cwd)) {
+        RepoGate::Eligible(root) => (Some(root), true),
+        RepoGate::NoZavetDir(root) => (Some(root), false),
+        RepoGate::NotGit => (None, false),
     }
 }
 
@@ -356,6 +359,52 @@ mod tests {
         };
         assert!(!s.daemon_running());
         assert!(!s.supervised());
+    }
+
+    /// Per-harness knowledge is spread over three tables that no compiler
+    /// check ties together: `dira_sources::canonical_harness_id` (the wire
+    /// ids and their aliases), `init::WIRABLE` (what can actually be wired),
+    /// and this module's `HARNESSES` (what onboarding probes for). A harness
+    /// added to one and forgotten in another fails at runtime, not at build
+    /// time — and did: `--harness generic` passed validation against the
+    /// alias table and then had no dispatch arm.
+    ///
+    /// This pins all three together. It is not a substitute for merging them,
+    /// but it is what turns the next omission into a red test.
+    #[test]
+    fn the_three_harness_tables_agree() {
+        for p in HARNESSES {
+            assert_eq!(
+                dira_sources::canonical_harness_id(p.id),
+                Some(p.id),
+                "{} is not a canonical harness id",
+                p.id
+            );
+            assert!(
+                crate::init::is_wirable(p.id),
+                "{} is probed for but cannot be wired",
+                p.id
+            );
+        }
+        for id in crate::init::WIRABLE {
+            assert!(
+                HARNESSES.iter().any(|p| p.id == *id),
+                "{id} can be wired but is never detected, so onboarding will not offer it"
+            );
+        }
+    }
+
+    /// `generic` is a real wire id — the hook ingest path uses it for payloads
+    /// from an unrecognised harness — but there is no config to write for it.
+    /// It must therefore be rejected by the wirable gate, which is what stops
+    /// `--harness generic` from failing mid-run.
+    #[test]
+    fn generic_is_a_wire_id_but_not_a_wirable_harness() {
+        assert_eq!(
+            dira_sources::canonical_harness_id("generic"),
+            Some("generic")
+        );
+        assert!(!crate::init::is_wirable("generic"));
     }
 
     #[test]

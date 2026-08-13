@@ -71,24 +71,21 @@ impl Ui for Interactive {
     }
 }
 
-/// Answers without asking — `--yes`, and every flag-forced path.
+/// Answers without asking — `--yes`.
 ///
 /// `confirm` returns each question's own default, which is why the defaults
 /// encoded at the call sites are the real specification of what `--yes`
 /// does. `line` always returns empty, i.e. "skip": the only free-text
 /// question is the device link code, and there is no way to invent one.
-pub(crate) struct Auto {
-    /// Whether to echo the questions being auto-answered. On under `--yes`
-    /// (the user should see what was decided for them), off under `--print`
-    /// (which renders its own plan).
-    pub narrate: bool,
-}
+///
+/// It narrates unconditionally: a user who passed `--yes` still has to be
+/// able to see what was decided on their behalf. `--print` needs no silent
+/// variant because it returns before any `Ui` is constructed.
+pub(crate) struct Auto;
 
 impl Ui for Auto {
     fn confirm(&mut self, question: &str, default: bool) -> bool {
-        if self.narrate {
-            println!("{question} {} (auto)", if default { "yes" } else { "no" });
-        }
+        println!("{question} {} (auto)", if default { "yes" } else { "no" });
         default
     }
 
@@ -97,9 +94,7 @@ impl Ui for Auto {
     }
 
     fn say(&mut self, line: &str) {
-        if self.narrate {
-            println!("{line}");
-        }
+        println!("{line}");
     }
 }
 

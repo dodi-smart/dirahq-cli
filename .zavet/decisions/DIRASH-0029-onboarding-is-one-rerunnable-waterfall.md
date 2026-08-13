@@ -102,17 +102,23 @@ much of the setup happened.
 - Nothing in `onboard::detect` may create a file, run a migration, or spawn a
   process that does. If a probe needs an answer only a spawn can give, add an
   offline variant and use that (see `plugin_root_offline`).
-- Onboarding calls `init::run*` with `global: true` and
-  `OnUnparseable::Refuse`. `dira init` keeps `Overwrite` — the user named that
-  exact file there; onboard did not.
+- Both `dira init` and onboarding dispatch through `init::wire`; do not add a
+  second per-harness match. Onboarding passes `global: true` and
+  `OnUnparseable::Refuse`, `dira init` passes `Overwrite` — the user named
+  that exact file there; onboard did not.
+- Validate a user-supplied harness against `init::is_wirable`, never against
+  `canonical_harness_id` alone: the latter also resolves `generic`, which has
+  no config to write. A new harness goes in `init::WIRABLE` **and**
+  `detect::HARNESSES`; `the_three_harness_tables_agree` pins them together.
 - The daemon step stops a bare-started daemon before `daemon install`. Never
   reorder those: the socket is the single-instance guard.
 - Never run `zavet hooks install` and never write `core.hooksPath`
   (DIRASH-0024 governs this; onboarding inherits it).
-- In `install.sh`, keep `2>/dev/null` **before** `>/dev/tty` in `_can_prompt`.
-  Redirections apply left to right, so the other order prints
-  "/dev/tty: Device not configured" on every non-tty run — i.e. in every CI
-  job — which reads as a failed install.
+- In `install.sh`, ask through `_confirm <prompt> <default> <notty>`; do not
+  hand-roll a second `/dev/tty` read. The `notty` argument is separate from
+  `default` on purpose: a scripted `--uninstall` must proceed unattended while
+  a service install must never happen unattended, so the two questions need
+  opposite fallbacks.
 - `install.ps1`'s Administrator branch keeps precedence over the prompt. Never
   offer to install a service from an elevated shell; that is the setup its
   warning exists to prevent.

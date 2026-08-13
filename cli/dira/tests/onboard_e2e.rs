@@ -28,66 +28,17 @@
 //!
 //! ## Staging discipline
 //!
-//! Every spawn goes through [`output_staged`]. D-0021 forbids bare
-//! `Command::output()` in binary-exec'ing tests: the fork window is what
-//! produced the `ETXTBSY` flakes in issue #80, and the lock closes it. The
-//! lock is held across the spawn only, never the wait, so tests still overlap.
+//! Every spawn goes through `common::output_staged`, and the isolation comes
+//! from `common::isolate_user_dirs` — shared with `update_e2e.rs` rather than
+//! copied, because D-0021's "one helper" rule exists precisely to stop the two
+//! from drifting apart.
 
 #![cfg(unix)]
 
+mod common;
+use common::{isolate_user_dirs, output_staged};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Mutex;
-
-/// See the module doc. Same rationale (and the same poison tolerance) as the
-/// twin in `update_e2e.rs`; duplicated rather than shared because integration
-/// test binaries do not share a crate.
-static EXEC_STAGING: Mutex<()> = Mutex::new(());
-
-fn lock_staging() -> std::sync::MutexGuard<'static, ()> {
-    EXEC_STAGING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn output_staged(cmd: &mut Command) -> std::io::Result<Output> {
-    let child = {
-        let _staging = lock_staging();
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?
-    };
-    child.wait_with_output()
-}
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "dira-onboard-e2e-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// Point every user-directory lookup at `home`. Kept as one helper for the
-/// reason D-0021 gives: a var added inline in one test silently leaves every
-/// other test writing to the real machine.
-fn isolate_user_dirs(cmd: &mut Command, home: &Path) {
-    cmd.env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("XDG_CACHE_HOME", home.join("cache"))
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        // Never created: the daemon probes must resolve to "not running"
-        // rather than finding the developer's real, machine-global dirad.
-        .env("DIRA_SOCKET_PATH", home.join("never-created.sock"))
-        .env("DIRA_DB_PATH", home.join("dira.db"));
-}
 
 /// `dira onboard <args…>` inside an isolated `$HOME`, with `cwd` set to it.
 fn run_onboard(home: &Path, args: &[&str]) -> Output {
@@ -109,11 +60,12 @@ fn stdout(out: &Output) -> String {
 /// that the isolated home is byte-for-byte unchanged afterwards.
 #[test]
 fn print_changes_nothing_on_disk() {
-    let home = tempdir("print");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
     std::fs::create_dir_all(home.join(".claude")).unwrap();
 
-    let before = walk(&home);
-    let out = run_onboard(&home, &["--print"]);
+    let before = walk(home);
+    let out = run_onboard(home, &["--print"]);
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -122,7 +74,7 @@ fn print_changes_nothing_on_disk() {
 
     let text = stdout(&out);
     assert!(text.contains("Nothing was changed"), "got:\n{text}");
-    assert_eq!(before, walk(&home), "--print must not touch the filesystem");
+    assert_eq!(before, walk(home), "--print must not touch the filesystem");
 }
 
 /// The idempotency property, end to end: a first `--yes` run wires the
@@ -132,12 +84,13 @@ fn print_changes_nothing_on_disk() {
 /// re-running silently redoes work.
 #[test]
 fn yes_wires_a_detected_harness_and_a_second_run_is_a_noop() {
-    let home = tempdir("idempotent");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
     // A `.claude` directory is one of the two presence signals, so this
     // fixture makes Claude Code "detected" without needing a CLI on PATH.
     std::fs::create_dir_all(home.join(".claude")).unwrap();
 
-    let first = run_onboard(&home, &["--yes", "--no-zavet", "--knowledge", "off"]);
+    let first = run_onboard(home, &["--yes", "--no-zavet", "--knowledge", "off"]);
     assert!(
         first.status.success(),
         "stderr: {}",
@@ -163,7 +116,7 @@ fn yes_wires_a_detected_harness_and_a_second_run_is_a_noop() {
 
     let stamp = std::fs::metadata(&settings).unwrap().modified().unwrap();
 
-    let second = run_onboard(&home, &["--yes", "--no-zavet", "--knowledge", "off"]);
+    let second = run_onboard(home, &["--yes", "--no-zavet", "--knowledge", "off"]);
     assert!(second.status.success());
     let out2 = stdout(&second);
     assert!(
@@ -182,17 +135,18 @@ fn yes_wires_a_detected_harness_and_a_second_run_is_a_noop() {
 /// whole consent step depends on this write actually happening.
 #[test]
 fn the_knowledge_tier_is_written_to_config_toml() {
-    let home = tempdir("knowledge");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
     std::fs::create_dir_all(home.join(".claude")).unwrap();
 
-    let out = run_onboard(&home, &["--yes", "--no-zavet", "--knowledge", "full"]);
+    let out = run_onboard(home, &["--yes", "--no-zavet", "--knowledge", "full"]);
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let config = find_config_toml(&home).unwrap_or_else(|| {
+    let config = find_config_toml(home).unwrap_or_else(|| {
         panic!(
             "no config.toml written under {}; stdout:\n{}",
             home.display(),
@@ -209,13 +163,14 @@ fn the_knowledge_tier_is_written_to_config_toml() {
 /// a machine that quietly grew a service.
 #[test]
 fn a_non_interactive_run_without_yes_prints_the_plan_and_exits_clean() {
-    let home = tempdir("noninteractive");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
     std::fs::create_dir_all(home.join(".claude")).unwrap();
 
-    let before = walk(&home);
+    let before = walk(home);
     // stdin is `Stdio::null()` via `output_staged`, so this is exactly the
     // piped/CI shape.
-    let out = run_onboard(&home, &[]);
+    let out = run_onboard(home, &[]);
     assert!(out.status.success());
     let text = stdout(&out);
     assert!(text.contains("not a terminal"), "got:\n{text}");
@@ -223,21 +178,22 @@ fn a_non_interactive_run_without_yes_prints_the_plan_and_exits_clean() {
         text.contains("--yes"),
         "must say how to proceed; got:\n{text}"
     );
-    assert_eq!(before, walk(&home), "must not act without a decision");
+    assert_eq!(before, walk(home), "must not act without a decision");
 }
 
 /// An unknown `--harness` fails before any step runs, rather than five steps
 /// in with half the machine already changed.
 #[test]
 fn an_unknown_harness_fails_before_touching_anything() {
-    let home = tempdir("badharness");
-    let before = walk(&home);
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let before = walk(home);
 
-    let out = run_onboard(&home, &["--yes", "--harness", "emacs"]);
+    let out = run_onboard(home, &["--yes", "--harness", "emacs"]);
     assert!(!out.status.success(), "an unknown harness must be an error");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("unknown harness 'emacs'"), "got:\n{err}");
-    assert_eq!(before, walk(&home));
+    assert_eq!(before, walk(home));
 }
 
 /// Every path in `home`, with contents, for before/after comparison.

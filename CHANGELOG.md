@@ -1,3 +1,32 @@
+## [0.5.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.4.0...v0.5.0) (2026-08-13)
+
+### ✨ Features
+
+* **cli:** add `dira onboard`, one re-runnable command from install to capturing ([9ebffa0](https://github.com/dodi-smart/dirahq-cli/commit/9ebffa08881d8ae05dca0a46b1426954390454d0))
+* **cli:** add `dira zavet reindex` to index history behind the capture baseline ([025e94b](https://github.com/dodi-smart/dirahq-cli/commit/025e94babff2f3dcedcdcea03d2a88339eea53d2))
+* **cli:** add `dira zavet sync` to sweep and register a repo on demand ([c9cadb0](https://github.com/dodi-smart/dirahq-cli/commit/c9cadb01ebd8705efb6952a116b81e5f9104e7e3))
+* **cli:** make zavet decisions and wiki readable, branch-aware and ASCII-safe ([11ecd8d](https://github.com/dodi-smart/dirahq-cli/commit/11ecd8d86bfca51899fb0d6641c9b6223b34e2a0))
+
+### 🐛 Bug Fixes
+
+* **cli:** retry and bound the update download, and surface repeated failures ([9efbd49](https://github.com/dodi-smart/dirahq-cli/commit/9efbd493656651b1e40e87b474b3950dca3d777d))
+* **cli:** stop reporting routine repo-less token turns as a writer fault ([e5cf9e1](https://github.com/dodi-smart/dirahq-cli/commit/e5cf9e159909459bb4145e84ffe44ddc34b0c831)), closes [#93](https://github.com/dodi-smart/dirahq-cli/issues/93)
+* **daemon:** resolve past a non-origin remote, and say when capture is unattributed ([f888c19](https://github.com/dodi-smart/dirahq-cli/commit/f888c19debe20411cd8c2324fb59953eade772ac)), closes [#111](https://github.com/dodi-smart/dirahq-cli/issues/111)
+
+### 📚 Documentation
+
+* **repo:** record the knowledge-sync channel and the reindex gaps as knowledge ([dc5f88b](https://github.com/dodi-smart/dirahq-cli/commit/dc5f88b73193ec25a969b87046c23ba88b42ce18))
+
+### ♻️ Code Refactoring
+
+* **cli:** dedup onboard's dispatch, prompts and test fixtures ([959620a](https://github.com/dodi-smart/dirahq-cli/commit/959620a474f2e54304df8b659aa6e96d4ebde2fa))
+* **cli:** dedup the update retry helpers and stop over-counting failures ([1b77de3](https://github.com/dodi-smart/dirahq-cli/commit/1b77de3d75116f80161cffa83e1b95f3e8d90454))
+* **cli:** share the reindex config, narrow its prefetch, and make its output testable ([0084593](https://github.com/dodi-smart/dirahq-cli/commit/0084593cae1637375a1317ce1ba923e504129dcb))
+
+### ✅ Tests
+
+* **cli:** assert the registered repo dir by shape, not by path spelling ([f8b0e0b](https://github.com/dodi-smart/dirahq-cli/commit/f8b0e0b35926423535b90c76a55ae8f4dfe24d84))
+
 ## [0.4.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.3.0...v0.4.0) (2026-08-10)
 
 ### ✨ Features

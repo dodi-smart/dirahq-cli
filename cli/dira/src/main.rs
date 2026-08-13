@@ -103,7 +103,8 @@ Examples:
   dira status | cat         plain, parseable output for scripts"
     )]
     Status {
-        /// Also show the PARALLEL lanes, ACTIVE SESSIONS table, and TODAY report.
+        /// Also show the PARALLEL lanes, ACTIVE SESSIONS table, TODAY report,
+        /// and the count of token turns captured outside a repo.
         #[arg(long, alias = "full")]
         detailed: bool,
     },

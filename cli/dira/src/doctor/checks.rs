@@ -500,6 +500,57 @@ pub(crate) fn breadcrumb(h: Option<&Health>) -> Check {
     }))
 }
 
+/// Does the invoking directory resolve to a project ref?
+///
+/// Capture works regardless — this is about ATTRIBUTION. Work with no project
+/// ref ships `repoCanonical: null`, and the cloud can never anchor it: no repo
+/// means no commit to match, so no sweep will ever promote it and it stays
+/// unbillable unless a human signs it off row by row. That was invisible before
+/// this check: a session with no project still resolves its BRANCH (that only
+/// needs `rev-parse`), so it arrives looking well-captured (#111).
+///
+/// Never a failure, and deliberately so. A directory that is not a git repo, or
+/// a local-only repo with no remote, is a legitimate place to work — dira
+/// anchors against commits confirmed in a remote, so there is genuinely nothing
+/// to anchor to. The verdicts split on whether anything is actionable:
+///
+/// - not a repo — skip; there is no misconfiguration to report.
+/// - no usable remote — warn; it may be intentional, but this is the silent
+///   attribution loss, and only the user can say which.
+pub(crate) fn project_resolves(f: &Facts) -> Check {
+    const ID: &str = "project.resolves";
+    use dira_core::project::ProjectMiss;
+
+    let where_ = f.cwd.clone().unwrap_or_else(|| "this directory".into());
+    match &f.project {
+        Ok(project) => Check::ok(ID, format!("{where_} resolves to {project}"))
+            .detail(json!({ "cwd": f.cwd, "project": project })),
+        Err(ProjectMiss::NotAGitRepo) => {
+            Check::skip(ID, format!("{where_} is not a git repository"))
+                .detail(json!({ "cwd": f.cwd, "reason": "not_a_git_repo" }))
+        }
+        Err(miss) => {
+            let remedy = match miss {
+                ProjectMiss::NoRemotes => "add a remote (`git remote add origin <url>`) if this work should be anchored and billable. A local-only repo has nothing to anchor against, so leaving it is a valid choice — its time will show as `Unattributed · no repo`.".to_string(),
+                ProjectMiss::AmbiguousRemotes(rs) => format!(
+                    "name one of them `origin`, or set an upstream for this branch (`git branch --set-upstream-to <remote>/<branch>`), so the project ref is not a guess between {}.",
+                    rs.join(", ")
+                ),
+                ProjectMiss::UnparseableRemote { remote, url } => format!(
+                    "remote `{remote}` is `{url}`, which has no host and owner/name to canonicalize. Point it at an http(s) or ssh URL if this work should be attributed."
+                ),
+                ProjectMiss::NotAGitRepo => unreachable!("handled above"),
+            };
+            Check::warn(
+                ID,
+                format!("{where_} has no project ref — {miss}; work here is captured but cannot be anchored"),
+            )
+            .remedy(remedy)
+            .detail(json!({ "cwd": f.cwd, "reason": miss.to_string() }))
+        }
+    }
+}
+
 /// Is the daemon's own verdict on sync healthy?
 ///
 /// Never a failure: a stalled sync loses nothing locally, it only delays the
@@ -594,7 +645,80 @@ pub(crate) mod tests {
             breadcrumb: None,
             current_exe: None,
             doctor_elevated: false,
+            cwd: Some("/work/api".into()),
+            project: Ok("github.com/acme/api".into()),
         }
+    }
+
+    // --- project.resolves (#111) --------------------------------------------
+
+    fn facts_with_project(p: Result<String, dira_core::project::ProjectMiss>) -> Facts {
+        Facts {
+            project: p,
+            ..facts_with_no_daemon()
+        }
+    }
+
+    #[test]
+    fn a_resolved_project_is_ok_and_names_it() {
+        let c = project_resolves(&facts_with_project(Ok("github.com/acme/api".into())));
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.summary.contains("github.com/acme/api"), "{}", c.summary);
+    }
+
+    /// Not a misconfiguration — there is nothing to report, and per DIRASH-0022
+    /// absent evidence must never raise the exit code.
+    #[test]
+    fn a_plain_directory_skips_rather_than_warning() {
+        let c = project_resolves(&facts_with_project(Err(
+            dira_core::project::ProjectMiss::NotAGitRepo,
+        )));
+        assert_eq!(c.level, Level::Skip);
+    }
+
+    /// The silent case #111 is about. A warning, never a failure: a local-only
+    /// repo is a legitimate place to work, and doctor reports rather than judges
+    /// the user's setup.
+    #[test]
+    fn a_repo_with_no_remote_warns_and_never_fails() {
+        let c = project_resolves(&facts_with_project(Err(
+            dira_core::project::ProjectMiss::NoRemotes,
+        )));
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.remedy.is_some(), "a warning must be actionable");
+        assert!(
+            c.summary.contains("cannot be anchored"),
+            "must say what is actually lost: {}",
+            c.summary
+        );
+    }
+
+    #[test]
+    fn ambiguous_remotes_name_the_candidates_in_the_remedy() {
+        let c = project_resolves(&facts_with_project(Err(
+            dira_core::project::ProjectMiss::AmbiguousRemotes(vec![
+                "fork".into(),
+                "upstream".into(),
+            ]),
+        )));
+        assert_eq!(c.level, Level::Warn);
+        let remedy = c.remedy.unwrap_or_default();
+        assert!(
+            remedy.contains("fork") && remedy.contains("upstream"),
+            "{remedy}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_remote_reports_which_one() {
+        let c = project_resolves(&facts_with_project(Err(
+            dira_core::project::ProjectMiss::UnparseableRemote {
+                remote: "origin".into(),
+                url: "/srv/git/api.git".into(),
+            },
+        )));
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.remedy.unwrap_or_default().contains("/srv/git/api.git"));
     }
 
     fn info() -> Info {

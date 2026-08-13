@@ -138,10 +138,18 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
     // whom that command keeps failing. Best-effort and never fatal: a cache
     // that can't be written must not turn a successful update into an error,
     // nor add a second failure on top of a real one.
+    //
+    // A pinned `--version` is excluded for the same reason `run_check` refuses
+    // to cache one: it isn't an attempt at *the latest*. Two failed
+    // `--version 0.3.5` runs must not escalate a notice about 0.4.0, which may
+    // well install fine.
+    let pinned = args.version.is_some();
     let outcome = run_update(config, args, &http, channel).await;
-    match &outcome {
-        Ok(()) => notice::clear_update_failures(),
-        Err(e) => notice::record_update_failure(&format!("{e:#}")),
+    if !pinned {
+        match &outcome {
+            Ok(()) => notice::clear_update_failures(),
+            Err(_) => notice::record_update_failure(),
+        }
     }
     outcome
 }
@@ -198,7 +206,7 @@ async fn run_update(
     artifact::download(http, &resolved.archive, &archive_path)
         .await
         .with_context(|| format!("download {}", resolved.archive_name))?;
-    artifact::download(http, &resolved.sha, &sha_path)
+    artifact::download_checksum(http, &resolved.sha, &sha_path)
         .await
         .with_context(|| format!("download {}", resolved.sha_name))?;
 
@@ -427,12 +435,6 @@ async fn run_check(http: &reqwest::Client, version_pin: Option<&str>, channel: C
         }
     }
 }
-
-// The cache writer that used to live here (a hand-rolled `json!` mirroring
-// `notice`'s struct) now lives in `notice` itself as `record_check`, alongside
-// the struct it has to stay in step with. Two independent spellings of one
-// on-disk shape is how a field added to one silently disappears through the
-// other — which is exactly what the update-failure counter would have hit.
 
 /// Serializes every test in this crate that mutates process-global env vars
 /// (`PATH`, `DIRA_TARGET`, `DIRA_API_URL`, `GH_TOKEN`, …) so parallel `cargo

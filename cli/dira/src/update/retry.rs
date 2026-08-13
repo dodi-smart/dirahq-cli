@@ -68,14 +68,17 @@ pub(super) fn classify_transport(err: &reqwest::Error) -> Disposition {
 
 /// Read a `Retry-After` delay from response headers.
 ///
-/// Only the delta-seconds form is honoured. The HTTP-date form is legal but
-/// GitHub does not send it, and parsing dates here would mean trusting the
-/// client's clock to compute a delay that [`Policy::transient_wait`] caps at a
-/// few seconds regardless — not worth the dependency or the skew bug.
+/// The seconds-only parse itself lives in `dira_core::sync` — shared with the
+/// daemon's rate-limit handling, and already tested there (including that the
+/// legal-but-unused HTTP-date form yields `None` rather than a misparsed small
+/// number).
 pub(super) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    let secs: u64 = raw.trim().parse().ok()?;
-    Some(Duration::from_secs(secs))
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()
+        .and_then(dira_core::sync::parse_retry_after_secs)
+        .map(Duration::from_secs)
 }
 
 /// How hard to try, how long to wait between tries, and how long one try may
@@ -115,6 +118,19 @@ impl Policy {
         }
     }
 
+    /// The policy for the `.sha256` companion file — the same ladder, but a
+    /// per-attempt timeout sized to ~100 bytes rather than to the archive.
+    ///
+    /// Sharing the archive's 120s budget would mean a stalled checksum fetch
+    /// burning 4 × 120s of dead wall clock on top of whatever the archive
+    /// already spent, for a file that arrives in one packet.
+    pub(super) const fn checksum() -> Self {
+        Self {
+            timeout: API_TIMEOUT,
+            ..Self::download()
+        }
+    }
+
     /// The exponential ladder: [`Self::seed`] seed, doubling, capped at
     /// [`Self::max_backoff`]. Mirrors `dirad::sync::next_backoff`.
     pub(super) fn next_backoff(&self, current: Duration) -> Duration {
@@ -127,16 +143,21 @@ impl Policy {
     }
 
     /// The wait before retrying a transient failure: the server's
-    /// `Retry-After` when present, else the ladder off `current` — either way
-    /// capped at [`Self::max_backoff`]. Mirrors `dirad::sync::transient_wait`.
+    /// `Retry-After` when present, else the ladder off `current`. Mirrors
+    /// `dirad::sync::transient_wait`.
+    ///
+    /// Only the header needs capping here — [`Self::next_backoff`] already
+    /// returns a capped value — but capping it matters: a misbehaving or
+    /// hostile `Retry-After` must not wedge an interactive command.
     pub(super) fn transient_wait(
         &self,
         retry_after: Option<Duration>,
         current: Duration,
     ) -> Duration {
-        retry_after
-            .unwrap_or_else(|| self.next_backoff(current))
-            .min(self.max_backoff)
+        retry_after.map_or_else(
+            || self.next_backoff(current),
+            |after| after.min(self.max_backoff),
+        )
     }
 }
 
@@ -210,20 +231,25 @@ mod tests {
         );
     }
 
+    /// The seconds/HTTP-date parse rules are `dira_core::sync`'s and tested
+    /// there; this covers only the header extraction layered on top.
     #[test]
-    fn retry_after_parses_delta_seconds_only() {
+    fn retry_after_reads_the_header_when_present() {
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("7"));
         assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(7)));
 
-        // The HTTP-date form is deliberately ignored, not mis-parsed as 0.
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            RETRY_AFTER,
-            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
-        );
-        assert_eq!(parse_retry_after(&headers), None);
-
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    /// The checksum is a ~100-byte file; it must not inherit the archive's
+    /// per-attempt budget, or a stall costs minutes instead of seconds.
+    #[test]
+    fn the_checksum_policy_keeps_the_ladder_but_shortens_the_timeout() {
+        let (archive, sha) = (Policy::download(), Policy::checksum());
+        assert!(sha.timeout < archive.timeout);
+        assert_eq!(sha.attempts, archive.attempts);
+        assert_eq!(sha.seed, archive.seed);
+        assert_eq!(sha.max_backoff, archive.max_backoff);
     }
 }

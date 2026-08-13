@@ -64,6 +64,31 @@ both executables and restarts whatever is supervising the daemon.
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
   is safe in a script.
+- Every network step is bounded and retried. The artifact download makes up to
+  4 attempts on a 500ms-seeded ladder capped at 4s, retrying transport
+  failures, timeouts, 5xx and 429 (honouring `Retry-After`, itself capped);
+  a 4xx is **never** retried, because it is deterministic — the 404 keeps its
+  "asset not found on that release" wording and fails on the first attempt.
+  Timeouts are per-request rather than client-wide (a small JSON API response
+  and a ~20MB artifact want very different budgets), plus a shared 10s
+  `connect_timeout`. Both installers already retried (`install.ps1`'s 3-attempt
+  loop, `install.sh`'s `curl --retry 3`); the updater was the one downloader
+  that did not, so a single mid-stream abort — routine on a lossy or
+  TLS-inspecting corporate link — failed the whole update. This is not
+  platform-specific: it fails identically on macOS, Linux and Windows.
+  *Known gap:* the body is buffered whole (`resp.bytes()`), so a retry re-pulls
+  the entire archive rather than resuming with a `Range` request.
+- A failed `dira update` is recorded, not just returned. The passive notice's
+  cache carries a consecutive-failure count next to the resolve half, and after
+  2 failures the notice escalates from "run `dira update`" to naming how many
+  attempts failed. The two halves are independent on purpose: a resolve that
+  succeeds says nothing about whether installing works, and that exact
+  combination — a healthy check advertising a version every update attempt
+  fails to install — is what let a user lose a week to a retryable blip with no
+  signal anywhere. The count survives `write_sentinel`'s TTL rollover, or it
+  would silently un-escalate about once a day. Writing happens only in
+  `update::run`; the foreground notice path stays read-only and network-free
+  per D-0006.
 - Every comparison of a resolved release against the **running** version goes
   through `resolve::compare_versions` (SemVer 2.0 §11), never string equality.
   Three callers share it — `--check`'s message, the passive notice, and the

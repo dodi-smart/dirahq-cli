@@ -7,10 +7,12 @@
 //! reasoning behind each check.
 
 use super::resolve::AssetRef;
+use super::retry;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 /// Detect this host's release target triple.
 ///
@@ -67,33 +69,145 @@ fn user_agent() -> String {
     format!("dira/{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// A failed attempt, tagged with whether another one could plausibly succeed.
+enum Attempt {
+    /// Deterministic — surface it immediately, unchanged.
+    Fatal(anyhow::Error),
+    /// Transient. `retry_after` carries a server-supplied delay when there was
+    /// a response to read one from (a 429); a dead connection has none.
+    Transient {
+        err: anyhow::Error,
+        retry_after: Option<Duration>,
+    },
+}
+
 /// Download `asset` to `dest`. Redirect-following is `reqwest`'s default and
 /// matters here: GitHub 302s an unauthenticated asset URL to
 /// `objects.githubusercontent.com`.
+///
+/// Retries transport failures, timeouts, 5xx and 429 on a bounded ladder — see
+/// [`retry`] for the policy and for why a 4xx (notably the 404 below) is never
+/// retried. A single mid-stream abort on a lossy link used to fail the whole
+/// update; the installers have always retried (`install.ps1`, `install.sh`'s
+/// `curl --retry 3`) and this closes the gap.
 pub async fn download(http: &reqwest::Client, asset: &AssetRef, dest: &Path) -> Result<()> {
+    download_with(http, asset, dest, retry::Policy::download()).await
+}
+
+async fn download_with(
+    http: &reqwest::Client,
+    asset: &AssetRef,
+    dest: &Path,
+    policy: retry::Policy,
+) -> Result<()> {
+    let url = asset.url();
+    let mut backoff = Duration::ZERO;
+
+    for attempt in 1..=policy.attempts {
+        match download_once(http, asset, dest, policy.timeout).await {
+            Ok(()) => return Ok(()),
+            Err(Attempt::Fatal(err)) => return Err(err),
+            Err(Attempt::Transient { err, retry_after }) => {
+                if attempt == policy.attempts {
+                    return Err(err.context(format!(
+                        "download failed after {} attempts: {url}",
+                        policy.attempts
+                    )));
+                }
+                backoff = policy.transient_wait(retry_after, backoff);
+                // To stderr, not stdout: `dira update`'s stdout is its progress
+                // narrative, and this is a hiccup being handled, not progress.
+                // Saying it out loud beats a long unexplained pause.
+                eprintln!(
+                    "dira update: download attempt {attempt}/{} failed ({err}) — retrying in {:.1}s",
+                    policy.attempts,
+                    backoff.as_secs_f32()
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+
+    // `policy.attempts` is always >= 1, so the loop either returned or
+    // exhausted its budget through the `attempt == attempts` arm above.
+    unreachable!("download loop exhausted without returning")
+}
+
+/// One attempt: request, status check, body read, write. Every failure is
+/// classified here so [`download_with`] only has to decide whether to wait.
+async fn download_once(
+    http: &reqwest::Client,
+    asset: &AssetRef,
+    dest: &Path,
+    timeout: Duration,
+) -> std::result::Result<(), Attempt> {
     let url = asset.url();
     let mut req = http
         .get(url)
+        .timeout(timeout)
         .header(reqwest::header::USER_AGENT, user_agent());
     if asset.is_authenticated() {
         req = req
             .header(reqwest::header::ACCEPT, "application/octet-stream")
             .header("X-GitHub-Api-Version", "2022-11-28");
     }
-    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let disposition = retry::classify_transport(&e);
+            let err = anyhow::Error::new(e).context(format!("GET {url}"));
+            return Err(match disposition {
+                retry::Disposition::Fatal => Attempt::Fatal(err),
+                retry::Disposition::Retry => Attempt::Transient {
+                    err,
+                    retry_after: None,
+                },
+            });
+        }
+    };
+
     let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        anyhow::bail!("download failed: {url} returned 404 (asset not found on that release)");
-    }
     if !status.is_success() {
-        anyhow::bail!("download failed: {url} returned {status}");
+        // 404 keeps its bespoke message: it is by far the most likely
+        // deterministic failure here and "asset not found on that release"
+        // says more than the status alone.
+        let err = if status == reqwest::StatusCode::NOT_FOUND {
+            anyhow::anyhow!("download failed: {url} returned 404 (asset not found on that release)")
+        } else {
+            anyhow::anyhow!("download failed: {url} returned {status}")
+        };
+        return Err(match retry::classify_status(status) {
+            retry::Disposition::Fatal => Attempt::Fatal(err),
+            retry::Disposition::Retry => Attempt::Transient {
+                retry_after: retry::parse_retry_after(resp.headers()),
+                err,
+            },
+        });
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .with_context(|| format!("read response body for {url}"))?;
-    std::fs::write(dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
-    Ok(())
+
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // The observed failure: the body starts arriving and the stream
+            // dies part-way through.
+            let disposition = retry::classify_transport(&e);
+            let err = anyhow::Error::new(e).context(format!("read response body for {url}"));
+            return Err(match disposition {
+                retry::Disposition::Fatal => Attempt::Fatal(err),
+                retry::Disposition::Retry => Attempt::Transient {
+                    err,
+                    retry_after: None,
+                },
+            });
+        }
+    };
+
+    // A local write failure is never a network problem — don't spend the retry
+    // budget on a full disk or a read-only directory.
+    std::fs::write(dest, &bytes)
+        .with_context(|| format!("write {}", dest.display()))
+        .map_err(Attempt::Fatal)
 }
 
 /// Parse a `sha256sum`-style checksum file and return the hex digest for
@@ -254,6 +368,185 @@ fn extract_impl(archive: &Path, dest_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // --- download retry -----------------------------------------------------
+
+    /// One scripted response for [`scripted_server`].
+    #[derive(Clone)]
+    enum Reply {
+        /// A complete, well-formed 200.
+        Body(&'static str),
+        /// A status line with no body (plus optional extra headers).
+        Status(u16, &'static str),
+        /// Announce a `Content-Length` far larger than what is actually sent,
+        /// then drop the connection — the exact shape of the reported failure
+        /// ("connection closed before message completed"): the body starts
+        /// arriving and the stream dies part-way through.
+        Truncated,
+    }
+
+    /// A raw HTTP server on an OS-assigned loopback port that serves `script`
+    /// in order (the last entry repeats once exhausted), counting connections
+    /// so a test can assert exactly how many attempts were made.
+    ///
+    /// Deliberately not [`crate::test_support::MockCloud`]: axum cannot express
+    /// a half-written body, which is the whole point of [`Reply::Truncated`].
+    async fn scripted_server(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted server");
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+
+                // Drain the request head so the client sees a well-formed
+                // exchange rather than a connection reset on write.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+
+                let reply = script
+                    .get(n)
+                    .or_else(|| script.last())
+                    .cloned()
+                    .unwrap_or(Reply::Status(500, ""));
+                match reply {
+                    Reply::Body(body) => {
+                        let head =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(body.as_bytes()).await;
+                    }
+                    Reply::Status(code, extra) => {
+                        let head = format!("HTTP/1.1 {code} X\r\n{extra}Content-Length: 0\r\n\r\n");
+                        let _ = sock.write_all(head.as_bytes()).await;
+                    }
+                    Reply::Truncated => {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\nhalf")
+                            .await;
+                        // Dropping `sock` here closes mid-body.
+                    }
+                }
+                let _ = sock.flush().await;
+            }
+        });
+
+        (format!("http://{addr}/artifact.zip"), hits)
+    }
+
+    /// The production loop on a millisecond ladder, so these tests assert the
+    /// real control flow without adding seconds of sleeping to the suite.
+    fn fast_policy(attempts: u32) -> retry::Policy {
+        retry::Policy {
+            attempts,
+            seed: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(4),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    async fn run_download(script: Vec<Reply>, attempts: u32) -> (Result<()>, usize, PathBuf) {
+        let (url, hits) = scripted_server(script).await;
+        let dir = std::env::temp_dir().join(format!("dira-dl-test-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("artifact.zip");
+        let http = reqwest::Client::builder().build().unwrap();
+        let out = download_with(&http, &AssetRef::Url(url), &dest, fast_policy(attempts)).await;
+        (out, hits.load(Ordering::SeqCst), dest)
+    }
+
+    /// The reported incident, deterministically: one mid-stream abort followed
+    /// by a good response. Before the retry loop this failed the whole update.
+    #[tokio::test]
+    async fn a_truncated_body_is_retried_and_the_next_attempt_succeeds() {
+        let (out, hits, dest) =
+            run_download(vec![Reply::Truncated, Reply::Body("payload-bytes")], 4).await;
+        out.expect("transient abort should be retried");
+        assert_eq!(hits, 2, "should have taken exactly one retry");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "payload-bytes");
+    }
+
+    /// A missing asset is deterministic: fail immediately with the bespoke
+    /// message, and above all do not spend the retry budget on it.
+    #[tokio::test]
+    async fn a_404_fails_on_the_first_attempt() {
+        let (out, hits, _) = run_download(vec![Reply::Status(404, "")], 4).await;
+        let err = out.expect_err("404 must fail");
+        assert!(
+            format!("{err:#}").contains("asset not found on that release"),
+            "404 should keep its bespoke message, got: {err:#}"
+        );
+        assert_eq!(hits, 1, "a 404 must not be retried");
+    }
+
+    #[tokio::test]
+    async fn a_non_404_client_error_also_fails_on_the_first_attempt() {
+        let (out, hits, _) = run_download(vec![Reply::Status(403, "")], 4).await;
+        out.expect_err("403 must fail");
+        assert_eq!(hits, 1, "a 4xx must not be retried");
+    }
+
+    #[tokio::test]
+    async fn server_errors_are_retried_until_one_succeeds() {
+        let (out, hits, dest) = run_download(
+            vec![
+                Reply::Status(500, ""),
+                Reply::Status(503, ""),
+                Reply::Body("ok"),
+            ],
+            4,
+        )
+        .await;
+        out.expect("5xx should be retried");
+        assert_eq!(hits, 3);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "ok");
+    }
+
+    /// The budget is bounded: a server that is simply down fails, and does so
+    /// after exactly `attempts` tries rather than looping forever.
+    #[tokio::test]
+    async fn retries_are_bounded_and_the_final_error_says_so() {
+        let (out, hits, _) = run_download(vec![Reply::Status(503, "")], 3).await;
+        let err = out.expect_err("a permanently failing server must still fail");
+        assert_eq!(hits, 3, "should stop at the attempt budget");
+        assert!(
+            format!("{err:#}").contains("after 3 attempts"),
+            "the final error should report the budget, got: {err:#}"
+        );
+    }
+
+    /// A 429's `Retry-After` is honoured in place of the ladder — and capped,
+    /// so a huge value can't wedge an interactive command (the cap itself is
+    /// unit-tested in `retry`; here we only prove the header reaches it).
+    #[tokio::test]
+    async fn a_429_is_retried_and_honours_retry_after() {
+        let started = std::time::Instant::now();
+        let (out, hits, _) = run_download(
+            vec![
+                Reply::Status(429, "Retry-After: 9999\r\n"),
+                Reply::Body("x"),
+            ],
+            4,
+        )
+        .await;
+        out.expect("429 should be retried");
+        assert_eq!(hits, 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a huge Retry-After must be capped, not slept through"
+        );
+    }
 
     // --- detect_target ------------------------------------------------------
 

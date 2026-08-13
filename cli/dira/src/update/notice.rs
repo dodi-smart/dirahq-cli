@@ -48,7 +48,31 @@ struct Cache {
     /// content) selects the shorter negative TTL below.
     #[serde(default)]
     error: Option<String>,
+    /// How many `dira update` attempts have failed in a row, reset to 0 by the
+    /// next success.
+    ///
+    /// Distinct from [`Cache::error`], which is about the *resolve* half
+    /// (`--check`): a resolve can succeed — telling us a new version exists —
+    /// while every attempt to actually install it fails. That combination is
+    /// what stranded a user on an old version for a week while the notice kept
+    /// cheerfully advertising the upgrade, so it needs its own counter.
+    ///
+    /// Written by `update::run` (the command), never by [`maybe_print`] — the
+    /// foreground notice path stays read-only and network-free per D-0006.
+    #[serde(default)]
+    update_failures: u32,
+    /// The last failed `dira update`'s error, kept so the escalated notice can
+    /// point at something concrete.
+    #[serde(default)]
+    update_error: Option<String>,
 }
+
+/// Consecutive failures before the notice stops repeating an unqualified "run
+/// `dira update`". One failure is a blip — and is now retried internally
+/// (`update::artifact`), so a single one that still surfaced is worth
+/// mentioning but not alarming. Two in a row means the retries aren't covering
+/// it and the user deserves to know before they lose a week to it.
+const ESCALATE_AFTER_FAILURES: u32 = 2;
 
 /// Re-check at most once a day after a successful check.
 const SUCCESS_TTL_SECS: i64 = 24 * 60 * 60;
@@ -176,31 +200,125 @@ fn should_notify(cache: &Cache, env: &Env, is_tty: bool, current_version: &str) 
     if super::resolve::compare_versions(latest, current_version) != Some(Ordering::Greater) {
         return None;
     }
+    // Repeated failures change the advice, not just its tone: telling someone
+    // to run the command that has already failed three times is what turned a
+    // retryable network blip into a week of silent confusion.
+    if cache.update_failures >= ESCALATE_AFTER_FAILURES {
+        let n = cache.update_failures;
+        return Some(format!(
+            "dira {latest} is available (you have {current_version}) — {n} recent update \
+             attempts failed; run `dira update` to see why"
+        ));
+    }
     Some(format!(
         "dira {latest} is available (you have {current_version}) — run `dira update`"
     ))
 }
 
-/// Write a `checked_at` sentinel (no `latest`/`error` yet) *before* spawning,
-/// so two concurrent `dira status` invocations don't both spawn a checker.
-/// Best-effort: failure to write is swallowed, matching the "never blocks,
-/// never errors" contract of the whole feature.
-fn write_sentinel(path: &Path, now: i64) {
+/// Overwrite the cache file, best-effort. Shared by every writer so the
+/// on-disk shape is produced in exactly one place (the previous split between
+/// this module and `mod.rs`'s hand-rolled `json!` is what made it easy to add
+/// a field in one and silently drop it in the other).
+fn write_cache(path: &Path, cache: &Cache) {
     let Some(parent) = path.parent() else {
         return;
     };
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let sentinel = Cache {
-        checked_at: now,
-        latest: None,
-        channel: None,
-        error: None,
-    };
-    if let Ok(bytes) = serde_json::to_vec(&sentinel) {
+    if let Ok(bytes) = serde_json::to_vec(cache) {
         let _ = fs::write(path, bytes);
     }
+}
+
+/// Refresh the *resolve* half of the cache after `dira update --check`,
+/// preserving the update-failure half. Best-effort, like every write here.
+pub(super) fn record_check(
+    checked_at: i64,
+    latest: Option<&str>,
+    channel: &str,
+    error: Option<&str>,
+) {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    let prior = read_cache(&path).unwrap_or_default();
+    write_cache(
+        &path,
+        &Cache {
+            checked_at,
+            latest: latest.map(str::to_string),
+            channel: Some(channel.to_string()),
+            error: error.map(str::to_string),
+            // A successful resolve says nothing about whether installing works.
+            ..prior
+        },
+    );
+}
+
+/// Record that a `dira update` attempt failed, incrementing the consecutive
+/// count without disturbing `checked_at`/`latest` — the resolve half is still
+/// accurate, and expiring it here would cost the user a background refresh for
+/// no reason.
+pub(super) fn record_update_failure(error: &str) {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    let prior = read_cache(&path).unwrap_or_default();
+    write_cache(
+        &path,
+        &Cache {
+            update_failures: prior.update_failures.saturating_add(1),
+            update_error: Some(error.to_string()),
+            ..prior
+        },
+    );
+}
+
+/// Clear the failure count after a successful `dira update`. Called even
+/// though the new binary's version makes the notice fall silent anyway: the
+/// count must not survive to haunt the *next* upgrade cycle.
+pub(super) fn clear_update_failures() {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    let Some(prior) = read_cache(&path) else {
+        return;
+    };
+    if prior.update_failures == 0 && prior.update_error.is_none() {
+        return;
+    }
+    write_cache(
+        &path,
+        &Cache {
+            update_failures: 0,
+            update_error: None,
+            ..prior
+        },
+    );
+}
+
+/// Write a `checked_at` sentinel (no `latest`/`error` yet) *before* spawning,
+/// so two concurrent `dira status` invocations don't both spawn a checker.
+/// Best-effort: failure to write is swallowed, matching the "never blocks,
+/// never errors" contract of the whole feature.
+///
+/// Carries `prior`'s update-failure count through: a stale *resolve* cache
+/// says nothing about whether installing works, and clearing the count here
+/// would silently un-escalate the notice on every TTL rollover — exactly the
+/// amnesia this feature exists to fix.
+fn write_sentinel(path: &Path, now: i64, prior: &Cache) {
+    write_cache(
+        path,
+        &Cache {
+            checked_at: now,
+            latest: None,
+            channel: None,
+            error: None,
+            update_failures: prior.update_failures,
+            update_error: prior.update_error.clone(),
+        },
+    );
 }
 
 /// Spawn a fully detached `dira update --check` to refresh the cache. Never
@@ -250,7 +368,7 @@ pub fn maybe_print(config: &Config) {
     let cache = read_cache(&path).unwrap_or_default();
 
     if !env.checking_disabled() && is_stale(&cache, now) {
-        write_sentinel(&path, now);
+        write_sentinel(&path, now, &cache);
         spawn_refresh();
     }
 
@@ -269,6 +387,17 @@ mod tests {
             latest: latest.map(str::to_string),
             channel: Some("stable".to_string()),
             error: error.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A cache carrying `n` consecutive `dira update` failures on top of a
+    /// perfectly healthy resolve — the combination that stranded a user.
+    fn cache_with_failures(latest: &str, n: u32) -> Cache {
+        Cache {
+            update_failures: n,
+            update_error: Some("connection closed before message completed".to_string()),
+            ..cache(1_770_000_000, Some(latest), None)
         }
     }
 
@@ -386,6 +515,96 @@ mod tests {
             msg,
             "dira 0.3.0 is available (you have 0.2.0) — run `dira update`"
         );
+    }
+
+    // --- repeated-failure escalation -----------------------------------------
+
+    /// A single failure stays quiet about itself: the download now retries
+    /// internally, so one that still surfaced is most likely a one-off, and
+    /// crying wolf on it would devalue the escalated line below.
+    #[test]
+    fn one_failure_does_not_change_the_notice() {
+        let c = cache_with_failures("0.4.0", 1);
+        assert_eq!(
+            should_notify(&c, &allow_env(), true, "0.2.3").unwrap(),
+            "dira 0.4.0 is available (you have 0.2.3) — run `dira update`"
+        );
+    }
+
+    /// The regression guard for the reported incident: after repeated
+    /// failures the notice must stop implying nothing is wrong.
+    #[test]
+    fn repeated_failures_escalate_the_notice() {
+        let c = cache_with_failures("0.4.0", 3);
+        let msg = should_notify(&c, &allow_env(), true, "0.2.3").unwrap();
+        assert_eq!(
+            msg,
+            "dira 0.4.0 is available (you have 0.2.3) — 3 recent update attempts failed; run \
+             `dira update` to see why"
+        );
+    }
+
+    #[test]
+    fn escalation_starts_at_the_documented_threshold() {
+        let below = cache_with_failures("0.4.0", ESCALATE_AFTER_FAILURES - 1);
+        assert!(!should_notify(&below, &allow_env(), true, "0.2.3")
+            .unwrap()
+            .contains("failed"));
+
+        let at = cache_with_failures("0.4.0", ESCALATE_AFTER_FAILURES);
+        assert!(should_notify(&at, &allow_env(), true, "0.2.3")
+            .unwrap()
+            .contains("recent update attempts failed"));
+    }
+
+    /// Escalation reports a failure, it never manufactures a reason to speak:
+    /// every existing suppression still wins, and an up-to-date machine stays
+    /// silent no matter what the counter says.
+    #[test]
+    fn escalation_never_overrides_suppression_or_speaks_when_up_to_date() {
+        let c = cache_with_failures("0.4.0", 5);
+        assert!(should_notify(&c, &allow_env(), false, "0.2.3").is_none());
+        let mut env = allow_env();
+        env.ci = true;
+        assert!(should_notify(&c, &env, true, "0.2.3").is_none());
+        // Already on the latest — nothing to nag about, failures or not.
+        assert!(should_notify(&c, &allow_env(), true, "0.4.0").is_none());
+    }
+
+    /// The counter must survive a cache refresh. `write_sentinel` runs on
+    /// every TTL rollover, and clearing the count there would silently
+    /// un-escalate the notice roughly once a day.
+    #[test]
+    fn the_sentinel_preserves_the_failure_count() {
+        let dir = std::env::temp_dir().join(format!("dira-notice-{}", ulid::Ulid::generate()));
+        let path = dir.join("update-check.json");
+        let prior = cache_with_failures("0.4.0", 4);
+
+        write_sentinel(&path, 1_770_000_123, &prior);
+
+        let after = read_cache(&path).expect("sentinel should be readable");
+        assert_eq!(after.checked_at, 1_770_000_123);
+        assert_eq!(after.latest, None, "the resolve half is deliberately reset");
+        assert_eq!(after.update_failures, 4, "the failure half must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Old cache files predate both fields; they must still parse.
+    #[test]
+    fn a_cache_without_the_failure_fields_still_reads() {
+        let dir = std::env::temp_dir().join(format!("dira-notice-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("update-check.json");
+        std::fs::write(
+            &path,
+            br#"{"checked_at":1770000000,"latest":"0.4.0","channel":"stable","error":null}"#,
+        )
+        .unwrap();
+
+        let c = read_cache(&path).expect("a pre-existing cache must still parse");
+        assert_eq!(c.latest.as_deref(), Some("0.4.0"));
+        assert_eq!(c.update_failures, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

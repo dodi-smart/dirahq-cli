@@ -377,8 +377,7 @@ async fn process_message(
     // returned, an agent paused, or a session/manual session closed). The
     // capture is spawned detached + time-boxed, so it never blocks this loop.
     if let (Some(cwd), Some(proj)) = (ev.cwd.as_deref(), ev.project.as_deref()) {
-        crate::control::lock_recover_map(&state.repo_dirs)
-            .insert(proj.to_string(), cwd.to_string());
+        crate::control::register_repo_dir(state, proj, cwd);
         if capture::captures_commits(ev.kind) && throttle.ready(proj) {
             capture_fn(state, cwd, proj);
         }
@@ -878,10 +877,13 @@ async fn capture_tokens(
     }
     if unattributed > 0 {
         state.progress.mark_unattributed_token_rows(unattributed);
-        // `warn`, not `debug`: the default filter is `dirad=info,warn`, and under
-        // D-0026 an unattributed turn is compute nobody will ever see — an
-        // operator signal, not routine noise.
-        tracing::warn!(
+        // `debug`, not `warn`: the counter is still kept and still surfaced
+        // (`dira status --detailed`), but every turn a harness runs outside a
+        // repo lands here, so at the default `dirad=info,warn` filter this
+        // printed a fault-shaped line hundreds of times a day on a healthy
+        // daemon. Under D-0026 repo-less compute is invisible, not broken —
+        // the aggregate is the operator signal, not each occurrence.
+        tracing::debug!(
             turns = unattributed,
             session = %session_id,
             transcript = %transcript_path,

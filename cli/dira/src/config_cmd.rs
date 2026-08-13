@@ -105,6 +105,22 @@ const KNOBS: &[Knob] = &[
         kind: Kind::Enum(&["auto", "on", "off"]),
         help: "zavet knowledge module: auto (active when a repo has .zavet/), on, off",
     },
+    // The knowledge channel's consent tier. Unlike every other knob here this
+    // one governs whether *content* — decision and spec bodies, trailer
+    // values, check commands — leaves the machine, so it is worth being
+    // explicit about why it is settable at all: before this it was reachable
+    // only by hand-editing `config.toml` or exporting
+    // `DIRA_SYNC__KNOWLEDGE`, which made `dira onboard`'s consent step
+    // impossible to implement honestly.
+    //
+    // `KnowledgeSyncMode` is `#[serde(rename_all = "lowercase")]`, so the
+    // generic `Kind::Enum` path writes exactly the string it deserializes —
+    // no bespoke arm needed (contrast `update.check`, immediately below).
+    Knob {
+        key: "sync.knowledge",
+        kind: Kind::Enum(&["off", "metadata", "full"]),
+        help: "knowledge sync tier: off, metadata (ids + titles), full (+ record bodies)",
+    },
     // `Config.update.check` is a plain `bool` (see `dira_core::config::UpdateKnobs`),
     // not an enum type — unlike `modules.zavet`'s `ZavetMode`, there's no
     // `Deserialize`/`Serialize` impl mapping "on"/"off" to it for free. So this
@@ -132,7 +148,10 @@ pub(crate) fn knobs_after_help() -> String {
     }
     s.push_str(
         "\nDaemon-side changes take effect after a daemon restart\n\
-         (`dira daemon stop` then `dira daemon start`).",
+         (`dira daemon stop` then `dira daemon start`).\n\
+         \n\
+         `sync.knowledge` is only half the gate: the cloud workspace has its own\n\
+         tier, and content is stored only when both ends say `full`.",
     );
     s
 }
@@ -209,15 +228,40 @@ fn render_scalar(key: &str, v: &serde_json::Value) -> String {
 
 /// `dira config set <key> <value>` — validate then persist to `config.toml`.
 pub fn set(config: &Config, key: &str, raw: &str) -> Result<()> {
-    let Some(knob) = knob(key) else {
+    // The unknown-key error is richer here than in `set_quiet`: an
+    // interactive user gets the whole settable-key listing, which would be
+    // noise inside `dira onboard`'s per-step summary.
+    if knob(key).is_none() {
         let known = KNOBS
             .iter()
             .map(|k| format!("  {} — {}", k.key, k.help))
             .collect::<Vec<_>>()
             .join("\n");
         bail!("`{key}` is not settable. settable keys:\n{known}");
-    };
+    }
+    let path = set_quiet(config, key, raw)?;
 
+    println!("set {key} = {raw}");
+    println!("wrote {}", path.display());
+    println!("note: restart the daemon for daemon-side changes to take effect (`dira daemon stop` then `dira daemon start`)");
+    Ok(())
+}
+
+/// Validate and persist one knob, returning the file written.
+///
+/// The whole write path lives here and [`set`] delegates to it, so exactly one
+/// place resolves the config path, preserves the existing document, and writes
+/// it back — a future change (an atomic temp+rename, say) cannot land in one
+/// copy and miss the other.
+///
+/// `dira onboard` calls this directly because it renders its own per-step
+/// summary, and the loose "set … / wrote … / note: restart" block would
+/// interleave badly with it. Per DIRASH-0030 the knowledge tier is written
+/// through here and never by editing TOML in place.
+pub(crate) fn set_quiet(config: &Config, key: &str, raw: &str) -> Result<PathBuf> {
+    let Some(knob) = knob(key) else {
+        bail!("`{key}` is not settable");
+    };
     // Parse + validate the new value, computing the cross-field invariant against
     // the *currently resolved* config so e.g. coalesce stays under idle.
     let item = parse_and_validate(config, knob, raw)?;
@@ -236,11 +280,7 @@ pub fn set(config: &Config, key: &str, raw: &str) -> Result<()> {
         .with_context(|| format!("parse existing {}", path.display()))?;
     assign(&mut doc, key, item);
     std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
-
-    println!("set {key} = {raw}");
-    println!("wrote {}", path.display());
-    println!("note: restart the daemon for daemon-side changes to take effect (`dira daemon stop` then `dira daemon start`)");
-    Ok(())
+    Ok(path)
 }
 
 /// Write `item` at `key` in the document, where a dotted key (`modules.zavet`)
@@ -387,6 +427,59 @@ mod tests {
     fn rejects_unknown_key() {
         let err = set(&cfg(), "socket_path", "/tmp/x.sock").unwrap_err();
         assert!(err.to_string().contains("not settable"));
+    }
+
+    /// The knowledge consent tier must be reachable from `dira config set`:
+    /// it was file/env-only, so the one knob that decides whether record
+    /// bodies leave the machine could not be set by the command whose whole
+    /// job is setting knobs — and `dira onboard` cannot ask for consent it
+    /// has no supported way to honour.
+    #[test]
+    fn the_knowledge_tier_is_settable() {
+        let k = knob("sync.knowledge").expect("sync.knowledge must be listed as a knob");
+        for tier in ["off", "metadata", "full"] {
+            assert!(
+                parse_and_validate(&cfg(), k, tier).is_ok(),
+                "{tier} must be accepted"
+            );
+        }
+        assert!(parse_and_validate(&cfg(), k, "everything").is_err());
+    }
+
+    /// The written string has to be the one `KnowledgeSyncMode` deserializes,
+    /// or a successful `set` produces a config the daemon rejects at startup.
+    /// Anchored to `KnowledgeSyncMode::as_str` — core's own declaration of the
+    /// `config.toml` spelling — rather than to a literal repeated here, so a
+    /// rename on that side breaks this test instead of shipping silently.
+    ///
+    /// Also pins the nested-table shape: `sync.knowledge` must land under a
+    /// real `[sync]` table, since that is what `SyncKnobs` deserializes from.
+    #[test]
+    fn the_written_knowledge_tier_matches_the_cores_spelling() {
+        use dira_core::config::KnowledgeSyncMode;
+
+        for (raw, mode) in [
+            ("off", KnowledgeSyncMode::Off),
+            ("metadata", KnowledgeSyncMode::Metadata),
+            // Mixed case on the way in, canonical lowercase on the way out.
+            ("Full", KnowledgeSyncMode::Full),
+        ] {
+            let k = knob("sync.knowledge").unwrap();
+            let item = parse_and_validate(&cfg(), k, raw).unwrap();
+            let mut doc = DocumentMut::new();
+            assign(&mut doc, "sync.knowledge", item);
+            let rendered = doc.to_string();
+
+            assert!(
+                rendered.contains("[sync]"),
+                "must write a real [sync] table, got: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("knowledge = \"{}\"", mode.as_str())),
+                "expected the core spelling {:?}, got: {rendered}",
+                mode.as_str()
+            );
+        }
     }
 
     /// The agent thresholds are the knobs that decide whether a long tool call is

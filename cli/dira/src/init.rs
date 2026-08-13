@@ -21,10 +21,109 @@
 //!   `~/.grok/hooks/dira.json` (user scope is always trusted); each event runs
 //!   `dira hook grok` over the stdin→socket shim.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use dira_core::{Config, Store};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+
+/// What a single harness's wiring actually did.
+///
+/// The `run*` functions used to print their own three-line report and return
+/// `Result<()>`, which made them unusable from anything that needs to
+/// summarise several harnesses at once (`dira onboard` wires every detected
+/// harness in one pass and prints one block at the end). Printing therefore
+/// moved to the callers; `dira init`'s own output is unchanged, rendered by
+/// [`Wired::print`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wired {
+    /// Human label, as it appears in the report (`Claude Code`).
+    pub label: &'static str,
+    /// How this harness is wired, which is the whole reason the report has
+    /// two wordings: five harnesses merge hook entries, OpenCode gets a
+    /// forwarder plugin instead.
+    pub kind: Kind,
+    /// Where the config was written. `None` when nothing was written —
+    /// `--print`, or codex, whose snippet is only ever printed.
+    pub path: Option<PathBuf>,
+    /// The hook command embedded in the config — or, for a [`Kind::Plugin`]
+    /// harness, the URL its forwarder posts to.
+    pub command: String,
+    /// How many events this run newly added. Zero with a `Some(path)` means
+    /// every event was already wired — the idempotent re-run case.
+    pub events_added: usize,
+    /// Harness-specific aside (grok's user-level-only note, codex's paste
+    /// instruction).
+    pub note: Option<String>,
+}
+
+/// How a harness receives its wiring.
+///
+/// The distinction is real, not cosmetic — it decides whether `events_added`
+/// counts merged events or a single rewritten file — and it is what the two
+/// report wordings are derived from, so neither wording has to be carried on
+/// the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Hook entries merged into the harness's own JSON config.
+    Hooks,
+    /// A forwarder plugin file written whole (OpenCode).
+    Plugin,
+}
+
+impl Wired {
+    /// Nothing was added because everything was already there.
+    pub fn already_wired(&self) -> bool {
+        self.path.is_some() && self.events_added == 0
+    }
+
+    /// The report's first-line verb and second-line label, derived from
+    /// [`Kind`] rather than carried per instance.
+    ///
+    /// Split out of [`print`] so it is assertable without capturing stdout —
+    /// the wording is the part worth pinning, and it has no other guard.
+    ///
+    /// [`print`]: Wired::print
+    fn headline(&self) -> (String, &'static str) {
+        match self.kind {
+            Kind::Hooks => (format!("wired {} hooks", self.label), "hook command"),
+            Kind::Plugin => (format!("wrote {} forwarder plugin", self.label), "posts to"),
+        }
+    }
+
+    /// The report `dira init` has always printed, byte for byte.
+    pub fn print(&self) {
+        let Some(path) = &self.path else {
+            return; // --print / codex already emitted the payload itself
+        };
+        if let Some(note) = &self.note {
+            println!("{note}");
+        }
+        let (written, command_label) = self.headline();
+        println!(
+            "{written} {} {}",
+            crate::theme::glyphs().arrow,
+            path.display()
+        );
+        println!("{command_label}: {}", self.command);
+        println!("start the daemon with `dira daemon start`, then work as usual.");
+    }
+}
+
+/// What to do when a harness's existing config file is not valid JSON.
+///
+/// The historical behaviour is [`OnUnparseable::Overwrite`]: parse failure
+/// falls back to `{}`, so writing back silently discards whatever the file
+/// held. That is defensible for `dira init`, where the user typed the
+/// command at that exact file. It is not defensible for `dira onboard`,
+/// which touches several files the user never named — hence
+/// [`OnUnparseable::Refuse`], which reports the file and leaves it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUnparseable {
+    /// Start from `{}` and overwrite (the `dira init` default).
+    Overwrite,
+    /// Error out, touching nothing.
+    Refuse,
+}
 
 /// Claude Code events we hook and whether they need a tool matcher.
 const CLAUDE_EVENTS: &[(&str, bool)] = &[
@@ -79,8 +178,50 @@ const GROK_EVENTS: &[(&str, bool)] = &[
     ("Notification", false),
 ];
 
+/// Every harness `wire` can actually wire, in help/report order.
+///
+/// This is deliberately **not** `dira_sources::canonical_harness_id`'s domain:
+/// that table also resolves `generic`, a wire id used by the hook ingest path
+/// for payloads from an unrecognised harness. There is nothing to write for
+/// it, so accepting it here would mean a caller validating against the alias
+/// table and then failing at dispatch — which is exactly what `dira onboard
+/// --harness generic` used to do, passing its up-front check and then failing
+/// mid-run, five steps deep.
+pub const WIRABLE: &[&str] = &["claude", "codex", "gemini", "cursor", "opencode", "grok"];
+
+/// Whether [`wire`] accepts this canonical id.
+pub fn is_wirable(id: &str) -> bool {
+    WIRABLE.contains(&id)
+}
+
+/// Wire one harness by canonical id — the single dispatch point.
+///
+/// `dira init` and `dira onboard` differ only in the three policy arguments,
+/// so they share this rather than each carrying a six-arm match that has to
+/// be updated in lockstep when a harness is added.
+pub async fn wire(
+    id: &str,
+    config: &Config,
+    global: bool,
+    print_only: bool,
+    on_unparseable: OnUnparseable,
+) -> Result<Wired> {
+    match id {
+        "claude" => run(global, print_only, on_unparseable),
+        "codex" => run_codex(print_only),
+        "gemini" => run_gemini(global, print_only, on_unparseable),
+        "cursor" => run_cursor(global, print_only, on_unparseable),
+        "opencode" => run_opencode(config, print_only).await,
+        "grok" => run_grok(global, print_only, on_unparseable),
+        other => bail!(
+            "unknown harness '{other}' (expected: {})",
+            WIRABLE.join(", ")
+        ),
+    }
+}
+
 /// `dira init` (default) — wire Claude Code command hooks.
-pub fn run(global: bool, print_only: bool) -> Result<()> {
+pub fn run(global: bool, print_only: bool, on_unparseable: OnUnparseable) -> Result<Wired> {
     let (command, legacy_command) = hook_commands("claude");
     let path = if global {
         dira_core::config::home_dir()
@@ -89,14 +230,19 @@ pub fn run(global: bool, print_only: bool) -> Result<()> {
     } else {
         PathBuf::from(".claude/settings.json")
     };
-    apply_json_settings(path, print_only, "Claude Code", &command, |s| {
-        inject_nested_hooks(s, &command, &legacy_command, CLAUDE_EVENTS, "*");
-    })
+    apply_json_settings(
+        path,
+        print_only,
+        on_unparseable,
+        "Claude Code",
+        &command,
+        |s| inject_nested_hooks(s, &command, &legacy_command, CLAUDE_EVENTS, "*"),
+    )
 }
 
 /// `dira init gemini` — wire Gemini CLI command hooks into `~/.gemini/settings.json`
 /// (or `.gemini/settings.json` without `--global`).
-pub fn run_gemini(global: bool, print_only: bool) -> Result<()> {
+pub fn run_gemini(global: bool, print_only: bool, on_unparseable: OnUnparseable) -> Result<Wired> {
     let (command, legacy_command) = hook_commands("gemini");
     let path = if global {
         dira_core::config::home_dir()
@@ -106,14 +252,19 @@ pub fn run_gemini(global: bool, print_only: bool) -> Result<()> {
         PathBuf::from(".gemini/settings.json")
     };
     // Gemini matches tool events by regex, so the catch-all is `.*` (not Claude's `*`).
-    apply_json_settings(path, print_only, "Gemini CLI", &command, |s| {
-        inject_nested_hooks(s, &command, &legacy_command, GEMINI_EVENTS, ".*");
-    })
+    apply_json_settings(
+        path,
+        print_only,
+        on_unparseable,
+        "Gemini CLI",
+        &command,
+        |s| inject_nested_hooks(s, &command, &legacy_command, GEMINI_EVENTS, ".*"),
+    )
 }
 
 /// `dira init cursor` — wire Cursor agent hooks into `~/.cursor/hooks.json`
 /// (or `.cursor/hooks.json` without `--global`).
-pub fn run_cursor(global: bool, print_only: bool) -> Result<()> {
+pub fn run_cursor(global: bool, print_only: bool, on_unparseable: OnUnparseable) -> Result<Wired> {
     let (command, legacy_command) = hook_commands("cursor");
     let path = if global {
         dira_core::config::home_dir()
@@ -122,8 +273,8 @@ pub fn run_cursor(global: bool, print_only: bool) -> Result<()> {
     } else {
         PathBuf::from(".cursor/hooks.json")
     };
-    apply_json_settings(path, print_only, "Cursor", &command, |s| {
-        inject_cursor_hooks(s, &command, &legacy_command);
+    apply_json_settings(path, print_only, on_unparseable, "Cursor", &command, |s| {
+        inject_cursor_hooks(s, &command, &legacy_command)
     })
 }
 
@@ -133,20 +284,29 @@ pub fn run_cursor(global: bool, print_only: bool) -> Result<()> {
 /// `--global`. Home resolves via `home_dir()` (USERPROFILE-aware) and the
 /// command goes through `hook_commands` like every other harness — grok-build
 /// runs natively on windows too, with the same `%USERPROFILE%\.grok` layout.
-pub fn run_grok(global: bool, print_only: bool) -> Result<()> {
+pub fn run_grok(global: bool, print_only: bool, on_unparseable: OnUnparseable) -> Result<Wired> {
     let (command, legacy_command) = hook_commands("grok");
     let path = dira_core::config::home_dir()
         .context("resolve home directory")?
         .join(".grok/hooks/dira.json");
-    if !global && !print_only {
-        println!(
+    // Carried on the result rather than printed here, so the caller decides
+    // ordering — `Wired::print` emits it above the wired line exactly as
+    // before, and `dira onboard` folds it into its own summary.
+    let note = (!global && !print_only).then(|| {
+        format!(
             "note: grok hooks are user-level only (no trusted project scope); writing {}",
             path.display()
-        );
-    }
-    apply_json_settings(path, print_only, "Grok Build", &command, |s| {
-        inject_nested_hooks(s, &command, &legacy_command, GROK_EVENTS, "*");
-    })
+        )
+    });
+    let wired = apply_json_settings(
+        path,
+        print_only,
+        on_unparseable,
+        "Grok Build",
+        &command,
+        |s| inject_nested_hooks(s, &command, &legacy_command, GROK_EVENTS, "*"),
+    )?;
+    Ok(Wired { note, ..wired })
 }
 
 /// Resolve the path to this `dira` executable, canonicalized and normalized
@@ -406,35 +566,61 @@ pub(crate) fn harness_config_paths() -> Vec<HarnessConfig> {
 /// Load a JSON settings file (or start empty), let `inject` merge our hooks in,
 /// then either print or write it back — preserving existing keys. Shared by the
 /// harnesses whose config is JSON (Claude, Gemini, Cursor).
+///
+/// `inject` returns how many events it newly added, which is what lets a
+/// caller distinguish "wired it" from "was already wired" without re-reading
+/// the file.
 fn apply_json_settings(
     path: PathBuf,
     print_only: bool,
-    label: &str,
+    on_unparseable: OnUnparseable,
+    label: &'static str,
     command: &str,
-    inject: impl FnOnce(&mut Value),
-) -> Result<()> {
+    inject: impl FnOnce(&mut Value) -> usize,
+) -> Result<Wired> {
     let mut settings: Value = if path.exists() {
         let text = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+        match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => match on_unparseable {
+                OnUnparseable::Overwrite => json!({}),
+                OnUnparseable::Refuse => bail!(
+                    "{} is not valid JSON ({e}) — refusing to overwrite it. \
+                     Fix or move the file, then re-run.",
+                    path.display()
+                ),
+            },
+        }
     } else {
         json!({})
     };
 
-    inject(&mut settings);
+    let events_added = inject(&mut settings);
 
     if print_only {
         println!("{}", serde_json::to_string_pretty(&settings)?);
-        return Ok(());
+        return Ok(Wired {
+            label,
+            kind: Kind::Hooks,
+            path: None,
+            command: command.to_string(),
+            events_added,
+            note: None,
+        });
     }
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
-    println!("wired {label} hooks → {}", path.display());
-    println!("hook command: {command}");
-    println!("start the daemon with `dira daemon start`, then work as usual.");
-    Ok(())
+    Ok(Wired {
+        label,
+        kind: Kind::Hooks,
+        path: Some(path),
+        command: command.to_string(),
+        events_added,
+        note: None,
+    })
 }
 
 /// `dira init codex` — emit the `~/.codex/config.toml` hook tables that wire
@@ -446,7 +632,7 @@ fn apply_json_settings(
 ///
 /// Codex hooks use nested array-of-tables: `[[hooks.<Event>]]` (with an optional
 /// regex `matcher`) then `[[hooks.<Event>.hooks]]` carrying `type`/`command`.
-pub fn run_codex(_print_only: bool) -> Result<()> {
+pub fn run_codex(_print_only: bool) -> Result<Wired> {
     let (command, _legacy_command) = hook_commands("codex");
     // The snippet is only ever printed (never merged into an existing file),
     // so there's no idempotency check here and no need for the legacy form.
@@ -475,21 +661,40 @@ pub fn run_codex(_print_only: bool) -> Result<()> {
         println!();
     }
     println!("# Then start the daemon with `dira daemon start` and work as usual.");
-    Ok(())
+    // `path: None` — codex is print-only by construction, so there is nothing
+    // for a caller to report as written. `dira onboard` renders this as
+    // "snippet printed, paste it into ~/.codex/config.toml" rather than as a
+    // completed step, because it isn't one.
+    Ok(Wired {
+        label: "Codex CLI",
+        kind: Kind::Hooks,
+        path: None,
+        command,
+        events_added: 0,
+        note: Some("codex is print-only: paste the snippet above into ~/.codex/config.toml".into()),
+    })
 }
 
 /// `dira init opencode` — write the forwarder plugin to
 /// `~/.config/opencode/plugin/dira.js` (or print it with `--print`). The plugin
 /// POSTs Dira-vocabulary JSON to the daemon's HTTP `/hooks/opencode` route, so it
 /// needs the daemon's bearer token + port.
-pub async fn run_opencode(config: &Config, print_only: bool) -> Result<()> {
+pub async fn run_opencode(config: &Config, print_only: bool) -> Result<Wired> {
     let bearer = resolve_bearer(config).await?;
     let url = format!("http://127.0.0.1:{}", config.http_port);
     let plugin = dira_sources::opencode::plugin_js(&url, &bearer);
+    let command = format!("{url}/hooks/opencode");
 
     if print_only {
         println!("{plugin}");
-        return Ok(());
+        return Ok(Wired {
+            label: "OpenCode",
+            kind: Kind::Plugin,
+            path: None,
+            command,
+            events_added: 0,
+            note: None,
+        });
     }
 
     let home = dira_core::config::home_dir().context("resolve home directory")?;
@@ -498,10 +703,17 @@ pub async fn run_opencode(config: &Config, print_only: bool) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("dira.js");
     std::fs::write(&path, plugin)?;
-    println!("wrote OpenCode forwarder plugin → {}", path.display());
-    println!("posts to {url}/hooks/opencode");
-    println!("start the daemon with `dira daemon start`, then work as usual.");
-    Ok(())
+    // OpenCode is a written *plugin*, not merged events, so there is no
+    // per-event count to report — one file, always rewritten. Counted as a
+    // single added unit so `already_wired()` doesn't claim a no-op.
+    Ok(Wired {
+        label: "OpenCode",
+        kind: Kind::Plugin,
+        path: Some(path),
+        command,
+        events_added: 1,
+        note: None,
+    })
 }
 
 /// Resolve the daemon's HTTP bearer the same way `dirad` does: `DIRA_BEARER`
@@ -542,7 +754,7 @@ fn inject_nested_hooks(
     legacy_command: &str,
     events: &[(&str, bool)],
     matcher: &str,
-) {
+) -> usize {
     let hooks = settings
         .as_object_mut()
         .expect("settings is an object")
@@ -550,6 +762,7 @@ fn inject_nested_hooks(
         .or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().expect("hooks is an object");
 
+    let mut added = 0;
     for (event, needs_matcher) in events {
         let arr = hooks
             .entry((*event).to_string())
@@ -571,7 +784,9 @@ fn inject_nested_hooks(
             group["matcher"] = json!(matcher);
         }
         arr.push(group);
+        added += 1;
     }
+    added
 }
 
 /// Ensure each Cursor event has our `{ command }` entry under `hooks`, without
@@ -581,12 +796,13 @@ fn inject_nested_hooks(
 /// `dira init` may have already written (see [`hook_commands`]) — matched
 /// alongside `command` so re-running `init` after an upgrade doesn't
 /// duplicate the entry.
-fn inject_cursor_hooks(settings: &mut Value, command: &str, legacy_command: &str) {
+fn inject_cursor_hooks(settings: &mut Value, command: &str, legacy_command: &str) -> usize {
     let obj = settings.as_object_mut().expect("settings is an object");
     obj.entry("version".to_string()).or_insert_with(|| json!(1));
     let hooks = obj.entry("hooks".to_string()).or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().expect("hooks is an object");
 
+    let mut added = 0;
     for event in CURSOR_EVENTS {
         let arr = hooks
             .entry((*event).to_string())
@@ -605,7 +821,9 @@ fn inject_cursor_hooks(settings: &mut Value, command: &str, legacy_command: &str
             continue;
         }
         arr.push(json!({ "command": command }));
+        added += 1;
     }
+    added
 }
 
 #[cfg(test)]
@@ -956,5 +1174,125 @@ mod tests {
         inject_nested_hooks(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
         assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dira-init-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("settings.json")
+    }
+
+    fn wire(path: PathBuf, on_unparseable: OnUnparseable) -> Result<Wired> {
+        let (command, legacy) = ("dira hook claude", "dira hook claude");
+        apply_json_settings(path, false, on_unparseable, "Claude Code", command, |s| {
+            inject_nested_hooks(s, command, legacy, CLAUDE_EVENTS, "*")
+        })
+    }
+
+    /// The count is what lets a caller say "wired it" vs "already wired"
+    /// without re-reading the file — so a fresh file reports every event, and
+    /// an immediate re-run reports none.
+    #[test]
+    fn events_added_counts_the_first_run_and_zero_on_re_run() {
+        let path = tmp("count");
+        let first = wire(path.clone(), OnUnparseable::Overwrite).unwrap();
+        assert_eq!(first.events_added, CLAUDE_EVENTS.len());
+        assert!(!first.already_wired());
+
+        let second = wire(path, OnUnparseable::Overwrite).unwrap();
+        assert_eq!(second.events_added, 0);
+        assert!(
+            second.already_wired(),
+            "a second run must be reportable as a no-op"
+        );
+    }
+
+    /// `Refuse` exists because `dira onboard` writes files the user never
+    /// named. It must leave the bytes untouched — an error that still
+    /// clobbered the file would be worse than the fallback it replaces.
+    #[test]
+    fn refuse_leaves_an_unparseable_file_byte_identical() {
+        let path = tmp("refuse");
+        let original = "{ this is not json";
+        std::fs::write(&path, original).unwrap();
+
+        let err = wire(path.clone(), OnUnparseable::Refuse).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not valid JSON"), "got: {msg}");
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "the error must name the file: {msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// The historical `dira init` behaviour, pinned deliberately rather than
+    /// left implicit: parse failure falls back to `{}` and the previous
+    /// contents are lost.
+    #[test]
+    fn overwrite_discards_an_unparseable_file() {
+        let path = tmp("overwrite");
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        let wired = wire(path.clone(), OnUnparseable::Overwrite).unwrap();
+        assert_eq!(wired.events_added, CLAUDE_EVENTS.len());
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(after["hooks"]["SessionStart"].is_array());
+    }
+
+    /// `Kind` is what the two report wordings are derived from, so a wrong
+    /// variant silently changes `dira init opencode`'s output. Pins both
+    /// forms — the refactor that removed the per-instance `written`/
+    /// `command_label` strings had no other guard.
+    #[test]
+    fn the_report_wording_follows_the_kind() {
+        let hooks = Wired {
+            label: "Claude Code",
+            kind: Kind::Hooks,
+            path: Some(PathBuf::from("/tmp/settings.json")),
+            command: "dira hook claude".into(),
+            events_added: 8,
+            note: None,
+        };
+        let plugin = Wired {
+            label: "OpenCode",
+            kind: Kind::Plugin,
+            ..hooks.clone()
+        };
+        assert_eq!(
+            hooks.headline(),
+            ("wired Claude Code hooks".to_string(), "hook command")
+        );
+        assert_eq!(
+            plugin.headline(),
+            ("wrote OpenCode forwarder plugin".to_string(), "posts to")
+        );
+    }
+
+    /// A *valid* config is never discarded by either policy — the fallback
+    /// only ever applies to unparseable bytes.
+    #[test]
+    fn existing_keys_survive_both_policies() {
+        for policy in [OnUnparseable::Overwrite, OnUnparseable::Refuse] {
+            let path = tmp("preserve");
+            std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+            wire(path.clone(), policy).unwrap();
+            let after: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(after["theme"], "dark");
+            assert!(after["hooks"]["SessionStart"].is_array());
+        }
     }
 }

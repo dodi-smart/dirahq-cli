@@ -93,6 +93,41 @@ pub enum Request {
         cwd: Option<String>,
         repo: Option<String>,
     },
+    /// Sweep one repo's knowledge NOW instead of waiting for the idle ticker
+    /// (`dira zavet sync`), and register its directory so the ticker keeps
+    /// sweeping it.
+    ///
+    /// Local control protocol only — like [`Self::Shutdown`], this does not
+    /// touch the cloud wire contract under `/contract`.
+    ///
+    /// This closes a latency hole, not a scope one: capture reads decision
+    /// records out of git objects, so a sync only picks up what is already
+    /// COMMITTED. Records on disk stay reported, never ingested.
+    ZavetSync {
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// Rebuild a repo's knowledge index from git history (`dira zavet reindex`).
+    ///
+    /// The ambient poll only sweeps `COMMIT_BACKFILL_LIMIT` commits on a repo's
+    /// first sight and then records a baseline, so a fresh clone indexes only
+    /// the decisions and specs that fall in that window, and no later sweep
+    /// revisits the rest. This walks the full `.zavet/`-scoped history instead.
+    /// Explicit and user-initiated — never the ambient path. `all_trailers`
+    /// lifts the bound on the (unscoped, therefore costlier) trailer pass.
+    ///
+    /// Distinct from [`Self::ZavetSync`], which runs the same bounded capture
+    /// the ticker does, just sooner: sync cannot reach behind the baseline,
+    /// which is precisely what this exists for.
+    ///
+    /// Takes no `repo`, unlike its sibling `Zavet*` queries: this one reads git
+    /// history off a working tree, so a repo the caller is not standing in has
+    /// nothing to walk. The daemon resolves both the toplevel and the canonical
+    /// repo from `cwd`.
+    ZavetReindex {
+        cwd: Option<String>,
+        all_trailers: bool,
+    },
     /// Set or clear the per-repo zavet override (`dira zavet enable|disable`).
     /// `mode` is `on`, `off`, or `clear`.
     ZavetSetMode {
@@ -282,7 +317,7 @@ pub enum Response {
     /// `ZavetWhy`.
     ZavetWhy(Box<ZavetWhyView>),
     /// `ZavetDecisions`.
-    ZavetDecisions { decisions: Vec<ZavetDecisionView> },
+    ZavetDecisions(Box<ZavetDecisionsView>),
     /// `ZavetWhy` with an ambiguous free-text query: ranked matches instead
     /// of a single answer. Also `ZavetWiki` with a topic. `trailers` are
     /// matching orphan commit trailers — micro-decisions that never got a
@@ -307,6 +342,16 @@ pub enum Response {
     ZavetSpec(Box<ZavetSpecWhyView>),
     /// `ZavetSetMode`: the applied override (`on`/`off`) or `clear`.
     ZavetModeSet { repo: String, mode: String },
+    /// `ZavetSync`. Boxed like the other `Zavet*` views so the small arms stay
+    /// small. A new variant does not degrade across skew, which is harmless
+    /// here for the same reason as `ZavetSpec`: only a CLI new enough to send
+    /// `ZavetSync` can receive it, and an older daemon answers with an error
+    /// the CLI reports as version skew rather than as a failure.
+    ZavetSync(Box<ZavetSyncView>),
+    /// `ZavetReindex`: what the walk saw and what it actually wrote. Same
+    /// new-variant skew posture as `ZavetSpec` — only a CLI new enough to send
+    /// `ZavetReindex` can receive it.
+    ZavetReindex(Box<ZavetReindexView>),
     /// `CaptureProbe`. Boxed like `Status`/`Zavet*` so the small arms stay small.
     ///
     /// Same new-variant skew posture as `ZavetSpec`, and harmless here: only a
@@ -637,12 +682,127 @@ pub struct ZavetStatusView {
     pub guard_stats: Vec<ZavetGuardStatView>,
 }
 
+/// What one `dira zavet reindex` walk saw and what it actually wrote.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetReindexView {
+    pub repo: String,
+    /// False when the repo is not zavet-active — nothing was walked.
+    pub active: bool,
+    /// Commits returned by the `.zavet/`-scoped history walk.
+    pub commits_scanned: u64,
+    /// Commits returned by the trailer walk, and whether its bound was lifted.
+    pub trailer_commits_scanned: u64,
+    pub trailers_bounded: bool,
+    /// Records the walk parsed, split by what the store actually did. `skipped`
+    /// counts records whose content hash already matched — the measure of the
+    /// command being idempotent rather than re-stamping every row.
+    pub decisions_indexed: u64,
+    pub decisions_skipped: u64,
+    pub specs_indexed: u64,
+    pub specs_skipped: u64,
+    pub trailer_commits_recorded: u64,
+}
+
 /// Per-kind guard-event tallies with the honest unattributed count.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZavetGuardStatView {
     pub kind: String,
     pub total: u64,
     pub unattributed: u64,
+}
+
+/// Whether a captured record's file is on the branch the caller is standing on.
+///
+/// The store keys knowledge by repo alone, so a decision recorded on another
+/// branch keeps listing forever — correct for an append-only knowledge model
+/// (ids are minted repo-wide, and a row is never deleted), but it means the
+/// list cannot be read as "what governs the code in front of me" unless the
+/// distinction is shown. This is a *display* state computed per query; nothing
+/// in the store changes.
+///
+/// The absent case is deliberate and is spelled `Option::None` at every use
+/// site: with no working directory to ask git in (`--project <repo>` from
+/// elsewhere, or a daemon that has never seen the repo), presence is
+/// **unknown** and renders as nothing. It is never guessed — the same honesty
+/// rule [`ZavetSpecView::stale_commits`] follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ZavetPresence {
+    /// The record's path is in `HEAD`'s tree.
+    OnBranch,
+    /// Captured, but its path is not in `HEAD`'s tree — another branch's record.
+    OffBranch,
+}
+
+/// A record file found in the working tree that the store has never captured.
+///
+/// Capture reads decision records out of git objects, never the working tree,
+/// so a record written but not yet committed is invisible to every `dira zavet`
+/// query. Surfacing it as its own state is what keeps "I can see the file in my
+/// editor" and "dira does not list it" from reading as a bug.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetUncapturedView {
+    /// Parsed from the file's frontmatter; `None` when it does not parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Repo-relative path of the file on disk.
+    pub path: String,
+    /// `uncommitted` (not in `HEAD` either) or `awaiting sweep` (committed, but
+    /// the daemon has not walked that commit yet). The two need different
+    /// remedies, so they are not collapsed.
+    pub reason: String,
+    /// `decision` | `spec`.
+    pub kind: String,
+}
+
+/// `dira zavet decisions` — the captured decisions plus what the working tree
+/// says about them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetDecisionsView {
+    pub repo: String,
+    /// The checked-out branch, when a working directory was available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub decisions: Vec<ZavetDecisionView>,
+    /// Records on disk with no store row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncaptured: Vec<ZavetUncapturedView>,
+}
+
+/// The result of one on-demand knowledge sweep (`dira zavet sync`).
+///
+/// The counts are a before/after delta around the ordinary capture path, not a
+/// separate ingest: sync reuses `capture_commits` rather than forcing a
+/// re-read, so "unchanged HEAD captures nothing" stays as true here as it is
+/// for the idle ticker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSyncView {
+    /// Canonical repo that was swept.
+    pub repo: String,
+    /// Whether zavet is active for it. An inactive repo is swept for commits
+    /// like any other but yields no knowledge — worth saying rather than
+    /// reporting a bare zero.
+    pub active: bool,
+    /// Net new decision rows this sweep added. A sweep that re-captured an
+    /// AMENDED record upserts in place and does not move this — the delta
+    /// counts records the store had never seen, not writes performed.
+    pub decisions_captured: u64,
+    /// Net new commit trailers this sweep added.
+    pub trailers_captured: u64,
+    /// Decisions in the store for this repo after the sweep.
+    pub decisions_total: u64,
+    /// Whether this sweep is what first gave the daemon a directory for the
+    /// repo. That set is empty after a restart and is otherwise filled only by
+    /// session registration and agent events, so a repo nobody has opened a
+    /// session in is never swept at all.
+    pub registered: bool,
+    /// Records still on disk with no store row after the sweep — the ones a
+    /// sweep structurally cannot help with, because capture reads git objects
+    /// and never the working tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncaptured: Vec<ZavetUncapturedView>,
 }
 
 /// One captured decision (list row; `zavet why` carries the body separately).
@@ -680,6 +840,13 @@ pub struct ZavetDecisionView {
     /// — which is a finding, not a pass.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<ZavetCheckView>,
+    /// Whether this record's file is on the caller's branch; `None` = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<ZavetPresence>,
+    /// Per-kind guard-event tallies for THIS decision — how often the guard
+    /// actually fired. Empty means no guard event was ever recorded against it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_stats: Vec<ZavetGuardStatView>,
 }
 
 /// One verification binding as shown by `why` / `wiki`.
@@ -760,6 +927,9 @@ pub struct ZavetSpecView {
     /// from git. `None` when no working directory was available to ask in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_commits: Option<u64>,
+    /// Whether this spec's file is on the caller's branch; `None` = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<ZavetPresence>,
 }
 
 /// One ranked spec hit for a free-text `why`/`wiki` query.
@@ -793,6 +963,9 @@ pub struct ZavetSpecRef {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZavetWikiView {
     pub repo: String,
+    /// The checked-out branch, when a working directory was available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub decisions_total: u64,
     pub trailers: u64,
     pub guard_events: u64,
@@ -808,6 +981,9 @@ pub struct ZavetWikiView {
     /// Latest captured trailers, newest first: `(sha, key, value)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent: Vec<(String, String, String)>,
+    /// Decision records and specs on disk with no store row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncaptured: Vec<ZavetUncapturedView>,
 }
 
 /// A commit linked to a decision.

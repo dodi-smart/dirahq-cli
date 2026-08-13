@@ -52,22 +52,34 @@ debug_log() {
   fi
 }
 
-# _confirm <prompt> -- reads y/N from /dev/tty, never from stdin (stdin *is*
-# the script itself under `curl | sh`). When stdout isn't a terminal there is
-# nobody to ask, so we proceed rather than hang a non-interactive install.
+# _confirm <prompt> [default] [notty] -- ask a yes/no question.
+#
+# Reads from /dev/tty, never from stdin: under `curl | sh` stdin *is* the
+# script being read, so testing or reading it is meaningless. /dev/tty is the
+# controlling terminal however stdin is plumbed.
+#
+# `default` (yes|no, default no) answers a bare Enter. `notty` (yes|no,
+# default yes) answers when there is no terminal, no readable /dev/tty, or
+# --no-interactive was passed -- and it is deliberately a separate knob,
+# because the two questions want opposite fallbacks: a scripted
+# `--uninstall` must proceed unattended, while a service install must never
+# happen unattended.
 _confirm() {
-  local prompt="$1" reply
-  if ! _is_tty; then
-    return 0
+  local prompt="$1" default="${2:-no}" notty="${3:-yes}" reply
+  if [ "${no_interactive:-0}" = "1" ] || ! _is_tty || [ ! -r /dev/tty ]; then
+    [ "$notty" = "yes" ]
+    return $?
   fi
-  printf '%s [y/N] ' "$prompt" >&2
-  if [ -r /dev/tty ]; then
-    read -r reply <"/dev/tty" || reply=""
+  if [ "$default" = "yes" ]; then
+    printf '%s [Y/n] ' "$prompt" >&2
   else
-    reply=""
+    printf '%s [y/N] ' "$prompt" >&2
   fi
+  read -r reply <"/dev/tty" || reply=""
   case "$reply" in
   y | Y | yes | YES) return 0 ;;
+  n | N | no | NO) return 1 ;;
+  "") [ "$default" = "yes" ] ;;
   *) return 1 ;;
   esac
 }
@@ -104,6 +116,8 @@ FLAGS:
     --service                Also install dirad as a launchd/systemd-user service
     --no-daemon              Never start, restart, or install the daemon -- even if
                               one is already running
+    --no-interactive          Never prompt, even on a terminal (implies the historical
+                              hands-off daemon behaviour unless --daemon/--service given)
     --force                  Overwrite a `just install` dev symlink; skip the
                               --uninstall confirmation
     --uninstall              Remove dira + dirad (never touches config or data --
@@ -122,6 +136,7 @@ ENVIRONMENT:
                                         (GH_TOKEN wins if both are set)
     DIRA_START_DAEMON                   Same as --daemon        (set to 1)
     DIRA_INSTALL_SERVICE                 Same as --service        (set to 1)
+    DIRA_NO_INTERACTIVE                   Same as --no-interactive (set to 1)
     DIRA_ALLOW_ROOT                       Silence the "running as root" warning (set to 1)
     DIRA_DEBUG                             Verbose debug output on stderr (set to 1)
 
@@ -711,6 +726,8 @@ main() {
   debug=0
   [ "${DIRA_DEBUG:-0}" = "1" ] && debug=1
   no_daemon=0
+  no_interactive=0
+  [ "${DIRA_NO_INTERACTIVE:-0}" = "1" ] && no_interactive=1
   force=0
   uninstall_flag=0
 
@@ -767,6 +784,10 @@ main() {
       ;;
     --no-daemon)
       no_daemon=1
+      shift
+      ;;
+    --no-interactive)
+      no_interactive=1
       shift
       ;;
     --force)
@@ -930,19 +951,28 @@ main() {
     if [ "$install_service" = "1" ]; then
       info "installing the dirad service..."
       "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
+    # Installing a launchd/systemd agent is a persistent system change, so it
+    # is still never done silently. But the old rationale for not asking --
+    # "curl | sh has no usable stdin" -- was only half true, and /dev/tty is
+    # exactly the escape hatch for it. Default yes on a terminal, no without
+    # one, so CI keeps the historical hands-off behaviour.
+    elif _confirm "Install dirad as a login service so it survives reboots?" yes no; then
+      info "installing the dirad service..."
+      "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
+    else
+      debug_log "skipping the dirad service"
     fi
   fi
 
-  # 15. PATH hint + next steps. No interactive prompt here: installing a
-  # launchd/systemd agent is a persistent system change, and `curl | sh`
-  # has no usable stdin to ask with anyway.
+  # 15. PATH hint + next steps. One command, because the previous three-line
+  # block omitted `dira init` and so left anyone who followed it with a
+  # running daemon that captured nothing. It also recommended `daemon start`,
+  # which takes the control socket and blocks the `daemon install` above.
   _path_hint "$bin_dir"
   cat <<EOF
 
 Next steps:
-  $bin_dir/dira --version
-  $bin_dir/dira daemon start
-  $bin_dir/dira status
+  $bin_dir/dira onboard     wire your harnesses, link this device, verify capture
 EOF
 }
 

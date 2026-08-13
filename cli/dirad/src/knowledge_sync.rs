@@ -481,7 +481,12 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
     let now_str = crate::heartbeat::fmt_rfc3339(now);
     let mut out = Vec::new();
     for (repo, dir) in dirs {
-        let root = std::path::PathBuf::from(&dir);
+        // Resolve the toplevel: `repo_dirs` holds whatever the last writer put
+        // there, which may be a subdirectory. Probing `.zavet/` against a subdir
+        // silently drops the repo from the snapshot, and the pathspecs below are
+        // `:(glob)`, i.e. cwd-relative, so they would not match either.
+        let raw = std::path::PathBuf::from(&dir);
+        let root = dira_core::project::toplevel(&raw).unwrap_or(raw);
         if !root.join(".zavet").is_dir() {
             continue;
         }

@@ -27,6 +27,7 @@ pub mod artifact;
 pub mod notice;
 pub mod replace;
 pub mod resolve;
+mod retry;
 
 use crate::daemon;
 use anyhow::{Context, Result};
@@ -115,7 +116,15 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
         None => resolve::default_channel(),
     };
 
+    // `connect_timeout` only — no client-wide `.timeout(...)`, following the
+    // convention `dirad/src/lib.rs` states explicitly ("No default timeout —
+    // callers set a per-request timeout sized to that call"). The two calls
+    // here want very different budgets: a small JSON API response versus a
+    // ~20MB artifact, so each sets its own (see `retry::API_TIMEOUT` and
+    // `retry::Policy::download`). Without the connect bound, a link that
+    // stalls instead of closing hangs `dira update` forever.
     let http = reqwest::Client::builder()
+        .connect_timeout(retry::CONNECT_TIMEOUT)
         .build()
         .context("build HTTP client")?;
 
@@ -124,9 +133,38 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Record the outcome of every real update attempt, so the passive notice
+    // can stop repeating an unqualified "run `dira update`" at someone for
+    // whom that command keeps failing. Best-effort and never fatal: a cache
+    // that can't be written must not turn a successful update into an error,
+    // nor add a second failure on top of a real one.
+    //
+    // A pinned `--version` is excluded for the same reason `run_check` refuses
+    // to cache one: it isn't an attempt at *the latest*. Two failed
+    // `--version 0.3.5` runs must not escalate a notice about 0.4.0, which may
+    // well install fine.
+    let pinned = args.version.is_some();
+    let outcome = run_update(config, args, &http, channel).await;
+    if !pinned {
+        match &outcome {
+            Ok(()) => notice::clear_update_failures(),
+            Err(_) => notice::record_update_failure(),
+        }
+    }
+    outcome
+}
+
+/// The update proper — everything past the `--check` fork, factored out so
+/// [`run`] has exactly one success and one failure edge to record.
+async fn run_update(
+    config: &Config,
+    args: UpdateArgs,
+    http: &reqwest::Client,
+    channel: Channel,
+) -> Result<()> {
     let target = artifact::detect_target()?;
 
-    let resolved = resolve::resolve(&http, &target, args.version.as_deref(), channel)
+    let resolved = resolve::resolve(http, &target, args.version.as_deref(), channel)
         .await
         .context("resolve release")?;
 
@@ -165,10 +203,10 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
     let archive_path = workdir.path().join(&resolved.archive_name);
     let sha_path = workdir.path().join(&resolved.sha_name);
 
-    artifact::download(&http, &resolved.archive, &archive_path)
+    artifact::download(http, &resolved.archive, &archive_path)
         .await
         .with_context(|| format!("download {}", resolved.archive_name))?;
-    artifact::download(&http, &resolved.sha, &sha_path)
+    artifact::download_checksum(http, &resolved.sha, &sha_path)
         .await
         .with_context(|| format!("download {}", resolved.sha_name))?;
 
@@ -386,42 +424,15 @@ async fn run_check(http: &reqwest::Client, version_pin: Option<&str>, channel: C
             // A pinned `--version` check isn't "the latest" — don't let it
             // clobber the passive notice's idea of what's current.
             if version_pin.is_none() {
-                write_check_cache(now, Some(&resolved.version), channel, None);
+                notice::record_check(now, Some(&resolved.version), channel.label(), None);
             }
         }
         Err(e) => {
             eprintln!("dira update --check: {e:#}");
             if version_pin.is_none() {
-                write_check_cache(now, None, channel, Some(&e.to_string()));
+                notice::record_check(now, None, channel.label(), Some(&e.to_string()));
             }
         }
-    }
-}
-
-/// Write `project_dirs()?.cache_dir()/update-check.json`, matching
-/// [`notice`]'s documented on-disk shape exactly:
-/// `{ "checked_at", "latest", "channel", "error" }`. Best-effort: this is
-/// disposable derived state, so a write failure is swallowed rather than
-/// surfaced (mirrors `notice::write_sentinel`).
-fn write_check_cache(checked_at: i64, latest: Option<&str>, channel: Channel, error: Option<&str>) {
-    let Some(dirs) = dira_core::config::project_dirs() else {
-        return;
-    };
-    let path = dirs.cache_dir().join("update-check.json");
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let value = serde_json::json!({
-        "checked_at": checked_at,
-        "latest": latest,
-        "channel": channel.label(),
-        "error": error,
-    });
-    if let Ok(bytes) = serde_json::to_vec(&value) {
-        let _ = std::fs::write(path, bytes);
     }
 }
 

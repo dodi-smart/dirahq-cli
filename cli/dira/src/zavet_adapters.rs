@@ -63,7 +63,7 @@ pub(crate) enum AdapterMode {
 /// Pure: derive a [`RepoGate`] from an already-resolved git toplevel (or
 /// `None` when `cwd` isn't inside a work tree). Split out from [`repo_gate`]
 /// so the gate logic is unit-testable without shelling out to `git`.
-fn gate_from_toplevel(toplevel: Option<PathBuf>) -> RepoGate {
+pub(crate) fn gate_from_toplevel(toplevel: Option<PathBuf>) -> RepoGate {
     match toplevel {
         None => RepoGate::NotGit,
         Some(root) => {

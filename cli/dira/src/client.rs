@@ -96,13 +96,102 @@ pub async fn send_with_budget(
     dira_ipc::write_frame(&mut stream, &bytes).await?;
     let buf = dira_ipc::read_frame(&mut stream).await?;
 
-    Ok(serde_json::from_slice(&buf)?)
+    match serde_json::from_slice(&buf) {
+        Ok(resp) => Ok(resp),
+        // A response this build cannot read is almost always version skew, not
+        // corruption: `dira update` replaces both binaries, but the running
+        // `dirad` keeps serving its OLD code until it is restarted. Reporting
+        // the raw serde error ("missing field `repo`") plus a backtrace sends
+        // the reader hunting a parsing bug instead of restarting the daemon.
+        Err(e) => Err(anyhow!("{}", skew_message(socket, &e).await)),
+    }
+}
+
+/// Whether a `Response::Error` message means the resident daemon is older than
+/// this `dira` and does not know the request we just sent.
+///
+/// Adding a `Request` variant is the one protocol change that cannot degrade
+/// gracefully: an older `dirad` fails to deserialize the unknown tag and
+/// answers with serde's complaint, which reads like a bug in the CLI. The
+/// daemon wraps EVERY deserialization failure as `bad request: {e}`
+/// ([`crate`]'s counterpart in `control::handle_conn`), so both spellings have
+/// to count — they are the same event seen from different daemon versions.
+///
+/// String-sniffing is not a shortcut here, it is the only thing that can work:
+/// a typed signal would have to be emitted by the old daemon, which by
+/// definition does not have it.
+pub fn is_daemon_too_old(message: &str) -> bool {
+    message.contains("unknown variant") || message.starts_with("bad request")
+}
+
+/// The message for a response this build could not decode.
+///
+/// Asks the daemon its version first — [`Request::DaemonInfo`] is deliberately
+/// tolerant of skew in both directions — so the report can name both builds
+/// instead of guessing. If even that fails, the advice still holds.
+async fn skew_message(socket: &Path, err: &serde_json::Error) -> String {
+    skew_text(
+        env!("CARGO_PKG_VERSION"),
+        daemon_version(socket).await.as_deref(),
+        &err.to_string(),
+    )
+}
+
+/// The wording, pure so it is pinned by tests rather than only reachable by
+/// running two mismatched builds against each other.
+///
+/// Equal version strings still mean skew here: the decode already failed, so
+/// the daemon is serving different code under the same number — which is
+/// exactly what a dev build or an un-restarted daemon after `dira update`
+/// looks like, and the most confusing case to leave unexplained.
+fn skew_text(cli: &str, daemon: Option<&str>, err: &str) -> String {
+    let versions = match daemon {
+        Some(d) if d != cli => format!("dira is {cli}, the running dirad is {d}"),
+        Some(d) => {
+            format!("both report {d}, so the daemon is running an older build than it claims")
+        }
+        None => format!("dira is {cli}; the daemon did not report its version"),
+    };
+    format!(
+        "the daemon sent a response this dira cannot read — {versions}.\n\
+         Restart it to pick up the matching build: dira daemon restart\n\
+         (decode error: {err})"
+    )
+}
+
+/// The running daemon's reported version, or `None` if it cannot be asked.
+async fn daemon_version(socket: &Path) -> Option<String> {
+    let mut stream = dira_ipc::connect_with_budget(socket, dira_ipc::DEFAULT_BUSY_BUDGET)
+        .await
+        .ok()?;
+    let bytes = serde_json::to_vec(&Request::DaemonInfo).ok()?;
+    dira_ipc::write_frame(&mut stream, &bytes).await.ok()?;
+    let buf = dira_ipc::read_frame(&mut stream).await.ok()?;
+    match serde_json::from_slice(&buf).ok()? {
+        Response::DaemonInfo { version, .. } => Some(version),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
+
+    /// Every skew message names a remedy, and never leaves the reader with a
+    /// bare serde error to interpret.
+    #[test]
+    fn skew_text_always_names_the_remedy() {
+        for daemon in [Some("0.3.0"), Some("0.4.0"), None] {
+            let m = skew_text("0.4.0", daemon, "missing field `repo`");
+            assert!(m.contains("dira daemon restart"), "{m}");
+            assert!(m.contains("missing field `repo`"), "{m}");
+        }
+        assert!(skew_text("0.4.0", Some("0.3.0"), "e").contains("the running dirad is 0.3.0"));
+        // The confusing case: same number, different build.
+        assert!(skew_text("0.4.0", Some("0.4.0"), "e").contains("older build than it claims"));
+        assert!(skew_text("0.4.0", None, "e").contains("did not report its version"));
+    }
 
     /// The regression this enum exists for. `ERROR_ACCESS_DENIED` means a daemon
     /// is running and refusing us — the *opposite* of "not running".

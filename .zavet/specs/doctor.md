@@ -10,7 +10,7 @@ paths:
   - cli/dirad/src/probe.rs
   - cli/dira/src/hook_health.rs
   - cli/dira/src/init.rs
-decisions: [D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023]
+decisions: [D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029]
 ---
 
 ## Overview

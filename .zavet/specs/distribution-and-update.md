@@ -12,7 +12,7 @@ paths:
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0021, DIRASH-0024]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0021, DIRASH-0024, DIRASH-0029]
 ---
 
 ## Overview
@@ -37,6 +37,22 @@ both executables and restarts whatever is supervising the daemon.
   (D-0003), dev-install refusal (D-0004), user-scope PATH via
   `[Environment]::SetEnvironmentVariable` (never `setx`), default bin dir
   `%USERPROFILE%\.local\bin`.
+- **The service handoff.** Neither installer registers a launchd/systemd agent
+  or a scheduled task silently. When a terminal exists, both *ask*, and install
+  it on yes. install.sh reads `/dev/tty` rather than stdin — under
+  `curl … | sh` stdin is the script being read, which is why the script used to
+  claim it could not ask at all; install.ps1 gates on
+  `[Console]::IsInputRedirected`/`IsOutputRedirected` and its own `$Host.UI`.
+  With no terminal, or under `--no-interactive`/`-NoInteractive`, the
+  historical hands-off behaviour is unchanged. install.ps1's Administrator
+  branch keeps precedence and never prompts: a service installed from an
+  elevated shell is the broken setup that branch exists to warn about
+  (DIRASH-0029).
+- **Next steps are one command.** Both installers end on `dira onboard`. The
+  previous three-line block (`--version` / `daemon start` / `status`) omitted
+  `dira init`, so following it produced a daemon that captured nothing, and it
+  recommended `daemon start`, which takes the control socket and blocks the
+  `daemon install` the user actually wanted (D-0009).
 - Both installers make the same best-effort `dira daemon` calls around the
   swap (`status`, `stop`, `restart`, `uninstall`) and ignore their failures.
   install.sh neutralises them with `|| true`; install.ps1 routes every one
@@ -64,6 +80,37 @@ both executables and restarts whatever is supervising the daemon.
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
   is safe in a script.
+- Every network step is time-bounded; the artifact download is also retried.
+  The download makes up to 4 attempts on a 500ms-seeded ladder capped at 4s,
+  retrying transport failures, timeouts, 5xx and 429 (honouring `Retry-After`,
+  itself capped);
+  a 4xx is **never** retried, because it is deterministic — the 404 keeps its
+  "asset not found on that release" wording and fails on the first attempt.
+  Timeouts are per-request rather than client-wide (a small JSON API response
+  and a ~20MB artifact want very different budgets), plus a shared 10s
+  `connect_timeout`. Both installers already retried (`install.ps1`'s 3-attempt
+  loop, `install.sh`'s `curl --retry 3`); the updater was the one downloader
+  that did not, so a single mid-stream abort — routine on a lossy or
+  TLS-inspecting corporate link — failed the whole update. This is not
+  platform-specific: it fails identically on macOS, Linux and Windows.
+  The `.sha256` companion rides the same ladder with a per-attempt timeout
+  sized to ~100 bytes rather than to the archive, so a stall there costs
+  seconds, not minutes.
+  *Known gaps:* the body is buffered whole (`resp.bytes()`), so a retry
+  re-pulls the entire archive rather than resuming with a `Range` request; and
+  `resolve::gh_get` — the first of the two network hops — is bounded by a
+  timeout but not retried, so a transient abort there still fails the update.
+- A failed `dira update` is recorded, not just returned. The passive notice's
+  cache carries a consecutive-failure count next to the resolve half, and after
+  2 failures the notice escalates from "run `dira update`" to naming how many
+  attempts failed. The two halves are independent on purpose: a resolve that
+  succeeds says nothing about whether installing works, and that exact
+  combination — a healthy check advertising a version every update attempt
+  fails to install — is what let a user lose a week to a retryable blip with no
+  signal anywhere. The count survives `write_sentinel`'s TTL rollover, or it
+  would silently un-escalate about once a day. Writing happens only in
+  `update::run`; the foreground notice path stays read-only and network-free
+  per D-0006.
 - Every comparison of a resolved release against the **running** version goes
   through `resolve::compare_versions` (SemVer 2.0 §11), never string equality.
   Three callers share it — `--check`'s message, the passive notice, and the
@@ -143,6 +190,11 @@ both executables and restarts whatever is supervising the daemon.
   an update with a bumped plugin.
 - An update never *installs* a plugin the user never asked for. Absent or
   inconclusive detection is a silent no-op.
+- The installers prompt only where a terminal exists, and a non-interactive
+  run is byte-for-byte the behaviour that shipped before the prompt existed.
+  In `install.sh`'s `_can_prompt`, `2>/dev/null` must precede `>/dev/tty`:
+  redirections apply left to right, so the other order prints
+  `/dev/tty: Device not configured` on every CI run.
 - Checksum verification is mandatory and has no override flag. An
   unverifiable download is a pipeline bug, not a user decision.
 - The binary being replaced is never opened for writing — only renamed onto

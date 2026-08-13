@@ -34,6 +34,12 @@ agent context at session start — keep it short and non-negotiable.
   read filters that prefix, and the daemon never spawns the hook child — a
   child it forked would inherit an elevated token and certify the very bug the
   probe exists to catch. See DIRASH-0023.
+- `dira onboard` steps never abort the run (`StepOutcome`, not `?`), and its
+  detection pass never writes or spawns anything that writes — `--print` must
+  leave the filesystem byte-identical. See DIRASH-0029.
+- Knowledge-content consent is asked by its own prompt naming what it sends,
+  never implied by device linking or billing. Changing what `full` transmits
+  changes `KNOWLEDGE_DISCLOSURE` in the same commit. See DIRASH-0030.
 
 ### Recorded decisions (read the file before changing guarded code; ask /zavet:why)
 
@@ -62,6 +68,11 @@ agent context at session start — keep it short and non-negotiable.
 - DIRASH-0023 — The capture probe rides a daemon-minted reserved session prefix, and the daemon never spawns the child (active)
 - DIRASH-0024 — Repo-scope zavet writes are gated on cwd, and dira never sets core.hooksPath (active)
 - DIRASH-0025 — Token attribution resolves per turn, and never writes NULL when a fallback exists (active)
+- DIRASH-0026 — Branch presence is a display state on the zavet list views, never a deletion (active)
+- DIRASH-0027 — zavet sync registers the repo and reuses the ordinary sweep, never forcing a re-read (active)
+- DIRASH-0028 — Knowledge reindex is an explicit path-scoped command, never the ambient poll (active)
+- DIRASH-0029 — Onboarding is one re-runnable waterfall, and the installer prompts only where a tty exists (active)
+- DIRASH-0030 — Full-content knowledge sync is opted into by its own prompt, never implied by linking (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 
@@ -71,6 +82,8 @@ agent context at session start — keep it short and non-negotiable.
 - distribution-and-update — Distribution and self-update (session, high)
 - doctor — Diagnostics — dira doctor and the capture probe (session, high)
 - harness-sources — Harness sources and hook ingestion (session, high)
+- knowledge-sync — Knowledge sync — the consent-gated second channel (session, medium)
+- onboarding — Onboarding — dira onboard and the installer handoff (session, high)
 
 Capture bar: record non-obvious choices a future reader could not reconstruct — micro-decisions as commit trailers (Why:/Rejected:/Constraint:/Refs:), structural ones via /zavet:decide.
 Spec maintenance (do this as part of normal work, no command needed): when implementing or changing a feature, update its covering spec in .zavet/specs/ — or create one from .zavet/.spec-template.md (origin: session) for substantial new features — reference the decisions involved, and add a `Spec: <slug>` trailer to the commit.

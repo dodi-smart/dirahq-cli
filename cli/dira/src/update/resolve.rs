@@ -162,8 +162,13 @@ pub fn is_unauthorized(err: &anyhow::Error) -> bool {
 
 async fn gh_get(http: &reqwest::Client, ctx: &GhContext, path: &str) -> Result<String> {
     let url = format!("{}{path}", ctx.api_url.trim_end_matches('/'));
+    // Per-request budget rather than a client-wide one: this is a small JSON
+    // response, unlike the artifact download sharing the same client. `--check`
+    // also runs speculatively from a detached background refresh, where hanging
+    // is worse than missing a check.
     let mut req = http
         .get(&url)
+        .timeout(super::retry::API_TIMEOUT)
         .header(reqwest::header::USER_AGENT, user_agent())
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28");

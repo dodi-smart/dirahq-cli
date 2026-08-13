@@ -6,13 +6,14 @@
 //! parse the plain output (and pipes, which fall back to 80) stay stable.
 
 use crate::format::{
-    bar as bar_cells, billing_line, hms, kind_label, project_label, repo_short, tokens_compact,
-    truncate, usd_approx,
+    bar as bar_cells, billing_line, display_width, hms, kind_label, pad_cols, pad_left_cols,
+    project_label, repo_short, tokens_compact, truncate_cols, usd_approx,
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{
     any_engaged, LiveState, Response, SessionView, StatusView, ZavetCheckView, ZavetDecisionView,
-    ZavetGuardStatView, ZavetStatusView, ZavetWhyView,
+    ZavetDecisionsView, ZavetGuardStatView, ZavetPresence, ZavetReindexView, ZavetSpecView,
+    ZavetStatusView, ZavetSyncView, ZavetUncapturedView, ZavetWhyView,
 };
 use dira_core::report::Report;
 use time::OffsetDateTime;
@@ -121,6 +122,48 @@ fn resync_fallback_lines(pending: u64, pending_tokens: u64, from: Option<&str>) 
 }
 
 pub fn print(resp: &Response) -> bool {
+    print_with(resp, RowOpts::default())
+}
+
+/// Print one response as a single JSON object — the `--json` modes.
+///
+/// Lives here, beside the human renderers, because "how is this response
+/// presented" is one question with two answers. The boxed views are unwrapped
+/// so a script sees the view itself rather than a one-key envelope; anything
+/// without a natural view serializes whole. `Response` is `Serialize`, so the
+/// fallback means adding `--json` to another subcommand is a flag change, not a
+/// new match arm that silently falls through to human output when forgotten.
+///
+/// An error response still renders as an error, so a failure is never a
+/// silently empty document.
+pub fn print_json(resp: &Response) -> bool {
+    fn emit<T: serde::Serialize>(v: &T) -> bool {
+        match serde_json::to_string_pretty(v) {
+            Ok(s) => {
+                println!("{s}");
+                true
+            }
+            Err(e) => {
+                eprintln!("could not serialize response: {e}");
+                false
+            }
+        }
+    }
+    match resp {
+        Response::Error { .. } => print(resp),
+        Response::ZavetDecisions(v) => emit(v),
+        Response::ZavetSync(v) => emit(v),
+        Response::ZavetWiki(v) => emit(v),
+        Response::ZavetStatus(v) => emit(v),
+        Response::ZavetWhy(v) => emit(v),
+        Response::ZavetSpec(v) => emit(v),
+        other => emit(other),
+    }
+}
+
+/// [`print`], with per-row options the zavet list views honour. Every other
+/// response ignores them.
+pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
     match resp {
         Response::Ok => {
             println!("ok");
@@ -192,8 +235,14 @@ pub fn print(resp: &Response) -> bool {
             print_zavet_why(v);
             true
         }
-        Response::ZavetDecisions { decisions } => {
-            print_zavet_decisions(decisions);
+        Response::ZavetSync(v) => {
+            for line in zavet_sync_lines(v, terminal_cols() as usize) {
+                println!("{line}");
+            }
+            true
+        }
+        Response::ZavetDecisions(v) => {
+            print_zavet_decisions(v, opts);
             true
         }
         Response::ZavetSearch {
@@ -220,6 +269,10 @@ pub fn print(resp: &Response) -> bool {
             }
             true
         }
+        Response::ZavetReindex(v) => {
+            print_zavet_reindex(v);
+            true
+        }
         // The capture probe never routes through the generic printer — it is
         // driven directly by `doctor::capture`, which renders it as a check.
         // Reaching here means a request was built somewhere else by mistake.
@@ -236,9 +289,564 @@ pub fn print(resp: &Response) -> bool {
 // states, and pad-then-paint so SGR bytes never break column alignment.
 // ---------------------------------------------------------------------------
 
+/// The separator glyph between dotted metadata parts.
+fn dot_glyph() -> &'static str {
+    theme::glyphs().dot
+}
+
+/// The ` · ` separator as a measurable segment. One definition — it was being
+/// rebuilt inline at ten call sites.
+fn dot_sep() -> Seg {
+    Seg::new(&format!(" {} ", dot_glyph()), Role::Muted)
+}
+
+/// `1 commit` / `4 commits` — English pluralization for the counts these views
+/// print, in one place rather than inlined per call site.
+fn plural(n: u64, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
 /// A `key · key · key` line painted Muted.
 fn dots(parts: &[String]) -> String {
-    theme::paint(&parts.join(" · "), Role::Muted)
+    theme::paint(&parts.join(&dot_sep().plain), Role::Muted)
+}
+
+/// A rendered fragment that remembers its own uncoloured width.
+///
+/// `theme::paint` wraps text in SGR bytes that occupy zero display columns but
+/// that `display_width` counts anyway. Anything that MEASURES a fragment before
+/// deciding whether it fits therefore has to keep the plain text around — and
+/// the failure mode is nasty, because `paint` is a no-op when colour is off, so
+/// every NO_COLOR test passes while the real terminal collapses its layout.
+#[derive(Debug, Clone)]
+struct Seg {
+    plain: String,
+    painted: String,
+}
+
+impl Seg {
+    fn new(text: &str, role: Role) -> Self {
+        Seg {
+            plain: text.to_string(),
+            painted: theme::paint(text, role),
+        }
+    }
+
+    /// Join the non-empty segments with `sep`, keeping both halves in step.
+    fn joined(parts: &[Seg], sep: &Seg) -> Seg {
+        let kept: Vec<&Seg> = parts.iter().filter(|p| !p.plain.is_empty()).collect();
+        Seg {
+            plain: kept
+                .iter()
+                .map(|p| p.plain.as_str())
+                .collect::<Vec<_>>()
+                .join(&sep.plain),
+            painted: kept
+                .iter()
+                .map(|p| p.painted.as_str())
+                .collect::<Vec<_>>()
+                .join(&sep.painted),
+        }
+    }
+}
+
+/// Word-wrap `text` to `width` display columns.
+///
+/// Used for the prose lines — empty-state hints and section explanations —
+/// which are fixed sentences that would otherwise be the only thing in these
+/// views still hard-wrapping at whatever width the terminal happens to be.
+/// A single word longer than `width` is emitted whole rather than split.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    wrap_join(text.split_whitespace(), " ", width)
+}
+
+/// Greedy-wrap `items` joined by `sep` into lines at most `width` columns wide.
+///
+/// The one wrapper: prose (`sep = " "`) and dotted glob lists (`sep = " · "`)
+/// are the same accumulate-until-overflow loop, and having two copies meant
+/// any off-by-one in the budget had to be fixed twice. An item wider than
+/// `width` is emitted whole rather than split.
+fn wrap_join<'a>(items: impl Iterator<Item = &'a str>, sep: &str, width: usize) -> Vec<String> {
+    let width = width.max(20);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for item in items {
+        if !cur.is_empty() && display_width(&cur) + display_width(sep) + display_width(item) > width
+        {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push_str(sep);
+        }
+        cur.push_str(item);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// The `repo · branch` header, wrapped rather than truncated when it does not
+/// fit.
+///
+/// Both halves are identifiers the reader may need to copy — a canonical repo
+/// and a branch name — so clipping either one is worse than spending a second
+/// line. A branch that still overflows on its own is truncated, since at that
+/// point nothing fits.
+fn zavet_header(repo: &str, branch: Option<&str>, cols: usize, lead: Option<Seg>) -> Vec<String> {
+    let dot = Seg::new(&format!(" {} ", theme::glyphs().dot), Role::Muted);
+    // [`Seg`] carries the plain text alongside the painted one so the fit test
+    // below measures display columns rather than SGR bytes.
+    let mut first: Vec<Seg> = lead.into_iter().collect();
+    first.push(Seg::new(repo, Role::Ink));
+    let Some(b) = branch else {
+        return vec![Seg::joined(&first, &dot).painted];
+    };
+    let head = Seg::joined(&first, &dot);
+    let branch_seg = Seg::new(b, Role::Accent);
+    let one = Seg::joined(&[head.clone(), branch_seg.clone()], &dot);
+    if display_width(&one.plain) <= cols {
+        return vec![one.painted];
+    }
+    vec![
+        head.painted,
+        theme::paint(&truncate_cols(b, cols), Role::Accent),
+    ]
+}
+
+/// The indent every zavet row and section body carries.
+const ZAVET_INDENT: usize = 2;
+
+/// Resolved column widths for one pass over a decision list.
+///
+/// The old layout had this backwards: titles were clipped at a hardcoded 46
+/// columns while the guard globs beneath them ran to whatever length the repo's
+/// paths happened to be. On a wide terminal the most informative field was the
+/// only one rationed; on a deep-path Windows checkout the least informative one
+/// wrapped three times and the list stopped being a list.
+///
+/// So: the title takes every column the fixed fields do not, and the fixed
+/// fields drop out one at a time as the terminal narrows. A width of `0` means
+/// "this column is not drawn at this size". Order of sacrifice is by
+/// information density — activity first (it is the rarest to be non-empty),
+/// then the guard count, then age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ZavetLayout {
+    id: usize,
+    title: usize,
+    guards: usize,
+    activity: usize,
+    age: usize,
+}
+
+impl ZavetLayout {
+    /// Widths for a terminal `cols` wide, given the longest id in the list.
+    ///
+    /// `id` is measured rather than fixed because prefixes are per-repo
+    /// (`D-0001` is 6 columns, `DIRASH-0024` is 11) and padding every repo to
+    /// the longest possible prefix would waste columns on the common case.
+    fn for_width(cols: usize, id_width: usize) -> Self {
+        // The wiki's uncaptured section mixes decision ids with spec slugs,
+        // which run longer; 20 fits every real one. Rows truncate to this as a
+        // hard backstop so the "never wider than the terminal" invariant holds
+        // no matter what a repo names things.
+        let id = id_width.clamp(6, 20);
+        // The title floor. Below this, drop a fixed column instead of squeezing
+        // the one field that carries the actual knowledge — a 33-column title
+        // is the same unreadable list in a different shape.
+        let bare = ZAVET_INDENT + id + 2 + 36;
+        // Sacrifice order, least informative first: activity is the rarest to
+        // be non-empty, then the guard count, then age. Zeroing by index keeps
+        // the priority in one place instead of spread across match arms.
+        let mut opt = [18usize, 9, 4];
+        let fixed = |o: &[usize; 3]| o.iter().filter(|w| **w > 0).map(|w| w + 2).sum::<usize>();
+        for i in 0..opt.len() {
+            if cols >= bare + fixed(&opt) {
+                break;
+            }
+            opt[i] = 0;
+        }
+        let [activity, guards, age] = opt;
+        ZavetLayout {
+            id,
+            title: cols
+                .saturating_sub(ZAVET_INDENT + id + 2 + fixed(&opt))
+                .clamp(20, 90),
+            guards,
+            activity,
+            age,
+        }
+    }
+}
+
+/// The widest id the list will print, captured and uncaptured alike.
+///
+/// Ids are per-repo (`D-0001` is 6 columns, `DIRASH-0024` is 11), so the column
+/// is measured rather than fixed. Uncaptured rows count: they sit in the same
+/// table, and sizing the column without them makes every long id push its row
+/// out of alignment with the ones above it.
+fn id_width<'a>(
+    decisions: impl Iterator<Item = &'a ZavetDecisionView>,
+    uncaptured: &[ZavetUncapturedView],
+) -> usize {
+    decisions
+        .map(|d| display_width(&d.id))
+        .chain(
+            uncaptured
+                .iter()
+                .filter_map(|u| u.id.as_deref())
+                .map(display_width),
+        )
+        .max()
+        .unwrap_or(6)
+}
+
+/// What a caller wants on each row beyond the defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowOpts {
+    /// Spell out every guard glob beneath the row (`--guards`).
+    pub guards: bool,
+    /// Hide records whose file is not on the checked-out branch (`--branch`).
+    pub branch_only: bool,
+}
+
+/// `4d` / `3mo` since `created_at`, or `new` inside the first two days.
+///
+/// `created_at` is the *commit's* author date, not the ingest time, so this
+/// answers "how long has this decision been in the repo" — which is the
+/// question a reader scanning for recent work is actually asking.
+fn age_label(created_at: Option<&str>, now: OffsetDateTime) -> Option<(String, Role)> {
+    let t =
+        OffsetDateTime::parse(created_at?, &time::format_description::well_known::Rfc3339).ok()?;
+    let days = (now - t).whole_days();
+    if days < 0 {
+        // A clock skew or a rebased author date from the future. Say nothing
+        // rather than print a negative age.
+        return None;
+    }
+    Some(match days {
+        0..=1 => ("new".to_string(), Role::Engaged),
+        d if d < 30 => (format!("{d}d"), Role::Faint),
+        d if d < 365 => (format!("{}mo", d / 30), Role::Faint),
+        d => (format!("{}y", d / 365), Role::Faint),
+    })
+}
+
+/// Guard activity folded into the two numbers a reader can act on.
+///
+/// `blocked` and `complied` both mean the guard stopped a change that would
+/// have contradicted the record — a regression the decision prevented — so they
+/// sum into one `kept` count. `overridden` is the human going ahead anyway,
+/// which is the number worth seeing next to it: a decision overridden more than
+/// it is kept is a decision that needs revisiting, not a guard that needs
+/// tightening. `shown` is deliberately excluded; being displayed is not
+/// evidence of anything.
+///
+/// Empty when nothing fired — an absent number, never a zero, because "no guard
+/// event was ever recorded" and "the guard fired zero times" are the same
+/// display but a zero reads as a measurement.
+fn activity_label(stats: &[ZavetGuardStatView]) -> Option<String> {
+    let tally = |k: &str| stats.iter().find(|s| s.kind == k).map_or(0, |s| s.total);
+    let kept = tally("guard_blocked") + tally("guard_complied");
+    let over = tally("guard_overridden");
+    match (kept, over) {
+        (0, 0) => None,
+        (k, 0) => Some(format!("{k} kept")),
+        (0, o) => Some(format!("{o} over")),
+        (k, o) => Some(format!("{k} kept {} {o} over", theme::glyphs().dot)),
+    }
+}
+
+/// One decision as a single line: `id  title …  guards  activity  age`.
+///
+/// The one place a decision row is formatted — `decisions` and `wiki` both call
+/// it, so the two views cannot drift apart the way their two hand-rolled copies
+/// did. Fixed fields are right-aligned into a cluster the eye can scan or
+/// ignore as a column; the title absorbs the slack, so the cluster's left edge
+/// stays put down the whole list.
+fn decision_row(d: &ZavetDecisionView, l: &ZavetLayout, now: OffsetDateTime) -> String {
+    let mut out = format!(
+        "{}{}  {}",
+        " ".repeat(ZAVET_INDENT),
+        theme::paint(
+            &pad_cols(&truncate_cols(&d.id, l.id), l.id),
+            Role::Knowledge
+        ),
+        theme::paint(
+            &pad_cols(
+                &truncate_cols(d.title.as_deref().unwrap_or("(untitled)"), l.title),
+                l.title
+            ),
+            Role::Ink
+        ),
+    );
+    if l.guards > 0 {
+        let n = d.guards.len();
+        let text = if n == 0 {
+            String::new()
+        } else {
+            plural(n as u64, "guard")
+        };
+        out.push_str(&format!(
+            "  {}",
+            theme::paint(&pad_cols(&text, l.guards), Role::Faint)
+        ));
+    }
+    if l.activity > 0 {
+        let text = activity_label(&d.guard_stats).unwrap_or_default();
+        out.push_str(&format!(
+            "  {}",
+            theme::paint(&pad_cols(&text, l.activity), Role::Engaged)
+        ));
+    }
+    if l.age > 0 {
+        let (text, role) =
+            age_label(d.created_at.as_deref(), now).unwrap_or_else(|| (String::new(), Role::Faint));
+        out.push_str(&format!(
+            "  {}",
+            theme::paint(&pad_left_cols(&text, l.age), role)
+        ));
+    }
+    // Trailing padding is invisible but shows up in width assertions and in a
+    // terminal that highlights selections.
+    out.trim_end().to_string()
+}
+
+/// The guard globs for one row, wrapped to the title column instead of running
+/// off the edge. Only reached under `--guards`.
+fn guard_lines(d: &ZavetDecisionView, l: &ZavetLayout, cols: usize) -> Vec<String> {
+    let indent = ZAVET_INDENT + l.id + 2;
+    wrap_join(
+        d.guards.iter().map(String::as_str),
+        &dot_sep().plain,
+        cols.saturating_sub(indent),
+    )
+    .into_iter()
+    .map(|line| format!("{}{}", " ".repeat(indent), theme::paint(&line, Role::Faint)))
+    .collect()
+}
+
+/// A `TITLE · N` section head, with an optional dim explanation.
+///
+/// The note sits beside the head when it fits and wraps underneath when it does
+/// not — these explanations are the whole reason a reader knows what `OFF
+/// BRANCH` means, so they are never clipped.
+fn section_head(title: &str, count: usize, note: Option<&str>, cols: usize) -> Vec<String> {
+    let plain = format!("{title} {} {count}", theme::glyphs().dot);
+    let head = theme::paint(&plain, Role::Muted);
+    let Some(n) = note else {
+        return vec![head];
+    };
+    if display_width(&plain) + 3 + display_width(n) <= cols {
+        return vec![format!("{head}   {}", theme::paint(n, Role::Faint))];
+    }
+    let mut out = vec![head];
+    out.extend(
+        wrap_words(n, cols.saturating_sub(ZAVET_INDENT))
+            .into_iter()
+            .map(|l| {
+                format!(
+                    "{}{}",
+                    " ".repeat(ZAVET_INDENT),
+                    theme::paint(&l, Role::Faint)
+                )
+            }),
+    );
+    out
+}
+
+/// The section hint for a set of uncaptured rows.
+///
+/// The rows carry two different reasons and only one of them is fixed by
+/// committing: an `awaiting sweep` record IS committed, and telling its author
+/// to commit it sends them at a fix that cannot work. Pure so the pairing is
+/// pinned by a test.
+///
+/// `sync` is named first because it is the common case — a record committed
+/// moments ago, ahead of the baseline, which one sweep picks up. It cannot help
+/// a record BEHIND the baseline (a fresh clone's older history), and from here
+/// the two are indistinguishable: both are "in HEAD, not captured". So the
+/// hint names `reindex` as the fallback rather than leaving a user to re-run a
+/// sync that will never do anything (DIRASH-0028).
+fn uncaptured_hint(rows: &[ZavetUncapturedView]) -> &'static str {
+    let uncommitted = rows.iter().any(|u| u.reason == "uncommitted");
+    let awaiting = rows.iter().any(|u| u.reason == "awaiting sweep");
+    match (uncommitted, awaiting) {
+        (true, true) => {
+            "on disk, not captured — commit them, then `dira zavet sync` (or `reindex`)"
+        }
+        (false, true) => {
+            "committed, not yet swept — run `dira zavet sync`, or `reindex` if it stays"
+        }
+        // Includes the empty case, which never reaches a caller.
+        _ => "on disk, not captured — dira reads git, so commit them",
+    }
+}
+
+/// The `UNCAPTURED` rows: records dira can see on disk but has never captured.
+///
+/// This section exists because the alternative is silence. Capture reads git
+/// objects, so a record written a minute ago is absent from every query with no
+/// hint that anything is missing — the failure a user reads as "dira lost my
+/// decision". Naming the file and the remedy turns it into a two-second fix.
+fn uncaptured_lines(rows: &[ZavetUncapturedView], l: &ZavetLayout, cols: usize) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![String::new()];
+    out.extend(section_head(
+        "UNCAPTURED",
+        rows.len(),
+        Some(uncaptured_hint(rows)),
+        cols,
+    ));
+    // These rows carry a trailing reason that the decision layout knows nothing
+    // about, so they budget for it here rather than borrowing `l.title` — which
+    // is what pushed them past the edge at narrow widths. Capped at `l.title`
+    // so the two sections still share a left edge when there is room.
+    let reason_w = rows
+        .iter()
+        .map(|u| display_width(&u.reason))
+        .max()
+        .unwrap_or(0);
+    let width = cols
+        .saturating_sub(ZAVET_INDENT + l.id + 4 + reason_w)
+        .clamp(12, l.title.max(12));
+    for u in rows {
+        let label = u.id.clone().unwrap_or_else(|| "?".to_string());
+        let title = u.title.clone().unwrap_or_else(|| format!("({})", u.path));
+        out.push(format!(
+            "{}{}  {}  {}",
+            " ".repeat(ZAVET_INDENT),
+            theme::paint(
+                &pad_cols(&truncate_cols(&label, l.id), l.id),
+                Role::Knowledge
+            ),
+            theme::paint(&pad_cols(&truncate_cols(&title, width), width), Role::Ink),
+            theme::paint(&u.reason, Role::Compute),
+        ));
+    }
+    out
+}
+
+/// `dira zavet sync` as lines — pure, like the other zavet views, so the
+/// wording is pinned by tests rather than reachable only through stdout.
+///
+/// The uncaptured section rides the shared [`uncaptured_lines`] renderer, and
+/// deliberately prints AFTER the counts: a sweep that captured nothing because
+/// the records were never committed must not read as "already up to date".
+fn zavet_sync_lines(v: &ZavetSyncView, cols: usize) -> Vec<String> {
+    let mut out = vec![format!(
+        "{} {} {}",
+        theme::paint("zavet sync", Role::Knowledge),
+        theme::paint(dot_glyph(), Role::Muted),
+        theme::paint(&v.repo, Role::Ink),
+    )];
+    let mut why = Vec::new();
+    if !v.active {
+        why.push("zavet inactive here — nothing to capture".to_string());
+    }
+    if v.registered {
+        why.push("repo registered — the daemon will keep sweeping it".to_string());
+    }
+    if !why.is_empty() {
+        out.push(dots(&why));
+    }
+    out.push(String::new());
+    if v.decisions_captured == 0 && v.trailers_captured == 0 {
+        out.push(theme::paint(
+            "already up to date · nothing new to capture",
+            Role::Muted,
+        ));
+    } else {
+        out.push(format!(
+            "{}   {}",
+            theme::paint(
+                &format!(
+                    "captured {} · {}",
+                    plural(v.decisions_captured, "decision"),
+                    plural(v.trailers_captured, "trailer"),
+                ),
+                Role::Engaged
+            ),
+            theme::paint(
+                &format!("{} total", plural(v.decisions_total, "decision")),
+                Role::Muted
+            ),
+        ));
+    }
+    let l = ZavetLayout::for_width(cols, id_width(std::iter::empty(), &v.uncaptured));
+    out.extend(uncaptured_lines(&v.uncaptured, &l, cols));
+    out
+}
+
+/// `dira zavet decisions` as lines — pure, so the layout is pinned by tests
+/// rather than reachable only through stdout.
+fn zavet_decisions_lines(
+    v: &ZavetDecisionsView,
+    cols: usize,
+    opts: RowOpts,
+    now: OffsetDateTime,
+) -> Vec<String> {
+    if v.decisions.is_empty() && v.uncaptured.is_empty() {
+        return wrap_words(
+            "no captured decisions yet — record one with /zavet:decide, or run /zavet:backfill for an existing codebase",
+            cols,
+        )
+        .iter()
+        .map(|l| theme::paint(l, Role::Faint))
+        .collect();
+    }
+    let l = ZavetLayout::for_width(cols, id_width(v.decisions.iter(), &v.uncaptured));
+    let mut out = Vec::new();
+
+    out.extend(zavet_header(&v.repo, v.branch.as_deref(), cols, None));
+
+    // Off-branch is its own group rather than a badge on a flat list: the
+    // question "what governs the code in front of me" deserves an answer the
+    // eye can take in without filtering, and the pooled set stays visible
+    // directly beneath it.
+    let (present, off): (Vec<&ZavetDecisionView>, Vec<&ZavetDecisionView>) = v
+        .decisions
+        .iter()
+        .partition(|d| d.presence != Some(ZavetPresence::OffBranch));
+    let (active, superseded): (Vec<&ZavetDecisionView>, Vec<&ZavetDecisionView>) = present
+        .into_iter()
+        .partition(|d| d.status.as_deref().unwrap_or("active") == "active");
+
+    let mut section = |title: &str, note: Option<&str>, rows: Vec<&ZavetDecisionView>| {
+        if rows.is_empty() {
+            return;
+        }
+        out.push(String::new());
+        out.extend(section_head(title, rows.len(), note, cols));
+        for d in rows {
+            out.push(decision_row(d, &l, now));
+            if opts.guards {
+                out.extend(guard_lines(d, &l, cols));
+            }
+        }
+    };
+    section("ACTIVE", None, active);
+    section("SUPERSEDED", None, superseded);
+    if !opts.branch_only {
+        section(
+            "OFF BRANCH",
+            Some("recorded on another branch — not in this working tree"),
+            off,
+        );
+    } else if !off.is_empty() {
+        out.push(String::new());
+        out.push(theme::paint(
+            &format!(
+                "{} recorded on other branches — dira zavet decisions (without --branch)",
+                off.len()
+            ),
+            Role::Faint,
+        ));
+    }
+    out.extend(uncaptured_lines(&v.uncaptured, &l, cols));
+    out
 }
 
 /// The `[status]`/verification badges for a decision, pre-painted.
@@ -256,7 +864,7 @@ fn zavet_badges(status: Option<&str>, origin: Option<&str>, verified: Option<boo
         // Amber, deliberately loud: this is a hypothesis, not recorded fact.
         parts.push(theme::paint("unverified — hypothesis", Role::Compute));
     }
-    parts.join(&theme::paint(" · ", Role::Muted))
+    parts.join(&dot_sep().painted)
 }
 
 /// Guard-event tallies as one dotted line (`3 shown · 1 override`), the
@@ -266,7 +874,7 @@ fn guard_stats_line(stats: &[ZavetGuardStatView]) -> String {
         .iter()
         .map(|s| format!("{} {}", s.total, s.kind.trim_start_matches("guard_")))
         .collect::<Vec<_>>()
-        .join(" · ")
+        .join(&dot_sep().plain)
 }
 
 /// The first 9 characters of a sha (shorter values pass through whole).
@@ -286,28 +894,59 @@ fn spec_badges(
     verified: Option<bool>,
     stale_commits: Option<u64>,
 ) -> String {
-    let mut parts = Vec::new();
+    let (provenance, trust) = spec_badge_segs(origin, confidence, verified, stale_commits);
+    Seg::joined(&[provenance, trust], &dot_sep()).painted
+}
+
+/// The spec badge vocabulary, split into the two groups the list views drop
+/// independently: `(provenance, trust)`.
+///
+/// One definition for both callers. They previously had a copy each and had
+/// already drifted — the wiki rendered `⚠ stale 1` while `zavet why` rendered
+/// `⚠ stale · 1 commit` for the same state.
+fn spec_badge_segs(
+    origin: Option<&str>,
+    confidence: Option<&str>,
+    verified: Option<bool>,
+    stale_commits: Option<u64>,
+) -> (Seg, Seg) {
+    let dot = dot_sep();
+    let mut prov = Vec::new();
     if let Some(o) = origin {
-        parts.push(theme::paint(o, Role::Faint));
+        prov.push(Seg::new(o, Role::Faint));
     }
     if let Some(c) = confidence {
-        parts.push(theme::paint(&format!("confidence {c}"), Role::Faint));
+        prov.push(Seg::new(&format!("confidence {c}"), Role::Faint));
     }
-    if verified == Some(true) {
-        parts.push(theme::paint("✓ verified", Role::Engaged));
+    let mut trust = vec![if verified == Some(true) {
+        Seg::new(
+            &format!("{} verified", theme::glyphs().check),
+            Role::Engaged,
+        )
     } else {
         // Amber, deliberately loud: no human confirmed spec-matches-code yet.
-        parts.push(theme::paint("○ unverified", Role::Compute));
-    }
+        Seg::new(
+            &format!("{} unverified", theme::glyphs().open),
+            Role::Compute,
+        )
+    }];
     match stale_commits {
-        Some(0) => parts.push(theme::paint("✓ current", Role::Engaged)),
-        Some(n) => parts.push(theme::paint(
-            &format!("⚠ stale · {n} commit{}", if n == 1 { "" } else { "s" }),
+        Some(0) => trust.push(Seg::new(
+            &format!("{} current", theme::glyphs().check),
+            Role::Engaged,
+        )),
+        Some(n) => trust.push(Seg::new(
+            &format!(
+                "{} stale {} {}",
+                theme::glyphs().warn,
+                dot_glyph(),
+                plural(n, "commit")
+            ),
             Role::Compute,
         )),
         None => {}
     }
-    parts.join(&theme::paint(" · ", Role::Muted))
+    (Seg::joined(&prov, &dot), Seg::joined(&trust, &dot))
 }
 
 /// The CHECKS panel: how a record says its invariants are verified.
@@ -357,14 +996,17 @@ fn print_zavet_commits(commits: &[dira_core::protocol::ZavetCommitView]) {
         let sha = short_sha(&c.sha);
         let day = c.authored_at.as_deref().map(|t| &t[..t.len().min(10)]);
         let sess = match &c.session_id {
-            Some(s) => theme::paint(&format!("● {}", &s[..s.len().min(8)]), Role::Engaged),
+            Some(s) => theme::paint(
+                &format!("{} {}", theme::glyphs().bullet, &s[..s.len().min(8)]),
+                Role::Engaged,
+            ),
             None => theme::paint("unattributed", Role::Faint),
         };
         println!(
             "  {}  {}  {} {}",
             theme::paint(sha, Role::Faint),
             theme::paint(
-                &truncate(c.message.as_deref().unwrap_or("(not captured)"), 42),
+                &truncate_cols(c.message.as_deref().unwrap_or("(not captured)"), 42),
                 Role::Ink
             ),
             theme::paint(day.unwrap_or(""), Role::Muted),
@@ -384,7 +1026,7 @@ fn print_zavet_status(v: &ZavetStatusView) {
         "{} {} {} {}",
         theme::paint("zavet", Role::Knowledge),
         verdict,
-        theme::paint("·", Role::Muted),
+        theme::paint(dot_glyph(), Role::Muted),
         theme::paint(&v.repo, Role::Ink),
     );
     let mut why = vec![format!("mode {}", v.knob)];
@@ -398,23 +1040,24 @@ fn print_zavet_status(v: &ZavetStatusView) {
 
     println!();
     let shown = guard_stats_line(&v.guard_stats);
-    let rows: [(char, &str, String, String, Role); 3] = [
+    let g = theme::glyphs();
+    let rows: [(&str, &str, String, String, Role); 3] = [
         (
-            '◆',
+            g.diamond,
             "decisions",
             v.decisions_total.to_string(),
             format!("{} active", v.decisions_active),
             Role::Knowledge,
         ),
         (
-            '▪',
+            g.square,
             "trailers",
             v.trailers.to_string(),
             "micro-decisions in commit footers".to_string(),
             Role::Ink,
         ),
         (
-            '●',
+            g.bullet,
             "guards",
             v.guard_events.to_string(),
             if shown.is_empty() {
@@ -425,61 +1068,101 @@ fn print_zavet_status(v: &ZavetStatusView) {
             Role::Engaged,
         ),
     ];
-    let value_w = rows.iter().map(|r| r.2.chars().count()).max().unwrap_or(0);
-    for (glyph, label, value, note, role) in rows {
-        println!(
-            "{} {}   {}",
-            theme::paint(&format!("{glyph} {label:<10}"), role),
-            theme::paint(&format!("{value:>value_w$}"), Role::Ink),
-            theme::paint(&note, Role::Muted),
-        );
+    for line in metric_rows(&rows) {
+        println!("{line}");
     }
 }
 
-/// Render `dira zavet decisions`: an aligned table, guards underneath.
-fn print_zavet_decisions(decisions: &[ZavetDecisionView]) {
-    if decisions.is_empty() {
-        println!(
-            "{}",
-            theme::paint(
-                "no captured decisions yet — record one with /zavet:decide, or run /zavet:backfill for an existing codebase",
-                Role::Faint
+/// The zavet metric block: `glyph label  value   note`, values right-aligned to
+/// the widest one so the note column starts at a single x across every row.
+///
+/// Shared by every zavet screen that shows one — the alignment rules are layout,
+/// not content, and two copies would drift the first time either is tweaked.
+/// Glyphs are `&str` because the palette resolves them per terminal
+/// (`theme::glyphs`), and the ASCII fallbacks are not all one char.
+fn metric_rows(rows: &[(&str, &str, String, String, Role)]) -> Vec<String> {
+    let value_w = rows.iter().map(|r| r.2.chars().count()).max().unwrap_or(0);
+    rows.iter()
+        .map(|(glyph, label, value, note, role)| {
+            format!(
+                "{} {}   {}",
+                theme::paint(&format!("{glyph} {label:<10}"), *role),
+                theme::paint(&format!("{value:>value_w$}"), Role::Ink),
+                theme::paint(note, Role::Muted),
             )
-        );
-        return;
+        })
+        .collect()
+}
+
+/// Render `dira zavet decisions`.
+fn print_zavet_decisions(v: &ZavetDecisionsView, opts: RowOpts) {
+    for line in zavet_decisions_lines(v, terminal_cols() as usize, opts, OffsetDateTime::now_utc())
+    {
+        println!("{line}");
     }
-    println!(
-        "{}",
-        theme::paint(&format!("  {:<9}{:<12}TITLE", "ID", "STATUS"), Role::Muted)
-    );
-    for d in decisions {
-        let status = d.status.as_deref().unwrap_or("active");
-        println!(
-            "  {}{}{}",
-            theme::paint(&format!("{:<9}", d.id), Role::Knowledge),
-            theme::paint(
-                &format!("{status:<12}"),
-                if status == "active" {
-                    Role::Engaged
-                } else {
-                    Role::Faint
-                }
-            ),
-            theme::paint(
-                &truncate(d.title.as_deref().unwrap_or("(untitled)"), 46),
-                Role::Ink
-            ),
-        );
-        if !d.guards.is_empty() {
-            println!(
-                "  {}",
-                theme::paint(
-                    &format!("{:<9}guards {}", "", d.guards.join(" · ")),
-                    Role::Faint
-                )
-            );
-        }
+}
+
+/// `dira zavet reindex` — what the walk saw and what it wrote.
+fn print_zavet_reindex(v: &ZavetReindexView) {
+    for line in zavet_reindex_lines(v) {
+        println!("{line}");
     }
+}
+
+/// [`print_zavet_reindex`] as lines — pure, like every other zavet view, so
+/// what the command claims about its own coverage is testable rather than
+/// reachable only through stdout.
+fn zavet_reindex_lines(v: &ZavetReindexView) -> Vec<String> {
+    let mut out = vec![format!(
+        "{} {} {}",
+        theme::paint("zavet reindex", Role::Knowledge),
+        theme::paint(dot_glyph(), Role::Muted),
+        theme::paint(&v.repo, Role::Ink),
+    )];
+    if !v.active {
+        out.push(dots(
+            &["zavet inactive here — nothing to index".to_string()],
+        ));
+        return out;
+    }
+    out.push(String::new());
+    let g = theme::glyphs();
+    let rows: [(&str, &str, String, String, Role); 3] = [
+        (
+            g.diamond,
+            "decisions",
+            v.decisions_indexed.to_string(),
+            format!("{} unchanged", v.decisions_skipped),
+            Role::Knowledge,
+        ),
+        (
+            g.diamond_hollow,
+            "specs",
+            v.specs_indexed.to_string(),
+            format!("{} unchanged", v.specs_skipped),
+            Role::Knowledge,
+        ),
+        (
+            g.square,
+            "trailers",
+            v.trailer_commits_recorded.to_string(),
+            format!(
+                "commits carrying them, of {} scanned",
+                v.trailer_commits_scanned
+            ),
+            Role::Ink,
+        ),
+    ];
+    out.extend(metric_rows(&rows));
+    out.push(String::new());
+    let mut notes = vec![format!("{} commits touched .zavet/", v.commits_scanned)];
+    if v.trailers_bounded {
+        // Say what was NOT covered rather than letting a bounded scan read as
+        // exhaustive — the whole bug being fixed here was a silent bound.
+        notes.push("trailer scan bounded — `--all-trailers` for full history".to_string());
+    }
+    out.push(dots(&notes));
+    out
 }
 
 /// Render `dira zavet why`: the knowledge first, then evidence, then cost.
@@ -488,7 +1171,7 @@ fn print_zavet_why(v: &ZavetWhyView) {
     println!(
         "{} {} {}",
         theme::paint(&d.id, Role::Knowledge),
-        theme::paint("·", Role::Muted),
+        theme::paint(dot_glyph(), Role::Muted),
         theme::paint(d.title.as_deref().unwrap_or("(untitled)"), Role::Ink),
     );
     if let Some(q) = &v.matched_query {
@@ -497,7 +1180,7 @@ fn print_zavet_why(v: &ZavetWhyView) {
     println!(
         "{} {} {}",
         zavet_badges(d.status.as_deref(), d.origin.as_deref(), d.verified),
-        theme::paint("·", Role::Muted),
+        theme::paint(dot_glyph(), Role::Muted),
         theme::paint(&d.path, Role::Faint),
     );
     if let Some(s) = &d.supersedes {
@@ -506,7 +1189,10 @@ fn print_zavet_why(v: &ZavetWhyView) {
     if !v.corrects.is_empty() {
         println!(
             "{}",
-            theme::paint(&format!("corrects {}", v.corrects.join(" · ")), Role::Muted)
+            theme::paint(
+                &format!("corrects {}", v.corrects.join(&dot_sep().plain)),
+                Role::Muted
+            )
         );
     }
     if let Some(s) = &v.superseded_by {
@@ -525,7 +1211,10 @@ fn print_zavet_why(v: &ZavetWhyView) {
         println!(
             "{}",
             theme::paint(
-                &format!("⚠ corrected by {s} — one claim below is wrong; read that too"),
+                &format!(
+                    "{} corrected by {s} — one claim below is wrong; read that too",
+                    theme::glyphs().warn
+                ),
                 Role::Compute
             )
         );
@@ -534,7 +1223,7 @@ fn print_zavet_why(v: &ZavetWhyView) {
         println!(
             "{} {}",
             theme::paint("guards", Role::Muted),
-            theme::paint(&d.guards.join(" · "), Role::Ink),
+            theme::paint(&d.guards.join(&dot_sep().plain), Role::Ink),
         );
     }
     if !v.specs.is_empty() {
@@ -543,7 +1232,7 @@ fn print_zavet_why(v: &ZavetWhyView) {
             .iter()
             .map(|s| s.slug.clone())
             .collect::<Vec<_>>()
-            .join(" · ");
+            .join(&dot_sep().plain);
         println!(
             "{} {}",
             theme::paint("specs", Role::Muted),
@@ -606,10 +1295,20 @@ fn print_zavet_cost(
                         &format!("{:<10}", &s.session_id[..s.session_id.len().min(8)]),
                         Role::Muted
                     ),
-                    theme::paint(&format!("● {}", hms(s.human_seconds)), Role::Engaged),
-                    theme::paint(&format!("◆ {}", hms(s.agent_seconds)), Role::Agent),
                     theme::paint(
-                        &format!("◇ {} tok", tokens_compact(s.input_tokens + s.output_tokens)),
+                        &format!("{} {}", theme::glyphs().bullet, hms(s.human_seconds)),
+                        Role::Engaged,
+                    ),
+                    theme::paint(
+                        &format!("{} {}", theme::glyphs().diamond, hms(s.agent_seconds)),
+                        Role::Agent,
+                    ),
+                    theme::paint(
+                        &format!(
+                            "{} {} tok",
+                            theme::glyphs().diamond_hollow,
+                            tokens_compact(s.input_tokens + s.output_tokens)
+                        ),
                         Role::Compute
                     ),
                 );
@@ -618,15 +1317,27 @@ fn print_zavet_cost(
         println!(
             "  {}   {}   {}",
             theme::paint(
-                &format!("● engaged {}", hms(total_human_seconds)),
+                &format!(
+                    "{} engaged {}",
+                    theme::glyphs().bullet,
+                    hms(total_human_seconds)
+                ),
                 Role::Engaged
             ),
             theme::paint(
-                &format!("◆ agent {}", hms(total_agent_seconds)),
+                &format!(
+                    "{} agent {}",
+                    theme::glyphs().diamond,
+                    hms(total_agent_seconds)
+                ),
                 Role::Agent
             ),
             theme::paint(
-                &format!("◇ compute {} tok", tokens_compact(total_tokens)),
+                &format!(
+                    "{} compute {} tok",
+                    theme::glyphs().diamond_hollow,
+                    tokens_compact(total_tokens)
+                ),
                 Role::Compute
             ),
         );
@@ -649,7 +1360,7 @@ fn print_zavet_spec_why(v: &dira_core::protocol::ZavetSpecWhyView) {
     println!(
         "{} {} {}",
         theme::paint(&s.slug, Role::Knowledge),
-        theme::paint("·", Role::Muted),
+        theme::paint(dot_glyph(), Role::Muted),
         theme::paint(s.title.as_deref().unwrap_or("(untitled)"), Role::Ink),
     );
     if let Some(q) = &v.matched_query {
@@ -663,21 +1374,21 @@ fn print_zavet_spec_why(v: &dira_core::protocol::ZavetSpecWhyView) {
             s.verified,
             s.stale_commits
         ),
-        theme::paint("·", Role::Muted),
+        theme::paint(dot_glyph(), Role::Muted),
         theme::paint(&s.path, Role::Faint),
     );
     if !s.paths.is_empty() {
         println!(
             "{} {}",
             theme::paint("paths", Role::Muted),
-            theme::paint(&s.paths.join(" · "), Role::Ink),
+            theme::paint(&s.paths.join(&dot_sep().plain), Role::Ink),
         );
     }
     if !s.decisions.is_empty() {
         println!(
             "{} {}",
             theme::paint("decisions", Role::Muted),
-            theme::paint(&s.decisions.join(" · "), Role::Knowledge),
+            theme::paint(&s.decisions.join(&dot_sep().plain), Role::Knowledge),
         );
     }
 
@@ -737,7 +1448,7 @@ fn print_zavet_search(
                 "  {}  {} {}",
                 theme::paint(&format!("{:<8}", h.id), Role::Knowledge),
                 theme::paint(
-                    &truncate(h.title.as_deref().unwrap_or("(untitled)"), 52),
+                    &truncate_cols(h.title.as_deref().unwrap_or("(untitled)"), 52),
                     Role::Ink
                 ),
                 zavet_badges(h.status.as_deref(), None, h.verified),
@@ -745,7 +1456,7 @@ fn print_zavet_search(
             if let Some(e) = &h.excerpt {
                 println!(
                     "  {}",
-                    theme::paint(&format!("{:<8}  {}", "", truncate(e, 60)), Role::Faint)
+                    theme::paint(&format!("{:<8}  {}", "", truncate_cols(e, 60)), Role::Faint)
                 );
             }
         }
@@ -758,9 +1469,12 @@ fn print_zavet_search(
         for s in specs {
             println!(
                 "  {}  {} {}",
-                theme::paint(&format!("{:<18}", truncate(&s.slug, 18)), Role::Knowledge),
                 theme::paint(
-                    &truncate(s.title.as_deref().unwrap_or("(untitled)"), 42),
+                    &format!("{:<18}", truncate_cols(&s.slug, 18)),
+                    Role::Knowledge
+                ),
+                theme::paint(
+                    &truncate_cols(s.title.as_deref().unwrap_or("(untitled)"), 42),
                     Role::Ink
                 ),
                 spec_badges(
@@ -773,7 +1487,10 @@ fn print_zavet_search(
             if let Some(e) = &s.excerpt {
                 println!(
                     "  {}",
-                    theme::paint(&format!("{:<18}  {}", "", truncate(e, 50)), Role::Faint)
+                    theme::paint(
+                        &format!("{:<18}  {}", "", truncate_cols(e, 50)),
+                        Role::Faint
+                    )
                 );
             }
         }
@@ -788,7 +1505,7 @@ fn print_zavet_search(
                 "  {}  {} {}",
                 theme::paint(short_sha(&t.sha), Role::Faint),
                 theme::paint(&format!("{}:", t.key), Role::Knowledge),
-                theme::paint(&truncate(&t.value, 56), Role::Ink),
+                theme::paint(&truncate_cols(&t.value, 56), Role::Ink),
             );
         }
         println!(
@@ -813,13 +1530,147 @@ fn print_zavet_search(
 
 /// Render `dira zavet wiki`: the knowledge-base overview.
 fn print_zavet_wiki(v: &dira_core::protocol::ZavetWikiView) {
-    println!(
-        "{} {} {}",
-        theme::paint("ZAVET", Role::Knowledge),
-        theme::paint("·", Role::Muted),
-        theme::paint(&v.repo, Role::Ink),
+    for line in zavet_wiki_lines(v, terminal_cols() as usize, OffsetDateTime::now_utc()) {
+        println!("{line}");
+    }
+}
+
+/// How many decisions the overview shows per section before deferring to the
+/// full list. `wiki` is a landing page; a repo with eighty decisions should not
+/// print eighty rows before the specs the reader came for.
+const WIKI_SECTION_CAP: usize = 10;
+
+/// One spec row: `slug  title  badges`, with paths and linked decisions folded
+/// into counts.
+///
+/// The globs themselves were the other unbounded line in this view, and they
+/// are the same kind of detail the guard list is — useful when you are looking
+/// at one spec, noise when you are scanning ten. `dira zavet why <slug>` prints
+/// them in full.
+fn spec_tail(s: &ZavetSpecView, slug_w: usize, cols: usize) -> Seg {
+    let mut c: Vec<String> = Vec::new();
+    if !s.paths.is_empty() {
+        c.push(plural(s.paths.len() as u64, "path"));
+    }
+    if !s.decisions.is_empty() {
+        c.push(plural(s.decisions.len() as u64, "decision"));
+    }
+    let counts = Seg::new(&c.join(&dot_sep().plain), Role::Faint);
+    let (provenance, trust) = spec_badge_segs(
+        s.origin.as_deref(),
+        s.confidence.as_deref(),
+        s.verified,
+        s.stale_commits,
     );
-    let plural = |n: u64, s: &str| format!("{n} {s}{}", if n == 1 { "" } else { "s" });
+    // Priority order, most important first: trust says whether the document can
+    // be believed right now; the rest is context `dira zavet why <slug>` gives
+    // in full. The longest prefix that fits wins — clipping instead would cut a
+    // badge mid-word and read as corruption.
+    let parts = [trust, counts, provenance];
+    let sep = Seg::new(&format!("   {} ", dot_glyph()), Role::Muted);
+    let fixed = ZAVET_INDENT + slug_w + 2;
+    (1..=parts.len())
+        .rev()
+        .map(|n| Seg::joined(&parts[..n], &sep))
+        // 12 columns is the floor below which a title says nothing; anything
+        // narrower and the tail loses rather than the title.
+        .find(|t| fixed + 12 + 2 + display_width(&t.plain) <= cols)
+        .unwrap_or_else(|| Seg::new("", Role::Faint))
+}
+
+/// One spec row, given the section's shared column widths.
+fn spec_row(s: &ZavetSpecView, slug_w: usize, title_w: usize, tail: &Seg) -> String {
+    format!(
+        "{}{}  {}  {}",
+        " ".repeat(ZAVET_INDENT),
+        theme::paint(
+            &pad_cols(&truncate_cols(&s.slug, slug_w), slug_w),
+            Role::Knowledge
+        ),
+        theme::paint(
+            &pad_cols(
+                &truncate_cols(s.title.as_deref().unwrap_or("(untitled)"), title_w),
+                title_w
+            ),
+            Role::Ink
+        ),
+        tail.painted,
+    )
+    .trim_end()
+    .to_string()
+}
+
+/// The triage line: what in this knowledge base needs a human.
+///
+/// Sits directly under the totals because the totals answer "how much is here"
+/// and this answers "what is wrong with it" — which is the question that
+/// actually decides whether the reader does anything next. Empty (and omitted)
+/// when nothing needs attention, so its presence is itself the signal.
+fn wiki_attention_line(v: &dira_core::protocol::ZavetWikiView) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !v.uncaptured.is_empty() {
+        parts.push(format!("{} uncaptured", v.uncaptured.len()));
+    }
+    let off = v
+        .active
+        .iter()
+        .chain(&v.superseded)
+        .filter(|d| d.presence == Some(ZavetPresence::OffBranch))
+        .count();
+    if off > 0 {
+        parts.push(format!("{off} off branch"));
+    }
+    let unverified = v
+        .active
+        .iter()
+        .filter(|d| dira_core::zavet::is_unverified(d.origin.as_deref(), d.verified))
+        .count();
+    if unverified > 0 {
+        parts.push(format!("{unverified} unverified"));
+    }
+    let stale = v
+        .specs
+        .iter()
+        .filter(|s| s.stale_commits.is_some_and(|n| n > 0))
+        .count();
+    if stale > 0 {
+        parts.push(format!(
+            "{stale} stale spec{}",
+            if stale == 1 { "" } else { "s" }
+        ));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(theme::paint(
+        &format!(
+            "{} {}",
+            theme::glyphs().warn,
+            parts.join(&format!(" {} ", theme::glyphs().dot))
+        ),
+        Role::Compute,
+    ))
+}
+
+/// `dira zavet wiki` as lines — pure, so the layout is testable.
+fn zavet_wiki_lines(
+    v: &dira_core::protocol::ZavetWikiView,
+    cols: usize,
+    now: OffsetDateTime,
+) -> Vec<String> {
+    let l = ZavetLayout::for_width(
+        cols,
+        id_width(v.active.iter().chain(&v.superseded), &v.uncaptured),
+    );
+    let mut out = Vec::new();
+
+    out.extend(zavet_header(
+        &v.repo,
+        v.branch.as_deref(),
+        cols,
+        Some(Seg::new("ZAVET", Role::Knowledge)),
+    ));
+
     let mut summary = vec![
         plural(v.decisions_total, "decision"),
         plural(v.trailers, "trailer"),
@@ -828,95 +1679,108 @@ fn print_zavet_wiki(v: &dira_core::protocol::ZavetWikiView) {
     if v.specs_total > 0 {
         summary.push(plural(v.specs_total, "spec"));
     }
-    println!("{}", dots(&summary));
+    out.push(dots(&summary));
+    out.extend(wiki_attention_line(v));
 
-    let section = |title: &str, list: &[ZavetDecisionView]| {
-        if list.is_empty() {
+    let mut section = |title: &str, note: Option<&str>, rows: Vec<&ZavetDecisionView>| {
+        if rows.is_empty() {
             return;
         }
-        println!("\n{}", theme::paint(title, Role::Muted));
-        for d in list {
-            let verified = if dira_core::zavet::is_unverified(d.origin.as_deref(), d.verified) {
-                theme::paint("○ unverified", Role::Compute)
-            } else {
-                theme::paint("✓", Role::Engaged)
-            };
-            println!(
-                "  {}  {} {}",
-                theme::paint(&format!("{:<8}", d.id), Role::Knowledge),
+        out.push(String::new());
+        out.extend(section_head(title, rows.len(), note, cols));
+        for d in rows.iter().take(WIKI_SECTION_CAP) {
+            out.push(decision_row(d, &l, now));
+        }
+        if let Some(rest) = rows.len().checked_sub(WIKI_SECTION_CAP).filter(|n| *n > 0) {
+            out.push(format!(
+                "{}{}",
+                " ".repeat(ZAVET_INDENT),
                 theme::paint(
-                    &truncate(d.title.as_deref().unwrap_or("(untitled)"), 52),
-                    Role::Ink
-                ),
-                verified,
-            );
-            if !d.guards.is_empty() {
-                println!(
-                    "  {}",
-                    theme::paint(
-                        &format!("{:<8}  guards {}", "", d.guards.join(" · ")),
-                        Role::Faint
-                    )
-                );
-            }
+                    &format!(
+                        "{} {rest} more — dira zavet decisions",
+                        theme::glyphs().ellipsis
+                    ),
+                    Role::Faint
+                )
+            ));
         }
     };
-    section("ACTIVE DECISIONS", &v.active);
-    section("SUPERSEDED", &v.superseded);
+    let on_branch = |d: &&ZavetDecisionView| d.presence != Some(ZavetPresence::OffBranch);
+    section(
+        "ACTIVE DECISIONS",
+        None,
+        v.active.iter().filter(on_branch).collect(),
+    );
+    section(
+        "SUPERSEDED",
+        None,
+        v.superseded.iter().filter(on_branch).collect(),
+    );
+    section(
+        "OFF BRANCH",
+        Some("recorded on another branch — not in this working tree"),
+        v.active
+            .iter()
+            .chain(&v.superseded)
+            .filter(|d| d.presence == Some(ZavetPresence::OffBranch))
+            .collect(),
+    );
+    out.extend(uncaptured_lines(&v.uncaptured, &l, cols));
 
     if !v.specs.is_empty() {
-        println!("\n{}", theme::paint("SPECS", Role::Muted));
-        for s in &v.specs {
-            println!(
-                "  {}  {} {}",
-                theme::paint(&format!("{:<18}", truncate(&s.slug, 18)), Role::Knowledge),
-                theme::paint(
-                    &truncate(s.title.as_deref().unwrap_or("(untitled)"), 38),
-                    Role::Ink
-                ),
-                spec_badges(
-                    s.origin.as_deref(),
-                    s.confidence.as_deref(),
-                    s.verified,
-                    s.stale_commits
-                ),
-            );
-            let mut under: Vec<String> = Vec::new();
-            if !s.paths.is_empty() {
-                under.push(format!("paths {}", s.paths.join(" · ")));
-            }
-            if !s.decisions.is_empty() {
-                under.push(format!("decisions {}", s.decisions.join(" · ")));
-            }
-            if !under.is_empty() {
-                println!(
-                    "  {}",
-                    theme::paint(&format!("{:<18}  {}", "", under.join("  ·  ")), Role::Faint)
-                );
-            }
+        let slug_w = v
+            .specs
+            .iter()
+            .map(|s| s.slug.len())
+            .max()
+            .unwrap_or(18)
+            .clamp(12, 28);
+        out.push(String::new());
+        out.extend(section_head("SPECS", v.specs.len(), None, cols));
+        // One title width for the whole section, sized to the widest tail, so
+        // the badge column has a single left edge instead of ragging per row.
+        let tails: Vec<Seg> = v.specs.iter().map(|s| spec_tail(s, slug_w, cols)).collect();
+        let tail_w = tails
+            .iter()
+            .map(|t| display_width(&t.plain))
+            .max()
+            .unwrap_or(0);
+        let title_w = cols
+            .saturating_sub(ZAVET_INDENT + slug_w + 4 + tail_w)
+            .clamp(12, 60);
+        for (s, tail) in v.specs.iter().zip(&tails) {
+            out.push(spec_row(s, slug_w, title_w, tail));
         }
     }
 
     if !v.recent.is_empty() {
-        println!("\n{}", theme::paint("RECENT KNOWLEDGE", Role::Muted));
+        out.push(String::new());
+        out.extend(section_head("RECENT KNOWLEDGE", v.recent.len(), None, cols));
+        let w = cols
+            .saturating_sub(ZAVET_INDENT + 9 + 2 + 11 + 2)
+            .clamp(20, 80);
         for (sha, key, value) in &v.recent {
-            println!(
-                "  {}  {}  {}",
+            out.push(format!(
+                "{}{}  {}  {}",
+                " ".repeat(ZAVET_INDENT),
                 theme::paint(short_sha(sha), Role::Faint),
-                theme::paint(&format!("{key:<11}"), Role::Knowledge),
-                theme::paint(&truncate(value, 52), Role::Ink),
-            );
+                theme::paint(&pad_cols(key, 11), Role::Knowledge),
+                theme::paint(&truncate_cols(value, w), Role::Ink),
+            ));
         }
     }
-    if v.decisions_total == 0 {
-        println!(
-            "\n{}",
-            theme::paint(
+    if v.decisions_total == 0 && v.uncaptured.is_empty() {
+        out.push(String::new());
+        out.extend(
+            wrap_words(
                 "empty knowledge base — /zavet:decide records a decision, /zavet:backfill reverse-engineers an existing codebase",
-                Role::Faint
+                cols,
             )
+            .iter()
+            .map(|l| theme::paint(l, Role::Faint)),
         );
     }
+    out
 }
 
 /// Render `dira status`: the summary block always; the detail sections
@@ -964,7 +1828,7 @@ pub fn print_status(s: &StatusView, detailed: bool) {
     // something to say — a fully healthy writer prints nothing extra. Omitted
     // entirely for an older daemon (`writer_health: None`, skew-safe).
     if let Some(h) = &s.writer_health {
-        if let Some(line) = writer_health_line(h) {
+        if let Some(line) = writer_health_line(h, detailed) {
             println!("\n{}", theme::paint(&line, Role::Negative));
         }
     }
@@ -984,19 +1848,23 @@ pub fn print_status(s: &StatusView, detailed: bool) {
 /// when there's nothing worth surfacing. Pure (no printing), mirroring
 /// [`sync_health_line`], so the gate is unit-testable.
 ///
-/// Extended by issue #93: `unattributed_token_rows` renders on its own even
-/// with zero panics/stalls and not wedged — a healthy writer can still be
-/// silently losing compute to attribution failures, and D-0026 makes that
-/// worth a line every time it's nonzero, not just alongside a panic.
-fn writer_health_line(h: &dira_core::protocol::WriterHealthView) -> Option<String> {
-    if h.panics == 0 && h.stalls == 0 && !h.wedged && h.unattributed_token_rows == 0 {
+/// `unattributed_token_rows` (issue #93) is `detailed`-only. It is NOT a
+/// fault: every turn a harness runs outside a repo lands here, so on a normal
+/// machine it climbs into the hundreds within a day and would put a permanent
+/// red line under an entirely healthy `dira status` — the same failure mode
+/// `sync_health_line` avoids for a never-linked device. Under `--detailed` it
+/// still renders on its own (zero panics/stalls, not wedged), because that is
+/// where an operator goes to ask why the compute total looks low.
+fn writer_health_line(h: &dira_core::protocol::WriterHealthView, detailed: bool) -> Option<String> {
+    let show_unattributed = detailed && h.unattributed_token_rows > 0;
+    if h.panics == 0 && h.stalls == 0 && !h.wedged && !show_unattributed {
         return None;
     }
     let mut line = format!("writer: {} panic(s) caught", h.panics);
     if h.stalls > 0 {
         line.push_str(&format!(", {} stall(s) flagged", h.stalls));
     }
-    if h.unattributed_token_rows > 0 {
+    if show_unattributed {
         line.push_str(&format!(
             ", {} token turn(s) with no repo — that usage is not counted",
             h.unattributed_token_rows
@@ -1101,30 +1969,34 @@ fn summary_lines(s: &StatusView, active: &[SessionView], now: OffsetDateTime) ->
             .filter(|v| v.live_state() == LiveState::Engaged)
             .count();
         if you > 0 {
-            head.push_str(&theme::paint(" · ", Role::Muted));
+            head.push_str(&dot_sep().painted);
             head.push_str(&theme::paint(&format!("{you} you"), Role::Engaged));
         }
         if s.today.total_human_seconds > 0 {
             let mult = s.today.total_agent_seconds as f64 / s.today.total_human_seconds as f64;
-            head.push_str(&theme::paint(" · ", Role::Muted));
-            head.push_str(&theme::paint(&format!("{mult:.1}× parallel"), Role::Accent));
+            head.push_str(&dot_sep().painted);
+            head.push_str(&theme::paint(
+                &format!("{mult:.1}{} parallel", theme::glyphs().times),
+                Role::Accent,
+            ));
         }
         lines.push(head);
     }
 
     // --- metric rows ----------------------------------------------------------
     let tokens = s.tokens.filter(|t| t.total_tokens > 0);
-    let mut rows: Vec<(char, &str, String, String, Role)> = Vec::new();
+    let g = theme::glyphs();
+    let mut rows: Vec<(&str, &str, String, String, Role)> = Vec::new();
     if s.today.total_human_seconds > 0 || s.today.total_agent_seconds > 0 || tokens.is_some() {
         rows.push((
-            '●',
+            g.bullet,
             "engaged",
             hms(s.today.total_human_seconds),
             "billable base".to_string(),
             Role::Engaged,
         ));
         rows.push((
-            '◆',
+            g.diamond,
             "agent",
             hms(s.today.total_agent_seconds),
             "wall-clock".to_string(),
@@ -1134,7 +2006,7 @@ fn summary_lines(s: &StatusView, active: &[SessionView], now: OffsetDateTime) ->
     if let Some(t) = tokens {
         // `◇` is hollow on purpose: compute is an estimate, not measured time.
         rows.push((
-            '◇',
+            g.diamond_hollow,
             "compute",
             format!("{} tok", tokens_compact(t.total_tokens)),
             format!("{} est", usd_approx(t.est_cost_usd)),
@@ -1211,10 +2083,10 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout) {
         let state = theme::paint(label, role);
         println!(
             "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
-            truncate(&s.handle, 8),
-            truncate(dira_sources::harness_id(s.harness), 10),
-            truncate(kind_label(s.kind), 7),
-            truncate(&project_label(&s.project), pw),
+            truncate_cols(&s.handle, 8),
+            truncate_cols(dira_sources::harness_id(s.harness), 10),
+            truncate_cols(kind_label(s.kind), 7),
+            truncate_cols(&project_label(&s.project), pw),
             hms(s.human_seconds),
             hms(s.agent_seconds),
             state,
@@ -1235,7 +2107,7 @@ fn print_session_meta(s: &SessionView) {
         bits.push(format!("#{l}"));
     }
     if let Some(n) = &s.note {
-        bits.push(format!("\u{201c}{}\u{201d}", truncate(n, 56)));
+        bits.push(format!("\u{201c}{}\u{201d}", truncate_cols(n, 56)));
     }
     if !bits.is_empty() {
         println!(
@@ -1280,21 +2152,33 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
     };
     if eng > 0 {
         let parallel = today.total_agent_seconds as f64 / eng as f64;
-        let mult = theme::paint(&format!("{parallel:.1}× today"), Role::Accent);
-        println!("{head}  ·  {} agent(s){you} · {mult}", agents.len());
+        let mult = theme::paint(
+            &format!("{parallel:.1}{} today", theme::glyphs().times),
+            Role::Accent,
+        );
+        println!(
+            "{head}  {d}  {} agent(s){you} {d} {mult}",
+            agents.len(),
+            d = dot_glyph()
+        );
     } else {
-        println!("{head}  ·  {} agent(s){you}", agents.len());
+        println!(
+            "{head}  {d}  {} agent(s){you}",
+            agents.len(),
+            d = dot_glyph()
+        );
     }
     println!();
     // `◆` marks an agent lane (purple), `●` the deduped human baseline (teal) —
     // the same shape/colour language as the cloud's "Right Now" view. Painting
     // only the glyph keeps the padded label column aligned.
-    let agent_mark = theme::paint("◆", Role::Agent);
+    let agent_mark = theme::paint(theme::glyphs().diamond, Role::Agent);
     for s in &agents {
-        let label = truncate(
+        let label = truncate_cols(
             &format!(
-                "{} · {}",
+                "{} {} {}",
                 dira_sources::harness_id(s.harness),
+                dot_glyph(),
                 repo_short(&s.project)
             ),
             lw,
@@ -1307,7 +2191,7 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
     }
     println!(
         "  {} {:<lw$}   {}   {:>8}",
-        theme::paint("●", Role::Engaged),
+        theme::paint(theme::glyphs().bullet, Role::Engaged),
         "you (engaged)",
         bar(eng as f64 / max as f64, bw),
         hms(eng),
@@ -1326,14 +2210,15 @@ fn print_report(r: &Report, layout: &Layout) {
     for p in &r.projects {
         println!(
             "  {:<pw$} {:>10} {:>10}",
-            truncate(&project_label(&p.project), pw),
+            truncate_cols(&project_label(&p.project), pw),
             hms(p.human_seconds),
             hms(p.agent_wall_seconds),
         );
     }
+    let dash = theme::glyphs().dash;
     let total = format!(
         "  {:<pw$} {:>10} {:>10}",
-        "— total —",
+        format!("{dash} total {dash}"),
         hms(r.total_human_seconds),
         hms(r.total_agent_seconds),
     );
@@ -1344,6 +2229,93 @@ fn print_report(r: &Report, layout: &Layout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uncaptured_row(reason: &str) -> ZavetUncapturedView {
+        ZavetUncapturedView {
+            reason: reason.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// An `awaiting sweep` record is already committed, so the hint must not
+    /// tell its author to commit it — that is a fix which cannot work. Now that
+    /// `dira zavet sync` exists, there is a real remedy to name instead.
+    #[test]
+    fn the_uncaptured_hint_matches_the_reasons_present() {
+        let sync_only = uncaptured_hint(&[uncaptured_row("awaiting sweep")]);
+        assert!(sync_only.contains("dira zavet sync"));
+        assert!(
+            !sync_only.contains("commit them") && !sync_only.contains("commit it"),
+            "these are already committed; it must not ask for that: {sync_only}"
+        );
+
+        let commit_only = uncaptured_hint(&[uncaptured_row("uncommitted")]);
+        assert!(commit_only.contains("commit them"));
+        assert!(!commit_only.contains("dira zavet sync"));
+
+        let both = uncaptured_hint(&[
+            uncaptured_row("uncommitted"),
+            uncaptured_row("awaiting sweep"),
+        ]);
+        assert!(both.contains("commit them") && both.contains("dira zavet sync"));
+    }
+
+    /// DIRASH-0028's closing directive is "if a walk is bounded, say so in the
+    /// output". The trailer pass is the bounded half, so the disclosure has to
+    /// be present when it applies and absent when it doesn't — otherwise a full
+    /// scan reads as partial, or worse, a partial one reads as exhaustive.
+    #[test]
+    fn a_bounded_trailer_scan_says_so_and_a_full_one_does_not() {
+        let view = |bounded: bool| ZavetReindexView {
+            repo: "github.com/acme/api".into(),
+            active: true,
+            trailers_bounded: bounded,
+            ..Default::default()
+        };
+        let bounded = zavet_reindex_lines(&view(true)).join("\n");
+        assert!(bounded.contains("--all-trailers"), "{bounded}");
+
+        let full = zavet_reindex_lines(&view(false)).join("\n");
+        assert!(!full.contains("bounded"), "{full}");
+        assert!(!full.contains("--all-trailers"), "{full}");
+    }
+
+    /// An inactive repo must not render a metric block of zeroes — that reads
+    /// as "indexed nothing because there is nothing", not "did not look".
+    #[test]
+    fn an_inactive_repo_reports_why_instead_of_zero_counts() {
+        let lines = zavet_reindex_lines(&ZavetReindexView {
+            repo: "github.com/acme/api".into(),
+            active: false,
+            ..Default::default()
+        });
+        let text = lines.join("\n");
+        assert!(text.contains("inactive"), "{text}");
+        assert!(!text.contains("decisions"), "no metric block: {text}");
+    }
+
+    /// `sync` honors the capture baseline, so it can never pick up a record
+    /// from history BEHIND that baseline — a fresh clone's whole back catalogue.
+    /// From the uncaptured probe those are indistinguishable from a
+    /// just-committed record, so every hint that names `sync` must also name
+    /// the command that works when it doesn't, or the user re-runs a no-op
+    /// forever (DIRASH-0028).
+    #[test]
+    fn every_sync_hint_offers_reindex_as_the_fallback() {
+        for rows in [
+            vec![uncaptured_row("awaiting sweep")],
+            vec![
+                uncaptured_row("uncommitted"),
+                uncaptured_row("awaiting sweep"),
+            ],
+        ] {
+            let hint = uncaptured_hint(&rows);
+            assert!(
+                hint.contains("reindex"),
+                "a hint naming sync must name its fallback: {hint}"
+            );
+        }
+    }
 
     #[test]
     fn baseline_width_preserves_legacy_constants() {
@@ -1539,11 +2511,11 @@ mod tests {
 
     use dira_core::protocol::{SyncHealthView, WriterHealthView};
 
-    /// A nonzero `unattributed_token_rows` must render even with an otherwise
-    /// spotless writer — issue #93's whole point is that a healthy-looking
-    /// writer can still be silently losing compute.
+    /// Under `--detailed`, a nonzero `unattributed_token_rows` renders even
+    /// with an otherwise spotless writer — issue #93's whole point is that a
+    /// healthy-looking writer can still be silently losing compute.
     #[test]
-    fn writer_health_line_surfaces_unattributed_token_rows() {
+    fn writer_health_line_surfaces_unattributed_token_rows_when_detailed() {
         let h = WriterHealthView {
             panics: 0,
             stalls: 0,
@@ -1552,11 +2524,43 @@ mod tests {
             unattributed_token_rows: 142,
         };
         assert_eq!(
-            writer_health_line(&h),
+            writer_health_line(&h, true),
             Some(
                 "writer: 0 panic(s) caught, 142 token turn(s) with no repo — that usage is not counted"
                     .to_string()
             )
+        );
+    }
+
+    /// …and stays out of the default view entirely. Repo-less turns are
+    /// routine, so surfacing them there marks a healthy writer as unhealthy on
+    /// every single invocation.
+    #[test]
+    fn writer_health_line_hides_unattributed_token_rows_by_default() {
+        let h = WriterHealthView {
+            panics: 0,
+            stalls: 0,
+            idle_secs: Some(2),
+            wedged: false,
+            unattributed_token_rows: 671,
+        };
+        assert_eq!(writer_health_line(&h, false), None);
+    }
+
+    /// A real fault still prints in the default view — and without the
+    /// repo-less clause riding along.
+    #[test]
+    fn writer_health_line_reports_a_real_fault_without_the_unattributed_clause() {
+        let h = WriterHealthView {
+            panics: 2,
+            stalls: 0,
+            idle_secs: Some(2),
+            wedged: false,
+            unattributed_token_rows: 671,
+        };
+        assert_eq!(
+            writer_health_line(&h, false),
+            Some("writer: 2 panic(s) caught".to_string())
         );
     }
 
@@ -1569,7 +2573,8 @@ mod tests {
             wedged: false,
             unattributed_token_rows: 0,
         };
-        assert_eq!(writer_health_line(&h), None);
+        assert_eq!(writer_health_line(&h, false), None);
+        assert_eq!(writer_health_line(&h, true), None);
     }
 
     /// Issue #94: the generic fallback must carry the SAME disclosure as
@@ -1646,5 +2651,452 @@ mod tests {
             sync_health_line(&sync_health(Some("skipped"), 2)),
             Some("sync: 2 consecutive failure(s) (skipped)".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------
+    // zavet list views
+    // -----------------------------------------------------------------
+
+    fn dec(id: &str, title: &str, guards: usize) -> ZavetDecisionView {
+        ZavetDecisionView {
+            id: id.to_string(),
+            title: Some(title.to_string()),
+            status: Some("active".into()),
+            path: format!(".zavet/decisions/{id}.md"),
+            guards: (0..guards)
+                .map(|i| format!("src/lib/some/deeply/nested/module/path-{i}.ts"))
+                .collect(),
+            created_at: Some("2026-08-01T00:00:00Z".into()),
+            ..Default::default()
+        }
+    }
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::parse(
+            "2026-08-10T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    }
+
+    fn decisions_view(decisions: Vec<ZavetDecisionView>) -> ZavetDecisionsView {
+        ZavetDecisionsView {
+            repo: "gitlab.com/teamschedule/time-schedule-application".into(),
+            branch: Some("1881-time-related-configuration-overrides".into()),
+            decisions,
+            uncaptured: Vec::new(),
+        }
+    }
+
+    /// The defect the whole layout change exists to fix: a decision with a
+    /// fistful of long guard globs used to emit an unbounded second line that
+    /// wrapped two or three times in a real terminal. One record is one row.
+    #[test]
+    fn a_decision_with_long_guards_is_still_one_row() {
+        let v = decisions_view(vec![dec(
+            "D-0001",
+            "Deploy-skew defense is one coordinated system",
+            8,
+        )]);
+        let lines = zavet_decisions_lines(&v, 100, RowOpts::default(), now());
+        let rows: Vec<_> = lines.iter().filter(|l| l.contains("D-0001")).collect();
+        assert_eq!(rows.len(), 1, "expected one row, got {rows:#?}");
+        assert!(rows[0].contains("8 guards"));
+        assert!(!rows[0].contains("src/lib/some"));
+    }
+
+    /// Every emitted line has to fit the terminal it was measured for —
+    /// otherwise the renderer has merely moved the wrap, not removed it.
+    #[test]
+    fn no_line_exceeds_the_terminal_width() {
+        let v = decisions_view(vec![
+            dec(
+                "DIRASH-0024",
+                "Repo-scope zavet writes are gated on cwd, and dira never sets core.hooksPath",
+                6,
+            ),
+            dec(
+                "D-0002",
+                "Награди names the points-spending surface; магазин is the store",
+                3,
+            ),
+        ]);
+        for cols in [60, 80, 100, 120, 200] {
+            for line in zavet_decisions_lines(&v, cols, RowOpts::default(), now()) {
+                assert!(
+                    display_width(&line) <= cols,
+                    "{cols}-col line overflows ({}): {line:?}",
+                    display_width(&line)
+                );
+            }
+        }
+    }
+
+    /// `--guards` restores the globs, wrapped under the title column rather
+    /// than run out to whatever length the repo's paths happen to be.
+    #[test]
+    fn guards_flag_wraps_globs_within_the_width() {
+        let v = decisions_view(vec![dec("D-0001", "A decision", 8)]);
+        let opts = RowOpts {
+            guards: true,
+            ..Default::default()
+        };
+        let lines = zavet_decisions_lines(&v, 100, opts, now());
+        assert!(lines.iter().any(|l| l.contains("src/lib/some")));
+        for line in &lines {
+            assert!(display_width(line) <= 100, "overflow: {line:?}");
+        }
+    }
+
+    /// Off-branch records get their own group and are never dropped — id
+    /// allocation is repo-wide, so the row has to stay reachable.
+    #[test]
+    fn off_branch_decisions_are_grouped_not_hidden() {
+        let mut here = dec("D-0005", "On this branch", 1);
+        here.presence = Some(ZavetPresence::OnBranch);
+        let mut elsewhere = dec("D-0001", "From another branch", 1);
+        elsewhere.presence = Some(ZavetPresence::OffBranch);
+        let v = decisions_view(vec![elsewhere, here]);
+
+        let lines = zavet_decisions_lines(&v, 120, RowOpts::default(), now());
+        let text = lines.join("\n");
+        assert!(text.contains("OFF BRANCH"));
+        assert!(text.contains("D-0001"));
+        let off_at = lines.iter().position(|l| l.contains("OFF BRANCH")).unwrap();
+        let d1_at = lines.iter().position(|l| l.contains("D-0001")).unwrap();
+        let d5_at = lines.iter().position(|l| l.contains("D-0005")).unwrap();
+        assert!(
+            d5_at < off_at && off_at < d1_at,
+            "sections out of order:\n{text}"
+        );
+    }
+
+    /// `--branch` narrows to the checked-out branch but still says how many it
+    /// set aside — a record must never silently vanish from the list.
+    #[test]
+    fn branch_only_still_reports_what_it_excluded() {
+        let mut elsewhere = dec("D-0001", "From another branch", 1);
+        elsewhere.presence = Some(ZavetPresence::OffBranch);
+        let v = decisions_view(vec![elsewhere]);
+        let opts = RowOpts {
+            branch_only: true,
+            ..Default::default()
+        };
+        let text = zavet_decisions_lines(&v, 120, opts, now()).join("\n");
+        assert!(!text.contains("OFF BRANCH"));
+        assert!(text.contains("1 recorded on other branches"));
+    }
+
+    /// Uncaptured records name the file AND the remedy. The whole point is that
+    /// "I can see it in my editor" and "dira does not list it" stop reading as
+    /// a bug.
+    #[test]
+    fn uncaptured_records_report_their_reason() {
+        let mut v = decisions_view(vec![dec("D-0005", "Captured", 1)]);
+        v.uncaptured = vec![ZavetUncapturedView {
+            id: Some("D-0008".into()),
+            title: Some("Unassigned configuration resolution".into()),
+            path: ".zavet/decisions/D-0008-unassigned.md".into(),
+            reason: "uncommitted".into(),
+            kind: "decision".into(),
+        }];
+        let text = zavet_decisions_lines(&v, 120, RowOpts::default(), now()).join("\n");
+        assert!(text.contains("UNCAPTURED"));
+        assert!(text.contains("D-0008"));
+        assert!(text.contains("uncommitted"));
+        assert!(text.contains("commit them"));
+    }
+
+    /// Presence is unknown without a working directory, and unknown renders as
+    /// one plain list — never as "off branch", which would be a guess.
+    #[test]
+    fn unknown_presence_produces_no_branch_sections() {
+        let v = ZavetDecisionsView {
+            branch: None,
+            ..decisions_view(vec![dec("D-0001", "Something", 2)])
+        };
+        let text = zavet_decisions_lines(&v, 120, RowOpts::default(), now()).join("\n");
+        assert!(!text.contains("OFF BRANCH"));
+        assert!(text.contains("ACTIVE"));
+    }
+
+    /// A long repo plus a long branch is the common case on a ticket-numbered
+    /// branch; both are identifiers worth copying, so the header wraps rather
+    /// than clipping either one.
+    #[test]
+    fn a_long_header_wraps_instead_of_overflowing() {
+        let v = decisions_view(vec![dec("D-0001", "x", 0)]);
+        let lines = zavet_decisions_lines(&v, 80, RowOpts::default(), now());
+        assert!(display_width(&lines[0]) <= 80, "{:?}", lines[0]);
+        assert!(lines[1].contains("1881-time-related-config"));
+        // At a width that fits, it stays one line.
+        let wide = zavet_decisions_lines(&v, 160, RowOpts::default(), now());
+        assert!(wide[0].contains("1881-time-related-config"));
+    }
+
+    #[test]
+    fn age_label_marks_recent_records_and_ignores_the_future() {
+        let at = |s: &str| age_label(Some(s), now()).map(|(t, _)| t);
+        assert_eq!(at("2026-08-09T01:00:00Z").as_deref(), Some("new"));
+        assert_eq!(at("2026-08-08T00:00:00Z").as_deref(), Some("2d"));
+        assert_eq!(at("2026-05-10T00:00:00Z").as_deref(), Some("3mo"));
+        assert_eq!(at("2024-08-10T00:00:00Z").as_deref(), Some("2y"));
+        // Clock skew or a rebased author date: say nothing, never a negative.
+        assert_eq!(at("2026-09-01T00:00:00Z"), None);
+        assert_eq!(age_label(None, now()), None);
+    }
+
+    /// `blocked` and `complied` both mean the guard prevented a change; `shown`
+    /// is not evidence of anything and must not inflate the count.
+    #[test]
+    fn activity_folds_kept_and_separates_overrides() {
+        let stat = |kind: &str, total: u64| ZavetGuardStatView {
+            kind: kind.to_string(),
+            total,
+            unattributed: 0,
+        };
+        assert_eq!(activity_label(&[]), None);
+        assert_eq!(activity_label(&[stat("guard_shown", 9)]), None);
+        assert_eq!(
+            activity_label(&[stat("guard_blocked", 7), stat("guard_complied", 5)]).as_deref(),
+            Some("12 kept")
+        );
+        assert_eq!(
+            activity_label(&[stat("guard_overridden", 2)]).as_deref(),
+            Some("2 over")
+        );
+    }
+
+    /// Right-aligned columns are measured in cells, not chars — one ideograph
+    /// is two columns wide.
+    #[test]
+    fn truncate_cols_counts_display_cells() {
+        assert_eq!(display_width("日本語"), 6);
+        assert!(display_width(&crate::format::truncate_cols("日本語テスト", 6)) <= 6);
+        assert_eq!(crate::format::truncate_cols("abc", 10), "abc");
+    }
+
+    /// The overview leads with what needs a human, and stays silent when
+    /// nothing does — its presence is the signal.
+    #[test]
+    fn wiki_attention_line_summarizes_only_real_problems() {
+        let mut v = dira_core::protocol::ZavetWikiView {
+            repo: "gitlab.com/team/app".into(),
+            active: vec![dec("D-0001", "Fine", 1)],
+            ..Default::default()
+        };
+        assert_eq!(wiki_attention_line(&v), None);
+
+        v.uncaptured = vec![ZavetUncapturedView {
+            reason: "uncommitted".into(),
+            kind: "decision".into(),
+            ..Default::default()
+        }];
+        v.active[0].presence = Some(ZavetPresence::OffBranch);
+        let line = wiki_attention_line(&v).unwrap();
+        assert!(line.contains("1 uncaptured"), "{line}");
+        assert!(line.contains("1 off branch"), "{line}");
+    }
+
+    /// The wiki's uncaptured section mixes decision ids with spec slugs, which
+    /// are longer. A slug wider than the id column used to push its whole row
+    /// past the terminal edge.
+    #[test]
+    fn a_long_uncaptured_slug_does_not_widen_its_row() {
+        let mut v = decisions_view(vec![dec("D-0001", "Something", 1)]);
+        v.uncaptured = vec![ZavetUncapturedView {
+            id: Some("a-very-long-living-spec-slug-indeed".into()),
+            title: Some("Some spec".into()),
+            path: ".zavet/specs/a-very-long-living-spec-slug-indeed.md".into(),
+            reason: "awaiting sweep".into(),
+            kind: "spec".into(),
+        }];
+        for cols in [60, 80, 100, 200] {
+            for line in zavet_decisions_lines(&v, cols, RowOpts::default(), now()) {
+                assert!(
+                    display_width(&line) <= cols,
+                    "{cols}-col overflow ({}): {line:?}",
+                    display_width(&line)
+                );
+            }
+        }
+    }
+
+    /// Strip SGR sequences, so a painted line can be measured as the terminal
+    /// would see it.
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The regression `Seg` exists to prevent, exercised with colour ON.
+    ///
+    /// Every other width assertion in this module runs with `paint` as a no-op,
+    /// so none of them can catch a renderer that measures painted text. This
+    /// one forces colour, strips the escapes back off, and measures what the
+    /// terminal would actually show. Before `Seg`, the spec tail and the header
+    /// both failed here while the rest of the suite stayed green.
+    #[test]
+    fn every_view_fits_its_width_with_colour_on() {
+        theme::force_color(Some(true));
+        let decisions = decisions_view(vec![
+            dec("DIRASH-0024", "Repo-scope zavet writes are gated on cwd", 6),
+            dec("D-0002", "Награди names the points-spending surface", 3),
+        ]);
+        let wiki = dira_core::protocol::ZavetWikiView {
+            repo: "gitlab.com/teamschedule/time-schedule-application".into(),
+            branch: Some("1881-time-related-configuration-overrides".into()),
+            decisions_total: 2,
+            specs_total: 1,
+            active: decisions.decisions.clone(),
+            specs: vec![ZavetSpecView {
+                slug: "distribution-and-update".into(),
+                title: Some("Distribution and self-update".into()),
+                origin: Some("reverse-engineered".into()),
+                confidence: Some("low".into()),
+                stale_commits: Some(4),
+                paths: (0..6).map(|i| format!("p{i}")).collect(),
+                decisions: (0..13).map(|i| format!("D-{i:04}")).collect(),
+                ..Default::default()
+            }],
+            recent: vec![("f6ea343678fd".into(), "why".into(), "a trailer".into())],
+            ..Default::default()
+        };
+        let opts = RowOpts {
+            guards: true,
+            branch_only: false,
+        };
+        for cols in [60, 80, 100, 140, 200] {
+            let lines = zavet_decisions_lines(&decisions, cols, opts, now())
+                .into_iter()
+                .chain(zavet_wiki_lines(&wiki, cols, now()));
+            for line in lines {
+                let plain = strip_sgr(&line);
+                assert!(
+                    line.contains('\x1b') || plain.trim().is_empty(),
+                    "colour was not applied — this test proves nothing: {line:?}"
+                );
+                assert!(
+                    display_width(&plain) <= cols,
+                    "{cols}-col overflow ({}): {plain:?}",
+                    display_width(&plain)
+                );
+            }
+        }
+        // Overflow is only half the failure. Measuring painted text makes a
+        // segment look ~10 columns wider per part, so the real symptom is the
+        // opposite: badges silently DROP at a width where they fit. Assert the
+        // full tail survives on a wide terminal, or this test passes against
+        // the very bug it exists for.
+        let wide = zavet_wiki_lines(&wiki, 200, now()).join("\n");
+        let wide = strip_sgr(&wide);
+        assert!(wide.contains("unverified"), "trust badge dropped:\n{wide}");
+        assert!(wide.contains("stale"), "staleness badge dropped:\n{wide}");
+        assert!(wide.contains("13 decisions"), "counts dropped:\n{wide}");
+        assert!(
+            wide.contains("reverse-engineered"),
+            "provenance dropped:\n{wide}"
+        );
+        theme::force_color(None);
+    }
+
+    /// The invariant behind [`Seg`]: the measured half never carries SGR bytes.
+    ///
+    /// This cannot be caught by rendering assertions — `theme::paint` is a
+    /// no-op whenever stdout is not a TTY, which is always true under `cargo
+    /// test`, so a renderer that measures painted text passes every width test
+    /// and then collapses in a real terminal. It happened once; the type is the
+    /// fix and this pins it.
+    #[test]
+    fn seg_measures_plain_text_only() {
+        let a = Seg::new("verified", Role::Engaged);
+        let b = Seg::new("stale 4", Role::Compute);
+        let sep = Seg::new(" · ", Role::Muted);
+        let joined = Seg::joined(&[a, Seg::new("", Role::Faint), b], &sep);
+        assert_eq!(joined.plain, "verified · stale 4");
+        assert!(!joined.plain.contains('\x1b'));
+        // Empty segments drop out rather than leaving a dangling separator.
+        assert!(!joined.plain.contains("·  ·"));
+    }
+
+    /// Spec rows carry the widest badge set in either view; at 80 columns the
+    /// tail has to shed segments rather than run off the edge. Trust
+    /// (verified + staleness) is the last thing dropped — it is what says
+    /// whether the document can be believed right now.
+    #[test]
+    fn spec_rows_shed_badges_instead_of_overflowing() {
+        let spec = |slug: &str, stale: Option<u64>| ZavetSpecView {
+            slug: slug.to_string(),
+            title: Some("Distribution and self-update across every platform".into()),
+            origin: Some("reverse-engineered".into()),
+            confidence: Some("low".into()),
+            verified: None,
+            stale_commits: stale,
+            paths: (0..6).map(|i| format!("p{i}")).collect(),
+            decisions: (0..13).map(|i| format!("D-{i:04}")).collect(),
+            ..Default::default()
+        };
+        let v = dira_core::protocol::ZavetWikiView {
+            repo: "gitlab.com/team/app".into(),
+            specs_total: 2,
+            specs: vec![
+                spec("distribution-and-update", Some(4)),
+                spec("attestation-sync", Some(0)),
+            ],
+            ..Default::default()
+        };
+        for cols in [60, 80, 100, 140, 200] {
+            for line in zavet_wiki_lines(&v, cols, now()) {
+                assert!(
+                    display_width(&line) <= cols,
+                    "{cols}-col overflow ({}): {line:?}",
+                    display_width(&line)
+                );
+            }
+        }
+        // Even squeezed to 80, the trust badges survive.
+        let narrow = zavet_wiki_lines(&v, 80, now()).join("\n");
+        assert!(narrow.contains("unverified"), "{narrow}");
+        // One badge vocabulary across the views: the wiki says exactly what
+        // `dira zavet why` says, which is the point of the shared builder.
+        assert!(narrow.contains("stale · 4 commits"), "{narrow}");
+    }
+
+    /// The wiki is a landing page: it caps each section and points at the full
+    /// list rather than printing eighty rows before the specs.
+    #[test]
+    fn wiki_caps_sections_and_says_what_it_held_back() {
+        let v = dira_core::protocol::ZavetWikiView {
+            repo: "gitlab.com/team/app".into(),
+            decisions_total: 14,
+            active: (1..=14)
+                .map(|i| dec(&format!("D-{i:04}"), "A recorded decision", 2))
+                .collect(),
+            ..Default::default()
+        };
+        let lines = zavet_wiki_lines(&v, 120, now());
+        let shown = lines
+            .iter()
+            .filter(|l| l.contains("A recorded decision"))
+            .count();
+        assert_eq!(shown, WIKI_SECTION_CAP);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("4 more — dira zavet decisions")));
+        for line in &lines {
+            assert!(display_width(line) <= 120, "overflow: {line:?}");
+        }
     }
 }

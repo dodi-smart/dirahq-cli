@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "dira"
-version = "0.4.0"
+version = "0.5.0-develop.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1016,13 +1016,14 @@ dependencies = [
  "tokio",
  "toml_edit 0.25.13+spec-1.1.0",
  "ulid",
+ "unicode-width",
  "windows-sys 0.61.2",
  "zip",
 ]
 
 [[package]]
 name = "dira-contract"
-version = "0.4.0"
+version = "0.5.0-develop.7"
 dependencies = [
  "schemars",
  "serde",
@@ -1031,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "dira-core"
-version = "0.4.0"
+version = "0.5.0-develop.7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1058,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "dira-ipc"
-version = "0.4.0"
+version = "0.5.0-develop.7"
 dependencies = [
  "tempfile",
  "tokio",
@@ -1067,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "dira-sources"
-version = "0.4.0"
+version = "0.5.0-develop.7"
 dependencies = [
  "dira-contract",
  "dira-core",
@@ -1077,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "dirad"
-version = "0.4.0"
+version = "0.5.0-develop.7"
 dependencies = [
  "anyhow",
  "axum",

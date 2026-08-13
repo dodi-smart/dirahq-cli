@@ -1,15 +1,16 @@
 ---
 title: Zavet capture pipeline
-version: 3
+version: 5
 origin: session
 verified: false
 confidence: high
-date: 2026-08-07
+date: 2026-08-11
 paths:
   - cli/dirad/src/capture.rs
+  - cli/dirad/src/zavet.rs
   - cli/core/src/zavet.rs
   - cli/core/src/project.rs
-decisions: [D-0001]
+decisions: [D-0001, DIRASH-0027, DIRASH-0028]
 ---
 
 ## Overview
@@ -47,10 +48,29 @@ commit poll — no filesystem watcher, no extra daemon.
   spec's identity). Uppercase is load-bearing rather than cosmetic: the old
   `D-` literal excluded stray files for free, and a case-insensitive shape
   would let `notes-2024.md` read as a record.
+- That first-sight window is bounded AND followed by a baseline write, so a
+  clone whose `.zavet/` history predates the window indexes almost nothing and
+  no later sweep revisits it — `zavet sync` included, since it honors the same
+  baseline. `dira zavet reindex` is the explicit recovery: full history scoped
+  to a `.zavet/` pathspec for decisions and specs, a separately bounded pass
+  for trailers (`--all-trailers` lifts it), driving the same sweep. It skips
+  records whose content hash and path both already match, collapses each record
+  to its first and last sighting, attributes to no session, and never writes
+  `repo_baseline` — so a repeat run writes nothing and pushes nothing. This is
+  the deeper backfill DIRASH-0027 anticipates, not a `force` flag on sync.
+  See DIRASH-0028.
 - Spec staleness is never materialized: it is computed at query time as
   `git log <last_commit>..HEAD -- :(glob)<path>…` over the spec's declared
   paths, in the repo dir the daemon last observed (else the caller's cwd;
   with neither it reads *unknown*, never guessed).
+
+- `dira zavet sync` (`Request::ZavetSync`) runs one sweep on demand and
+  registers the repo dir (DIRASH-0027). Both halves matter: the idle ticker only
+  visits repos in `repo_dirs`, which is empty after a daemon restart and is
+  otherwise filled only by session registration and agent events, so an unswept
+  repo had no user-side remedy at all. It reuses `capture_commits` rather than
+  forcing a re-read, so an unchanged HEAD stays a no-op here too, and it can
+  never pick up an uncommitted record.
 
 ## Interfaces & data
 
@@ -86,6 +106,11 @@ commit poll — no filesystem watcher, no extra daemon.
   wholesale on each capture; links live on the spec side only.
 - Attribution: the unique active session for the repo or NULL — never
   guessed. Unattributed evidence is still counted and reported.
+- Every decision/spec upsert bumps `touched_seq`, which is the change signal
+  the knowledge channel reads. What happens to a captured record after this
+  point — cursors, tiers, the consent gate — is `knowledge-sync`'s spec, not
+  this one. The coupling matters in one direction only: a writer here that
+  re-stamps unchanged rows silently re-pushes the whole knowledge set.
 
 ## Invariants
 
@@ -100,12 +125,34 @@ commit poll — no filesystem watcher, no extra daemon.
   every later upsert: provenance points at the commit that INTRODUCED the
   record.
 - The knowledge sweep shares the walk's blocking budget and never touches the
-  accounting hot path.
+  accounting hot path. The reindex path is the one exception and earns it by
+  being user-initiated and off the poll: it takes no capture timeout, and it
+  still drives the same sweep rather than a second parser (DIRASH-0028).
 
 ## Open Questions
 
-- Should huge backfills (>15-commit first sight) sweep older knowledge too,
-  or is the bounded window acceptable long-term?
+- **Provenance cannot be repaired once wrong.** First-sight fields are excluded
+  from both upserts' `DO UPDATE SET`, so whichever row lands first owns
+  `first_commit`/`created_at` forever. On a fresh clone the bounded walk indexes
+  any record edited inside its window and stamps it with that recent commit;
+  `reindex` then finds the content already current and correctly skips it, so
+  the wrong introducing commit survives every subsequent run. Fixing it needs
+  the store to accept an explicit first-seen pair, which is a change to the
+  upsert contract that the ambient path shares.
+- **Nothing reconciles the index against HEAD.** Capture only ever inserts, and
+  a full-history walk can re-add a record whose file was later renamed or
+  deleted. DIRASH-0026 makes this *visible* (`off-branch`) rather than silent,
+  and deliberately never deletes a row, since ids are minted repo-wide. But
+  there is still no answer for a record that is genuinely gone rather than
+  merely on another branch, and the resurrected row inflates the totals a drift
+  figure would be computed from.
+- **`--all-trailers` has an argv ceiling.** `commit_trailers` passes one sha per
+  argument to a single `git log --no-walk`, so a large enough repo (order
+  25–50k commits, platform-dependent `ARG_MAX`) fails the spawn. `git()` maps
+  that to `None`, which becomes an empty trailer set — the command reports
+  success having recorded nothing. The default bound hides it; only the
+  documented escape hatch reaches it. Chunking the sha list, or feeding it via
+  `--stdin`, would remove the ceiling.
 - A dangling `corrected-by` is knowable here (the target may simply not be
   captured yet) but is only reported by the plugin's `zavet check`. Whether
   dira should surface it too — and how it would tell "not captured yet" from

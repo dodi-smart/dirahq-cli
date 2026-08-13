@@ -131,6 +131,7 @@ pub(crate) const CHECK_IDS: &[&str] = &[
     "hooks.config",
     "hooks.exe_path",
     "hook.breadcrumb",
+    "project.resolves",
     "sync.health",
     "device.link",
     // Opt-in: only ever emitted with `--probe`, because it spawns a child
@@ -176,6 +177,11 @@ pub(crate) struct Facts {
     pub hooks: Vec<checks::HarnessWiring>,
     pub breadcrumb: Option<crate::hook_health::Health>,
     pub current_exe: Option<String>,
+    /// The directory doctor was invoked from, and whether it resolves to a
+    /// canonical project ref. Gathered here (it shells out to git) so the judge
+    /// stays a pure function of already-gathered facts.
+    pub cwd: Option<String>,
+    pub project: Result<String, dira_core::project::ProjectMiss>,
     /// Is THIS process elevated? Gathered rather than probed inside a judge:
     /// the advice for a refused channel differs by it, and a judge that asks
     /// the OS is a judge whose verdict changes with the host it runs on — which
@@ -251,7 +257,15 @@ async fn gather(config: &Config) -> Facts {
         Err(e) => (Err(format!("{e}")), None),
     };
 
+    let cwd = std::env::current_dir().ok();
+    let project = match cwd.as_deref() {
+        Some(dir) => dira_core::project::explain_project(dir),
+        None => Err(dira_core::project::ProjectMiss::NotAGitRepo),
+    };
+
     Facts {
+        cwd: cwd.map(|d| d.display().to_string()),
+        project,
         daemon_socket: config.socket_path.display().to_string(),
         daemon,
         supervision,
@@ -312,6 +326,7 @@ pub(crate) fn run_checks(f: &Facts, args: &Args) -> Vec<Check> {
     push(checks::hooks_config(&f.hooks));
     push(checks::hooks_exe_path(&f.hooks, f.current_exe.as_deref()));
     push(checks::breadcrumb(f.breadcrumb.as_ref()));
+    push(checks::project_resolves(f));
 
     push(match &f.device {
         Some(d) => checks::sync_health(d),

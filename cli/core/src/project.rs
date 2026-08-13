@@ -19,18 +19,107 @@ pub struct Resolved {
     pub identity_name: Option<String>,
 }
 
+/// Why a directory has no canonical project ref.
+///
+/// Exists so a diagnostic can tell a legitimate state ("this is not a git repo")
+/// apart from a misconfiguration ("this repo's remote is not called `origin`").
+/// Both used to surface identically as `project: None`, which made an
+/// unattributed session indistinguishable from a correctly unattributable one
+/// (dodi-smart/dirahq-cli#111).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectMiss {
+    /// Not inside a git work tree. Legitimate; nothing to anchor against.
+    NotAGitRepo,
+    /// A git repo with no remotes at all. Also legitimate — dira anchors against
+    /// commits confirmed in a remote, so a local-only repo genuinely has none.
+    NoRemotes,
+    /// Several remotes and no way to pick: no `origin`, and the current branch
+    /// has no upstream. Deliberately NOT guessed.
+    AmbiguousRemotes(Vec<String>),
+    /// A remote was chosen but its URL is not a form we can canonicalize
+    /// (a filesystem or `file://` remote, typically).
+    UnparseableRemote { remote: String, url: String },
+}
+
+impl std::fmt::Display for ProjectMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAGitRepo => write!(f, "not a git repository"),
+            Self::NoRemotes => write!(f, "git repository has no remotes"),
+            Self::AmbiguousRemotes(rs) => write!(
+                f,
+                "several remotes ({}) and none is `origin`, nor does the current branch track one",
+                rs.join(", ")
+            ),
+            Self::UnparseableRemote { remote, url } => {
+                write!(f, "remote `{remote}` has an unrecognizable URL ({url})")
+            }
+        }
+    }
+}
+
+/// Which remote to read the project ref from, and why nothing qualifies.
+///
+/// Order is "most explicit first": `origin` by convention, then whatever the
+/// current branch actually tracks, then the only remote there is. It stops
+/// rather than guessing between several — resolving ambiguity by picking is how
+/// a repo silently attributes to the wrong project.
+fn pick_remote(root: &Path) -> Result<String, ProjectMiss> {
+    let remotes: Vec<String> = git_output(root, &["remote"])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+
+    match remotes.len() {
+        0 => return Err(ProjectMiss::NoRemotes),
+        1 => return Ok(remotes.into_iter().next().expect("len checked")),
+        _ => {}
+    }
+
+    if remotes.iter().any(|r| r == "origin") {
+        return Ok("origin".into());
+    }
+
+    // What the branch tracks beats what we would have guessed.
+    if let Some(branch) = current_branch(root) {
+        let key = format!("branch.{branch}.remote");
+        if let Some(tracked) = git(root, &["config", "--get", &key]) {
+            if remotes.contains(&tracked) {
+                return Ok(tracked);
+            }
+        }
+    }
+
+    Err(ProjectMiss::AmbiguousRemotes(remotes))
+}
+
+/// Resolve a directory to its canonical project ref, explaining any miss.
+///
+/// The single code path behind both [`resolve`] and `dira doctor`'s
+/// `project.resolves` — a second copy of this logic is exactly how a diagnostic
+/// comes to disagree with the thing it diagnoses.
+pub fn explain_project(cwd: &Path) -> Result<String, ProjectMiss> {
+    let Some(toplevel) = git(cwd, &["rev-parse", "--show-toplevel"]) else {
+        return Err(ProjectMiss::NotAGitRepo);
+    };
+    let root = Path::new(&toplevel);
+
+    let remote = pick_remote(root)?;
+    let url = git(root, &["remote", "get-url", &remote]).ok_or(ProjectMiss::NoRemotes)?;
+    canonicalize_remote(&url).ok_or(ProjectMiss::UnparseableRemote { remote, url })
+}
+
 /// Resolve a directory to its project + identity. Never errors — an unresolvable
 /// directory simply yields `None` fields.
 pub fn resolve(cwd: &Path) -> Resolved {
     let toplevel = git(cwd, &["rev-parse", "--show-toplevel"]);
     let root = toplevel.as_deref().map(Path::new).unwrap_or(cwd);
 
-    let project = git(root, &["remote", "get-url", "origin"])
-        .as_deref()
-        .and_then(canonicalize_remote);
-
     Resolved {
-        project,
+        project: explain_project(cwd).ok(),
         identity_email: git(root, &["config", "user.email"]),
         identity_name: git(root, &["config", "user.name"]),
     }
@@ -746,8 +835,8 @@ pub fn canonicalize_remote(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_remote, first_commit_date, knowledge_activity, log_commit_refs,
-        paths_touched_since_days,
+        canonicalize_remote, explain_project, first_commit_date, knowledge_activity,
+        log_commit_refs, paths_touched_since_days, resolve, ProjectMiss,
     };
 
     #[test]
@@ -904,6 +993,114 @@ mod tests {
         run_git(&root, &["add", "."]);
         run_git_at(&root, &["commit", "-q", "-m", "base"], date);
         root
+    }
+
+    // --- Which remote a project ref comes from (#111) ------------------------
+
+    /// A repo with the given remotes, each pointing at a canonicalizable URL.
+    fn init_repo_with_remotes(tag: &str, remotes: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = init_plain_repo(tag, "2026-01-01T00:00:00Z");
+        for (name, url) in remotes {
+            run_git(&root, &["remote", "add", name, url]);
+        }
+        root
+    }
+
+    #[test]
+    fn origin_is_preferred_when_several_remotes_exist() {
+        let root = init_repo_with_remotes(
+            "remote-origin",
+            &[
+                ("upstream", "git@github.com:acme/upstream.git"),
+                ("origin", "git@github.com:acme/api.git"),
+            ],
+        );
+        assert_eq!(explain_project(&root), Ok("github.com/acme/api".into()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The regression #111 is about: a repo whose only remote is not called
+    /// `origin` used to resolve to `None`, indistinguishable from having no
+    /// remote at all — so every session from it shipped unattributed.
+    #[test]
+    fn a_sole_remote_is_used_whatever_it_is_called() {
+        let root = init_repo_with_remotes(
+            "remote-sole",
+            &[("upstream", "git@github.com:acme/api.git")],
+        );
+        assert_eq!(explain_project(&root), Ok("github.com/acme/api".into()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_branch_upstream_breaks_a_tie_between_remotes() {
+        let root = init_repo_with_remotes(
+            "remote-tracked",
+            &[
+                ("fork", "git@github.com:me/api.git"),
+                ("upstream", "git@github.com:acme/api.git"),
+            ],
+        );
+        run_git(&root, &["config", "branch.main.remote", "upstream"]);
+        assert_eq!(explain_project(&root), Ok("github.com/acme/api".into()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Deliberately a miss, not a guess: picking one of several would silently
+    /// attribute the work to the wrong project.
+    #[test]
+    fn several_remotes_and_no_signal_is_ambiguous_not_guessed() {
+        let root = init_repo_with_remotes(
+            "remote-ambig",
+            &[
+                ("fork", "git@github.com:me/api.git"),
+                ("upstream", "git@github.com:acme/api.git"),
+            ],
+        );
+        match explain_project(&root) {
+            Err(ProjectMiss::AmbiguousRemotes(mut rs)) => {
+                rs.sort();
+                assert_eq!(rs, vec!["fork".to_string(), "upstream".to_string()]);
+            }
+            other => panic!("expected AmbiguousRemotes, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repo_with_no_remotes_says_so() {
+        let root = init_plain_repo("remote-none", "2026-01-01T00:00:00Z");
+        assert_eq!(explain_project(&root), Err(ProjectMiss::NoRemotes));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_filesystem_remote_is_reported_as_unparseable_not_absent() {
+        let root = init_repo_with_remotes("remote-file", &[("origin", "/srv/git/api.git")]);
+        match explain_project(&root) {
+            Err(ProjectMiss::UnparseableRemote { remote, .. }) => assert_eq!(remote, "origin"),
+            other => panic!("expected UnparseableRemote, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_a_git_repo() {
+        let dir = temp_repo_dir("remote-nogit");
+        assert_eq!(explain_project(&dir), Err(ProjectMiss::NotAGitRepo));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `resolve` must keep agreeing with `explain_project` — one code path, so a
+    /// diagnostic can never disagree with the thing it diagnoses.
+    #[test]
+    fn resolve_mirrors_explain_project() {
+        let root = init_repo_with_remotes(
+            "remote-mirror",
+            &[("upstream", "git@github.com:acme/api.git")],
+        );
+        assert_eq!(resolve(&root).project, explain_project(&root).ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn commit_file(root: &Path, rel: &str, body: &str, msg: &str, date: &str) {

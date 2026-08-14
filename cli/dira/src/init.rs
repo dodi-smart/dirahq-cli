@@ -660,7 +660,13 @@ pub fn run_codex(_print_only: bool) -> Result<Wired> {
         println!("command = \"{toml_command}\"");
         println!();
     }
-    println!("# Then start the daemon with `dira daemon start` and work as usual.");
+    // `dira daemon start` is exactly the trap DIRASH-0029 exists to delete:
+    // a bare-started daemon holds the control socket, which then blocks
+    // `dira daemon install` (D-0009). Point at the commands that actually
+    // set the machine up instead.
+    println!(
+        "# Then run `dira onboard` (or `dira daemon install` to register it as a login service)."
+    );
     // `path: None` — codex is print-only by construction, so there is nothing
     // for a caller to report as written. `dira onboard` renders this as
     // "snippet printed, paste it into ~/.codex/config.toml" rather than as a
@@ -673,6 +679,15 @@ pub fn run_codex(_print_only: bool) -> Result<Wired> {
         events_added: 0,
         note: Some("codex is print-only: paste the snippet above into ~/.codex/config.toml".into()),
     })
+}
+
+/// Whether `path` already holds exactly `plugin` — a missing or unreadable
+/// file, or content that differs at all, is "not current" and must be
+/// (re)written. Pulled out of [`run_opencode`] so the no-op decision is
+/// testable against a real temp file without resolving `home_dir()` or a
+/// daemon bearer token, neither of which this check needs.
+fn opencode_plugin_is_current(path: &std::path::Path, plugin: &str) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|existing| existing == plugin)
 }
 
 /// `dira init opencode` — write the forwarder plugin to
@@ -702,16 +717,26 @@ pub async fn run_opencode(config: &Config, print_only: bool) -> Result<Wired> {
     let dir = home.join(".config/opencode/plugin");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("dira.js");
-    std::fs::write(&path, plugin)?;
+
     // OpenCode is a written *plugin*, not merged events, so there is no
-    // per-event count to report — one file, always rewritten. Counted as a
-    // single added unit so `already_wired()` doesn't claim a no-op.
+    // per-event count to report — one file, wholesale. `already_wired()`
+    // is `path.is_some() && events_added == 0`, so an unconditional `1`
+    // here meant it could never be true for OpenCode: every re-run —
+    // including onboarding's second, nothing-should-change pass — rewrote
+    // the file and reported it as newly wired. Read the existing file
+    // first; identical content is a real no-op.
+    let events_added = if opencode_plugin_is_current(&path, &plugin) {
+        0
+    } else {
+        std::fs::write(&path, &plugin)?;
+        1
+    };
     Ok(Wired {
         label: "OpenCode",
         kind: Kind::Plugin,
         path: Some(path),
         command,
-        events_added: 1,
+        events_added,
         note: None,
     })
 }
@@ -1294,5 +1319,35 @@ mod apply_tests {
             assert_eq!(after["theme"], "dark");
             assert!(after["hooks"]["SessionStart"].is_array());
         }
+    }
+
+    /// A missing file is never "current" — the first run of `dira init
+    /// opencode` must write, not silently no-op.
+    #[test]
+    fn opencode_plugin_is_current_is_false_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dira.js");
+        assert!(!opencode_plugin_is_current(&path, "// plugin body"));
+    }
+
+    /// The re-run case this fix exists for: identical content on disk is a
+    /// real no-op, so `run_opencode`'s `events_added` can be `0` and
+    /// `already_wired()` can finally be true for OpenCode.
+    #[test]
+    fn opencode_plugin_is_current_matches_identical_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dira.js");
+        std::fs::write(&path, "// plugin body").unwrap();
+        assert!(opencode_plugin_is_current(&path, "// plugin body"));
+    }
+
+    /// Any drift at all — a bearer rotation, a port change, an upgrade that
+    /// changes the generated plugin — must still trigger a real rewrite.
+    #[test]
+    fn opencode_plugin_is_current_is_false_when_content_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dira.js");
+        std::fs::write(&path, "// old plugin body").unwrap();
+        assert!(!opencode_plugin_is_current(&path, "// new plugin body"));
     }
 }

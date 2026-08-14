@@ -59,7 +59,10 @@ fn write_record(root: &Path, id: &str, title: &str) -> String {
 /// "unknown" instead of pinning what it says it pins.
 fn init_repo(dir: &Path) {
     git(dir, &["init", "-q", "-b", "main"]);
-    git(dir, &["remote", "add", "origin", "git@github.com:acme/api.git"]);
+    git(
+        dir,
+        &["remote", "add", "origin", "git@github.com:acme/api.git"],
+    );
     git(dir, &["config", "user.email", "t@example.com"]);
     git(dir, &["config", "user.name", "T"]);
     std::fs::write(dir.join("README.md"), "x").unwrap();
@@ -244,7 +247,10 @@ async fn an_unborn_branch_still_reports_records_on_disk() {
     // Remoted to REPO even with no commits yet: `rev-parse --show-toplevel`
     // and reading `remote.origin.url` both work on an unborn branch, and the
     // repo-binding fix needs this to trust the cwd as REPO's own tree.
-    git(root, &["remote", "add", "origin", "git@github.com:acme/api.git"]);
+    git(
+        root,
+        &["remote", "add", "origin", "git@github.com:acme/api.git"],
+    );
     git(root, &["config", "user.email", "t@example.com"]);
     git(root, &["config", "user.name", "T"]);
     // No commit — HEAD does not resolve.
@@ -276,8 +282,8 @@ async fn decisions_with_a_mismatched_cwd_and_project_reports_unknown() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     init_repo(root); // remoted to REPO, github.com/acme/api
-                      // On disk in THIS checkout — would show as uncaptured if the mismatched
-                      // cwd were ever trusted as OTHER's working tree.
+                     // On disk in THIS checkout — would show as uncaptured if the mismatched
+                     // cwd were ever trusted as OTHER's working tree.
     write_record(root, "D-0009", "must never surface for another repo");
 
     const OTHER: &str = "github.com/acme/other";
@@ -296,8 +302,12 @@ async fn decisions_with_a_mismatched_cwd_and_project_reports_unknown() {
         .unwrap();
 
     let v = decisions_view(
-        dirad::zavet::decisions(&state, Some(root.display().to_string()), Some(OTHER.to_string()))
-            .await,
+        dirad::zavet::decisions(
+            &state,
+            Some(root.display().to_string()),
+            Some(OTHER.to_string()),
+        )
+        .await,
     );
 
     assert_eq!(v.branch, None, "no trusted root means no branch either");

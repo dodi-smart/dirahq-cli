@@ -13,6 +13,37 @@ use dira_core::config::KnowledgeSyncMode;
 use dira_core::Config;
 use std::path::{Path, PathBuf};
 
+/// Which harness ids to wire, before any of them are actually wired.
+///
+/// Pulled out of [`harnesses`] so target *selection* is testable without
+/// paying for target *wiring*: the loop in `harnesses()` dispatches to
+/// `init::wire`, which writes real harness configs (project- or
+/// global-scope files under `$HOME`). A test must never call `harnesses()`
+/// in-process for the same reason B1 moved `steps::knowledge` off a direct
+/// `config_cmd::set_quiet` call — it is a real write with no test seam.
+///
+/// An explicit `--harness` list bypasses detection entirely and is returned
+/// as-is, unprompted: the user has told us what they run, and a probe that
+/// disagrees is the probe's problem, not theirs.
+pub(crate) fn wiring_targets(state: &State, opts: &Options, ui: &mut dyn Ui) -> Vec<String> {
+    if !opts.harness.is_empty() {
+        return opts.harness.clone();
+    }
+    state
+        .wirable()
+        .into_iter()
+        .filter(|h| {
+            let how = match (h.on_path, h.has_config_dir) {
+                (true, true) => "found on PATH and configured",
+                (true, false) => "found on PATH",
+                _ => "config directory found",
+            };
+            ui.confirm(&format!("Wire {} ({how})?", h.probe.label), true)
+        })
+        .map(|h| h.probe.id.to_string())
+        .collect()
+}
+
 /// Step 2 — wire the harnesses.
 ///
 /// Wires every harness the user confirms, in one pass. This is the step that
@@ -27,39 +58,25 @@ pub(crate) async fn harnesses(
 ) -> Vec<(String, StepOutcome)> {
     let mut out = Vec::new();
 
-    // An explicit `--harness` list bypasses detection entirely: the user has
-    // told us what they run, and a probe that disagrees is the probe's
-    // problem, not theirs.
-    let targets: Vec<String> = if !opts.harness.is_empty() {
-        opts.harness.clone()
-    } else {
-        let candidates = state.wirable();
-        if candidates.is_empty() {
-            let all_wired = state.harnesses.iter().any(|h| h.wired);
-            return vec![(
-                "harnesses".into(),
-                if all_wired {
-                    StepOutcome::AlreadyDone("every detected harness is already wired".into())
-                } else {
-                    StepOutcome::Skipped(
-                        "no AI harness detected — install one, then re-run `dira onboard`".into(),
-                    )
-                },
-            )];
-        }
-        let mut chosen: Vec<String> = Vec::new();
-        for h in candidates {
-            let how = match (h.on_path, h.has_config_dir) {
-                (true, true) => "found on PATH and configured",
-                (true, false) => "found on PATH",
-                _ => "config directory found",
-            };
-            if ui.confirm(&format!("Wire {} ({how})?", h.probe.label), true) {
-                chosen.push(h.probe.id.to_string());
-            }
-        }
-        chosen
-    };
+    // Nothing to offer and nothing named explicitly: a distinct outcome from
+    // "asked and the user declined everything", which `wiring_targets`
+    // collapses to the same empty `Vec` — so this has to be checked before
+    // calling it, not after.
+    if opts.harness.is_empty() && state.wirable().is_empty() {
+        let all_wired = state.harnesses.iter().any(|h| h.wired);
+        return vec![(
+            "harnesses".into(),
+            if all_wired {
+                StepOutcome::AlreadyDone("every detected harness is already wired".into())
+            } else {
+                StepOutcome::Skipped(
+                    "no AI harness detected — install one, then re-run `dira onboard`".into(),
+                )
+            },
+        )];
+    }
+
+    let targets = wiring_targets(state, opts, ui);
 
     for id in targets {
         let id = id.as_str();
@@ -179,7 +196,14 @@ pub(crate) async fn daemon(
 /// The one step that needs something from outside the terminal, so empty
 /// input means skip and the run continues. Local capture is fully functional
 /// unlinked; only sync and billables need this.
-pub(crate) async fn device(config: &Config, state: &State, ui: &mut dyn Ui) -> StepOutcome {
+///
+/// Takes `state` by mutable reference and flips `device_linked` on a
+/// successful link: the knowledge step's "(pending — nothing syncs until this
+/// device is linked)" caveat and `print_open_items`' both-ends dashboard hint
+/// both read that flag, and both run after this step in the same `run()` —
+/// without the write-back, a device linked mid-run still read as unlinked to
+/// everything downstream of it.
+pub(crate) async fn device(config: &Config, state: &mut State, ui: &mut dyn Ui) -> StepOutcome {
     if state.device_linked {
         return StepOutcome::AlreadyDone("device already linked".into());
     }
@@ -197,7 +221,10 @@ pub(crate) async fn device(config: &Config, state: &State, ui: &mut dyn Ui) -> S
         );
     }
     match crate::device::link(config, Some(code), None).await {
-        Ok(()) => StepOutcome::Done("device linked".into()),
+        Ok(()) => {
+            state.device_linked = true;
+            StepOutcome::Done("device linked".into())
+        }
         Err(e) => StepOutcome::Failed(format!("link failed: {e}")),
     }
 }
@@ -517,16 +544,20 @@ mod tests {
     /// Setting a tier without a linked device is recorded but inert — the
     /// daemon's flush is gated on the link. Saying "done" without that caveat
     /// would be a lie.
+    ///
+    /// Uses an explicit tier + stub writer so the write actually happens
+    /// (`state.knowledge` starts `Off`, distinct from the requested `Full`):
+    /// the previous version of this test fixed `state.knowledge` to the
+    /// requested tier, which forced the `AlreadyDone` early return and so
+    /// never reached the "pending" wording at all.
     #[test]
     fn an_unlinked_device_reports_the_tier_as_pending() {
         let mut ui = ScriptedUi::new();
         let st = State {
-            knowledge: KnowledgeSyncMode::Full,
+            knowledge: KnowledgeSyncMode::Off,
             device_linked: false,
             ..state()
         };
-        // Already at the requested tier, so this exercises the report path
-        // without writing config.
         let writer = RecordingWriter::new();
         let outcome = knowledge(
             &st,
@@ -537,7 +568,52 @@ mod tests {
             &mut ui,
             &writer.as_fn(),
         );
-        assert!(matches!(outcome, StepOutcome::AlreadyDone(_)));
+        assert_eq!(writer.calls(), vec!["full".to_string()]);
+        match &outcome {
+            StepOutcome::Done(m) => assert!(
+                m.contains("pending"),
+                "an unlinked device must caveat the tier as pending: {m}"
+            ),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// The linked twin of the test above: once the device is linked, the
+    /// caveat shifts from "pending" (the daemon can't flush at all) to the
+    /// workspace side of the double-ended gate (the daemon can flush, but
+    /// bodies still need the workspace to also say `full`).
+    #[test]
+    fn a_linked_device_reports_the_workspace_caveat_instead() {
+        let mut ui = ScriptedUi::new();
+        let st = State {
+            knowledge: KnowledgeSyncMode::Off,
+            device_linked: true,
+            ..state()
+        };
+        let writer = RecordingWriter::new();
+        let outcome = knowledge(
+            &st,
+            &Options {
+                knowledge: Some(KnowledgeSyncMode::Full),
+                ..Options::default()
+            },
+            &mut ui,
+            &writer.as_fn(),
+        );
+        assert_eq!(writer.calls(), vec!["full".to_string()]);
+        match &outcome {
+            StepOutcome::Done(m) => {
+                assert!(
+                    !m.contains("pending"),
+                    "a linked device must not say pending: {m}"
+                );
+                assert!(
+                    m.contains("workspace must also be set to `full`"),
+                    "a linked device must state the workspace caveat: {m}"
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
     }
 
     /// Empty input means skip, and the skip must be first-class: the run
@@ -547,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn a_blank_link_code_skips_without_failing() {
         let mut ui = ScriptedUi::new().with_lines(&[""]);
-        let outcome = device(&cfg(), &state(), &mut ui).await;
+        let outcome = device(&cfg(), &mut state(), &mut ui).await;
         match outcome {
             StepOutcome::Skipped(m) => assert!(m.contains("dira device link"), "got {m}"),
             other => panic!("a blank code must skip, not {other:?}"),
@@ -564,13 +640,13 @@ mod tests {
     /// property, on the step where re-running would be most annoying.
     #[tokio::test]
     async fn an_already_linked_device_is_not_prompted() {
-        let st = State {
+        let mut st = State {
             device_linked: true,
             ..state()
         };
         let mut ui = ScriptedUi::new();
         assert!(matches!(
-            device(&cfg(), &st, &mut ui).await,
+            device(&cfg(), &mut st, &mut ui).await,
             StepOutcome::AlreadyDone(_)
         ));
         assert!(ui.transcript().is_empty(), "must ask nothing");
@@ -650,21 +726,58 @@ mod tests {
     }
 
     /// The `--harness` list is an override: detection is not consulted and no
-    /// confirmation is asked.
+    /// confirmation is asked — even when the detected candidates disagree
+    /// with what was named explicitly.
+    ///
+    /// Drives `wiring_targets` (the pure selection logic `harnesses()`
+    /// dispatches to), not `harnesses()` itself: the latter ends by calling
+    /// `init::wire`, which writes real per-harness config files, and no unit
+    /// test may pay that cost or fake it away in-process (the same hazard
+    /// class B1 closed for `config_cmd::set_quiet`).
     #[test]
     fn an_explicit_harness_list_bypasses_detection() {
         let st = State {
             harnesses: vec![present(HARNESSES[0])],
             ..state()
         };
-        assert_eq!(st.wirable().len(), 1);
+        assert_eq!(st.wirable().len(), 1, "claude is present and unwired");
 
         let opts = Options {
             harness: vec!["gemini".into()],
             ..Options::default()
         };
-        // Only checking the target-selection logic here; the wiring itself
-        // writes files and is covered by the e2e test.
-        assert_eq!(opts.harness, vec!["gemini".to_string()]);
+        let mut ui = ScriptedUi::new();
+        let targets = wiring_targets(&st, &opts, &mut ui);
+        assert_eq!(
+            targets,
+            vec!["gemini".to_string()],
+            "the explicit list wins even though claude, not gemini, is what was detected"
+        );
+        assert!(
+            ui.transcript().is_empty(),
+            "an explicit list must not prompt"
+        );
+    }
+
+    /// The complement: with no explicit `--harness`, detection drives
+    /// selection and each wirable harness gets its own confirmation.
+    #[test]
+    fn detection_prompts_once_per_wirable_harness() {
+        let st = State {
+            harnesses: vec![present(HARNESSES[0]), present(HARNESSES[2])],
+            ..state()
+        };
+        assert_eq!(st.wirable().len(), 2, "both claude and gemini are present");
+
+        // Accept the first, decline the second.
+        let mut ui = ScriptedUi::new().with_confirms(&[true, false]);
+        let targets = wiring_targets(&st, &Options::default(), &mut ui);
+        assert_eq!(targets, vec![HARNESSES[0].id.to_string()]);
+        assert_eq!(
+            ui.asked.len(),
+            2,
+            "must ask once per wirable harness, got: {:?}",
+            ui.asked
+        );
     }
 }

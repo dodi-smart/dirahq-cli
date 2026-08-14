@@ -173,6 +173,10 @@ async fn download_with(
     dest: &Path,
     policy: retry::Policy,
 ) -> Result<()> {
+    debug_assert!(
+        policy.attempts > 0,
+        "a zero-attempt policy would never call download_once and never return"
+    );
     let url = asset.url();
     let mut backoff = Duration::ZERO;
     let mut attempt = 1;
@@ -181,7 +185,14 @@ async fn download_with(
         match download_once(http, asset, dest, policy.timeout).await {
             Ok(()) => return Ok(()),
             Err(Attempt::Fatal(err)) => return Err(err),
-            Err(Attempt::Transient { err, .. }) if attempt == policy.attempts => {
+            // `>=`, not `==`: the dedup that produced this loop's current shape
+            // used to live inside a `for attempt in 1..=policy.attempts` whose
+            // range itself made "exhausted" impossible to get wrong. `==` alone
+            // is exact for every value this policy ever constructs today, but
+            // it is a silent infinite-retry trap for any future policy whose
+            // `attempts` this loop is entered with already past — `>=` is
+            // correct either way and costs nothing.
+            Err(Attempt::Transient { err, .. }) if attempt >= policy.attempts => {
                 return Err(err.context(format!(
                     "download failed after {} attempts: {url}",
                     policy.attempts
@@ -191,9 +202,13 @@ async fn download_with(
                 backoff = policy.transient_wait(retry_after, backoff);
                 // To stderr, not stdout: `dira update`'s stdout is its progress
                 // narrative, and this is a hiccup being handled, not progress.
-                // Saying it out loud beats a long unexplained pause.
+                // Saying it out loud beats a long unexplained pause. `{err:#}`
+                // (not `{err}`) so the anyhow context chain — e.g. "connection
+                // closed before message completed" — actually reaches the line
+                // a user sees mid-retry, instead of just the outer "GET <url>"
+                // wrapper.
                 eprintln!(
-                    "dira update: download attempt {attempt}/{} failed ({err}) — retrying in {:.1}s",
+                    "dira update: download attempt {attempt}/{} failed ({err:#}) — retrying in {:.1}s",
                     policy.attempts,
                     backoff.as_secs_f32()
                 );

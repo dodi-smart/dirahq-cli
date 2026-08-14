@@ -161,7 +161,9 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
     // says so when a restart is still needed.
     results.push((
         "knowledge".into(),
-        steps::knowledge(config, &state, &opts, ui.as_mut()),
+        steps::knowledge(&state, &opts, ui.as_mut(), &|raw: &str| {
+            crate::config_cmd::set_quiet(config, "sync.knowledge", raw)
+        }),
     ));
 
     print_summary(&results);

@@ -11,7 +11,7 @@ use super::{Options, StepOutcome};
 use crate::init::{self, OnUnparseable};
 use dira_core::config::KnowledgeSyncMode;
 use dira_core::Config;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Step 2 — wire the harnesses.
 ///
@@ -220,11 +220,19 @@ Knowledge sync is a separate channel from time tracking, with its own consent.
 /// Kept apart from the plugin install and the scaffold so that declining one
 /// does not decline the others: a user may well want the knowledge layer
 /// locally and no content sync at all.
+///
+/// `write_tier` is injected rather than calling `config_cmd::set_quiet`
+/// directly: that function resolves its target via `project_dirs()` and
+/// ignores whatever `Config` it is handed, so an in-process unit test that
+/// called it wrote the developer's real `config.toml` — `onboard_e2e.rs`'s
+/// `isolate_user_dirs` only contains the real binary's *subprocess*, not
+/// `cargo test --bin dira` running this function in-process. `mod::run`
+/// passes a closure over the real `set_quiet`; tests pass a recording stub.
 pub(crate) fn knowledge(
-    config: &Config,
     state: &State,
     opts: &Options,
     ui: &mut dyn Ui,
+    write_tier: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
 ) -> StepOutcome {
     let want = match opts.knowledge {
         Some(tier) => tier,
@@ -245,7 +253,7 @@ pub(crate) fn knowledge(
     // Writes through `dira config set`'s own validation rather than editing
     // the TOML here, so there is exactly one place that decides what a valid
     // tier is.
-    match crate::config_cmd::set_quiet(config, "sync.knowledge", want.as_str()) {
+    match write_tier(want.as_str()) {
         Ok(_) => {
             let mut msg = format!("knowledge sync set to `{}`", want.as_str());
             if !state.device_linked {
@@ -422,13 +430,44 @@ mod tests {
         }
     }
 
+    /// A `set_quiet` stand-in that records the tier it was asked to write
+    /// instead of touching disk.
+    ///
+    /// Every `knowledge()` test uses this, never `config_cmd::set_quiet`
+    /// directly: that function resolves `project_dirs()` regardless of the
+    /// `Config` passed to it, so calling it in-process (as `cargo test --bin
+    /// dira` does, unlike the e2e suite's isolated subprocess) wrote the
+    /// developer's real `config.toml`. See DIRASH-0030's B1 fix.
+    struct RecordingWriter(std::cell::RefCell<Vec<String>>);
+
+    impl RecordingWriter {
+        fn new() -> Self {
+            Self(std::cell::RefCell::new(Vec::new()))
+        }
+
+        /// Every tier this was asked to write, in call order.
+        fn calls(&self) -> Vec<String> {
+            self.0.borrow().clone()
+        }
+
+        /// Borrows `self`, so the returned closure — and the `&dyn Fn` made
+        /// from it — cannot outlive this recorder.
+        fn as_fn(&self) -> impl Fn(&str) -> anyhow::Result<PathBuf> + '_ {
+            move |raw: &str| {
+                self.0.borrow_mut().push(raw.to_string());
+                Ok(PathBuf::from("/dev/null/recording-writer-stub"))
+            }
+        }
+    }
+
     /// The disclosure has to name the content, not just the tier. This is the
     /// only place the user is told what `full` sends.
     #[test]
     fn the_knowledge_prompt_names_what_it_sends() {
         let mut ui = ScriptedUi::new();
         let opts = Options::default();
-        let _ = knowledge(&cfg(), &state(), &opts, &mut ui);
+        let writer = RecordingWriter::new();
+        let _ = knowledge(&state(), &opts, &mut ui, &writer.as_fn());
         let t = ui.transcript();
         for phrase in ["record bodies", "trailer values", "check commands"] {
             assert!(
@@ -446,7 +485,8 @@ mod tests {
             knowledge: Some(KnowledgeSyncMode::Metadata),
             ..Options::default()
         };
-        let _ = knowledge(&cfg(), &state(), &opts, &mut ui);
+        let writer = RecordingWriter::new();
+        let _ = knowledge(&state(), &opts, &mut ui, &writer.as_fn());
         assert!(
             !ui.transcript().contains("Send full knowledge content"),
             "an explicit --knowledge must not re-ask"
@@ -462,10 +502,15 @@ mod tests {
             knowledge: KnowledgeSyncMode::Metadata,
             ..state()
         };
-        let outcome = knowledge(&cfg(), &st, &Options::default(), &mut ui);
+        let writer = RecordingWriter::new();
+        let outcome = knowledge(&st, &Options::default(), &mut ui, &writer.as_fn());
         assert!(
             matches!(&outcome, StepOutcome::AlreadyDone(m) if m.contains("metadata")),
             "got {outcome:?}"
+        );
+        assert!(
+            writer.calls().is_empty(),
+            "already at the target tier — must not write"
         );
     }
 
@@ -482,14 +527,15 @@ mod tests {
         };
         // Already at the requested tier, so this exercises the report path
         // without writing config.
+        let writer = RecordingWriter::new();
         let outcome = knowledge(
-            &cfg(),
             &st,
             &Options {
                 knowledge: Some(KnowledgeSyncMode::Full),
                 ..Options::default()
             },
             &mut ui,
+            &writer.as_fn(),
         );
         assert!(matches!(outcome, StepOutcome::AlreadyDone(_)));
     }

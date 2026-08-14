@@ -16,7 +16,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use dira_core::{config::project_dirs, Config};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut};
 
 /// A settable knob: its key, the kind of value it accepts, and a one-line help.
@@ -247,18 +247,24 @@ pub fn set(config: &Config, key: &str, raw: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate and persist one knob, returning the file written.
+/// Validate and persist one knob at an explicit `path`, returning the file
+/// written.
 ///
-/// The whole write path lives here and [`set`] delegates to it, so exactly one
-/// place resolves the config path, preserves the existing document, and writes
-/// it back — a future change (an atomic temp+rename, say) cannot land in one
-/// copy and miss the other.
+/// The whole write path lives here — parse, validate, create the parent dir,
+/// preserve the existing document, write it back — so a future change (an
+/// atomic temp+rename, say) cannot land in one copy and miss the other.
+/// [`set_quiet`] is a thin wrapper that resolves the real XDG path and calls
+/// straight through; it exists so callers that always want the real config
+/// (the interactive `dira config set`, `dira onboard`) don't have to resolve
+/// the path themselves.
 ///
-/// `dira onboard` calls this directly because it renders its own per-step
-/// summary, and the loose "set … / wrote … / note: restart" block would
-/// interleave badly with it. Per DIRASH-0030 the knowledge tier is written
-/// through here and never by editing TOML in place.
-pub(crate) fn set_quiet(config: &Config, key: &str, raw: &str) -> Result<PathBuf> {
+/// This is also the seam that keeps `dira onboard`'s in-process unit tests
+/// off the developer's machine: `set_quiet` resolves its target via
+/// `project_dirs()` regardless of what `Config` it is handed, so a test that
+/// called it directly wrote the real `~/…/sh.dirahq.dira/config.toml` — the
+/// exact DIRASH-0030 hazard this split exists to close. Tests inject a
+/// recording stub instead of calling either of these.
+pub(crate) fn set_quiet_at(path: &Path, config: &Config, key: &str, raw: &str) -> Result<PathBuf> {
     let Some(knob) = knob(key) else {
         bail!("`{key}` is not settable");
     };
@@ -266,7 +272,6 @@ pub(crate) fn set_quiet(config: &Config, key: &str, raw: &str) -> Result<PathBuf
     // the *currently resolved* config so e.g. coalesce stays under idle.
     let item = parse_and_validate(config, knob, raw)?;
 
-    let path = config_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create config dir {}", parent.display()))?;
@@ -274,13 +279,24 @@ pub(crate) fn set_quiet(config: &Config, key: &str, raw: &str) -> Result<PathBuf
 
     // Load the existing document (or start a fresh one), edit surgically, write
     // back — comments, ordering, and untouched keys are preserved by toml_edit.
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
     let mut doc: DocumentMut = existing
         .parse()
         .with_context(|| format!("parse existing {}", path.display()))?;
     assign(&mut doc, key, item);
-    std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
-    Ok(path)
+    std::fs::write(path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
+    Ok(path.to_path_buf())
+}
+
+/// [`set_quiet_at`] against the real XDG `config.toml`.
+///
+/// `dira onboard` calls this directly because it renders its own per-step
+/// summary, and the loose "set … / wrote … / note: restart" block would
+/// interleave badly with it. Per DIRASH-0030 the knowledge tier is written
+/// through here and never by editing TOML in place.
+pub(crate) fn set_quiet(config: &Config, key: &str, raw: &str) -> Result<PathBuf> {
+    let path = config_path()?;
+    set_quiet_at(&path, config, key, raw)
 }
 
 /// Write `item` at `key` in the document, where a dotted key (`modules.zavet`)

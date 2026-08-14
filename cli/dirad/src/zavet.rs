@@ -350,12 +350,20 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
 
 /// Repo resolution ladder for the query commands: explicit repo wins, else
 /// resolve from `cwd` (or the daemon's own cwd). Also reports whether the
-/// resolved toplevel carries `.zavet/` when a directory was available.
+/// resolved toplevel carries `.zavet/` when a directory was available, and a
+/// TRUSTED toplevel to run every git probe (presence, staleness) and every
+/// write (`sync`) against.
+///
+/// The root is trusted, never assumed: every consumer used to fall back to the
+/// caller's raw `cwd` whenever the daemon had no directory on file for a named
+/// repo, which handed `sync` — and every read — the CALLER'S checkout under
+/// whatever name `--project` happened to name. A `cwd` is only ever a valid
+/// stand-in for `repo` when it demonstrably resolves to that same repo.
 async fn query_repo(
     state: &AppState,
     repo: Option<String>,
     cwd: Option<String>,
-) -> Result<(String, Option<bool>, ZavetConfig), Response> {
+) -> Result<(String, Option<bool>, ZavetConfig, Option<PathBuf>), Response> {
     // An explicit --project names a repo THIS PROCESS is not standing in — but
     // the daemon may well remember a directory for it, and that repo's id
     // conventions (`id-width`, the prefix set) still govern how a query id
@@ -366,17 +374,35 @@ async fn query_repo(
     // `dir_exists` stays `None`: it answers the `auto` probe for the tree this
     // process is standing in, and a named project is not that tree.
     if let Some(r) = repo {
-        let cfg = match repo_root(known_dir(state, &r)).await {
-            Some(root) => tokio::task::spawn_blocking(move || read_config(&root))
-                .await
-                .unwrap_or_default(),
-            None => ZavetConfig::default(),
+        if let Some(dir) = known_dir(state, &r) {
+            // The daemon already remembers a directory for `r` — trust it, and
+            // reuse the resolved toplevel as the root rather than discarding it
+            // once the config read is done.
+            let root = repo_root(Some(dir)).await;
+            let cfg = match root.clone() {
+                Some(root) => tokio::task::spawn_blocking(move || read_config(&root))
+                    .await
+                    .unwrap_or_default(),
+                None => ZavetConfig::default(),
+            };
+            return Ok((r, None, cfg, root));
+        }
+        // No directory on file for `r`. The caller's cwd is trusted ONLY IF it
+        // demonstrably belongs to `r` — its own remote resolves to the exact
+        // repo asked about — never assumed. Trusting an unrelated checkout is
+        // the data-poisoning bug: `--project some-other-repo` must not hand
+        // back whatever tree the caller happens to be standing in.
+        let resolved = resolve_repo(caller_dir(cwd)).await;
+        let (root, cfg) = if resolved.repo.as_deref() == Some(r.as_str()) {
+            (resolved.top, resolved.cfg)
+        } else {
+            (None, ZavetConfig::default())
         };
-        return Ok((r, None, cfg));
+        return Ok((r, None, cfg, root));
     }
     let r = resolve_repo(caller_dir(cwd)).await;
     match r.repo {
-        Some(repo) => Ok((repo, Some(r.dir_exists), r.cfg)),
+        Some(repo) => Ok((repo, Some(r.dir_exists), r.cfg, r.top)),
         None => Err(Response::Error {
             message: "not inside a repo with a recognizable remote; pass --project".into(),
         }),
@@ -403,13 +429,6 @@ fn spec_view(s: &ZavetSpecRow, stale_commits: Option<u64>) -> ZavetSpecView {
         stale_commits,
         presence: None,
     }
-}
-
-/// A working directory to ask git about `repo` in: the dir the daemon last
-/// observed for it, else the caller's `cwd`. `None` means staleness stays
-/// unknown — never guessed.
-fn repo_workdir(state: &AppState, repo: &str, cwd: Option<&str>) -> Option<PathBuf> {
-    known_dir(state, repo).or_else(|| cwd.map(PathBuf::from))
 }
 
 /// The directory the daemon last observed for `repo`, if any.
@@ -626,7 +645,7 @@ fn guard_stat_views(stats: Vec<dira_core::store::ZavetGuardStat>) -> Vec<ZavetGu
 
 /// `Request::ZavetStatus`.
 pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, dir_exists, _) = match query_repo(state, repo, cwd).await {
+    let (repo, dir_exists, _, _) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -658,7 +677,7 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
 
 /// `Request::ZavetDecisions`.
 pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
+    let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -673,7 +692,7 @@ pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<Strin
     let mut decisions: Vec<ZavetDecisionView> = rows.iter().map(decision_view).collect();
     attach_guard_stats(state, &repo, &mut decisions).await;
     let probe = working_tree_probe(
-        repo_root(repo_workdir(state, &repo, cwd.as_deref())).await,
+        root,
         cfg,
         // A spec on disk is not a decision — this view reports only its kind,
         // and scanning `.zavet/specs/` here would parse every spec to discard it.
@@ -711,13 +730,16 @@ pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<Strin
 /// record — capture reads git objects, not the worktree (DIRASH-0026). Those
 /// stay reported through `uncaptured`.
 pub async fn sync(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, dir_exists, cfg) = match query_repo(state, repo, cwd.clone()).await {
+    let (repo, dir_exists, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     // A sweep needs a real directory, not just a canonical name: `--project`
-    // alone can only work if the daemon already remembers a dir for it.
-    let Some(root) = repo_root(repo_workdir(state, &repo, cwd.as_deref())).await else {
+    // alone can only work if the daemon already remembers a dir for it, or the
+    // caller's own cwd demonstrably belongs to the named repo (`query_repo`).
+    // Never the caller's cwd unconditionally — that is what let an unknown
+    // `--project` register and capture a foreign checkout under the wrong name.
+    let Some(root) = root else {
         return Response::Error {
             message: format!(
                 "no working directory known for {repo}; run `dira zavet sync` from inside a checkout"
@@ -764,7 +786,7 @@ pub async fn wiki(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
+    let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -804,8 +826,8 @@ pub async fn wiki(
         .await
         .unwrap_or_default();
     // One working directory for every git probe, so staleness, branch and
-    // presence can never describe two different trees.
-    let root = repo_root(repo_workdir(state, &repo, cwd.as_deref())).await;
+    // presence can never describe two different trees — the trusted root
+    // `query_repo` resolved, never the caller's raw cwd.
     let staleness = spec_staleness(
         root.clone(),
         spec_rows.iter().map(staleness_input).collect(),
@@ -1112,7 +1134,7 @@ pub async fn set_mode(
     repo: Option<String>,
     mode: String,
 ) -> Response {
-    let (repo, _, _) = match query_repo(state, repo, cwd).await {
+    let (repo, _, _, _) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1143,7 +1165,7 @@ pub async fn why(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
+    let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1189,7 +1211,7 @@ pub async fn why(
             .await
             .unwrap_or(None)
         {
-            return spec_why(state, &repo, spec, None, cwd.as_deref()).await;
+            return spec_why(state, &repo, spec, None, root.clone()).await;
         }
     }
     // Free text ranks decisions AND specs with ONE confidence rule: the top
@@ -1221,7 +1243,7 @@ pub async fn why(
     if top > 0 && top >= own_second.max(other_top).max(best_trailer) * 2 {
         return if spec_wins {
             let (spec, _) = results.specs.remove(0);
-            spec_why(state, &repo, spec, Some(query), cwd.as_deref()).await
+            spec_why(state, &repo, spec, Some(query), root).await
         } else {
             let (decision, _) = results.decisions.remove(0);
             decision_why(state, &repo, decision, Some(query)).await
@@ -1341,7 +1363,7 @@ async fn spec_why(
     repo: &str,
     spec: ZavetSpecRow,
     matched_query: Option<String>,
-    cwd: Option<&str>,
+    root: Option<PathBuf>,
 ) -> Response {
     let commits = state
         .store
@@ -1353,7 +1375,12 @@ async fn spec_why(
         .zavet_sessions_for_spec(repo, &spec.slug)
         .await
         .unwrap_or_default();
-    let stale = spec_staleness(repo_workdir(state, repo, cwd), vec![staleness_input(&spec)])
+    // `root` is the trusted toplevel `query_repo` resolved — passing the raw
+    // cwd here used to feed a cwd-relative `:(glob)` pathspec from whatever
+    // subdirectory the caller happened to be in, reading staleness as `Some(0)`
+    // instead of the real count (the same class of bug `compute_repo_stats`
+    // fixes in `knowledge_sync.rs` by resolving to the toplevel before probing).
+    let stale = spec_staleness(root, vec![staleness_input(&spec)])
         .await
         .pop()
         .flatten();

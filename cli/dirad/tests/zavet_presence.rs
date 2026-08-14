@@ -51,8 +51,15 @@ fn write_record(root: &Path, id: &str, title: &str) -> String {
 }
 
 /// A repo with `.zavet/`, one commit on `main`, and git identity configured.
+///
+/// Remoted to `REPO` (`github.com/acme/api`): `query_repo`'s repo-binding fix
+/// trusts a `--project`-named repo's own cwd only when that cwd's remote
+/// actually resolves to the same repo — a fixture with no remote at all would
+/// never match, and every presence test below would silently degrade to
+/// "unknown" instead of pinning what it says it pins.
 fn init_repo(dir: &Path) {
     git(dir, &["init", "-q", "-b", "main"]);
+    git(dir, &["remote", "add", "origin", "git@github.com:acme/api.git"]);
     git(dir, &["config", "user.email", "t@example.com"]);
     git(dir, &["config", "user.name", "T"]);
     std::fs::write(dir.join("README.md"), "x").unwrap();
@@ -234,6 +241,10 @@ async fn an_unborn_branch_still_reports_records_on_disk() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     git(root, &["init", "-q", "-b", "main"]);
+    // Remoted to REPO even with no commits yet: `rev-parse --show-toplevel`
+    // and reading `remote.origin.url` both work on an unborn branch, and the
+    // repo-binding fix needs this to trust the cwd as REPO's own tree.
+    git(root, &["remote", "add", "origin", "git@github.com:acme/api.git"]);
     git(root, &["config", "user.email", "t@example.com"]);
     git(root, &["config", "user.name", "T"]);
     // No commit — HEAD does not resolve.
@@ -253,4 +264,51 @@ async fn an_unborn_branch_still_reports_records_on_disk() {
     assert_eq!(v.uncaptured[0].id.as_deref(), Some("D-0001"));
     // Nothing is committed, so "uncommitted" is the truthful reason.
     assert_eq!(v.uncaptured[0].reason, "uncommitted");
+}
+
+/// The read-side twin of the sync repo-binding fix: `--project` naming a repo
+/// the caller's cwd does not belong to must not borrow that cwd's tree either.
+/// Presence, branch, and the uncaptured scan all come back as "no working
+/// directory to ask git in", never a report borrowed from someone else's
+/// checkout.
+#[tokio::test]
+async fn decisions_with_a_mismatched_cwd_and_project_reports_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_repo(root); // remoted to REPO, github.com/acme/api
+                      // On disk in THIS checkout — would show as uncaptured if the mismatched
+                      // cwd were ever trusted as OTHER's working tree.
+    write_record(root, "D-0009", "must never surface for another repo");
+
+    const OTHER: &str = "github.com/acme/other";
+    let state = test_state().await;
+    let cap = ZavetDecisionCapture {
+        id: "D-0001".to_string(),
+        title: Some("D-0001".to_string()),
+        status: Some("active".into()),
+        path: ".zavet/decisions/D-0001-x.md".to_string(),
+        ..Default::default()
+    };
+    state
+        .store
+        .zavet_upsert_decision(OTHER, &cap, "sha1", None, None)
+        .await
+        .unwrap();
+
+    let v = decisions_view(
+        dirad::zavet::decisions(&state, Some(root.display().to_string()), Some(OTHER.to_string()))
+            .await,
+    );
+
+    assert_eq!(v.branch, None, "no trusted root means no branch either");
+    assert_eq!(v.decisions.len(), 1);
+    assert_eq!(
+        v.decisions[0].presence, None,
+        "the cwd belongs to a different repo than the one asked about"
+    );
+    assert!(
+        v.uncaptured.is_empty(),
+        "D-0009 lives in a checkout this query has no business reading: {:#?}",
+        v.uncaptured
+    );
 }

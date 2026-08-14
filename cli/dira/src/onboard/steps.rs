@@ -261,10 +261,15 @@ pub(crate) fn knowledge(
     ui: &mut dyn Ui,
     write_tier: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
 ) -> StepOutcome {
+    // Unconditional, and above the `opts.knowledge` match on purpose: per
+    // DIRASH-0030 every consent path — the interactive prompt, `--yes`, and
+    // an explicit `--knowledge <tier>` — has to name exactly what `full`
+    // sends before this step acts, not just the one that stops to ask.
+    ui.say(KNOWLEDGE_DISCLOSURE);
+
     let want = match opts.knowledge {
         Some(tier) => tier,
         None => {
-            ui.say(KNOWLEDGE_DISCLOSURE);
             if ui.confirm("Send full knowledge content to your workspace?", true) {
                 KnowledgeSyncMode::Full
             } else {
@@ -517,6 +522,33 @@ mod tests {
         assert!(
             !ui.transcript().contains("Send full knowledge content"),
             "an explicit --knowledge must not re-ask"
+        );
+    }
+
+    /// `--yes` resolves to `opts.knowledge = Some(Full)` before this step
+    /// ever runs (`Options::resolve_defaults`), so it takes the same
+    /// no-prompt path as an explicit `--knowledge full`. Per DIRASH-0030 that
+    /// must not mean silent: the disclosure has to name what `full` sends on
+    /// this path too, not only the interactive one.
+    #[test]
+    fn a_yes_shaped_run_still_shows_the_disclosure() {
+        let mut ui = ScriptedUi::new();
+        let opts = Options {
+            knowledge: Some(KnowledgeSyncMode::Full),
+            ..Options::default()
+        };
+        let writer = RecordingWriter::new();
+        let _ = knowledge(&state(), &opts, &mut ui, &writer.as_fn());
+        let t = ui.transcript();
+        for phrase in ["record bodies", "trailer values", "check commands"] {
+            assert!(
+                t.contains(phrase),
+                "a --yes-shaped run must still disclose {phrase:?}; got:\n{t}"
+            );
+        }
+        assert!(
+            !t.contains("Send full knowledge content"),
+            "an explicit tier must still not re-ask"
         );
     }
 

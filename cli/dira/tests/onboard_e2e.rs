@@ -64,6 +64,40 @@ fn print_changes_nothing_on_disk() {
     let home = tmp.path();
     std::fs::create_dir_all(home.join(".claude")).unwrap();
 
+    // A real, migrated DB at the exact path `isolate_user_dirs` points
+    // `DIRA_DB_PATH` at. Without this, that path never exists, so
+    // `detect::device_linked` short-circuits on the file's absence before
+    // ever reaching an open call — vacuous for the branch this test exists
+    // to cover (DIRASH-0029 rule 3): a *present* database must also not be
+    // written to by detection (`Store::open_readonly`, never `Store::open`).
+    let db_path = home.join("isolated.db");
+    tokio::runtime::Runtime::new()
+        .expect("build a tokio runtime")
+        .block_on(async {
+            let store = dira_core::Store::open(&db_path)
+                .await
+                .expect("create the isolated db");
+            // Fold the WAL into the main file (and truncate it) before this
+            // test's own before/after snapshot, rather than racing sqlx's
+            // asynchronous pool-close checkpoint — an uncheckpointed WAL is
+            // exactly what `Store::open_readonly`'s `immutable(true)` never
+            // looks at (see its doc comment), so a race here would make this
+            // assertion pass for the wrong reason.
+            store
+                .wal_checkpoint_truncate()
+                .await
+                .expect("checkpoint the isolated db");
+        });
+    // `wal_checkpoint_truncate` zeroes the WAL but does not delete the
+    // (now-empty) `-wal`/`-shm` sidecars, and this runtime's own pool-close
+    // cleanup — which does delete them, on the last connection closing — runs
+    // asynchronously on no promised schedule. Remove them here, synchronously,
+    // so the "before" snapshot below isn't racing that cleanup: whether it
+    // wins or loses would make this test flaky for a reason that has nothing
+    // to do with what it exists to check.
+    let _ = std::fs::remove_file(home.join("isolated.db-wal"));
+    let _ = std::fs::remove_file(home.join("isolated.db-shm"));
+
     let before = walk(home);
     let out = run_onboard(home, &["--print"]);
     assert!(

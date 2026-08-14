@@ -69,6 +69,36 @@ impl Store {
         Ok(Self { pool })
     }
 
+    /// Open `path` read-only, for a probe that must not write anything —
+    /// never creates the file, never migrates.
+    ///
+    /// **Why `immutable(true)`, not just `read_only(true)`.** Opening a
+    /// WAL-mode database with `read_only(true)` alone still writes: SQLite
+    /// creates the `-wal`/`-shm` sidecar files so it can consult the
+    /// wal-index, even though the connection can never write a row. That
+    /// still trips a `--print` snapshot comparison (DIRASH-0029 rule 3:
+    /// detection never writes). Confirmed empirically on this codebase — a
+    /// bare `read_only(true)` open of a freshly-migrated WAL db left
+    /// `-wal`/`-shm` behind; `read_only(true)` plus `immutable(true)` left
+    /// nothing. `immutable` tells SQLite the file will not change for the
+    /// life of the connection, which skips the wal-index setup entirely.
+    /// This is safe for a probe that opens, runs one query, and closes: a
+    /// concurrently-written row it misses is a probe answering "not linked"
+    /// a beat early, not a correctness bug (`device_linked` already treats
+    /// any open/read failure the same way).
+    pub async fn open_readonly(path: &Path) -> Result<Self, Error> {
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .immutable(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        Ok(Self { pool })
+    }
+
     /// Open an in-memory store (tests).
     pub async fn open_in_memory() -> Result<Self, Error> {
         let pool = SqlitePoolOptions::new()
@@ -2516,6 +2546,83 @@ mod tests {
             activity: None,
             note: None,
         }
+    }
+
+    fn dir_snapshot(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `open_readonly` must never write, on a WAL-mode database that already
+    /// exists: no `-wal`/`-shm` sidecars, no journal/synchronous pragma
+    /// writes — a real `--print` snapshot comparison would fail on any of
+    /// those. It still has to be able to read what's there.
+    #[tokio::test]
+    async fn open_readonly_leaves_no_trace_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "dira-open-readonly-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+
+        // A real migrated WAL-mode store, exactly as the daemon leaves one.
+        // Force a checkpoint before dropping it: `open_readonly`'s
+        // `immutable(true)` tells SQLite the file will never change, which
+        // per SQLite's own docs means it never looks at a WAL — so unless
+        // the write is checkpointed into the *main* file first, an
+        // immutable read sees a stale (possibly schema-less) snapshot. A
+        // clean pool close eventually checkpoints too, but asynchronously
+        // and on no promised schedule, which would make this a flaky race
+        // rather than a deterministic check.
+        let store = Store::open(&path).await.unwrap();
+        store.meta_set("k", "v").await.unwrap();
+        store.wal_checkpoint_truncate().await.unwrap();
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let before = dir_snapshot(&dir);
+
+        let ro = Store::open_readonly(&path).await.unwrap();
+        let got = ro.meta_get("k").await.unwrap();
+        assert_eq!(got.as_deref(), Some("v"));
+        drop(ro);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let after = dir_snapshot(&dir);
+        assert_eq!(
+            before, after,
+            "open_readonly must not create any sidecar file"
+        );
+    }
+
+    /// A missing file must fail, not be created — `open` creates on demand,
+    /// `open_readonly` is exclusively for probing something that may or may
+    /// not already exist.
+    #[tokio::test]
+    async fn open_readonly_does_not_create_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "dira-open-readonly-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("never-created.db");
+
+        assert!(Store::open_readonly(&path).await.is_err());
+        assert!(!path.exists(), "open_readonly must not create the file");
     }
 
     #[tokio::test]

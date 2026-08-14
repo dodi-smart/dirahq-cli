@@ -159,7 +159,7 @@ pub(crate) fn probe_harness(
     }
 }
 
-/// Which harnesses already carry dira hooks.
+/// Which harnesses already carry dira hooks, at **global** scope.
 ///
 /// Reuses `doctor`'s reader (`read_harness_wiring`) rather than re-parsing
 /// config files, so "wired" means exactly what `dira doctor` means by it. A
@@ -167,9 +167,27 @@ pub(crate) fn probe_harness(
 /// config (new events added by an upgrade) must still be offered, since
 /// re-running `init` is what fills the gap.
 pub(crate) fn wired_harness_ids() -> Vec<&'static str> {
-    crate::doctor::checks::read_harness_wiring()
+    globally_wired(crate::doctor::checks::read_harness_wiring())
+}
+
+/// Filter a wiring report down to the fully-wired, **global**-scope entries.
+///
+/// `read_harness_wiring()` reports project scope too — Claude Code's own
+/// precedence puts it first — but onboarding wires at user scope
+/// (DIRASH-0029's "why user scope": a machine-setup command, not a per-repo
+/// one). Counting a project-scope wiring here meant a user who had run a bare
+/// `dira init` inside one repo got `AlreadyDone` from onboarding's harness
+/// step, and every other repo on the machine stayed silently uncaptured with
+/// no signal why — the exact silent-undercapture failure DIRASH-0029 exists
+/// to prevent.
+///
+/// Split out from [`wired_harness_ids`] so the scope filter is testable
+/// without a real `$HOME`: `read_harness_wiring()` has no injection point,
+/// it always reads the process's real config paths.
+fn globally_wired(wiring: Vec<crate::doctor::checks::HarnessWiring>) -> Vec<&'static str> {
+    wiring
         .into_iter()
-        .filter(|w| w.missing.is_empty())
+        .filter(|w| w.missing.is_empty() && w.scope == "global")
         .map(|w| w.harness)
         .collect()
 }
@@ -291,6 +309,39 @@ mod tests {
         assert!(h.wired);
         let h = probe_harness(claude(), &home, &["gemini"], true);
         assert!(!h.wired);
+    }
+
+    /// A project-scope wiring (a bare `dira init` run inside one repo) must
+    /// not count as "done" for onboarding, which wires user/global scope —
+    /// otherwise a user who ran `dira init` in one repo gets `AlreadyDone`
+    /// from the harness step and every other repo on the machine stays
+    /// silently uncaptured (DIRASH-0029's "why user scope").
+    #[test]
+    fn only_global_scope_counts_as_wired_for_onboarding() {
+        use crate::doctor::checks::HarnessWiring;
+        let wiring = vec![
+            HarnessWiring {
+                harness: "claude",
+                scope: "project",
+                path: "./.claude/settings.json".to_string(),
+                expected: 5,
+                missing: Vec::new(),
+                commands: Vec::new(),
+            },
+            HarnessWiring {
+                harness: "gemini",
+                scope: "global",
+                path: "/home/x/.gemini/settings.json".to_string(),
+                expected: 5,
+                missing: Vec::new(),
+                commands: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            globally_wired(wiring),
+            vec!["gemini"],
+            "the fully-wired project-scope claude entry must not count"
+        );
     }
 
     /// An already-wired harness is not offered again — that is what makes a

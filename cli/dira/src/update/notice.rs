@@ -171,12 +171,35 @@ impl Env {
 /// from a dev build outright — because it must decide install *behavior*
 /// (refuse a dev symlink unless `--force`; always refuse a dev build), not
 /// just whether to print a notice. This copy is deliberately independent so
-/// T5 doesn't have to land after T4; unify them once both exist.
+/// T5 doesn't have to land after T4; unify them once both exist (D-0006).
 fn is_dev_build() -> bool {
     let Ok(exe) = env::current_exe() else {
         return false;
     };
-    let mut components = exe.components().map(|c| c.as_os_str());
+    is_dev_build_path(&exe)
+}
+
+/// The path-comparison half of [`is_dev_build`], split out so it is testable
+/// against an arbitrary path instead of only the test binary's own
+/// `current_exe()` (which — being built by `cargo test` — always resolves
+/// under `target/debug` regardless of what this function does).
+///
+/// `current_exe()` does not canonicalize consistently across platforms: on
+/// Linux it reads `/proc/self/exe`, which the kernel already fully resolves,
+/// but on macOS it can return the path as invoked — symlink and all. A
+/// `just install` PATH entry (`~/.local/bin/dira` -> `target/release/dira`)
+/// therefore carries no literal `target`/`release` component on macOS until
+/// this canonicalizes it, so this must resolve the symlink itself rather
+/// than trust `current_exe()` to have already done it — otherwise this
+/// recognizes strictly fewer dev installs than
+/// `update::replace::discover_install`'s PATH-entry check does (D-0004), and
+/// the passive notice nags exactly the symlinked-dev-build user the D-0004
+/// guard already refuses to update. `canonicalize` failing (a dangling
+/// symlink, a removed exe) falls back to the raw path rather than erroring —
+/// "no signal" here, same as everywhere else in this module.
+fn is_dev_build_path(exe: &Path) -> bool {
+    let resolved = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let mut components = resolved.components().map(|c| c.as_os_str());
     let saw_target = components.clone().any(|c| c == "target");
     let saw_profile_dir = components.any(|c| c == "release" || c == "debug");
     saw_target && saw_profile_dir
@@ -733,6 +756,76 @@ mod tests {
             ..allow_env()
         }
         .checking_disabled());
+    }
+
+    // --- is_dev_build_path (symlink canonicalization) ------------------------
+
+    #[test]
+    fn dev_build_path_matches_a_plain_target_debug_path() {
+        assert!(is_dev_build_path(Path::new(
+            "/home/dev/dirahq-cli/target/debug/dira"
+        )));
+        assert!(is_dev_build_path(Path::new(
+            "/home/dev/dirahq-cli/target/release/dira"
+        )));
+    }
+
+    #[test]
+    fn dev_build_path_does_not_match_an_installed_path() {
+        assert!(!is_dev_build_path(Path::new("/home/user/.local/bin/dira")));
+    }
+
+    /// The regression this exists to fix: on macOS `current_exe()` can return
+    /// the path as invoked — a `just install` symlink, unresolved — which
+    /// carries no `target`/`release` component at all until canonicalized.
+    /// Builds a real symlink chain (`bin/dira` -> `target/release/dira`) and
+    /// confirms `is_dev_build_path` still recognizes it via the *unresolved*
+    /// symlink path, exactly the shape `current_exe()` can hand back.
+    #[cfg(unix)]
+    #[test]
+    fn dev_build_path_resolves_a_symlink_into_target_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("target").join("release");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_exe = real_dir.join("dira");
+        fs::write(&real_exe, b"fake").unwrap();
+
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let symlink_path = bin_dir.join("dira");
+        std::os::unix::fs::symlink(&real_exe, &symlink_path).unwrap();
+
+        assert!(
+            is_dev_build_path(&symlink_path),
+            "an unresolved symlink into target/release must still canonicalize to a dev build"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_build_path_falls_back_to_the_raw_path_on_a_dangling_symlink() {
+        // canonicalize() fails on a dangling symlink; this must not panic or
+        // error, and must not lose the signal either — fall back to judging
+        // the unresolved path itself, which is still under target/release
+        // here even though the symlink's *target* does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        let release_dir = dir.path().join("target").join("release");
+        fs::create_dir_all(&release_dir).unwrap();
+        let symlink_path = release_dir.join("dira");
+        std::os::unix::fs::symlink(dir.path().join("nonexistent-target-binary"), &symlink_path)
+            .unwrap();
+        assert!(
+            fs::canonicalize(&symlink_path).is_err(),
+            "the fixture must actually be dangling for this test to mean anything"
+        );
+
+        assert!(
+            is_dev_build_path(&symlink_path),
+            "a dangling symlink whose own path is under target/release must still fall back to matching"
+        );
+
+        let installed_like = dir.path().join("bin").join("dira-does-not-exist");
+        assert!(!is_dev_build_path(&installed_like));
     }
 
     // --- Env::from_process wiring -------------------------------------------

@@ -600,3 +600,100 @@ async fn version_pin_downgrades_without_resistance() {
         "expected the downgraded version, got: {dira_out}"
     );
 }
+
+/// The regression this exists to prevent (#101): a D-0004 dev-install
+/// refusal is deterministic and permanent-by-design -- no amount of retrying
+/// `dira update` fixes it -- so it must never bump the passive notice's
+/// consecutive-failure counter. Before the fix, a `just install` contributor
+/// who ran an ordinary (unpinned) `dira update` against their dev build got
+/// the refusal *and* a bumped counter, and two such runs alone escalated the
+/// notice to "N recent update attempts failed" for a condition that was
+/// never going away on its own.
+///
+/// Triggers `Guard::DevBuild` (not the PATH-symlink `DevSymlink` guard,
+/// which is simpler to stage): running the copied test binary itself out of
+/// a `target/debug` ancestor trips it unconditionally, regardless of
+/// `--bin-dir` -- see `replace::discover_install`. The run is deliberately
+/// *not* `--version`-pinned (unlike every other test in this file), because
+/// a pinned run is excluded from the counter for an unrelated reason
+/// (`update::run`'s `pinned` check) and would not exercise the `Refusal`
+/// marker this test is actually pinning down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dev_build_refusal_does_not_bump_the_update_failure_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let dev_dir = tmp.path().join("target").join("debug");
+    std::fs::create_dir_all(&dev_dir).unwrap();
+    let dira_copy = dev_dir.join("dira");
+    {
+        // Held across the write so no other test thread can fork while a
+        // write fd to this staged executable is open (D-0021).
+        let _staging = lock_staging();
+        std::fs::copy(env!("CARGO_BIN_EXE_dira"), &dira_copy).unwrap();
+        std::fs::set_permissions(&dira_copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+
+    let mock = MockGitHub::start().await;
+    // Ahead of any plausible running dev version, so the (unrelated)
+    // downgrade guard never intervenes before the DevBuild guard is reached.
+    mock.set_latest_tag("v999.0.0");
+
+    let home = tmp.path().join("home");
+    let mut cmd = Command::new(&dira_copy);
+    cmd.arg("update")
+        .arg("--bin-dir")
+        .arg(&bin_dir)
+        .arg("--no-restart")
+        .env("DIRA_API_URL", mock.api_base())
+        .env("DIRA_DOWNLOAD_URL", mock.download_base())
+        .env("DIRA_REPO", "test-repo")
+        .env("DIRA_TARGET", TARGET)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN");
+    isolate_user_dirs(&mut cmd, &home);
+    let out = output_staged(&mut cmd).expect("spawn the target/debug copy");
+
+    assert!(
+        !out.status.success(),
+        "a DevBuild install must refuse: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("target/{release,debug}"),
+        "expected the DevBuild refusal text, got: {stderr}"
+    );
+
+    // With the Refusal marker recognised, `update::run` never calls
+    // `record_update_failure`, so the update-check cache is never written at
+    // all along this path (nothing else in an unpinned, non---check run
+    // touches it). Before the fix this file would exist with
+    // `update_failures: 1`.
+    assert!(
+        find_cache_file(&home).is_none(),
+        "a deterministic refusal must not create or bump the update-check cache"
+    );
+}
+
+/// Recursively find `update-check.json` under `home` -- the update-check
+/// cache resolves via `project_dirs()` (platform-specific: e.g.
+/// `Library/Caches/sh.dirahq.dira` on macOS, `$XDG_CACHE_HOME/dira` on
+/// Linux), so this walks rather than hard-coding one shape.
+fn find_cache_file(home: &Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(home).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_cache_file(&path) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|n| n == "update-check.json") {
+            return Some(path);
+        }
+    }
+    None
+}

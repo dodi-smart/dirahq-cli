@@ -1156,6 +1156,15 @@ fn zavet_reindex_lines(v: &ZavetReindexView) -> Vec<String> {
     out.extend(metric_rows(&rows));
     out.push(String::new());
     let mut notes = vec![format!("{} commits touched .zavet/", v.commits_scanned)];
+    if v.provenance_repaired > 0 {
+        // Worth a line of its own: this is the one thing a reindex changes that
+        // an "unchanged" record count actively hides, and it rewrites a date the
+        // reader may have quoted elsewhere.
+        notes.push(format!(
+            "{} record(s) had their introducing commit corrected",
+            v.provenance_repaired
+        ));
+    }
     if v.trailers_bounded {
         // Say what was NOT covered rather than letting a bounded scan read as
         // exhaustive — the whole bug being fixed here was a silent bound.

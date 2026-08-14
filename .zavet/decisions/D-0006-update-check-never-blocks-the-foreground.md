@@ -53,6 +53,36 @@ interactive session is current instead of paying for a first fetch.
 - Keep the notice on stderr, and keep the call sites to `status`, `version`
   and `daemon status` — never `watch`, `hook`, or `zavet emit`.
 - Write the `checked_at` sentinel before spawning the refresh, not after.
-- `is_dev_build` here duplicates part of `update::replace::discover_install`
+- ~~`is_dev_build` here duplicates part of `update::replace::discover_install`
   (D-0004) deliberately, to avoid a dependency between the two modules.
-  Unify only if the detection rule itself changes.
+  Unify only if the detection rule itself changes.~~
+  **Struck — see the amendment below.** The two now share one predicate,
+  `replace::under_target_release_or_debug`. Never re-derive it.
+
+## Amendment: the dev-install predicate is shared (2026-08-14)
+
+The duplication above was permitted "unless the detection rule itself changes".
+It changed, silently, by drifting: `notice::is_dev_build_path` matched a
+`target` component and a `release`/`debug` component *anywhere* in the path,
+while `replace::under_target_release_or_debug` required them *adjacent*. So
+`/home/target/projects/release/dira` was a dev build to the notice and an
+ordinary install to the updater — the passive notice advertising an upgrade
+that `dira update` would then refuse under this very record's sibling, D-0004.
+
+`notice::is_dev_build_path` now calls the `replace` predicate. Adjacency won:
+the looser rule has false positives, and a false positive here suppresses a
+real upgrade notice.
+
+This does not weaken the "avoid a dependency" reasoning so much as spend it:
+`notice` already calls `super::resolve::compare_versions`, so a second
+intra-`update` call costs nothing new, and the modules were never independent
+crates.
+
+What stays split is the *subject*, and that split is load-bearing. D-0004
+requires the install location to come from the PATH entry via
+`symlink_metadata`; the notice asks only about the canonicalized
+`current_exe()`. Sharing the predicate must never become sharing the subject.
+
+Pinned by `dev_build_path_agrees_with_the_install_guards_predicate`, which
+asserts both functions return the same answer for the same path, including the
+non-adjacent case that used to split them.

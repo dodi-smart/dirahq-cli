@@ -1,18 +1,31 @@
 //! Bounded retry policy for the updater's network calls.
 //!
-//! Deliberately a local mirror of `dirad::sync`'s `next_backoff` /
-//! `transient_wait` ladder rather than a shared helper: `dira` does not depend
-//! on `dirad` (see `cli/dira/Cargo.toml`), and the two want different caps
-//! anyway. The daemon retries in the background and can afford `MAX_BACKOFF`
-//! of 300s; `dira update` is an interactive command a human is watching, so
-//! this ladder is capped in seconds. Keeping the *shape* identical is the
-//! point — anyone who has read one can read the other.
+//! The backoff ladder itself is `dira_core::sync::Backoff`, shared with
+//! `dirad::sync` (DIRASH-0031). This module used to carry a deliberate local
+//! *copy* of it, on the reasoning that `dira` does not depend on `dirad` and
+//! the two want different caps — both still true, but neither needs a second
+//! implementation: the caps are values, and both crates already depend on
+//! `dira_core`. The two copies had in fact drifted (this one capped only the
+//! `Retry-After` branch), which is what the shared type removes.
 //!
-//! Everything here is pure, so the classification rules and the cap are
-//! unit-testable without a network (mirrors `sync.rs`'s tests for the same
-//! helpers).
+//! What stays here is what is genuinely the updater's: an attempt budget (the
+//! daemon retries indefinitely; an interactive command must give up), a
+//! per-attempt timeout, the classification of which failures are worth another
+//! try at all, and [`with_retry`] — the one loop both of `dira update`'s
+//! network hops run on.
+//!
+//! [`with_retry`] is deliberately scoped to this crate. DIRASH-0031 rejected
+//! sharing a *loop* with `dirad::sync`, whose typed `SyncError` arms have no
+//! analogue here; sharing one between this crate's own two GETs is a different
+//! question, and the answer is yes — see [`Attempt`].
+//!
+//! Everything except [`with_retry`] is pure, so the classification rules and
+//! the ladder are unit-testable without a network.
 
+use std::future::Future;
 use std::time::Duration;
+
+use anyhow::Result;
 
 /// Ceiling on establishing the TCP+TLS connection, shared by every request the
 /// updater makes.
@@ -100,11 +113,11 @@ pub(super) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
 pub(super) struct Policy {
     /// Total attempts, i.e. the first try plus this many minus one retries.
     pub attempts: u32,
-    /// First wait after a failed attempt; doubles from there.
-    pub seed: Duration,
-    /// Ceiling on any single wait, including a server-supplied `Retry-After`,
-    /// so a misbehaving header can't wedge an interactive command.
-    pub max_backoff: Duration,
+    /// How long to wait between tries. The ladder itself is
+    /// [`dira_core::sync::Backoff`], shared with the daemon (DIRASH-0031); the
+    /// seed and cap below are this caller's — an interactive command a human
+    /// is watching, so capped in seconds rather than the daemon's minutes.
+    pub backoff: dira_core::sync::Backoff,
     /// Ceiling on one attempt, applied per attempt rather than per download —
     /// so the retry budget multiplies it.
     pub timeout: Duration,
@@ -138,8 +151,10 @@ impl Policy {
     pub(super) const fn download() -> Self {
         Self {
             attempts: 4,
-            seed: Duration::from_millis(500),
-            max_backoff: Duration::from_secs(4),
+            backoff: dira_core::sync::Backoff {
+                seed: Duration::from_millis(500),
+                max: Duration::from_secs(4),
+            },
             timeout: Duration::from_secs(600),
         }
     }
@@ -157,33 +172,122 @@ impl Policy {
         }
     }
 
-    /// The exponential ladder: [`Self::seed`] seed, doubling, capped at
-    /// [`Self::max_backoff`]. Mirrors `dirad::sync::next_backoff`.
-    pub(super) fn next_backoff(&self, current: Duration) -> Duration {
-        let next = if current.is_zero() {
-            self.seed
-        } else {
-            current * 2
-        };
-        next.min(self.max_backoff)
+    /// The policy for GitHub Releases API calls.
+    ///
+    /// Three attempts rather than the download's four: this hop is a small
+    /// JSON GET, and it runs on the foreground path of `--check` as well as
+    /// `update`, where a long ladder is worse than a miss. It is also the hop
+    /// most likely to see a 429 rather than a dead socket — anonymous API
+    /// calls are rate-limited to 60/hr per IP, which on a shared corporate
+    /// egress can be exhausted by other people entirely, and a `Retry-After`
+    /// on that response is honoured (capped) instead of the ladder.
+    pub(super) const fn api() -> Self {
+        Self {
+            attempts: 3,
+            timeout: API_TIMEOUT,
+            ..Self::download()
+        }
+    }
+}
+
+/// A failed attempt, tagged with whether another one could plausibly succeed.
+pub(super) enum Attempt {
+    /// Deterministic — surface it immediately, unchanged.
+    Fatal(anyhow::Error),
+    /// Transient. `retry_after` carries a server-supplied delay when there was
+    /// a response to read one from (a 429); a dead connection has none.
+    Transient {
+        err: anyhow::Error,
+        retry_after: Option<Duration>,
+    },
+}
+
+impl Attempt {
+    /// Pair a classified disposition with the error that produced it. One
+    /// constructor for every failure point in every attempt body, so the
+    /// retryable-vs-fatal decision is spelled out once rather than per site.
+    pub(super) fn new(
+        disposition: Disposition,
+        err: anyhow::Error,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        match disposition {
+            Disposition::Fatal => Attempt::Fatal(err),
+            Disposition::Retry => Attempt::Transient { err, retry_after },
+        }
     }
 
-    /// The wait before retrying a transient failure: the server's
-    /// `Retry-After` when present, else the ladder off `current`. Mirrors
-    /// `dirad::sync::transient_wait`.
-    ///
-    /// Only the header needs capping here — [`Self::next_backoff`] already
-    /// returns a capped value — but capping it matters: a misbehaving or
-    /// hostile `Retry-After` must not wedge an interactive command.
-    pub(super) fn transient_wait(
-        &self,
-        retry_after: Option<Duration>,
-        current: Duration,
-    ) -> Duration {
-        retry_after.map_or_else(
-            || self.next_backoff(current),
-            |after| after.min(self.max_backoff),
-        )
+    /// A transport failure — no response, so never a `Retry-After`.
+    pub(super) fn from_transport(e: reqwest::Error, context: String) -> Self {
+        let disposition = classify_transport(&e);
+        Self::new(disposition, anyhow::Error::new(e).context(context), None)
+    }
+}
+
+/// Run `once` until it succeeds, until it fails deterministically, or until
+/// `policy.attempts` is exhausted, waiting on the ladder in between.
+///
+/// `what` names the operation for the mid-retry line and the final context
+/// ("download", "release lookup"); `target` is the URL both messages cite.
+///
+/// The unit of retry is deliberately "make the request AND fully read the
+/// body", not "send the request". #113's reported failure — `connection closed
+/// before message completed` — surfaces from the body read, *after* `send()`
+/// has already returned `Ok`, so a driver wrapped around `send()` alone would
+/// not have retried the very failure this exists for. Both callers therefore
+/// do their whole read inside `once`.
+///
+/// Status→error mapping stays in `once` rather than being baked in here: the
+/// download wants a bespoke 404 message ("asset not found on that release"),
+/// the API hop wants a typed `Unauthorized` the token fallback can downcast,
+/// and neither is expressible as a shared rule.
+pub(super) async fn with_retry<T, Fut>(
+    policy: Policy,
+    what: &str,
+    target: &str,
+    mut once: impl FnMut() -> Fut,
+) -> Result<T>
+where
+    Fut: Future<Output = std::result::Result<T, Attempt>>,
+{
+    debug_assert!(
+        policy.attempts > 0,
+        "a zero-attempt policy would never call `once` and never return"
+    );
+    let mut backoff = Duration::ZERO;
+    let mut attempt = 1;
+
+    loop {
+        match once().await {
+            Ok(value) => return Ok(value),
+            Err(Attempt::Fatal(err)) => return Err(err),
+            // `>=`, not `==`: `==` is exact for every policy constructed today,
+            // but it is a silent infinite-retry trap for any future policy this
+            // loop is entered with `attempts` already past. `>=` is correct
+            // either way and costs nothing.
+            Err(Attempt::Transient { err, .. }) if attempt >= policy.attempts => {
+                return Err(err.context(format!(
+                    "{what} failed after {} attempts: {target}",
+                    policy.attempts
+                )));
+            }
+            Err(Attempt::Transient { err, retry_after }) => {
+                backoff = policy.backoff.transient_wait(retry_after, backoff);
+                // To stderr, not stdout: `dira update`'s stdout is its progress
+                // narrative, and this is a hiccup being handled, not progress.
+                // Saying it out loud beats a long unexplained pause. `{err:#}`
+                // (not `{err}`) so the anyhow context chain — e.g. "connection
+                // closed before message completed" — actually reaches the line
+                // a user sees mid-retry, instead of just the outer wrapper.
+                eprintln!(
+                    "dira update: {what} attempt {attempt}/{} failed ({err:#}) — retrying in {:.1}s",
+                    policy.attempts,
+                    backoff.as_secs_f32()
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -228,32 +332,38 @@ mod tests {
         }
     }
 
+    /// The ladder's own seed/double/cap behaviour is `dira_core::sync`'s and
+    /// tested there. What matters here is that the updater still carries the
+    /// numbers it is supposed to — the shared type made these a value, and a
+    /// value is exactly what a careless edit can change without breaking a
+    /// compile.
     #[test]
-    fn backoff_ladder_seeds_doubles_and_caps() {
+    fn the_updater_keeps_its_interactive_ladder() {
         let p = Policy::download();
-        assert_eq!(p.next_backoff(Duration::ZERO), p.seed);
-        assert_eq!(p.next_backoff(p.seed), p.seed * 2);
-        assert_eq!(
-            p.next_backoff(Duration::from_secs(1)),
-            Duration::from_secs(2)
-        );
-        // ...and never grows past the cap, however long the ladder runs.
-        assert_eq!(p.next_backoff(p.max_backoff), p.max_backoff);
-        assert_eq!(p.next_backoff(Duration::from_secs(600)), p.max_backoff);
+        assert_eq!(p.backoff.seed, Duration::from_millis(500));
+        assert_eq!(p.backoff.max, Duration::from_secs(4));
+        assert_eq!(p.backoff.next(Duration::ZERO), p.backoff.seed);
+        assert_eq!(p.backoff.next(p.backoff.seed), Duration::from_secs(1));
+        assert_eq!(p.backoff.next(Duration::from_secs(600)), p.backoff.max);
     }
 
     #[test]
     fn retry_after_overrides_the_ladder_but_is_still_capped() {
         let p = Policy::download();
         assert_eq!(
-            p.transient_wait(Some(Duration::from_secs(1)), Duration::from_secs(2)),
+            p.backoff
+                .transient_wait(Some(Duration::from_secs(1)), Duration::from_secs(2)),
             Duration::from_secs(1)
         );
-        assert_eq!(p.transient_wait(None, Duration::ZERO), p.seed);
+        assert_eq!(
+            p.backoff.transient_wait(None, Duration::ZERO),
+            p.backoff.seed
+        );
         // A huge Retry-After must not wedge an interactive command.
         assert_eq!(
-            p.transient_wait(Some(Duration::from_secs(999_999)), Duration::ZERO),
-            p.max_backoff
+            p.backoff
+                .transient_wait(Some(Duration::from_secs(999_999)), Duration::ZERO),
+            p.backoff.max
         );
     }
 
@@ -275,7 +385,6 @@ mod tests {
         let (archive, sha) = (Policy::download(), Policy::checksum());
         assert!(sha.timeout < archive.timeout);
         assert_eq!(sha.attempts, archive.attempts);
-        assert_eq!(sha.seed, archive.seed);
-        assert_eq!(sha.max_backoff, archive.max_backoff);
+        assert_eq!(sha.backoff, archive.backoff);
     }
 }

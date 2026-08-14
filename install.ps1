@@ -1089,10 +1089,13 @@ function Invoke-Main {
 
             if ($wantService) {
                 # Best-effort stop of an unmanaged daemon that may or may not be
-                # running: `daemon install` never does this itself, and skipping
-                # it is what let the fresh service flap against a still-live bare
-                # process for the control pipe. Silent -- "nothing was running" is
-                # not a warning-worthy outcome here, only a failed *install* is.
+                # running. `dira daemon install` now does this itself and waits
+                # for the process to exit, so this is belt-and-braces -- kept
+                # because the binary being installed here may be OLDER than that
+                # change, and on such a binary skipping it is what let the fresh
+                # service flap against a still-live bare process for the control
+                # pipe. Silent -- "nothing was running" is not a warning-worthy
+                # outcome here, only a failed *install* is.
                 Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'stop') | Out-Null
                 Write-Info "installing the dirad service..."
                 if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'install')) -ne 0) {

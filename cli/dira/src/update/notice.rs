@@ -72,7 +72,7 @@ struct Cache {
 /// (`update::artifact`), so a single one that still surfaced is worth
 /// mentioning but not alarming. Two in a row means the retries aren't covering
 /// it and the user deserves to know before they lose a week to it.
-const ESCALATE_AFTER_FAILURES: u32 = 2;
+pub(crate) const ESCALATE_AFTER_FAILURES: u32 = 2;
 
 /// Re-check at most once a day after a successful check.
 const SUCCESS_TTL_SECS: i64 = 24 * 60 * 60;
@@ -98,6 +98,35 @@ fn cache_path() -> Option<PathBuf> {
 fn read_cache(path: &Path) -> Option<Cache> {
     let bytes = fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// What the update cache knows, for a reader outside this module.
+///
+/// A flattened copy rather than exposing [`Cache`]: the on-disk shape is this
+/// module's business, and the only other consumer — `doctor`'s `update.lands`
+/// — wants a snapshot to judge, not a file format to maintain.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CacheFacts {
+    /// Unix seconds of the last check.
+    pub checked_at: i64,
+    /// Latest version the last successful check resolved, if any.
+    pub latest: Option<String>,
+    /// Consecutive `dira update` failures — see [`Cache::update_failures`].
+    pub update_failures: u32,
+}
+
+/// Read the update-check cache, or `None` when nothing has ever written it.
+///
+/// Read-only and network-free, so it is safe on any path D-0006 governs.
+/// `None` means "no evidence", which every caller must treat as a skip rather
+/// than as a healthy answer.
+pub(crate) fn cache_facts() -> Option<CacheFacts> {
+    let cache = read_cache(&cache_path()?)?;
+    Some(CacheFacts {
+        checked_at: cache.checked_at,
+        latest: cache.latest,
+        update_failures: cache.update_failures,
+    })
 }
 
 /// True once `cache` is old enough to warrant a refresh. `checked_at: 0`
@@ -164,14 +193,6 @@ impl Env {
 /// path has a `target/{release,debug}` ancestor. Nagging someone running
 /// straight out of `just install` (which symlinks into `target/release`) is
 /// pure noise.
-///
-/// Duplication note for T4: `update::replace::discover_install` (plan §A3)
-/// does the same detection more precisely — via `symlink_metadata` on the
-/// *PATH entry* rather than `current_exe()`, distinguishing a dev symlink
-/// from a dev build outright — because it must decide install *behavior*
-/// (refuse a dev symlink unless `--force`; always refuse a dev build), not
-/// just whether to print a notice. This copy is deliberately independent so
-/// T5 doesn't have to land after T4; unify them once both exist (D-0006).
 fn is_dev_build() -> bool {
     let Ok(exe) = env::current_exe() else {
         return false;
@@ -184,25 +205,36 @@ fn is_dev_build() -> bool {
 /// `current_exe()` (which — being built by `cargo test` — always resolves
 /// under `target/debug` regardless of what this function does).
 ///
-/// `current_exe()` does not canonicalize consistently across platforms: on
-/// Linux it reads `/proc/self/exe`, which the kernel already fully resolves,
-/// but on macOS it can return the path as invoked — symlink and all. A
-/// `just install` PATH entry (`~/.local/bin/dira` -> `target/release/dira`)
-/// therefore carries no literal `target`/`release` component on macOS until
-/// this canonicalizes it, so this must resolve the symlink itself rather
-/// than trust `current_exe()` to have already done it — otherwise this
-/// recognizes strictly fewer dev installs than
-/// `update::replace::discover_install`'s PATH-entry check does (D-0004), and
-/// the passive notice nags exactly the symlinked-dev-build user the D-0004
-/// guard already refuses to update. `canonicalize` failing (a dangling
-/// symlink, a removed exe) falls back to the raw path rather than erroring —
-/// "no signal" here, same as everywhere else in this module.
+/// The predicate is
+/// [`replace::under_target_release_or_debug`](super::replace::under_target_release_or_debug),
+/// shared with the D-0004 install guard so the two cannot disagree.
+///
+/// They did. This side matched a `target` component and a `release`/`debug`
+/// component *anywhere* in the path; the guard requires them *adjacent*. So
+/// `/home/target/x/release/dira` read as a dev build here and as an ordinary
+/// install there — the passive notice nagging about an upgrade `dira update`
+/// would then refuse, which is precisely the disagreement D-0006's directive
+/// anticipated. Sharing the predicate is that directive's own escape clause
+/// (unify if the detection rule changes) taken up.
+///
+/// What is deliberately NOT shared is the subject. The guard reads the *PATH
+/// entry* via `symlink_metadata`, because it must tell a dev symlink from a
+/// dev build to decide install behaviour (refuse a symlink unless `--force`,
+/// always refuse a build). This only needs to know what is running now.
+///
+/// Canonicalizing first is load-bearing and stays here: `current_exe()` does
+/// not resolve symlinks consistently across platforms — on Linux it reads
+/// `/proc/self/exe`, already fully resolved, but on macOS it can return the
+/// path as invoked. A `just install` PATH entry (`~/.local/bin/dira` ->
+/// `target/release/dira`) therefore carries no literal `target`/`release`
+/// component on macOS until this resolves it, and without that the notice
+/// recognizes strictly fewer dev installs than the D-0004 guard does.
+/// `canonicalize` failing (a dangling symlink, a removed exe) falls back to
+/// the raw path rather than erroring — "no signal" here, same as everywhere
+/// else in this module.
 fn is_dev_build_path(exe: &Path) -> bool {
     let resolved = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
-    let mut components = resolved.components().map(|c| c.as_os_str());
-    let saw_target = components.clone().any(|c| c == "target");
-    let saw_profile_dir = components.any(|c| c == "release" || c == "debug");
-    saw_target && saw_profile_dir
+    super::replace::under_target_release_or_debug(&resolved)
 }
 
 /// Decide whether a notice should be printed, and if so, its exact text.
@@ -844,6 +876,41 @@ mod tests {
     #[test]
     fn dev_build_path_does_not_match_an_installed_path() {
         assert!(!is_dev_build_path(Path::new("/home/user/.local/bin/dira")));
+    }
+
+    /// #124: the notice and the D-0004 install guard must answer the same
+    /// question the same way. They did not — this side matched `target` and
+    /// `release` as *separate* components anywhere in the path, so a user
+    /// whose home happened to sit under a `target/` directory got nagged
+    /// about an upgrade `dira update` would then refuse (or, with the paths
+    /// reversed, silently never got told). Both now go through
+    /// `replace::under_target_release_or_debug`, which requires adjacency.
+    #[test]
+    fn dev_build_path_agrees_with_the_install_guards_predicate() {
+        for path in [
+            // The trap: `target` and `release` both present, not adjacent.
+            "/home/target/projects/release/dira",
+            "/target/x/debug/dira",
+            "/home/user/.local/bin/dira",
+            "/home/dev/dirahq-cli/target/debug/dira",
+            "/home/dev/dirahq-cli/target/release/dira",
+        ] {
+            let p = Path::new(path);
+            assert_eq!(
+                is_dev_build_path(p),
+                super::super::replace::under_target_release_or_debug(p),
+                "the notice and the install guard disagree about {path}"
+            );
+        }
+    }
+
+    /// The concrete case the shared predicate fixes, pinned on its own so a
+    /// regression names the behaviour rather than just "they disagree".
+    #[test]
+    fn a_non_adjacent_target_and_release_is_not_a_dev_build() {
+        assert!(!is_dev_build_path(Path::new(
+            "/home/target/projects/release/dira"
+        )));
     }
 
     /// The regression this exists to fix: on macOS `current_exe()` can return

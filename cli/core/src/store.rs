@@ -1131,27 +1131,35 @@ impl Store {
         Ok(Some(decision))
     }
 
-    /// `(key, content_hash, path)` for every captured decision and spec in
-    /// `repo` — the identity a bulk re-ingest compares against, and nothing
-    /// else. Read-only: no cursor, no stream, nothing to blank in `nuke`.
+    /// `(key, content_hash, path, first_commit, created_at)` for every captured
+    /// decision and spec in `repo` — the identity a bulk re-ingest compares
+    /// against, and nothing else. Read-only: no cursor, no stream, nothing to
+    /// blank in `nuke`.
     ///
     /// Deliberately not `zavet_decisions_list` + `zavet_specs_list`: those load
     /// every `body_md` and run five further queries for guards, checks, spec
     /// paths and spec links, all of which a hash comparison discards. On this
     /// repo that is ~166 KB of record bodies read to produce ~4 KB of keys.
+    ///
+    /// The provenance half rides along because a reindex has to compare it too:
+    /// a record whose content is unchanged can still be recorded against the
+    /// wrong introducing commit, and skipping on content alone is what made
+    /// that unrepairable (DIRASH-0032).
     pub async fn zavet_record_identities(
         &self,
         repo: &str,
     ) -> Result<(Vec<ZavetIdentity>, Vec<ZavetIdentity>), Error> {
         let decisions = self
             .zavet_identities(
-                "SELECT id AS key, content_hash, path FROM zavet_decisions WHERE repo = ?1",
+                "SELECT id AS key, content_hash, path, first_commit, created_at
+                 FROM zavet_decisions WHERE repo = ?1",
                 repo,
             )
             .await?;
         let specs = self
             .zavet_identities(
-                "SELECT slug AS key, content_hash, path FROM zavet_specs WHERE repo = ?1",
+                "SELECT slug AS key, content_hash, path, first_commit, created_at
+                 FROM zavet_specs WHERE repo = ?1",
                 repo,
             )
             .await?;
@@ -1170,8 +1178,88 @@ impl Store {
                 key: r.get::<String, _>("key"),
                 content_hash: r.get::<Option<String>, _>("content_hash"),
                 path: r.get::<String, _>("path"),
+                first_commit: r.get::<Option<String>, _>("first_commit"),
+                created_at: r.get::<Option<String>, _>("created_at"),
             })
             .collect())
+    }
+
+    /// Repair a record's first-sight triple: `first_commit`, `created_at` and
+    /// the `source_session` that goes with them.
+    ///
+    /// `kind` selects the table (`"decision"` or `"spec"`); `key` is the
+    /// decision id or spec slug. Returns whether a row was actually updated.
+    ///
+    /// # Why this exists
+    ///
+    /// `zavet_upsert_*` preserves first-sight fields on conflict, which is right
+    /// for the ambient path: a live capture must not overwrite the introducing
+    /// commit with whatever edit it just saw. But it also means a record the
+    /// ambient poll first met on an *edit* commit keeps that edit as its
+    /// recorded "decided at" forever, and no later upsert can lower it. Since
+    /// `zavet_sessions_for_decision` and `zavet_commits_for_decision` both join
+    /// `artifacts` on `first_commit`, a wrong value there does not merely
+    /// misdate the record — it bills `dira zavet why`'s cost to the wrong
+    /// session.
+    ///
+    /// # Why attribution is resolved here rather than passed in
+    ///
+    /// `source_session` is read from the `artifacts` row for the *new*
+    /// `first_commit`, inside the same statement. Repairing the commit while
+    /// leaving attribution pointing at a different one would produce a row that
+    /// contradicts itself — and that row ships to the cloud over the knowledge
+    /// channel, where nothing re-derives it. Sourcing it here is what makes
+    /// "`source_session` tracks `first_commit`" structural instead of a
+    /// convention a caller can forget.
+    ///
+    /// This is NOT the ambient-session stamping DIRASH-0028 rejects: that would
+    /// invent provenance from whatever session happens to be open during the
+    /// reindex. This reads a recorded fact keyed by the commit itself — the same
+    /// join the local read path already trusts.
+    ///
+    /// It writes NULL when `artifacts` has no session for that sha. That does
+    /// not contradict DIRASH-0025's "never write NULL when a fallback exists":
+    /// the only candidate fallback is a value that provably belongs to a
+    /// different commit, which is not a fallback but a lie.
+    ///
+    /// `touched_seq` is bumped so the correction reaches the cloud.
+    pub async fn zavet_repair_provenance(
+        &self,
+        repo: &str,
+        kind: ZavetKind,
+        key: &str,
+        first_commit: &str,
+        created_at: Option<&str>,
+    ) -> Result<bool, Error> {
+        // Two whole statements rather than one interpolated on a table name —
+        // the table and key column differ, and spelling both out keeps the SQL
+        // greppable. An exhaustive `match` on [`ZavetKind`] rather than a
+        // string with a default arm: a third record kind must not be able to
+        // silently update `zavet_decisions`.
+        const DECISION: &str = "UPDATE zavet_decisions SET
+                first_commit = ?3,
+                created_at = ?4,
+                source_session = (SELECT a.source_session FROM artifacts a WHERE a.sha = ?3),
+                touched_seq = (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_decisions)
+             WHERE repo = ?1 AND id = ?2";
+        const SPEC: &str = "UPDATE zavet_specs SET
+                first_commit = ?3,
+                created_at = ?4,
+                source_session = (SELECT a.source_session FROM artifacts a WHERE a.sha = ?3),
+                touched_seq = (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_specs)
+             WHERE repo = ?1 AND slug = ?2";
+        let sql = match kind {
+            ZavetKind::Decision => DECISION,
+            ZavetKind::Spec => SPEC,
+        };
+        let res = sqlx::query(sql)
+            .bind(repo)
+            .bind(key)
+            .bind(first_commit)
+            .bind(created_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// All decisions for a repo (with guards), ordered by id. Guards come from
@@ -2306,6 +2394,27 @@ pub struct ZavetSessionTotals {
     pub output_tokens: u64,
 }
 
+/// Which zavet record table an operation addresses.
+///
+/// An enum rather than a `&str` because it selects a *table*: a typo in a
+/// stringly-typed version updates the wrong one silently, where this fails to
+/// compile. (Distinct from the `kind: &str` parameters elsewhere in this file,
+/// where the string is stored *as data* in a `subject_kind` column.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZavetKind {
+    Decision,
+    Spec,
+}
+
+impl std::fmt::Display for ZavetKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ZavetKind::Decision => "decision",
+            ZavetKind::Spec => "spec",
+        })
+    }
+}
+
 /// A captured record's identity: what it is, what it held, and where it lived.
 ///
 /// Both halves are load-bearing for a re-ingest's skip check. The hash alone
@@ -2317,6 +2426,13 @@ pub struct ZavetIdentity {
     pub key: String,
     pub content_hash: Option<String>,
     pub path: String,
+    /// The commit currently recorded as having introduced this record, and its
+    /// author date. Carried so a reindex can tell a record whose *content* is
+    /// current from one whose *provenance* is — they are different questions,
+    /// and only comparing the first is what let a wrong introducing commit
+    /// survive every subsequent reindex (DIRASH-0032).
+    pub first_commit: Option<String>,
+    pub created_at: Option<String>,
 }
 
 /// Capture-health counters for a repo.
@@ -3412,6 +3528,157 @@ mod tests {
         assert_eq!(d.content_hash.as_deref(), Some("blob2"));
         // Guards were replaced wholesale, not accumulated.
         assert_eq!(d.guards, vec!["a/**".to_string()]);
+    }
+
+    /// The repair the upsert above deliberately cannot do (DIRASH-0032).
+    ///
+    /// Preserving first-sight fields on conflict is right for the ambient path,
+    /// but it also means a record first *seen* on an edit keeps that edit as its
+    /// origin forever. An explicit reindex repairs all three fields together —
+    /// and attribution is read from the introducing commit's own artifact row,
+    /// never carried over, or the row would name a session belonging to a
+    /// different commit.
+    #[tokio::test]
+    async fn repairing_provenance_moves_the_whole_first_sight_triple() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+
+        // The introducing commit is on record, attributed to the session that
+        // actually made it.
+        store
+            .record_commit(
+                &crate::project::CapturedCommit {
+                    sha: "intro".into(),
+                    authored_at: Some("2026-01-01T00:00:00Z".into()),
+                    author_email: None,
+                    author_name: None,
+                    message: "docs: record it".into(),
+                    additions: 1,
+                    deletions: 0,
+                    patch_id: None,
+                },
+                Some(repo),
+                None,
+                Some("decided-it"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // …but the record got bound to a later edit, by a later session.
+        store
+            .zavet_upsert_decision(
+                repo,
+                &decision("D-0001", &["a/**"]),
+                "edit",
+                Some("2026-06-01T00:00:00Z"),
+                Some("merely-edited-it"),
+            )
+            .await
+            .unwrap();
+        let before = store.zavet_decision_get(repo, "D-0001").await.unwrap();
+        let seq_before = before.unwrap();
+        assert_eq!(seq_before.first_commit.as_deref(), Some("edit"));
+
+        assert!(store
+            .zavet_repair_provenance(
+                repo,
+                ZavetKind::Decision,
+                "D-0001",
+                "intro",
+                Some("2026-01-01T00:00:00Z")
+            )
+            .await
+            .unwrap());
+
+        let d = store
+            .zavet_decision_get(repo, "D-0001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.first_commit.as_deref(), Some("intro"));
+        assert_eq!(d.created_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            d.source_session.as_deref(),
+            Some("decided-it"),
+            "attribution is resolved from the artifacts row for the new origin"
+        );
+        // The living fields are untouched — this repairs provenance only.
+        assert_eq!(d.last_commit.as_deref(), Some("edit"));
+    }
+
+    /// No artifact row for the introducing commit means no honest attribution,
+    /// and NULL is the honest answer. Keeping the previous value would keep a
+    /// session that provably belongs to a different commit — not a fallback,
+    /// which is why this does not contradict DIRASH-0025.
+    #[tokio::test]
+    async fn repairing_to_an_uncaptured_commit_clears_stale_attribution() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_decision(
+                repo,
+                &decision("D-0001", &["a/**"]),
+                "edit",
+                Some("2026-06-01T00:00:00Z"),
+                Some("merely-edited-it"),
+            )
+            .await
+            .unwrap();
+
+        store
+            .zavet_repair_provenance(
+                repo,
+                ZavetKind::Decision,
+                "D-0001",
+                "never-captured",
+                Some("2026-01-01T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+
+        let d = store
+            .zavet_decision_get(repo, "D-0001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.first_commit.as_deref(), Some("never-captured"));
+        assert_eq!(
+            d.source_session, None,
+            "a session belonging to a different commit is a lie, not a fallback"
+        );
+    }
+
+    /// The correction has to reach the cloud, and `touched_seq` is the knowledge
+    /// cursor that carries it (DIRASH-0028).
+    #[tokio::test]
+    async fn repairing_provenance_advances_the_knowledge_cursor() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_decision(
+                repo,
+                &decision("D-0001", &["a/**"]),
+                "edit",
+                Some("2026-06-01T00:00:00Z"),
+                None,
+            )
+            .await
+            .unwrap();
+        let cursor = store.zavet_decisions_since(0, 100).await.unwrap();
+        let seq = cursor.last().map(|(s, _)| *s).unwrap_or(0);
+
+        store
+            .zavet_repair_provenance(repo, ZavetKind::Decision, "D-0001", "intro", None)
+            .await
+            .unwrap();
+
+        let after = store.zavet_decisions_since(seq, 100).await.unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "a repaired record must re-enter the knowledge sync window"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 ---
 title: Distribution and self-update
-version: 7
+version: 8
 origin: session
 verified: false
 confidence: high
@@ -12,7 +12,7 @@ paths:
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0021, DIRASH-0024, DIRASH-0029]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0024, DIRASH-0029, DIRASH-0031]
 ---
 
 ## Overview
@@ -52,15 +52,32 @@ both executables and restarts whatever is supervising the daemon.
   at all, then take exactly one of three arms: want-service (flag or a "yes"
   answer) does a best-effort, silent `dira daemon stop` followed by
   `dira daemon install`; otherwise a daemon that was already running gets
-  restarted; otherwise `--daemon`/`-Daemon` starts one. `daemon install` never
-  stops an unmanaged daemon itself, so the old restart/start-then-install
-  ordering left a freshly-installed launchd (`KeepAlive=true`) / systemd
-  (`Restart=always`) / scheduled-task service racing an already-live bare
-  process for D-0009's single-instance control-socket flock — both sides
-  losing the race in turn and respawning indefinitely. Deciding the question
-  first and taking a single arm removes the race rather than papering over
-  it; the silent best-effort stop is deliberate, since "nothing was running"
-  is not a warning-worthy outcome there, only a failed *install* is.
+  restarted; otherwise `--daemon`/`-Daemon` starts one. The old
+  restart/start-then-install ordering left a freshly-installed launchd
+  (`KeepAlive=true`) / systemd (`Restart=always`) / scheduled-task service
+  racing an already-live bare process for D-0009's single-instance
+  control-socket flock — both sides losing the race in turn and respawning
+  indefinitely. Deciding the question first and taking a single arm removes the
+  race rather than papering over it; the silent best-effort stop is deliberate,
+  since "nothing was running" is not a warning-worthy outcome there, only a
+  failed *install* is.
+  `dira daemon install` now does the stop **itself**, and waits for the process
+  to exit. The pre-stop used to live in three callers — the onboard step and
+  both installers — and not in the fourth, so a bare `dira daemon install` on a
+  machine with a hand-started `dirad` walked straight into the flap, which is
+  the documented path anyone following the old `daemon start` advice was on. It
+  stops only a daemon nothing is supervising; stopping a supervised one would
+  just make its supervisor restart it mid-install. The installers keep their
+  own best-effort stop because they may be driving a binary older than this.
+  Unix `stop` confirms the exit rather than assuming it: SIGTERM, wait for the
+  process, escalate to SIGKILL, wait again, and only then release the pidfile
+  and socket. It previously signalled, unlinked both immediately and printed
+  "stopped" — so even the callers that did pre-stop were racing the guard, and
+  unlinking the socket under a live daemon made it worse. D-0019's directive is
+  not platform-scoped; unix was exempt only because the flock makes a duplicate
+  *safe*, which is not the same as unnecessary. A stop that cannot confirm exit
+  is a hard error naming the pid, and `install` refuses rather than registering
+  a service over it.
 - **Next steps are one command.** Both installers end on `dira onboard`. The
   previous three-line block (`--version` / `daemon start` / `status`) omitted
   `dira init`, so following it produced a daemon that captured nothing, and it
@@ -132,11 +149,27 @@ both executables and restarts whatever is supervising the daemon.
   declared length at all still passes (GitHub's release CDN always sends
   one; this exists to catch an implausible *declared* size, not to enforce a
   hard cap through every possible proxy).
-  *Known gaps:* the body is buffered whole (`resp.bytes()`) up to that cap,
-  so a retry re-pulls the entire archive rather than resuming with a `Range`
-  request; and `resolve::gh_get` — the first of the two network hops — is
-  bounded by a timeout but not retried, so a transient abort there still
-  fails the update.
+  **Both** network hops ride this ladder. `resolve::gh_get` used to be bounded
+  by a timeout and never retried, so a transient abort on the resolve hop
+  failed the whole update — the same stranded state one step earlier. It runs
+  on `Policy::api()` (3 attempts, 30s per attempt): fewer than the download's
+  four because it is a small JSON GET that also runs on `--check`'s foreground
+  path, where a long ladder is worse than a miss. It is the hop most exposed to
+  a 429, anonymous API calls being capped at 60/hr per IP.
+  The retried unit is "request **and** fully read the body", not "send the
+  request": the reported failure surfaces from the body read, after `send()`
+  has already returned `Ok`, so a driver wrapped around `send()` alone would
+  not retry the failure it exists for. One driver, `retry::with_retry`, serves
+  both hops; the status→error mapping stays per-caller, which is what keeps the
+  download's bespoke 404 text and the API hop's typed `Unauthorized` intact. A
+  4xx stays fatal, so the authenticated→anonymous token fallback is unaffected.
+  The ladder itself is `dira_core::sync::Backoff`, shared with the daemon
+  (DIRASH-0031); the attempt budget stays with each caller.
+  *Known gap:* the body is buffered whole (`resp.bytes()`) up to that cap, so a
+  retry re-pulls the entire archive rather than resuming with a `Range` request
+  (#116 — deliberately not taken: the retry already makes the reported incident
+  invisible, and streaming-to-file is what the size cap and the sha256 gate
+  currently rest on).
 - A failed `dira update` is recorded, not just returned — **except** a
   deterministic, permanent-by-design refusal (the D-0004 dev-install guard, or
   an implicit channel downgrade), which never counts. Those two error paths

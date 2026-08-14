@@ -1,16 +1,16 @@
 ---
 title: Diagnostics — dira doctor and the capture probe
-version: 1
+version: 2
 origin: session
 verified: false
 confidence: high
-date: 2026-08-09
+date: 2026-08-14
 paths:
   - cli/dira/src/doctor/**
   - cli/dirad/src/probe.rs
   - cli/dira/src/hook_health.rs
   - cli/dira/src/init.rs
-decisions: [D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029]
+decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029]
 ---
 
 ## Overview
@@ -26,11 +26,11 @@ events, every one from a manual timer, zero agent events — while
 listening, commit capture worked, and cloud sync was green. The one broken link
 was the hook shim's connect to the control channel, and nothing exercised it.
 
-The command has two halves. Thirteen **static checks** read the daemon, the
-store, the harness configs and the cloud state. One opt-in **capture probe**
-(`--probe`) injects a synthetic hook through the command string the harness
-config actually invokes and verifies a row lands — the only check that would
-have caught the incident above.
+The command has two halves. Sixteen **static checks** read the daemon, the
+store, the harness configs, the cloud state and whether self-update is landing.
+One opt-in **capture probe** (`--probe`) injects a synthetic hook through the
+command string the harness config actually invokes and verifies a row lands —
+the only check that would have caught the incident above.
 
 ## Behavior
 
@@ -61,6 +61,23 @@ have caught the incident above.
   unquoted form can contain spaces. Binary identity is `hooks.exe_path`'s
   question, and it expands `$HOME`/`~` before testing existence, reporting
   anything else as unverifiable rather than as a false alarm.
+- Three `update.*` checks answer whether self-update is actually taking effect,
+  which the passive notice cannot: that only escalates on failures the counter
+  saw. `update.rollback` reports a leftover `.dira*.old.restore.<pid>` sidecar,
+  written only by the rollback path, so its presence proves a swap completed and
+  was undone. `update.shadowed` reports an install directory that is not where
+  the running `dira` came from — an earlier `PATH` entry shadowing the updated
+  binary. `update.failures` reports the counter, at the passive notice's own
+  threshold rather than a second copy of it. Together they are the manual
+  diagnosis from the #113 report.
+  Three ids rather than one because they can co-occur and a check reports a
+  single level: bundled, a machine with both a rollback and a shadowing PATH
+  entry would be told about the rollback, act on it, and only meet the shadowing
+  on the next run — the two-round diagnosis they exist to end. Adding ids is free
+  under the schema rule above; growing one id's meaning is not.
+  None ever returns `fail`. They share one `UpdateFacts` gather, and reuse
+  `update::replace`'s own PATH-entry probe and sidecar listing rather than
+  re-deriving either, so they cannot disagree with what the updater does.
 - `--probe` runs last and only on request. It spawns a child and writes+deletes
   a row, so keeping the default side-effect-free is what makes a bare
   `dira doctor` safe for `install.sh` and CI.
@@ -130,6 +147,8 @@ changing what a level means for an existing id, does.
   ships from the live registry and no SQL filter reaches it.
 - **`DIRA_HOOK_PROBE` never writes `hook_health`.** A diagnostic must not
   overwrite the evidence it exists to report on.
+- **No `update.*` check ever returns `fail`.** A stale binary is not broken
+  capture, and exit `2` is an installer-facing contract meaning it is.
 - **The harness hook contract is otherwise unchanged**: a hook still always
   exits 0 and never writes stdout. Probe mode is the sole exception, and only a
   process `dira doctor` spawned itself can be in it.

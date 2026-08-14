@@ -47,6 +47,15 @@ agent context at session start — keep it short and non-negotiable.
 - Knowledge-content consent is asked by its own prompt naming what it sends,
   never implied by device linking or billing. Changing what `full` transmits
   changes `KNOWLEDGE_DISCLOSURE` in the same commit. See DIRASH-0030.
+- One backoff ladder: `dira_core::sync::Backoff`. Never re-add a local
+  seed/double/cap; attempt budgets stay with the caller. See DIRASH-0031.
+- A record's `first_commit`/`created_at`/`source_session` are repaired as a
+  unit and only ever earlier, with attribution read from the `artifacts` row
+  for the introducing commit — never from the session doing the repair. See
+  DIRASH-0032.
+- Nothing enters `repo_dirs` unless the directory demonstrably belongs to the
+  repo it is filed under, and `register_repo_dir` stays I/O-free.
+  See DIRASH-0027.
 
 ### Recorded decisions (read the file before changing guarded code; ask /zavet:why)
 
@@ -80,6 +89,8 @@ agent context at session start — keep it short and non-negotiable.
 - DIRASH-0028 — Knowledge reindex is an explicit path-scoped command, never the ambient poll (active)
 - DIRASH-0029 — Onboarding is one re-runnable waterfall, and the installer prompts only where a tty exists (active)
 - DIRASH-0030 — Full-content knowledge sync is opted into by its own prompt, never implied by linking (active)
+- DIRASH-0031 — One backoff ladder lives in dira_core; callers own their attempt budget (active)
+- DIRASH-0032 — A record's first-sight triple is repaired as a unit, from recorded facts (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

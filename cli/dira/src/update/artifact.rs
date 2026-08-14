@@ -7,7 +7,7 @@
 //! reasoning behind each check.
 
 use super::resolve::AssetRef;
-use super::retry;
+use super::retry::{self, Attempt};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -106,40 +106,6 @@ fn oversized_content_length_message(url: &str, declared: u64) -> String {
     )
 }
 
-/// A failed attempt, tagged with whether another one could plausibly succeed.
-enum Attempt {
-    /// Deterministic — surface it immediately, unchanged.
-    Fatal(anyhow::Error),
-    /// Transient. `retry_after` carries a server-supplied delay when there was
-    /// a response to read one from (a 429); a dead connection has none.
-    Transient {
-        err: anyhow::Error,
-        retry_after: Option<Duration>,
-    },
-}
-
-impl Attempt {
-    /// Pair a classified disposition with the error that produced it. One
-    /// constructor for all three failure points in [`download_once`], so the
-    /// retryable-vs-fatal decision is spelled out once rather than per site.
-    fn new(
-        disposition: retry::Disposition,
-        err: anyhow::Error,
-        retry_after: Option<Duration>,
-    ) -> Self {
-        match disposition {
-            retry::Disposition::Fatal => Attempt::Fatal(err),
-            retry::Disposition::Retry => Attempt::Transient { err, retry_after },
-        }
-    }
-
-    /// A transport failure — no response, so never a `Retry-After`.
-    fn from_transport(e: reqwest::Error, context: String) -> Self {
-        let disposition = retry::classify_transport(&e);
-        Self::new(disposition, anyhow::Error::new(e).context(context), None)
-    }
-}
-
 /// Download `asset` to `dest`. Redirect-following is `reqwest`'s default and
 /// matters here: GitHub 302s an unauthenticated asset URL to
 /// `objects.githubusercontent.com`.
@@ -173,50 +139,11 @@ async fn download_with(
     dest: &Path,
     policy: retry::Policy,
 ) -> Result<()> {
-    debug_assert!(
-        policy.attempts > 0,
-        "a zero-attempt policy would never call download_once and never return"
-    );
     let url = asset.url();
-    let mut backoff = Duration::ZERO;
-    let mut attempt = 1;
-
-    loop {
-        match download_once(http, asset, dest, policy.timeout).await {
-            Ok(()) => return Ok(()),
-            Err(Attempt::Fatal(err)) => return Err(err),
-            // `>=`, not `==`: the dedup that produced this loop's current shape
-            // used to live inside a `for attempt in 1..=policy.attempts` whose
-            // range itself made "exhausted" impossible to get wrong. `==` alone
-            // is exact for every value this policy ever constructs today, but
-            // it is a silent infinite-retry trap for any future policy whose
-            // `attempts` this loop is entered with already past — `>=` is
-            // correct either way and costs nothing.
-            Err(Attempt::Transient { err, .. }) if attempt >= policy.attempts => {
-                return Err(err.context(format!(
-                    "download failed after {} attempts: {url}",
-                    policy.attempts
-                )));
-            }
-            Err(Attempt::Transient { err, retry_after }) => {
-                backoff = policy.transient_wait(retry_after, backoff);
-                // To stderr, not stdout: `dira update`'s stdout is its progress
-                // narrative, and this is a hiccup being handled, not progress.
-                // Saying it out loud beats a long unexplained pause. `{err:#}`
-                // (not `{err}`) so the anyhow context chain — e.g. "connection
-                // closed before message completed" — actually reaches the line
-                // a user sees mid-retry, instead of just the outer "GET <url>"
-                // wrapper.
-                eprintln!(
-                    "dira update: download attempt {attempt}/{} failed ({err:#}) — retrying in {:.1}s",
-                    policy.attempts,
-                    backoff.as_secs_f32()
-                );
-                tokio::time::sleep(backoff).await;
-                attempt += 1;
-            }
-        }
-    }
+    retry::with_retry(policy, "download", url, || {
+        download_once(http, asset, dest, policy.timeout)
+    })
+    .await
 }
 
 /// One attempt: request, status check, body read, write. Every failure is
@@ -444,108 +371,16 @@ fn extract_impl(archive: &Path, dest_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{scripted_server, Reply};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::sync::atomic::Ordering;
 
     // --- download retry -----------------------------------------------------
 
-    /// One scripted response for [`scripted_server`].
-    #[derive(Clone)]
-    enum Reply {
-        /// A complete, well-formed 200.
-        Body(&'static str),
-        /// A status line with no body (plus optional extra headers).
-        Status(u16, &'static str),
-        /// Announce a `Content-Length` far larger than what is actually sent,
-        /// then drop the connection — the exact shape of the reported failure
-        /// ("connection closed before message completed"): the body starts
-        /// arriving and the stream dies part-way through.
-        Truncated,
-        /// A 200 declaring a `Content-Length` over [`MAX_ARTIFACT_BYTES`]. No
-        /// body needs to follow — the size cap must fire before any read is
-        /// attempted.
-        OversizedContentLength,
-        /// A well-formed 200 with a body but deliberately no `Content-Length`
-        /// header at all — terminated by closing the connection, the way a
-        /// real server without a known length would. The size cap must never
-        /// reject this: a missing declared length is not the same claim as
-        /// an oversized one.
-        NoContentLength(&'static str),
-    }
-
-    /// A raw HTTP server on an OS-assigned loopback port that serves `script`
-    /// in order (the last entry repeats once exhausted), counting connections
-    /// so a test can assert exactly how many attempts were made.
-    ///
-    /// Deliberately not [`crate::test_support::MockCloud`]: axum cannot express
-    /// a half-written body, which is the whole point of [`Reply::Truncated`].
-    async fn scripted_server(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind scripted server");
-        let addr = listener.local_addr().unwrap();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let counter = hits.clone();
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let n = counter.fetch_add(1, Ordering::SeqCst);
-
-                // Drain the request head so the client sees a well-formed
-                // exchange rather than a connection reset on write.
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-
-                let reply = script
-                    .get(n)
-                    .or_else(|| script.last())
-                    .cloned()
-                    .unwrap_or(Reply::Status(500, ""));
-                match reply {
-                    Reply::Body(body) => {
-                        let head =
-                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
-                        let _ = sock.write_all(head.as_bytes()).await;
-                        let _ = sock.write_all(body.as_bytes()).await;
-                    }
-                    Reply::Status(code, extra) => {
-                        let head = format!("HTTP/1.1 {code} X\r\n{extra}Content-Length: 0\r\n\r\n");
-                        let _ = sock.write_all(head.as_bytes()).await;
-                    }
-                    Reply::Truncated => {
-                        let _ = sock
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\nhalf")
-                            .await;
-                        // Dropping `sock` here closes mid-body.
-                    }
-                    Reply::OversizedContentLength => {
-                        let head = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                            MAX_ARTIFACT_BYTES + 1
-                        );
-                        let _ = sock.write_all(head.as_bytes()).await;
-                        // No body -- the cap must reject this before ever
-                        // trying to read one.
-                    }
-                    Reply::NoContentLength(body) => {
-                        let _ = sock
-                            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
-                            .await;
-                        let _ = sock.write_all(body.as_bytes()).await;
-                        // Dropping `sock` here is how a Content-Length-less
-                        // response is framed: read until EOF.
-                    }
-                }
-                let _ = sock.flush().await;
-            }
-        });
-
-        (format!("http://{addr}/artifact.zip"), hits)
+    /// A 200 declaring a `Content-Length` over [`MAX_ARTIFACT_BYTES`], with no
+    /// body — the size cap must fire before any read is attempted.
+    fn oversized() -> Reply {
+        Reply::DeclaredLength(MAX_ARTIFACT_BYTES + 1)
     }
 
     /// The production loop on a millisecond ladder, so these tests assert the
@@ -553,8 +388,10 @@ mod tests {
     fn fast_policy(attempts: u32) -> retry::Policy {
         retry::Policy {
             attempts,
-            seed: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(4),
+            backoff: dira_core::sync::Backoff {
+                seed: Duration::from_millis(1),
+                max: Duration::from_millis(4),
+            },
             timeout: Duration::from_secs(5),
         }
     }
@@ -565,7 +402,8 @@ mod tests {
         script: Vec<Reply>,
         attempts: u32,
     ) -> (Result<()>, usize, PathBuf, tempfile::TempDir) {
-        let (url, hits) = scripted_server(script).await;
+        let (base, hits) = scripted_server(script).await;
+        let url = format!("{base}/artifact.zip");
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("artifact.zip");
         let http = reqwest::Client::builder().build().unwrap();
@@ -663,7 +501,7 @@ mod tests {
     /// server that will say the same implausible thing every time.
     #[tokio::test]
     async fn an_oversized_declared_length_is_fatal_and_not_retried() {
-        let (out, hits, _, _dir) = run_download(vec![Reply::OversizedContentLength], 4).await;
+        let (out, hits, _, _dir) = run_download(vec![oversized()], 4).await;
         let err = out.expect_err("an implausible declared length must fail");
         assert!(
             format!("{err:#}").contains("Content-Length"),

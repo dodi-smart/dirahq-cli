@@ -20,7 +20,7 @@ pub use billing::{
 pub use drift::{body_head, warn_unreadable_body};
 pub use handshake::{parse_ingest_response, IngestResponse, SyncBlock};
 pub use health::{parse_sync_health, SyncHealth, META_SYNC_HEALTH};
-pub use ratelimit::{parse_retry_after_body, parse_retry_after_secs};
+pub use ratelimit::{parse_retry_after_body, parse_retry_after_secs, Backoff};
 
 /// `meta` key: the last event id confirmed-synced to the cloud. The window for a
 /// flush is `(cursor, max_event_id]`. Lives here (rather than in the daemon) so

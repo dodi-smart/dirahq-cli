@@ -130,26 +130,48 @@ pub fn toplevel(cwd: &Path) -> Option<std::path::PathBuf> {
     git(cwd, &["rev-parse", "--show-toplevel"]).map(std::path::PathBuf::from)
 }
 
-/// Raw trailer pairs for each of `shas`, in one batched `git log --no-walk`
-/// call: `%x1e`-separated records of `SHA%x1f<trailers, unfolded>`. Commits
-/// with no trailers return an empty list. Best-effort — a git failure yields
-/// an empty map.
+/// Max shas per `git log --no-walk` invocation in [`commit_trailers`].
+///
+/// Argv has an OS ceiling (Linux's `E2BIG`, ~a couple MB by default) — past
+/// roughly 25k shas in one call `Command::output()` fails, `git` collapses
+/// that to `None`, and every trailer for the whole walk goes silently empty
+/// while `dira zavet reindex` still reports `trailers_bounded: false`, i.e. a
+/// bound was NOT hit. Chunking trades one unbounded-size spawn for several
+/// bounded ones. Order across chunks is irrelevant — every caller only ever
+/// builds a map from the result.
+const TRAILER_CHUNK_SIZE: usize = 1000;
+
+/// Raw trailer pairs for each of `shas`, in batched `git log --no-walk` calls:
+/// `%x1e`-separated records of `SHA%x1f<trailers, unfolded>`. Commits with no
+/// trailers return an empty list. Best-effort — a chunk git fails on is
+/// dropped, not the whole result.
 pub fn commit_trailers(root: &Path, shas: &[String]) -> Vec<(String, Vec<(String, String)>)> {
+    commit_trailers_chunked(root, shas, TRAILER_CHUNK_SIZE)
+}
+
+/// [`commit_trailers`] with the chunk size as a parameter, so a test can pin
+/// the chunking behavior without constructing tens of thousands of commits.
+fn commit_trailers_chunked(
+    root: &Path,
+    shas: &[String],
+    chunk_size: usize,
+) -> Vec<(String, Vec<(String, String)>)> {
     if shas.is_empty() {
         return Vec::new();
     }
-    let mut args: Vec<&str> = vec![
-        "log",
-        "--no-walk=unsorted",
-        "--no-color",
-        "--pretty=format:%H%x1f%(trailers:only,unfold)%x1e",
-    ];
-    args.extend(shas.iter().map(String::as_str));
-    let Some(out) = git(root, &args) else {
-        return Vec::new();
-    };
-    out.split('\u{1e}')
-        .filter_map(|record| {
+    let mut out = Vec::with_capacity(shas.len());
+    for chunk in shas.chunks(chunk_size.max(1)) {
+        let mut args: Vec<&str> = vec![
+            "log",
+            "--no-walk=unsorted",
+            "--no-color",
+            "--pretty=format:%H%x1f%(trailers:only,unfold)%x1e",
+        ];
+        args.extend(chunk.iter().map(String::as_str));
+        let Some(text) = git(root, &args) else {
+            continue;
+        };
+        out.extend(text.split('\u{1e}').filter_map(|record| {
             let record = record.trim_start_matches(['\n', '\r']);
             let (sha, block) = record.split_once('\u{1f}')?;
             let sha = sha.trim();
@@ -157,8 +179,9 @@ pub fn commit_trailers(root: &Path, shas: &[String]) -> Vec<(String, Vec<(String
                 return None;
             }
             Some((sha.to_string(), crate::zavet::parse_trailer_block(block)))
-        })
-        .collect()
+        }));
+    }
+    out
 }
 
 /// Repo-relative paths added/modified/renamed-to by `sha` (deleted files
@@ -1601,6 +1624,57 @@ mod tests {
     fn log_commit_refs_none_outside_a_repo() {
         let dir = temp_repo_dir("refsnonrepo");
         assert!(log_commit_refs(&dir, &[], None).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Chunked trailer batching (E2BIG past ~25k shas in one argv) --------
+
+    use super::commit_trailers_chunked;
+
+    /// A chunk size small enough to force several `git log --no-walk`
+    /// invocations must still concatenate to exactly what one unchunked call
+    /// (chunk size covering everything) produces.
+    #[test]
+    fn commit_trailers_chunking_matches_the_unchunked_result() {
+        let root = temp_repo_dir("trailers-chunk");
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        run_git(&root, &["config", "user.email", "t@example.com"]);
+        run_git(&root, &["config", "user.name", "T"]);
+
+        let mut shas = Vec::new();
+        for i in 0..5 {
+            write(&root, "f.txt", &format!("v{i}\n"));
+            run_git(&root, &["add", "."]);
+            run_git(
+                &root,
+                &[
+                    "commit",
+                    "-q",
+                    "-m",
+                    &format!("chore: change {i}\n\nDecision: D-{i:04}"),
+                ],
+            );
+            shas.push(out_git(&root, &["rev-parse", "HEAD"]));
+        }
+
+        let unchunked = commit_trailers_chunked(&root, &shas, usize::MAX);
+        let chunked = commit_trailers_chunked(&root, &shas, 2);
+
+        let sorted = |mut v: Vec<(String, Vec<(String, String)>)>| {
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(chunked.len(), 5, "one record per commit, across 3 chunks");
+        assert_eq!(sorted(unchunked), sorted(chunked));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An empty sha list must never spawn git at all, chunked or not.
+    #[test]
+    fn commit_trailers_chunking_empty_input_is_empty() {
+        let dir = temp_repo_dir("trailers-chunk-empty");
+        assert!(commit_trailers_chunked(&dir, &[], 2).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

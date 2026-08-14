@@ -1112,7 +1112,63 @@ fn pid_is_alive(pid: u32, runner: &dyn Runner, os: Os) -> bool {
     let Some(out) = runner.run("kill", &["-0", &pid.to_string()]) else {
         return false;
     };
+    if !out.status.success() {
+        return false;
+    }
+    // `kill -0` answers "does this PID exist", which is not the same question as
+    // "is this process running". A pid stays allocated after exit until its
+    // parent reaps it, and `kill -0` succeeds on that zombie — SIGKILL included,
+    // since there is nothing left to kill.
+    //
+    // `dira daemon start` spawns `dirad` and exits, so `dirad` is orphaned onto
+    // pid 1. Any init reaps it immediately and this never shows. A container
+    // whose pid 1 is not a reaper (`tail -f /dev/null`, the shape GitHub
+    // Actions' container jobs use) never does, so the process reads as alive
+    // forever: `stop` burned its whole grace budget, force-killed a corpse, and
+    // then reported it could not confirm exit.
+    //
+    // A zombie IS exited for every purpose a caller here has: the kernel closed
+    // its fds at exit, so D-0009's flock and the control socket are already
+    // released and a replacement can bind. Treating it as alive is the bug.
+    !pid_is_zombie(pid, runner, os)
+}
+
+/// True if `pid` exists but has already exited and is only awaiting reaping.
+///
+/// Two probes because there is no one portable answer. Linux — including the
+/// musl/BusyBox images this matters most on — has `/proc`, which needs no
+/// subprocess at all. macOS has no `/proc` and needs `ps`; that is also why
+/// `ps` cannot be the single implementation, since BusyBox's `ps` supports
+/// neither `-p` nor `-o`.
+///
+/// Anything unreadable answers `false`: a probe that cannot see is not evidence
+/// of death, and over-reporting "exited" would let a replacement start against
+/// a daemon that is genuinely still running (D-0019).
+fn pid_is_zombie(pid: u32, runner: &dyn Runner, os: Os) -> bool {
+    if os == Os::Linux {
+        return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| proc_stat_state(&stat))
+            == Some('Z');
+    }
+    let Some(out) = runner.run("ps", &["-o", "state=", "-p", &pid.to_string()]) else {
+        return false;
+    };
     out.status.success()
+        && String::from_utf8_lossy(&out.stdout)
+            .trim_start()
+            .starts_with('Z')
+}
+
+/// The process-state field of a `/proc/<pid>/stat` line.
+///
+/// The format is `pid (comm) state ...`, and `comm` is the raw executable name:
+/// it can contain spaces *and* parentheses, so neither splitting on whitespace
+/// nor finding the first `)` is safe. The kernel's own documented parse is to
+/// anchor on the LAST `)`, which is what this does.
+fn proc_stat_state(stat: &str) -> Option<char> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().next()?.chars().next()
 }
 
 /// Poll until `pid` is gone, up to `attempts × interval`. Returns whether exit
@@ -1739,6 +1795,17 @@ mod tests {
                 &["/FI", "PID eq 4242", "/NH"],
                 0,
                 "dirad.exe                     4242 Console   1     12,345 K",
+            )
+        }
+
+        /// The container case: `kill -0` keeps succeeding because the pid is a
+        /// zombie nobody has reaped, and `ps` reports state `Z`.
+        fn zombie_unix(self) -> Self {
+            self.returning("kill", &["-0", "4242"], 0, "").returning(
+                "ps",
+                &["-o", "state=", "-p", "4242"],
+                0,
+                "Z+\n",
             )
         }
 
@@ -2525,6 +2592,77 @@ mod tests {
         .await;
         assert!(stopped, "an exited process must be reported as stopped");
         assert!(!runner.called("taskkill", &["/PID", "4242", "/F"]));
+    }
+
+    // --- a zombie pid is exited, not alive ---------------------------------
+
+    /// The alpine smoke-leg regression. `kill -0` answers "does this pid exist",
+    /// and a pid stays allocated after exit until its parent reaps it — so on a
+    /// container whose pid 1 is not a reaper, an exited `dirad` read as alive
+    /// forever. `stop` burned its full grace budget, force-killed a corpse, and
+    /// then refused to confirm the exit that had already happened.
+    #[tokio::test]
+    async fn a_zombie_pid_is_not_alive() {
+        let runner = FakeRunner::default().zombie_unix();
+        assert!(
+            !pid_is_alive(4242, &runner, Os::Macos),
+            "a reaped-pending process has already released its fds, flock and socket"
+        );
+    }
+
+    /// …and the whole stop sequence therefore succeeds instead of erroring out
+    /// after the full 20s budget.
+    #[tokio::test]
+    async fn stopping_a_zombie_confirms_the_exit_it_already_made() {
+        let config = test_config("unix-stop-zombie");
+        let pf = pidfile(&config);
+        std::fs::write(&pf, "4242").unwrap();
+        let runner = FakeRunner::default().zombie_unix();
+
+        stop_with(&config, &runner, Os::Macos, 2, FAST)
+            .await
+            .expect("an exited-but-unreaped daemon is stopped");
+
+        assert!(
+            !runner.called("kill", &["-9", "4242"]),
+            "there is nothing left to force-kill"
+        );
+        assert!(!pf.exists(), "the pidfile is released");
+    }
+
+    /// A live process must still read as live — the fix must not make every
+    /// `kill -0` hit answer "gone", which would let a replacement start against
+    /// a daemon that is genuinely running (D-0019).
+    #[tokio::test]
+    async fn a_running_pid_is_still_alive() {
+        let runner = FakeRunner::default()
+            .returning("kill", &["-0", "4242"], 0, "")
+            .returning("ps", &["-o", "state=", "-p", "4242"], 0, "S\n");
+        assert!(pid_is_alive(4242, &runner, Os::Macos));
+    }
+
+    /// An unreadable probe is not evidence of death. `ps` missing or failing
+    /// must leave the verdict at "alive", never flip it.
+    #[tokio::test]
+    async fn an_unanswerable_zombie_probe_leaves_the_pid_alive() {
+        // `kill -0` succeeds, `ps` is not scripted at all -> runner returns None.
+        let runner = FakeRunner::default().returning("kill", &["-0", "4242"], 0, "");
+        assert!(pid_is_alive(4242, &runner, Os::Macos));
+    }
+
+    /// `comm` is the raw executable name: it can contain spaces and parentheses,
+    /// so the state field is only findable by anchoring on the LAST `)`.
+    #[test]
+    fn proc_stat_state_survives_a_hostile_comm() {
+        assert_eq!(proc_stat_state("154 (dirad) Z 1 154 154 0 -1"), Some('Z'));
+        assert_eq!(proc_stat_state("154 (dirad) S 1 154"), Some('S'));
+        assert_eq!(
+            proc_stat_state("154 (weird (name) with ) spaces) Z 1 154"),
+            Some('Z'),
+            "the last ')' ends comm, not the first"
+        );
+        assert_eq!(proc_stat_state("garbage with no parens"), None);
+        assert_eq!(proc_stat_state(""), None);
     }
 
     // --- unix stop confirms exit, and install stops first (#123 / D-0019) ---

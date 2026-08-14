@@ -1057,7 +1057,48 @@ function Invoke-Main {
             Write-Info "  $installedDira daemon start"
             Write-Info "  $installedDira daemon install   # logon task, runs unelevated"
         } elseif (-not $NoDaemon) {
-            if ($daemonWasRunning) {
+            # The service question is decided FIRST, before anything else touches
+            # the daemon. `dira daemon install` (the scheduled task's own retry
+            # semantics) never stops an already-running unmanaged daemon itself,
+            # so restarting or starting one and THEN installing the service left
+            # the freshly-installed service racing an already-live bare process
+            # for D-0009's single-instance control-pipe flock. Deciding first and
+            # taking exactly one of the three arms below removes the race instead
+            # of papering over it.
+            $wantService = $false
+            if ($installService) {
+                $wantService = $true
+            } elseif (Test-CanPrompt -NoInteractive:$noInteractive) {
+                # Registering a scheduled task is a persistent system change, so it is
+                # still never done silently -- but "irm | iex has no usable stdin" was
+                # only half true. `iex` consumes the *downloaded script* as text; the
+                # console's own input is untouched, which is what Read-Host reads.
+                # No console (CI, a redirected pipe, -NoInteractive) keeps the
+                # historical hands-off behaviour exactly as it was.
+                #
+                # This branch is reachable only when not elevated: it is the
+                # `elseif` sibling of the Administrator arm above, not code that
+                # arm falls through into, and that arm never reaches here itself.
+                # Prompting to install a service from an elevated shell would offer
+                # to create exactly the broken setup that branch exists to prevent.
+                $answer = Read-Host 'Install dirad as a logon task so it survives reboots? [Y/n]'
+                if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^(y|yes)$') {
+                    $wantService = $true
+                }
+            }
+
+            if ($wantService) {
+                # Best-effort stop of an unmanaged daemon that may or may not be
+                # running: `daemon install` never does this itself, and skipping
+                # it is what let the fresh service flap against a still-live bare
+                # process for the control pipe. Silent -- "nothing was running" is
+                # not a warning-worthy outcome here, only a failed *install* is.
+                Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'stop') | Out-Null
+                Write-Info "installing the dirad service..."
+                if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'install')) -ne 0) {
+                    Write-Warn "could not install the dirad service automatically -- run '$installedDira daemon install' yourself"
+                }
+            } elseif ($daemonWasRunning) {
                 Write-Info "restarting dirad..."
                 if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'restart')) -ne 0) {
                     Write-Warn "could not restart dirad automatically -- run '$installedDira daemon restart' yourself"
@@ -1067,33 +1108,8 @@ function Invoke-Main {
                 if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'start')) -ne 0) {
                     Write-Warn "could not start dirad automatically -- run '$installedDira daemon start' yourself"
                 }
-            }
-            if ($installService) {
-                Write-Info "installing the dirad service..."
-                if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'install')) -ne 0) {
-                    Write-Warn "could not install the dirad service automatically -- run '$installedDira daemon install' yourself"
-                }
-            } elseif (Test-CanPrompt -NoInteractive:$noInteractive) {
-                # Registering a scheduled task is a persistent system change, so it is
-                # still never done silently -- but "irm | iex has no usable stdin" was
-                # only half true. `iex` consumes the *downloaded script* as text; the
-                # console's own input is untouched, which is what Read-Host reads.
-                # No console (CI, a redirected pipe, -NoInteractive) keeps the
-                # historical hands-off behaviour exactly as it was.
-                #
-                # Note this arm is unreachable when elevated: the Administrator branch
-                # above returns before here, and it must keep precedence. Prompting to
-                # install a service from an elevated shell would offer to create
-                # exactly the broken setup that branch exists to prevent.
-                $answer = Read-Host 'Install dirad as a logon task so it survives reboots? [Y/n]'
-                if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^(y|yes)$') {
-                    Write-Info "installing the dirad service..."
-                    if ((Invoke-BestEffort -Exe $installedDira -Arguments @('daemon', 'install')) -ne 0) {
-                        Write-Warn "could not install the dirad service automatically -- run '$installedDira daemon install' yourself"
-                    }
-                } else {
-                    Write-Info "skipping the service -- run '$installedDira daemon install' whenever you want it"
-                }
+            } else {
+                Write-Info "skipping the service -- run '$installedDira daemon install' whenever you want it"
             }
         }
 

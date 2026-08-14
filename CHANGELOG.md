@@ -1,3 +1,33 @@
+## [0.5.1](https://github.com/dodi-smart/dirahq-cli/compare/v0.5.0...v0.5.1) (2026-08-14)
+
+### 🐛 Bug Fixes
+
+* **cli:** bound update downloads by inactivity, not total transfer time ([52511ef](https://github.com/dodi-smart/dirahq-cli/commit/52511ef969cdbd7281b4b3c9bf934fa9c46fb36f))
+* **cli:** detect harness wiring at global scope only during onboarding ([f0cff5a](https://github.com/dodi-smart/dirahq-cli/commit/f0cff5a8a377ebc431677fdacf6ee687a1c78d98))
+* **cli:** guard the retry loop, log root causes and write the notice cache atomically ([d9d5cb9](https://github.com/dodi-smart/dirahq-cli/commit/d9d5cb9858089932fcbb135e3da3a14e3fa358cf))
+* **cli:** print the knowledge disclosure on every consent path ([41e3be0](https://github.com/dodi-smart/dirahq-cli/commit/41e3be0a8ce16e4e7e1155ab3dd36f346dfc3ef3))
+* **cli:** probe the store read-only so onboard --print stays side-effect free ([ba7253c](https://github.com/dodi-smart/dirahq-cli/commit/ba7253c82906a3d4fe97d0af5005d432e2cc5d65))
+* **cli:** propagate device-link success into onboarding state ([a164ac2](https://github.com/dodi-smart/dirahq-cli/commit/a164ac2c4801d5db2286aa643f1edd3cbed3cbd1))
+* **cli:** reject update artifacts whose declared length is implausible ([32902db](https://github.com/dodi-smart/dirahq-cli/commit/32902dbfb9e55dd045fd2d722adc5d3a121c99b6))
+* **cli:** retire daemon-start advice from codex init and make opencode wiring idempotent ([934643c](https://github.com/dodi-smart/dirahq-cli/commit/934643cefa7713ffa95d8eaed2cda1c7c90a6214))
+* **cli:** route the onboarding tier write through an injectable set_quiet target ([a4eee40](https://github.com/dodi-smart/dirahq-cli/commit/a4eee4039dc766fd0d68874d6a5575f44d1325f6))
+* **cli:** stop counting dev-install refusals as update failures ([7bd6614](https://github.com/dodi-smart/dirahq-cli/commit/7bd661430fbc27678d5a29f3bb5de04520270ec3))
+* **cli:** treat a zombie pid as exited, not as a live daemon ([7b1948d](https://github.com/dodi-smart/dirahq-cli/commit/7b1948d2bdbd73035b49db253eabfafc0f07f521))
+* **daemon:** bind zavet sync and query roots to the named repo, never the caller's cwd ([dccfd58](https://github.com/dodi-smart/dirahq-cli/commit/dccfd58ed95d94aa8a190f8038fa5601af20daaf))
+* **daemon:** chunk commit-trailer argv to survive large repos ([37afbb8](https://github.com/dodi-smart/dirahq-cli/commit/37afbb87a101b4ac89653a0188d3df7b37edbddc))
+* **daemon:** record the reindex sweep's trailers and count actual writes ([e592d51](https://github.com/dodi-smart/dirahq-cli/commit/e592d512ed2f7d182e1a17093abfb9f308578e21))
+* **daemon:** tell an unborn HEAD apart from a live one that failed, and dedup git/git_output ([9c627f6](https://github.com/dodi-smart/dirahq-cli/commit/9c627f6e5eb12fd202762bc5e1a2702cbd0760f0))
+* **repo:** decide the service question before daemon handling in the installers ([6d09842](https://github.com/dodi-smart/dirahq-cli/commit/6d09842d441bc72253fb6c1396fa2dc0414ec514))
+* **repo:** v0.5 review follow-ups — update retry, doctor, daemon install, zavet provenance ([46c8641](https://github.com/dodi-smart/dirahq-cli/commit/46c864192e32a9cd5f224ffa0cbe6aebdc49e64b)), closes [113/#114](https://github.com/113/dirahq-cli/issues/114) [#119](https://github.com/dodi-smart/dirahq-cli/issues/119) [#122](https://github.com/dodi-smart/dirahq-cli/issues/122) [#119](https://github.com/dodi-smart/dirahq-cli/issues/119) [#120](https://github.com/dodi-smart/dirahq-cli/issues/120) [#116](https://github.com/dodi-smart/dirahq-cli/issues/116) [#114](https://github.com/dodi-smart/dirahq-cli/issues/114) [#115](https://github.com/dodi-smart/dirahq-cli/issues/115) [#117](https://github.com/dodi-smart/dirahq-cli/issues/117) [#120](https://github.com/dodi-smart/dirahq-cli/issues/120) [#121](https://github.com/dodi-smart/dirahq-cli/issues/121) [#122](https://github.com/dodi-smart/dirahq-cli/issues/122) [#123](https://github.com/dodi-smart/dirahq-cli/issues/123) [#124](https://github.com/dodi-smart/dirahq-cli/issues/124) [#116](https://github.com/dodi-smart/dirahq-cli/issues/116)
+
+### 📚 Documentation
+
+* **cli:** align onboard step numbering, the spec summary row and a store doc comment ([cba09f0](https://github.com/dodi-smart/dirahq-cli/commit/cba09f0db426d722e088a3541d2392b230ebf58e))
+* **repo:** correct the distribution spec's prompt invariant and record C1-C5 ([9736675](https://github.com/dodi-smart/dirahq-cli/commit/9736675fe9ac70619bd8152516b63b2913f81aee))
+* **repo:** record why a zombie pid counts as exited ([79a95ac](https://github.com/dodi-smart/dirahq-cli/commit/79a95aca5374bc4296dc3faeaf7fe8067c1d1f0a))
+* **repo:** refresh the zavet index after merging the review workstreams ([6c03549](https://github.com/dodi-smart/dirahq-cli/commit/6c035494ccc7061e4732cdce7a19a9f7ab8f6b7a))
+* **repo:** update capture-pipeline spec for the repo-binding, reindex-merge and chunking fixes ([517f768](https://github.com/dodi-smart/dirahq-cli/commit/517f7682e333da529d5184b78d93ba371827c8c7))
+
 ## [0.5.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.4.0...v0.5.0) (2026-08-13)
 
 ### ✨ Features

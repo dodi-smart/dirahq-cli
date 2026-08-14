@@ -242,7 +242,12 @@ Knowledge sync is a separate channel from time tracking, with its own consent.
   full      all of the above, plus the record bodies, commit trailer values,
             and guard check commands — the text of your decisions and specs";
 
-/// Step 5a — the knowledge consent tier.
+/// Step 7 — the knowledge consent tier.
+///
+/// Last of the mutating steps, deliberately: it writes config the daemon
+/// reads at startup, and step 3 (the daemon step) may have just restarted
+/// it. Running after zavet's two steps (5 and 6 — see `mod::run`) means the
+/// value lands on disk before the *next* daemon start rather than racing it.
 ///
 /// Kept apart from the plugin install and the scaffold so that declining one
 /// does not decline the others: a user may well want the knowledge layer
@@ -304,7 +309,7 @@ pub(crate) fn knowledge(
     }
 }
 
-/// Step 5b — install the zavet plugin.
+/// Step 5 — install the zavet plugin.
 pub(crate) fn zavet_plugin(state: &State, opts: &Options, ui: &mut dyn Ui) -> StepOutcome {
     if opts.no_zavet {
         return StepOutcome::Skipped("--no-zavet".into());
@@ -338,7 +343,7 @@ pub(crate) fn zavet_plugin(state: &State, opts: &Options, ui: &mut dyn Ui) -> St
     }
 }
 
-/// Step 5c — scaffold `.zavet/` in this repo and turn the module on for it.
+/// Step 6 — scaffold `.zavet/` in this repo and turn the module on for it.
 ///
 /// Shells out to the plugin's own `bin/zavet` rather than reimplementing
 /// `init`. That script is ~2900 lines of POSIX sh and is also the *runtime*

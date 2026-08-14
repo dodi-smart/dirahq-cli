@@ -1131,8 +1131,6 @@ impl Store {
         Ok(Some(decision))
     }
 
-    /// All decisions for a repo (with guards), ordered by id. Guards come from
-    /// one bulk query grouped in memory, not a per-decision lookup.
     /// `(key, content_hash, path)` for every captured decision and spec in
     /// `repo` — the identity a bulk re-ingest compares against, and nothing
     /// else. Read-only: no cursor, no stream, nothing to blank in `nuke`.
@@ -1176,6 +1174,8 @@ impl Store {
             .collect())
     }
 
+    /// All decisions for a repo (with guards), ordered by id. Guards come from
+    /// one bulk query grouped in memory, not a per-decision lookup.
     pub async fn zavet_decisions_list(&self, repo: &str) -> Result<Vec<ZavetDecisionRow>, Error> {
         let rows = sqlx::query(
             "SELECT repo, id, slug, title, status, path, supersedes, body_md,

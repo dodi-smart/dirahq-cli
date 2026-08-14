@@ -77,6 +77,30 @@ pub enum Kinds {
     Both,
 }
 
+/// The remedy-labeled reason a record on disk has no store row.
+///
+/// `in_head` is `Some` whenever `ls-tree` actually ran: membership decides
+/// `awaiting sweep` (committed, daemon hasn't walked it yet) vs `uncommitted`
+/// (never committed). `None` means it could not run, and `head_resolves` is
+/// what tells apart WHY: an unborn branch (no HEAD at all) makes `uncommitted`
+/// truthful — nothing genuinely is committed yet, the case a fresh `git init`
+/// needs this feature for. But a live HEAD whose `ls-tree` still failed (a git
+/// error unrelated to history) must not report `uncommitted` either — "commit
+/// it" is not usable advice when git itself is what broke — so that case reads
+/// `unknown` instead.
+fn uncaptured_reason(
+    in_head: Option<&std::collections::HashSet<String>>,
+    head_resolves: bool,
+    rel: &str,
+) -> &'static str {
+    match in_head {
+        Some(set) if set.contains(rel) => "awaiting sweep",
+        Some(_) => "uncommitted",
+        None if head_resolves => "unknown",
+        None => "uncommitted",
+    }
+}
+
 /// Record files in the working tree that the store has no row for.
 ///
 /// Files are matched against the store by id/slug, not by path, so a record
@@ -97,7 +121,8 @@ fn scan_uncaptured(
     kinds: Kinds,
     captured_keys: &std::collections::HashSet<String>,
     captured_paths: &std::collections::HashSet<String>,
-    in_head: &std::collections::HashSet<String>,
+    in_head: Option<&std::collections::HashSet<String>>,
+    head_resolves: bool,
 ) -> Vec<ZavetUncapturedView> {
     let mut out: Vec<ZavetUncapturedView> = Vec::new();
     let dirs: &[&str] = match kinds {
@@ -135,15 +160,7 @@ fn scan_uncaptured(
             }
             out.push(ZavetUncapturedView {
                 kind: if is_spec { "spec" } else { "decision" }.to_string(),
-                // Committed but absent from the store means the daemon has not
-                // walked that commit yet; absent from HEAD means it was never
-                // committed. Different remedies, so they stay distinct.
-                reason: if in_head.contains(&rel) {
-                    "awaiting sweep"
-                } else {
-                    "uncommitted"
-                }
-                .to_string(),
+                reason: uncaptured_reason(in_head, head_resolves, &rel).to_string(),
                 id,
                 title,
                 path: rel,
@@ -171,19 +188,23 @@ async fn working_tree_probe(
     };
     tokio::task::spawn_blocking(move || {
         let branch = dira_core::project::current_branch(&root);
-        // `None` = no HEAD (an unborn branch) or not a repo. That makes
-        // *presence* unknown — never guessed — but it does NOT make the
-        // on-disk scan unknown: the files are still right there. Bailing out
-        // here would report zero uncaptured records in a freshly-`git init`ed
-        // repo, which is the very case this feature exists to catch (the first
-        // decision of a project is written before the first commit).
-        //
-        // With no HEAD, nothing is committed, so an empty set is the truthful
-        // input and every record correctly reports `uncommitted`.
+        // `None` = no HEAD (an unborn branch), not a repo, or an unrelated git
+        // failure. That makes *presence* unknown — never guessed — but it does
+        // NOT make the on-disk scan unknown: the files are still right there.
+        // Bailing out here would report zero uncaptured records in a
+        // freshly-`git init`ed repo, which is the very case this feature
+        // exists to catch (the first decision of a project is written before
+        // the first commit).
         let in_head = dira_core::project::ls_tree_paths(
             &root,
             &[dira_core::zavet::DECISIONS_DIR, dira_core::zavet::SPECS_DIR],
         );
+        // Distinguishes WHY `in_head` came back `None`: an unborn branch (no
+        // HEAD to resolve) makes `uncommitted` truthful, since nothing is
+        // committed. A live HEAD whose `ls-tree` still failed is a DIFFERENT
+        // git error and must not read as the same thing — see
+        // `uncaptured_reason`.
+        let head_resolves = dira_core::project::head_sha(&root).is_some();
         let keys = captured.iter().map(|(_, k)| k.clone()).collect();
         let paths = captured.iter().map(|(p, _)| p.clone()).collect();
         let uncaptured = scan_uncaptured(
@@ -192,9 +213,8 @@ async fn working_tree_probe(
             kinds,
             &keys,
             &paths,
-            in_head
-                .as_ref()
-                .unwrap_or(&std::collections::HashSet::new()),
+            in_head.as_ref(),
+            head_resolves,
         );
         TreeProbe {
             branch,
@@ -1543,6 +1563,38 @@ mod tests {
         assert!(zavet_dir_exists(tmp.path()));
     }
 
+    /// The four-way split `uncaptured_reason` decides, pinned without a real
+    /// git repo: `ls-tree` succeeding beats everything, and the two ways to
+    /// come back `None` diverge on whether HEAD itself resolved.
+    #[test]
+    fn uncaptured_reason_distinguishes_an_unborn_head_from_a_live_one() {
+        let mut in_tree = std::collections::HashSet::new();
+        in_tree.insert(".zavet/decisions/D-0001-x.md".to_string());
+        const PATH: &str = ".zavet/decisions/D-0001-x.md";
+        const OTHER: &str = ".zavet/decisions/D-0002-y.md";
+
+        assert_eq!(
+            uncaptured_reason(Some(&in_tree), true, PATH),
+            "awaiting sweep",
+            "committed, daemon hasn't walked it yet"
+        );
+        assert_eq!(
+            uncaptured_reason(Some(&in_tree), true, OTHER),
+            "uncommitted",
+            "ls-tree ran and the path is simply not in HEAD's tree"
+        );
+        assert_eq!(
+            uncaptured_reason(None, false, PATH),
+            "uncommitted",
+            "an unborn branch: nothing is committed, so this is the truth"
+        );
+        assert_eq!(
+            uncaptured_reason(None, true, PATH),
+            "unknown",
+            "a live HEAD whose ls-tree still failed must not read as 'commit it'"
+        );
+    }
+
     /// `(id, content_hash)` standing in for a swept record.
     fn rec(id: &str, hash: &str) -> (String, String) {
         (id.to_string(), hash.to_string())
@@ -1825,7 +1877,11 @@ mod reindex_tests {
         let cfg = r.cfg.clone();
         let records = dira_core::project::log_commit_refs(&top, &REINDEX_PATHS, None);
         let trailer_commits = dira_core::project::log_commit_refs(&top, &[], Some(1));
-        assert_eq!(trailer_commits.len(), 1, "bounded to the newest commit only");
+        assert_eq!(
+            trailer_commits.len(),
+            1,
+            "bounded to the newest commit only"
+        );
         let sweep = crate::capture::zavet_sweep(&top, &records);
         let trailers = crate::capture::zavet_trailers(&top, &trailer_commits, &cfg);
         assert!(

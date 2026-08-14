@@ -807,18 +807,11 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Run a git command in `dir`, returning trimmed stdout on success.
+/// Run a git command in `dir`, returning trimmed stdout on success, or `None`
+/// on failure OR success-with-empty-output. [`git_output`] keeps the second
+/// case distinguishable for the handful of callers that need to.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = git_command().arg("-C").arg(dir).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    git_output(dir, args).filter(|s| !s.is_empty())
 }
 
 /// Normalize any git remote URL to `host/owner/repo` (lowercased), independent of

@@ -1,6 +1,6 @@
 ---
 title: Distribution and self-update
-version: 8
+version: 9
 origin: session
 verified: false
 confidence: high
@@ -78,6 +78,19 @@ both executables and restarts whatever is supervising the daemon.
   *safe*, which is not the same as unnecessary. A stop that cannot confirm exit
   is a hard error naming the pid, and `install` refuses rather than registering
   a service over it.
+  "Confirmed exited" means the *process* is gone, and `kill -0` does not answer
+  that — it answers whether the pid still exists, which stays true for a zombie
+  until its parent reaps it, force-kill included. `dira daemon start` orphans
+  `dirad` onto pid 1, so on a container whose pid 1 is not a reaper (`tail -f
+  /dev/null`, the shape CI container jobs use) an exited daemon read as alive
+  forever and `stop` burned its whole budget before refusing. A zombie is
+  exited for every purpose here — the kernel closed its fds, so the flock and
+  socket are already free — so the liveness probe checks for it: `/proc` on
+  Linux (no subprocess, and the musl/BusyBox images are where this bites),
+  `ps -o state=` on macOS, which cannot be the single implementation because
+  BusyBox `ps` has neither `-p` nor `-o`. A probe that cannot answer reports
+  *alive*: absence of evidence is not exit, and over-reporting exit is the one
+  direction D-0019 forbids.
 - **Next steps are one command.** Both installers end on `dira onboard`. The
   previous three-line block (`--version` / `daemon start` / `status`) omitted
   `dira init`, so following it produced a daemon that captured nothing, and it

@@ -949,6 +949,16 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         }
     };
 
+    // `sweep.trailers` is that same walk's OWN trailer stage (see
+    // `zavet_sweep`) — computed over the `.zavet/`-scoped, UNBOUNDED `records`
+    // window — and was previously discarded in favor of the separately-walked
+    // `trailers` (the wide, by-default-BOUNDED `trailer_commits` window). The
+    // two windows disagree on old history: a commit that touched `.zavet/` and
+    // also carries an arbitrary `Decision:` trailer can sit past
+    // `REINDEX_TRAILER_LIMIT` and only ever show up in `sweep.trailers`. Merge
+    // both before recording rather than persisting only the bounded half.
+    let trailer_rows = merge_trailer_windows(trailers, &sweep.trailers);
+
     // Content-hash short-circuit. Every upsert bumps `touched_seq`, which is the
     // knowledge-sync cursor — without this, each reindex would re-stamp every
     // row and re-push the entire knowledge set. With it, a second run on an
@@ -969,6 +979,15 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
             .collect()
     };
     let (known_decisions, known_specs) = (by_key(known_decisions), by_key(known_specs));
+
+    // Before/after delta rather than counting offers (mirrors `sync`'s own
+    // pattern): `zavet_record_trailers` is INSERT OR IGNORE, so a loop that
+    // counts every call it MADE — the previous behavior — counts every commit
+    // the walk still finds on a repeat run, even though every one of those
+    // calls is a no-op. Snapshotting the actual row count before and after is
+    // what makes a true no-op reindex report zero rather than "recorded" the
+    // same set again.
+    let before = state.store.zavet_counts(&repo).await.unwrap_or_default();
 
     let mut view = dira_core::protocol::ZavetReindexView {
         repo: repo.clone(),
@@ -1033,17 +1052,19 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         }
     }
     // Trailers are keyed `(sha, seq)` and inserted OR IGNORE, so re-recording a
-    // sha already present is already a no-op — no hash check needed.
-    for (sha, ts) in &trailers {
-        match state
+    // sha already present is already a no-op — no hash check needed. The merged
+    // window (see above), not the bounded-by-default `trailers` walk alone.
+    for (sha, ts) in &trailer_rows {
+        if let Err(e) = state
             .store
             .zavet_record_trailers(Some(&repo), sha, ts)
             .await
         {
-            Ok(()) => view.trailer_commits_recorded += 1,
-            Err(e) => tracing::warn!("zavet reindex trailers for {sha} failed: {e}"),
+            tracing::warn!("zavet reindex trailers for {sha} failed: {e}");
         }
     }
+    let after = state.store.zavet_counts(&repo).await.unwrap_or_default();
+    view.trailer_commits_recorded = after.trailers.saturating_sub(before.trailers);
 
     if view.decisions_indexed > 0 || view.specs_indexed > 0 || view.trailer_commits_recorded > 0 {
         let _ = state.knowledge_sync.trigger.try_send(());
@@ -1055,6 +1076,28 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         "zavet reindex complete"
     );
     Response::ZavetReindex(Box::new(view))
+}
+
+/// Merge the reindex's two trailer windows into one map, keyed by sha.
+///
+/// `wide` is the general trailer walk (`trailer_commits`), bounded by default
+/// to `REINDEX_TRAILER_LIMIT`. `scoped` is `zavet_sweep`'s OWN trailer stage
+/// over the `.zavet/`-pathspec `records` walk, which is unbounded. A commit
+/// old enough to sit past the wide window's bound but that also touched
+/// `.zavet/` (and so was walked by the scoped pass) shows up ONLY in `scoped`
+/// — dropping it there, as the reindex used to, silently lost its trailers on
+/// every run. Either side wins on a collision: the parse of a given sha is the
+/// same regardless of which walk found it first.
+fn merge_trailer_windows(
+    wide: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
+    scoped: &[(String, Vec<dira_core::store::ZavetTrailer>)],
+) -> HashMap<String, Vec<dira_core::store::ZavetTrailer>> {
+    let mut merged: HashMap<String, Vec<dira_core::store::ZavetTrailer>> =
+        wide.into_iter().collect();
+    for (sha, ts) in scoped.iter().cloned() {
+        merged.entry(sha).or_insert(ts);
+    }
+    merged
 }
 
 /// One record's oldest and newest appearance across the walked history.
@@ -1602,5 +1645,199 @@ mod tests {
             &Some("abc".into()),
             ".zavet/decisions/D-0001-new-slug.md"
         ));
+    }
+
+    fn trailer(key: &str, value: &str) -> dira_core::store::ZavetTrailer {
+        dira_core::store::ZavetTrailer {
+            key: key.to_string(),
+            value: value.to_string(),
+            decision_id: None,
+        }
+    }
+
+    /// Pins the merge half of the reindex trailer fix: a sha the wide
+    /// (by-default-bounded) walk never saw, but that the unbounded
+    /// `.zavet/`-scoped walk did, must survive into the merged map — the
+    /// exact shape of an old commit sitting past `REINDEX_TRAILER_LIMIT` that
+    /// also touched `.zavet/`.
+    #[test]
+    fn merge_trailer_windows_keeps_a_scoped_only_sha() {
+        let wide = vec![("wide-only".to_string(), vec![trailer("why", "recent")])];
+        let scoped = vec![(
+            "scoped-only".to_string(),
+            vec![trailer("decision", "D-0001")],
+        )];
+
+        let merged = merge_trailer_windows(wide, &scoped);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.get("scoped-only").map(|ts| ts.len()),
+            Some(1),
+            "an old .zavet/-touching commit past the trailer bound must not be dropped"
+        );
+        assert_eq!(merged.get("wide-only").map(|ts| ts.len()), Some(1));
+    }
+
+    /// Either side wins on a collision — the parse of a given sha is identical
+    /// regardless of which walk found it, so the wide value surviving is fine.
+    #[test]
+    fn merge_trailer_windows_a_collision_keeps_either_side() {
+        let wide = vec![("both".to_string(), vec![trailer("why", "from-wide")])];
+        let scoped = vec![("both".to_string(), vec![trailer("why", "from-scoped")])];
+
+        let merged = merge_trailer_windows(wide, &scoped);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("both").map(|ts| ts.len()), Some(1));
+    }
+}
+
+/// `dira zavet reindex` end-to-end: a real temp git repo + `AppState`, driving
+/// the actual `reindex` handler rather than its pure helpers. Separate `mod`
+/// so `tempfile`/`Store`/`AppState` imports don't leak into the pure-logic
+/// tests above.
+#[cfg(test)]
+mod reindex_tests {
+    use super::*;
+    use dira_core::{Config, Store};
+    use std::process::Command;
+
+    async fn test_state() -> (AppState, tokio::sync::mpsc::Receiver<()>) {
+        let store = Store::open_in_memory().await.expect("in-memory store");
+        let (state, _rx, _sync_rx, knowledge_rx) = crate::build_state(store, Config::default())
+            .await
+            .expect("build_state");
+        (state, knowledge_rx)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    fn init_repo(root: &Path) {
+        git(root, &["init", "-q", "-b", "main"]);
+        git(
+            root,
+            &["remote", "add", "origin", "git@github.com:acme/api.git"],
+        );
+        git(root, &["config", "user.email", "t@t.dev"]);
+        git(root, &["config", "user.name", "T"]);
+    }
+
+    fn write_decision(root: &Path, id: &str, title: &str) {
+        let dir = root.join(".zavet/decisions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}-{}.md", title.replace(' ', "-"))),
+            format!(
+                "---\nid: {id}\ntitle: {title}\nstatus: active\nguards:\n  - src/**\n---\n\n## Decision\n{title}.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn run_reindex(state: &AppState, cwd: &str) -> dira_core::protocol::ZavetReindexView {
+        match reindex(state, Some(cwd.to_string()), false).await {
+            Response::ZavetReindex(v) => *v,
+            other => panic!("expected ZavetReindex, got {other:?}"),
+        }
+    }
+
+    /// The write-counted trigger, both halves: a real reindex writes something
+    /// and nudges the knowledge channel; an immediate repeat is a true no-op —
+    /// zero recorded trailers, zero re-indexed records — and does not nudge it
+    /// again. Before the fix, `trailer_commits_recorded` counted OFFERS, so the
+    /// repeat run reported the same non-zero count and re-triggered every time.
+    #[tokio::test]
+    async fn a_second_reindex_reports_no_trailer_writes_and_does_not_retrigger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        write_decision(root, "D-0001", "reindex twice");
+        git(root, &["add", "-A"]);
+        git(
+            root,
+            &["commit", "-qm", "docs: record D-0001\n\nRefs: D-0001"],
+        );
+
+        let (state, mut knowledge_rx) = test_state().await;
+        let cwd = root.display().to_string();
+
+        let first = run_reindex(&state, &cwd).await;
+        assert!(first.decisions_indexed >= 1, "first run indexes D-0001");
+        assert!(
+            first.trailer_commits_recorded > 0,
+            "the commit's own Refs: trailer is recorded"
+        );
+        assert!(
+            knowledge_rx.try_recv().is_ok(),
+            "a run that wrote something must nudge the knowledge channel"
+        );
+
+        let second = run_reindex(&state, &cwd).await;
+        assert_eq!(
+            second.trailer_commits_recorded, 0,
+            "repeat run writes no NEW trailer rows, not the same offer count again"
+        );
+        assert_eq!(second.decisions_indexed, 0, "content hash unchanged");
+        assert_eq!(second.specs_indexed, 0);
+        assert!(
+            knowledge_rx.try_recv().is_err(),
+            "a true no-op repeat must not re-trigger the knowledge sync"
+        );
+    }
+
+    /// Pins the merge half end-to-end: a commit that touches `.zavet/` sits
+    /// inside the unbounded record walk regardless of how far back it is, so
+    /// its own `Refs:` trailer is recovered even with the wide trailer walk
+    /// bounded down to a single commit — the shape of a commit older than
+    /// `REINDEX_TRAILER_LIMIT` that the wide-only walk would have missed.
+    #[tokio::test]
+    async fn an_old_zavet_touching_commits_trailer_survives_a_bounded_wide_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        write_decision(root, "D-0001", "old decision with a trailer");
+        git(root, &["add", "-A"]);
+        git(
+            root,
+            &["commit", "-qm", "docs: record D-0001\n\nRefs: D-0001"],
+        );
+        // A newer, non-`.zavet/` commit so the wide trailer walk (newest-first)
+        // has something to prefer over the old one once bounded to 1.
+        std::fs::write(root.join("code.rs"), "fn main() {}\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "feat: unrelated change"]);
+
+        let cwd = root.display().to_string();
+
+        // Force the wide window down to the single newest commit — which
+        // carries no trailer — so only the merge can recover D-0001's.
+        let r = resolve_repo(cwd.clone()).await;
+        let top = r.top.expect("resolved toplevel");
+        let cfg = r.cfg.clone();
+        let records = dira_core::project::log_commit_refs(&top, &REINDEX_PATHS, None);
+        let trailer_commits = dira_core::project::log_commit_refs(&top, &[], Some(1));
+        assert_eq!(trailer_commits.len(), 1, "bounded to the newest commit only");
+        let sweep = crate::capture::zavet_sweep(&top, &records);
+        let trailers = crate::capture::zavet_trailers(&top, &trailer_commits, &cfg);
+        assert!(
+            trailers.is_empty(),
+            "the newest commit alone carries no trailer"
+        );
+
+        let merged = merge_trailer_windows(trailers, &sweep.trailers);
+        assert_eq!(
+            merged.len(),
+            1,
+            "D-0001's introducing commit is recovered from the scoped window"
+        );
     }
 }

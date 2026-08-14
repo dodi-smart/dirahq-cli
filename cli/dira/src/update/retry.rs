@@ -18,6 +18,17 @@ use std::time::Duration;
 /// updater makes.
 pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Ceiling on the gap between successful reads of a response body — an
+/// *inactivity* timeout, applied client-wide via `ClientBuilder::read_timeout`
+/// (reqwest 0.12.9+; this workspace pins 0.12.28). It resets on every read
+/// that makes progress, so unlike a total-transfer timeout it is safe to
+/// share across every call this client makes regardless of payload size: a
+/// connection that has stalled is stalled whether it was serving a small
+/// JSON response or a ~20MB archive. This is what actually bounds the *hang*
+/// case; [`Policy::download`]'s `timeout` field is a much longer backstop on
+/// the whole request, not the thing that catches a stall.
+pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Ceiling on a GitHub Releases API call. Short — these are small JSON
 /// responses, and `--check` runs speculatively from a detached background
 /// refresh where a long hang is worse than a miss.
@@ -105,24 +116,39 @@ impl Policy {
     /// Four attempts is sized against the failure this exists for: a single
     /// mid-stream abort on a lossy link, which clears on the very next
     /// attempt. More attempts would mostly add latency to genuinely-down
-    /// cases. The 120s per-attempt timeout is generous because the largest
-    /// published artifact is ~20MB and this must not fire on a slow-but-working
-    /// link — its job is bounding the *hang* case (a connection that stalls
-    /// instead of closing), which before this had no bound at all.
+    /// cases.
+    ///
+    /// `timeout` here is a per-attempt *total* backstop, not the thing that
+    /// bounds a stall — that job belongs to the client-wide [`READ_TIMEOUT`]
+    /// set once in `update::run` (an inactivity timeout that resets on every
+    /// read making progress). This field used to be the *only* bound, at
+    /// 120s, and that was the regression: `reqwest`'s per-request
+    /// `.timeout()` covers the WHOLE request including the body read, so a
+    /// genuinely working but merely slow link — anything under roughly
+    /// 1.4 Mbps for a ~20MB artifact — blew the budget and retried, then blew
+    /// it again, deterministically exhausting all 4 attempts on a download
+    /// that was never stalled, only slow. 600s is sized to still comfortably
+    /// fit the largest published artifact (~20MB) down to about 0.3 Mbps,
+    /// while staying short enough that a connection which genuinely never
+    /// progresses doesn't hang an interactive command indefinitely —
+    /// `READ_TIMEOUT` normally catches that case first, at 30s of no
+    /// progress; this is the backstop for whatever `READ_TIMEOUT` doesn't
+    /// (e.g. a link so marginal that a few bytes trickle in every 29s,
+    /// forever).
     pub(super) const fn download() -> Self {
         Self {
             attempts: 4,
             seed: Duration::from_millis(500),
             max_backoff: Duration::from_secs(4),
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_secs(600),
         }
     }
 
     /// The policy for the `.sha256` companion file — the same ladder, but a
     /// per-attempt timeout sized to ~100 bytes rather than to the archive.
     ///
-    /// Sharing the archive's 120s budget would mean a stalled checksum fetch
-    /// burning 4 × 120s of dead wall clock on top of whatever the archive
+    /// Sharing the archive's 600s budget would mean a stalled checksum fetch
+    /// burning 4 × 600s of dead wall clock on top of whatever the archive
     /// already spent, for a file that arrives in one packet.
     pub(super) const fn checksum() -> Self {
         Self {

@@ -116,15 +116,29 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
         None => resolve::default_channel(),
     };
 
-    // `connect_timeout` only — no client-wide `.timeout(...)`, following the
-    // convention `dirad/src/lib.rs` states explicitly ("No default timeout —
-    // callers set a per-request timeout sized to that call"). The two calls
-    // here want very different budgets: a small JSON API response versus a
-    // ~20MB artifact, so each sets its own (see `retry::API_TIMEOUT` and
-    // `retry::Policy::download`). Without the connect bound, a link that
-    // stalls instead of closing hangs `dira update` forever.
+    // `connect_timeout` bounds the TCP+TLS handshake; `read_timeout` bounds
+    // the gap between successful body reads (an inactivity timeout — it
+    // resets on every read that makes progress, so it is safe to share
+    // across every call this client makes regardless of payload size: a
+    // stalled connection is stalled whether it is serving a tiny JSON
+    // response or a 20MB archive). Still no client-wide `.timeout(...)`,
+    // following the convention `dirad/src/lib.rs` states explicitly ("No
+    // default timeout — callers set a per-request timeout sized to that
+    // call") — that call bounds the WHOLE request including the body read,
+    // so its budget genuinely differs per call (a small JSON API response
+    // versus a ~20MB artifact) and stays a per-request `.timeout()` set by
+    // the caller (see `retry::API_TIMEOUT` and
+    // `retry::Policy::download`/`checksum`). Without `connect_timeout`, a
+    // link that stalls instead of closing hangs `dira update` forever at the
+    // connect phase; without `read_timeout`, the same stall mid-body used to
+    // go uncaught until the per-request `.timeout()` fired — which is
+    // exactly what made a 20MB download over a merely-slow (not stalled)
+    // link fail deterministically, since that timeout used to bound the
+    // whole transfer rather than just a stall (see `retry::Policy::download`'s
+    // doc for that fix).
     let http = reqwest::Client::builder()
         .connect_timeout(retry::CONNECT_TIMEOUT)
+        .read_timeout(retry::READ_TIMEOUT)
         .build()
         .context("build HTTP client")?;
 

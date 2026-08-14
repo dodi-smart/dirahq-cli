@@ -29,6 +29,7 @@ pub(crate) mod render;
 /// when doctor last ran on this machine.
 const META_LAST_RUN: &str = "doctor_last_run_at";
 
+use crate::update::replace::Guard;
 use dira_core::{Config, Store};
 use serde::Serialize;
 
@@ -134,6 +135,9 @@ pub(crate) const CHECK_IDS: &[&str] = &[
     "project.resolves",
     "sync.health",
     "device.link",
+    "update.rollback",
+    "update.shadowed",
+    "update.failures",
     // Opt-in: only ever emitted with `--probe`, because it spawns a child
     // process and writes+deletes a row. Keeping the default side-effect-free
     // is what makes `dira doctor` safe to run from install.sh and CI.
@@ -187,6 +191,27 @@ pub(crate) struct Facts {
     /// the OS is a judge whose verdict changes with the host it runs on — which
     /// is exactly how the Windows arm escapes its own tests.
     pub doctor_elevated: bool,
+    /// What the update-check cache knows, and where an update would land.
+    pub update: UpdateFacts,
+}
+
+/// Everything the three `update.*` checks judge, gathered up front like the rest.
+///
+/// All three fields are "no evidence" by absence, and the judge treats them
+/// that way: a machine that has never run an update check has no cache, which
+/// is a skip and not a verdict (DIRASH-0022).
+#[derive(Debug, Default)]
+pub(crate) struct UpdateFacts {
+    pub cache: Option<crate::update::notice::CacheFacts>,
+    /// The directory `dira update` would install into, per the D-0004
+    /// PATH-entry probe. `None` when `dira` is not on `PATH`, or when this
+    /// process is itself a dev build — the updater refuses those outright, so
+    /// "where it would land" has no answer worth reporting.
+    pub install_dir: Option<std::path::PathBuf>,
+    /// `.dira*.old.*` sidecars beside the installed binary. A
+    /// `.old.restore.<pid>` is written only by the rollback path, so a leftover
+    /// is proof a swap completed and was then undone.
+    pub stale_sidecars: Vec<String>,
 }
 
 /// Run every requested check and print the report. Returns the process exit
@@ -263,9 +288,39 @@ async fn gather(config: &Config) -> Facts {
         None => Err(dira_core::project::ProjectMiss::NotAGitRepo),
     };
 
+    // Where an update would land, and what the last one left behind. Read-only:
+    // `discover_install` only probes `PATH` and `symlink_metadata`, and the
+    // sidecar listing is a `read_dir`. `Guard::DevSymlink` still yields a
+    // directory — a `just install` tree is exactly where a shadowing question
+    // is worth asking — while `DevBuild` yields none, because `dira update`
+    // refuses that outright and has no install directory to speak of.
+    let install_dir = match crate::update::replace::discover_install(None) {
+        Ok(Guard::Ok(dir) | Guard::DevSymlink { bin_dir: dir, .. }) => Some(dir),
+        _ => None,
+    };
+    // Reported by filename: the directory is already named separately, and the
+    // sidecar's own name is the diagnostic part (`.old.restore.<pid>`).
+    let stale_sidecars = install_dir
+        .as_deref()
+        .map(crate::update::replace::stale_old_files)
+        .unwrap_or_default()
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
     Facts {
         cwd: cwd.map(|d| d.display().to_string()),
         project,
+        update: UpdateFacts {
+            cache: crate::update::notice::cache_facts(),
+            install_dir,
+            stale_sidecars,
+        },
         daemon_socket: config.socket_path.display().to_string(),
         daemon,
         supervision,
@@ -336,6 +391,10 @@ pub(crate) fn run_checks(f: &Facts, args: &Args) -> Vec<Check> {
         Some(d) => checks::device_link(d, f.cloud_url.as_deref()),
         None => Check::skip("device.link", "the local store could not be read"),
     });
+
+    push(checks::update_rollback(&f.update));
+    push(checks::update_shadowed(&f.update, f.current_exe.as_deref()));
+    push(checks::update_failures(&f.update));
 
     out
 }

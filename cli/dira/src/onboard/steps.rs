@@ -164,16 +164,12 @@ pub(crate) async fn daemon(
         };
     }
 
-    if state.daemon_running() {
-        ui.say("stopping the unsupervised daemon first (it holds the control socket)");
-        if let Err(e) = crate::daemon::stop(config).await {
-            return StepOutcome::Failed(format!(
-                "could not stop the running daemon, so the service cannot bind the socket: {e}"
-            ));
-        }
-    }
-
-    match crate::daemon::install(config) {
+    // No pre-stop here any more: `daemon::install` stops an unmanaged daemon
+    // itself and waits for it to exit. This step used to do it, and so did both
+    // installers — while a bare `dira daemon install`, the caller that needed it
+    // most, did not. The ordering is unchanged; it just lives where it cannot be
+    // forgotten (#123).
+    match crate::daemon::install_with_supervision(config, state.supervision.clone()).await {
         Ok(()) => StepOutcome::Done("installed dirad as a login service".into()),
         // Falling back to a bare start is the honest answer when the service
         // manager refuses (a container with no systemd session, a locked-down

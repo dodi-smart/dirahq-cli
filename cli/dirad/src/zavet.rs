@@ -14,7 +14,7 @@ use dira_core::protocol::{
     ZavetPresence, ZavetSpecView, ZavetSpecWhyView, ZavetStatusView, ZavetSyncView,
     ZavetUncapturedView, ZavetWhyView,
 };
-use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
+use dira_core::store::{ZavetDecisionRow, ZavetKind, ZavetSpecRow};
 pub use dira_core::zavet::{
     canonical_decision_id, parse_config, parse_guard_event, GuardEventV1, ZavetConfig, CONFIG_PATH,
     ZAVET_DIR,
@@ -994,9 +994,7 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         .await
         .unwrap_or_default();
     let by_key = |rows: Vec<dira_core::store::ZavetIdentity>| -> HashMap<String, Stored> {
-        rows.into_iter()
-            .map(|r| (r.key, (r.content_hash, r.path)))
-            .collect()
+        rows.into_iter().map(|r| (r.key.clone(), r)).collect()
     };
     let (known_decisions, known_specs) = (by_key(known_decisions), by_key(known_specs));
 
@@ -1018,12 +1016,27 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         ..Default::default()
     };
 
-    // No session attribution: a reindex replays other people's history, and
-    // stamping it with whatever session happens to be open here would invent
-    // provenance. The ambient path attributes because it captures live work.
+    // Ordinary writes carry no session attribution: a reindex replays other
+    // people's history, and stamping it with whatever session happens to be open
+    // here would invent provenance. The ambient path attributes because it
+    // captures live work. The one exception is the provenance REPAIR below,
+    // which reads attribution from the artifacts row for the introducing commit
+    // — a recorded fact keyed by the commit, not the ambient session
+    // (DIRASH-0032).
     for group in collapse(&sweep.decisions, |d| d.cap.id.as_str()) {
         let newest = group.newest;
         let stored = known_decisions.get(&newest.cap.id);
+        view.provenance_repaired += u64::from(
+            repair_provenance(
+                state,
+                &repo,
+                ZavetKind::Decision,
+                &newest.cap.id,
+                stored,
+                group.oldest,
+            )
+            .await,
+        );
         if unchanged(stored, &newest.cap.content_hash, &newest.cap.path) {
             view.decisions_skipped += 1;
             continue;
@@ -1051,6 +1064,17 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
     for group in collapse(&sweep.specs, |s| s.cap.slug.as_str()) {
         let newest = group.newest;
         let stored = known_specs.get(&newest.cap.slug);
+        view.provenance_repaired += u64::from(
+            repair_provenance(
+                state,
+                &repo,
+                ZavetKind::Spec,
+                &newest.cap.slug,
+                stored,
+                group.oldest,
+            )
+            .await,
+        );
         if unchanged(stored, &newest.cap.content_hash, &newest.cap.path) {
             view.specs_skipped += 1;
             continue;
@@ -1173,9 +1197,8 @@ fn collapse<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> &'a str) -> Vec<Touche
     out
 }
 
-/// A stored record's identity for the skip check: its content hash and the
-/// path it was captured from.
-type Stored = (Option<String>, String);
+/// A stored record's identity for the skip check.
+type Stored = dira_core::store::ZavetIdentity;
 
 /// Whether a record already in the store matches the one just parsed.
 ///
@@ -1183,10 +1206,127 @@ type Stored = (Option<String>, String);
 /// unknown hash must never be read as "already current", or the record that
 /// most needs indexing is the one silently skipped. The path must match too:
 /// a renamed file keeps its blob oid, and `path`/`slug` come from the filename.
+///
+/// This answers "is the stored CONTENT current" and nothing else. Provenance is
+/// a separate question with its own answer ([`provenance_repair`]): a record can
+/// be content-current and still recorded against the wrong introducing commit,
+/// and treating the two as one question is what let that state survive every
+/// reindex forever.
 fn unchanged(stored: Option<&Stored>, fresh: &Option<String>, fresh_path: &str) -> bool {
     match (stored, fresh) {
-        (Some((Some(a), p)), Some(b)) => a == b && p == fresh_path,
+        (Some(s), Some(b)) => s.content_hash.as_deref() == Some(b.as_str()) && s.path == fresh_path,
         _ => false,
+    }
+}
+
+/// Parse a git author date (`%aI`, strict ISO 8601 *with the author's local
+/// offset*) into an instant.
+///
+/// Instants, never strings: two commits an hour apart can compare backwards
+/// lexicographically when their authors sat in different timezones
+/// (`2026-08-14T01:00+02:00` precedes `2026-08-14T00:30Z` in fact and follows
+/// it in ASCII).
+fn authored_instant(at: Option<&str>) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(at?, &time::format_description::well_known::Rfc3339).ok()
+}
+
+/// A record sighting's commit coordinates.
+///
+/// Exists so the repair step is written once rather than once per record kind:
+/// `ZavetDecisionAt` and `ZavetSpecAt` carry the same `(sha, authored_at)` pair
+/// and differ only in their `cap`, which the repair never reads.
+trait RecordOrigin {
+    fn sha(&self) -> &str;
+    fn authored_at(&self) -> Option<&str>;
+}
+
+macro_rules! impl_record_origin {
+    ($($t:ty),+) => {$(
+        impl RecordOrigin for $t {
+            fn sha(&self) -> &str {
+                &self.sha
+            }
+            fn authored_at(&self) -> Option<&str> {
+                self.authored_at.as_deref()
+            }
+        }
+    )+};
+}
+impl_record_origin!(crate::capture::ZavetDecisionAt, crate::capture::ZavetSpecAt);
+
+/// Apply [`provenance_repair_plan`] if it has anything to say. Returns whether
+/// a row was actually repaired, so the reindex can report it.
+///
+/// A failure is logged and swallowed rather than aborting the run: a record
+/// whose provenance could not be corrected is exactly as usable as it was a
+/// moment ago, and the next reindex will try again — the repair is idempotent.
+async fn repair_provenance<T: RecordOrigin>(
+    state: &AppState,
+    repo: &str,
+    kind: ZavetKind,
+    key: &str,
+    stored: Option<&Stored>,
+    oldest: &T,
+) -> bool {
+    let Some((sha, at)) = provenance_repair_plan(stored, oldest.sha(), oldest.authored_at()) else {
+        return false;
+    };
+    match state
+        .store
+        .zavet_repair_provenance(repo, kind, key, sha, at)
+        .await
+    {
+        Ok(repaired) => repaired,
+        Err(e) => {
+            tracing::warn!("zavet reindex could not repair provenance for {kind} {key}: {e}");
+            false
+        }
+    }
+}
+
+/// The `(sha, authored_at)` a stored record's first-sight fields should be
+/// repaired to, or `None` when they are already right.
+///
+/// Only ever moves a record's origin EARLIER. The reindex walk is unbounded over
+/// the `.zavet/` pathspec, so its oldest sighting is normally the true
+/// introducing commit — but a record whose file was moved into that pathspec
+/// later has history the walk cannot see, and pushing its origin *forward* would
+/// be worse than leaving it. "Earliest wins" also makes the repair monotone and
+/// therefore idempotent, which is what keeps the second reindex a true no-op and
+/// stops `touched_seq` re-pushing the whole knowledge set (DIRASH-0028).
+///
+/// Conservative in both unknowns. A stored row with no `created_at` is repaired
+/// regardless — there is nothing to be earlier than, and an unrecorded date is
+/// exactly what a reindex is for. A *walk* sighting with no parseable date is
+/// never used to overwrite a stored one: that would trade a wrong date for no
+/// date.
+fn provenance_repair_plan<'a>(
+    stored: Option<&Stored>,
+    oldest_sha: &'a str,
+    oldest_at: Option<&'a str>,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let stored = stored?;
+    if stored.first_commit.as_deref() == Some(oldest_sha) {
+        return None;
+    }
+    let repair = Some((oldest_sha, oldest_at));
+    // Nothing recorded to be earlier than — and no date to lose either.
+    if stored.created_at.is_none() {
+        return repair;
+    }
+    match (
+        authored_instant(stored.created_at.as_deref()),
+        authored_instant(oldest_at),
+    ) {
+        // `<=`, not `<`: git author dates have one-second resolution, so two
+        // commits made in the same second tie. On a tie the walk wins — it
+        // enumerates history in order and therefore knows which came first,
+        // which is exactly what the timestamp has lost. Still monotone: the
+        // early return above stops a second run repeating the write.
+        (Some(have), Some(found)) if found <= have => repair,
+        // Genuinely later, or either side unparseable: leave a dated record
+        // alone rather than trading a wrong date for no date.
+        _ => None,
     }
 }
 
@@ -1654,13 +1794,160 @@ mod tests {
         assert_eq!(groups[0].writes(false).count(), 1);
     }
 
+    /// A stored row as the skip/repair checks see it.
+    fn identity(
+        content_hash: Option<&str>,
+        path: &str,
+        first_commit: Option<&str>,
+        created_at: Option<&str>,
+    ) -> Stored {
+        Stored {
+            key: "D-0001".to_string(),
+            content_hash: content_hash.map(String::from),
+            path: path.to_string(),
+            first_commit: first_commit.map(String::from),
+            created_at: created_at.map(String::from),
+        }
+    }
+
+    // --- provenance repair (#120 / DIRASH-0032) --------------------------
+
+    const P0: &str = ".zavet/decisions/D-0001-x.md";
+
+    /// The bug: the ambient poll first met the record on an EDIT commit, so
+    /// that edit's date became its recorded "decided at" permanently. Because
+    /// `zavet_sessions_for_decision` joins `artifacts` on `first_commit`, that
+    /// also bills `dira zavet why` to whoever made the edit.
+    #[test]
+    fn an_origin_earlier_than_the_stored_one_is_repaired() {
+        let stored = identity(
+            Some("abc"),
+            P0,
+            Some("edit-sha"),
+            Some("2026-08-10T12:00:00+00:00"),
+        );
+        assert_eq!(
+            provenance_repair_plan(
+                Some(&stored),
+                "intro-sha",
+                Some("2026-08-01T09:00:00+00:00")
+            ),
+            Some(("intro-sha", Some("2026-08-01T09:00:00+00:00")))
+        );
+    }
+
+    /// Idempotence, which is what keeps a repeat reindex a true no-op and stops
+    /// `touched_seq` re-pushing the whole knowledge set (DIRASH-0028).
+    #[test]
+    fn a_record_already_at_its_earliest_sighting_is_not_repaired() {
+        let stored = identity(
+            Some("abc"),
+            P0,
+            Some("intro-sha"),
+            Some("2026-08-01T09:00:00+00:00"),
+        );
+        assert_eq!(
+            provenance_repair_plan(
+                Some(&stored),
+                "intro-sha",
+                Some("2026-08-01T09:00:00+00:00")
+            ),
+            None
+        );
+    }
+
+    /// Monotone: a walk that cannot see a record's earlier history must never
+    /// push its origin forward.
+    #[test]
+    fn a_later_sighting_never_moves_the_origin_forward() {
+        let stored = identity(
+            Some("abc"),
+            P0,
+            Some("intro-sha"),
+            Some("2026-08-01T09:00:00+00:00"),
+        );
+        assert_eq!(
+            provenance_repair_plan(
+                Some(&stored),
+                "later-sha",
+                Some("2026-08-20T09:00:00+00:00")
+            ),
+            None,
+            "a later commit is not a better origin"
+        );
+    }
+
+    /// `%aI` carries the author's local offset, so a string compare gets this
+    /// pair backwards: `T01:00+02:00` is 23:00 the previous day in UTC, and so
+    /// genuinely earlier than `T00:30Z` despite sorting after it.
+    #[test]
+    fn dates_are_compared_as_instants_not_as_strings() {
+        let stored = identity(Some("abc"), P0, Some("edit"), Some("2026-08-14T00:30:00Z"));
+        assert_eq!(
+            provenance_repair_plan(Some(&stored), "intro", Some("2026-08-14T01:00:00+02:00")),
+            Some(("intro", Some("2026-08-14T01:00:00+02:00"))),
+            "an offset-aware comparison must see this as earlier"
+        );
+    }
+
+    /// Git author dates resolve to the second, so a record introduced and
+    /// edited in the same second ties. The walk enumerates history in order and
+    /// so knows which came first; the timestamp does not.
+    #[test]
+    fn a_tie_on_the_second_defers_to_walk_order() {
+        let same = "2026-08-14T12:00:00Z";
+        let stored = identity(Some("abc"), P0, Some("edit"), Some(same));
+        assert_eq!(
+            provenance_repair_plan(Some(&stored), "intro", Some(same)),
+            Some(("intro", Some(same)))
+        );
+        // And still idempotent once applied.
+        let repaired = identity(Some("abc"), P0, Some("intro"), Some(same));
+        assert_eq!(
+            provenance_repair_plan(Some(&repaired), "intro", Some(same)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_recorded_date_is_always_repairable() {
+        let stored = identity(Some("abc"), P0, Some("edit"), None);
+        assert_eq!(
+            provenance_repair_plan(Some(&stored), "intro", Some("2026-08-01T09:00:00+00:00")),
+            Some(("intro", Some("2026-08-01T09:00:00+00:00"))),
+            "there is nothing to be earlier than"
+        );
+    }
+
+    /// Never trade a wrong date for no date: a sighting we cannot place in time
+    /// is not evidence that it came first.
+    #[test]
+    fn an_undatable_sighting_leaves_a_dated_record_alone() {
+        let stored = identity(Some("abc"), P0, Some("edit"), Some("2026-08-10T12:00:00Z"));
+        assert_eq!(provenance_repair_plan(Some(&stored), "intro", None), None);
+        assert_eq!(
+            provenance_repair_plan(Some(&stored), "intro", Some("not-a-date")),
+            None
+        );
+    }
+
+    /// A record the store has never seen is inserted by the ordinary write
+    /// path, which sets first-sight fields itself. Nothing to repair.
+    #[test]
+    fn an_unknown_record_is_not_a_repair() {
+        assert_eq!(
+            provenance_repair_plan(None, "intro", Some("2026-08-01T09:00:00+00:00")),
+            None
+        );
+    }
+
     /// The skip check gates every write, so "unknown" must never read as
     /// "current" — otherwise the record most in need of indexing is the one
     /// silently passed over.
     #[test]
     fn only_two_present_and_equal_hashes_count_as_unchanged() {
         const P: &str = ".zavet/decisions/D-0001-x.md";
-        let stored = |h: Option<&str>| (h.map(String::from), P.to_string());
+        let stored = |h: Option<&str>| identity(h, P, None, None);
         let h = Some("abc".to_string());
 
         assert!(unchanged(Some(&stored(Some("abc"))), &h, P));
@@ -1688,9 +1975,11 @@ mod tests {
     /// would skip the one record whose stored `path`/`slug` just went stale.
     #[test]
     fn a_renamed_record_is_not_unchanged() {
-        let stored = (
-            Some("abc".to_string()),
-            ".zavet/decisions/D-0001-old-slug.md".to_string(),
+        let stored = identity(
+            Some("abc"),
+            ".zavet/decisions/D-0001-old-slug.md",
+            None,
+            None,
         );
         assert!(!unchanged(
             Some(&stored),
@@ -1840,6 +2129,158 @@ mod reindex_tests {
         );
         assert_eq!(second.decisions_indexed, 0, "content hash unchanged");
         assert_eq!(second.specs_indexed, 0);
+        assert!(
+            knowledge_rx.try_recv().is_err(),
+            "a true no-op repeat must not re-trigger the knowledge sync"
+        );
+    }
+
+    /// What `init_repo`'s origin remote canonicalizes to.
+    const CANONICAL_TEST_REPO: &str = "github.com/acme/api";
+
+    /// Commit at a fixed author date. Without this two commits made in the same
+    /// second carry identical `%aI` values, and the test would silently exercise
+    /// the tie rule instead of the ordinary earlier-than case.
+    fn git_at(dir: &Path, date: &str, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    fn head_sha(root: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// #120 end to end. A record introduced long ago but first *seen* by the
+    /// ambient poll on a later edit keeps that edit as its recorded origin, and
+    /// no upsert can lower it — `ON CONFLICT` preserves first-sight fields by
+    /// design. Because `zavet_sessions_for_decision` joins `artifacts` on
+    /// `first_commit`, that also bills `dira zavet why` to whoever made the
+    /// edit. An explicit reindex must repair the whole triple, and attribution
+    /// must come from the introducing commit's own artifact row — never from
+    /// the session running the reindex (DIRASH-0032).
+    #[tokio::test]
+    async fn reindex_repairs_an_origin_the_ambient_poll_recorded_from_an_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+
+        const INTRO_AT: &str = "2026-01-01T00:00:00+00:00";
+
+        write_decision(root, "D-0001", "poll git");
+        git(root, &["add", "-A"]);
+        git_at(root, INTRO_AT, &["commit", "-qm", "docs: record D-0001"]);
+        let intro = head_sha(root);
+
+        write_decision(root, "D-0001", "poll git harder");
+        git(root, &["add", "-A"]);
+        git_at(
+            root,
+            "2026-06-01T00:00:00+00:00",
+            &["commit", "-qm", "docs: revise D-0001"],
+        );
+        let edit = head_sha(root);
+        assert_ne!(intro, edit);
+
+        let (state, mut knowledge_rx) = test_state().await;
+        let cwd = root.display().to_string();
+
+        // The ambient poll's window opened AFTER the introducing commit, so it
+        // only ever saw the edit — and attributed it to the session that was
+        // open at the time.
+        state
+            .store
+            .repo_baseline_set(CANONICAL_TEST_REPO, &intro)
+            .await
+            .unwrap();
+        crate::capture::capture_commits(&state, &cwd, CANONICAL_TEST_REPO).await;
+
+        // The introducing commit IS captured — by an earlier session, on some
+        // earlier run — it simply was not the one the record got bound to.
+        let intro_commit = dira_core::project::CapturedCommit {
+            sha: intro.clone(),
+            authored_at: Some(INTRO_AT.to_string()),
+            author_email: Some("t@t.dev".to_string()),
+            author_name: Some("T".to_string()),
+            message: "docs: record D-0001".to_string(),
+            additions: 1,
+            deletions: 0,
+            patch_id: None,
+        };
+        state
+            .store
+            .record_commit(
+                &intro_commit,
+                Some(CANONICAL_TEST_REPO),
+                None,
+                Some("session-that-decided-it"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let before = state
+            .store
+            .zavet_decision_get(CANONICAL_TEST_REPO, "D-0001")
+            .await
+            .unwrap()
+            .expect("captured");
+        assert_eq!(
+            before.first_commit.as_deref(),
+            Some(edit.as_str()),
+            "the fixture must actually reproduce the bug: origin bound to the edit"
+        );
+
+        while knowledge_rx.try_recv().is_ok() {}
+
+        let v = run_reindex(&state, &cwd).await;
+        assert_eq!(v.provenance_repaired, 1, "the record's origin was wrong");
+
+        let after = state
+            .store
+            .zavet_decision_get(CANONICAL_TEST_REPO, "D-0001")
+            .await
+            .unwrap()
+            .expect("still captured");
+        assert_eq!(
+            after.first_commit.as_deref(),
+            Some(intro.as_str()),
+            "origin moves back to the commit that introduced the record"
+        );
+        // Compared as an instant, not a string: git renders a `+00:00` offset
+        // as `Z`, and the point is the moment, not its spelling.
+        assert_eq!(
+            authored_instant(after.created_at.as_deref()),
+            authored_instant(Some(INTRO_AT)),
+            "and takes that commit's author date with it, got {:?}",
+            after.created_at
+        );
+        assert_eq!(
+            after.source_session.as_deref(),
+            Some("session-that-decided-it"),
+            "attribution follows first_commit, read from its artifact row — \
+             leaving it pointing at the edit's session would be a row that \
+             contradicts itself, and that row ships to the cloud"
+        );
+
+        // Idempotent: the repair is monotone, so a second run finds nothing and
+        // must not re-stamp `touched_seq` and re-push the knowledge set.
+        while knowledge_rx.try_recv().is_ok() {}
+        let second = run_reindex(&state, &cwd).await;
+        assert_eq!(second.provenance_repaired, 0, "already at its earliest");
+        assert_eq!(second.decisions_indexed, 0);
         assert!(
             knowledge_rx.try_recv().is_err(),
             "a true no-op repeat must not re-trigger the knowledge sync"

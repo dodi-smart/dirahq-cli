@@ -110,8 +110,10 @@ much of the setup happened.
   `canonical_harness_id` alone: the latter also resolves `generic`, which has
   no config to write. A new harness goes in `init::WIRABLE` **and**
   `detect::HARNESSES`; `the_three_harness_tables_agree` pins them together.
-- The daemon step stops a bare-started daemon before `daemon install`. Never
-  reorder those: the socket is the single-instance guard.
+- A bare-started daemon is stopped before `daemon install`, and never reordered:
+  the socket is the single-instance guard. The stop now lives *inside*
+  `daemon::install` rather than in this step — see the amendment below. Do not
+  re-add it here, and do not remove it from there.
 - Never run `zavet hooks install` and never write `core.hooksPath`
   (DIRASH-0024 governs this; onboarding inherits it).
 - In `install.sh`, ask through `_confirm <prompt> <default> <notty>`; do not
@@ -150,3 +152,30 @@ returns false in the piped/CI shape.
   been exercised on 7.x.
 - Harness detection has no signal for a harness installed under a
   non-standard config directory; such a machine falls back to `--harness`.
+
+## Amendment: the pre-stop moved into `daemon::install` (2026-08-14)
+
+The ordering above was right and stayed right; the *placement* was the bug.
+"The daemon step stops a bare-started daemon" described three callers — this
+step, `install.sh` and `install.ps1` — and silently excused the fourth. A bare
+`dira daemon install` never stopped anything, so on a machine with a
+hand-started `dirad` it installed a launchd `KeepAlive` / systemd
+`Restart=always` / logon-task service that could not bind D-0009's socket, lost
+the race, and was restarted into losing it again for as long as the old process
+lived. That is the documented path for anyone who followed the old
+"run `dira daemon start`" advice.
+
+`daemon::install` now stops an unmanaged daemon itself and waits for exit, so
+every caller is correct by construction. This step's own pre-stop is gone. Both
+installers keep theirs, because they may be driving an older binary that lacks
+this.
+
+Two things came with it, both required rather than incidental:
+
+- Unix `stop` now confirms the process exited (SIGTERM → wait → SIGKILL → wait)
+  instead of signalling, unlinking the pidfile and socket, and printing
+  "stopped". D-0019's directive is not platform-scoped; unix was exempt only
+  because D-0009's `flock` makes a duplicate *safe*. Safe is not the same as
+  unnecessary — a supervisor still flaps against a socket it cannot take.
+- `install` is now `async`, and only stops a daemon nothing is supervising.
+  Stopping a supervised one would just make its supervisor restart it mid-install.

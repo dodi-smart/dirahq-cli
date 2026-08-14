@@ -376,6 +376,13 @@ async fn process_message(
     // then capture commits at the points one likely just landed (a tool call
     // returned, an agent paused, or a session/manual session closed). The
     // capture is spawned detached + time-boxed, so it never blocks this loop.
+    //
+    // No repo-vs-dir verification here, unlike `control::start`: `enrich`
+    // derives `ev.project` from `ev.cwd` through `ProjectCache`, so the pair is
+    // one fact rather than a caller's assertion, and re-resolving it would put
+    // a git spawn on the hot path for no new information. Manual events — the
+    // one place a caller-supplied name reaches this loop — carry no `cwd` at
+    // all, and so never enter this branch.
     if let (Some(cwd), Some(proj)) = (ev.cwd.as_deref(), ev.project.as_deref()) {
         crate::control::register_repo_dir(state, proj, cwd);
         if capture::captures_commits(ev.kind) && throttle.ready(proj) {

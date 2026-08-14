@@ -102,7 +102,14 @@ to fail when the guard is stubbed out.
 
 `restart_bare`/`restart_scheduled_task` gained injectable grace budgets purely
 so these run in milliseconds — the same seam, for the same reason, as
-`graceful_then_force_windows`'s existing parameters.
+`graceful_then_force`'s existing parameters.
+
+Since 2026-08-14 that is **one** function taking `os`, not a per-platform pair:
+the sequence above is the invariant, only the ask (`Request::Shutdown` vs
+SIGTERM) and the force (`taskkill /F` vs SIGKILL) differ, and two hand-synced
+copies of an invariant are not a guarantee. Unix now runs it too — see the
+amendment in DIRASH-0029 for why the flock made that optional but not
+unnecessary.
 
 **Not verified on a real Windows host.** The teardown-overlap behaviour, the
 `tasklist` output shape, and the bind-before-store reorder under a contended

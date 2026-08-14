@@ -36,9 +36,21 @@ pub use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR, META_TOKEN_CU
 const DEBOUNCE: StdDuration = StdDuration::from_secs(3);
 /// Backstop cadence: flush even with no triggers (and retry after failures).
 const BACKSTOP: StdDuration = StdDuration::from_secs(90);
-/// Cap for exponential backoff after a network/5xx failure. Shared with the
-/// knowledge sync task, which rides the same [`next_backoff`] ladder.
-pub(crate) const MAX_BACKOFF: StdDuration = StdDuration::from_secs(300);
+/// The device→cloud backoff ladder: 2s seed, doubling, capped at 300s. Shared
+/// with the knowledge sync task, which rides the same ladder.
+///
+/// The ladder itself lives in `dira_core` so the updater's copy cannot drift
+/// from this one (DIRASH-0031); the numbers stay here because they are this
+/// caller's — a background task that retries indefinitely can afford a cap the
+/// interactive updater cannot.
+pub(crate) const SYNC_BACKOFF: dira_core::sync::Backoff = dira_core::sync::Backoff {
+    seed: StdDuration::from_secs(2),
+    max: StdDuration::from_secs(300),
+};
+/// Cap for exponential backoff after a network/5xx failure. An alias for
+/// [`SYNC_BACKOFF`]'s ceiling — several arms slam straight to the cap rather
+/// than climbing the ladder, and read better naming it directly.
+pub(crate) const MAX_BACKOFF: StdDuration = SYNC_BACKOFF.max;
 /// HTTP timeout for a single ingest chunk POST. Longer than the other
 /// device→cloud calls — a batch can carry a chunk's worth of intervals/sessions.
 const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -438,14 +450,15 @@ async fn try_reloaded_key_flush(state: &AppState, rejected: &DeviceKey) -> bool 
 }
 
 /// One exponential-backoff ladder for BOTH device→cloud channels (attestation
-/// and knowledge sync): 2s seed, doubling, capped at [`MAX_BACKOFF`].
+/// and knowledge sync): [`SYNC_BACKOFF`]'s 2s seed, doubling, capped at
+/// [`MAX_BACKOFF`].
+///
+/// A named wrapper rather than a bare `SYNC_BACKOFF.next(..)` at each of the
+/// dozen call sites: the arms below read as prose about *this* channel, and
+/// the indirection is what let the ladder move into `dira_core` (DIRASH-0031)
+/// without touching any of them.
 pub(crate) fn next_backoff(current: StdDuration) -> StdDuration {
-    let next = if current.is_zero() {
-        StdDuration::from_secs(2)
-    } else {
-        current * 2
-    };
-    next.min(MAX_BACKOFF)
+    SYNC_BACKOFF.next(current)
 }
 
 /// The wait to sleep before retrying a transient failure: the cloud's
@@ -457,9 +470,7 @@ pub(crate) fn transient_wait(
     retry_after: Option<StdDuration>,
     current: StdDuration,
 ) -> StdDuration {
-    retry_after
-        .unwrap_or_else(|| next_backoff(current))
-        .min(MAX_BACKOFF)
+    SYNC_BACKOFF.transient_wait(retry_after, current)
 }
 
 /// Minimum spacing between consecutive ingest POSTs inside one flush. 2.5s ⇒ at

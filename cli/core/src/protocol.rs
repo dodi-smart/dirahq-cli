@@ -701,6 +701,12 @@ pub struct ZavetReindexView {
     pub specs_indexed: u64,
     pub specs_skipped: u64,
     pub trailer_commits_recorded: u64,
+    /// Records whose introducing commit was corrected — counted separately
+    /// because it is orthogonal to `indexed`/`skipped`: a record can be
+    /// content-current (and so skipped) while its provenance was wrong, which
+    /// is the whole case this repair exists for (DIRASH-0032).
+    #[serde(default)]
+    pub provenance_repaired: u64,
 }
 
 /// Per-kind guard-event tallies with the honest unattributed count.

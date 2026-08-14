@@ -628,6 +628,105 @@ pub(crate) fn device_link(d: &DeviceProbe, cloud_url: Option<&str>) -> Check {
     Check::ok(ID, format!("linked, {} event(s) awaiting sync", d.pending)).detail(detail)
 }
 
+// --- is `dira update` actually landing? ---------------------------------
+//
+// The passive notice escalates on repeated *failures*. These three cover the
+// ways an update silently does not land while nothing reports a failure at all
+// — the forensics the #113 reporter did by hand.
+//
+// Three ids rather than one, because they can co-occur and a check reports one
+// level: a machine with both a rollback and a shadowing PATH entry would
+// otherwise be told about the rollback, act on it, and only meet the shadowing
+// on the next run — the two-round diagnosis these exist to end. Adding ids is
+// free under DIRASH-0022's schema rule; growing one id's meaning is not.
+//
+// None of them ever returns `Fail`. A stale binary is not broken capture, and
+// the exit code is a contract an installer reads: `2` has to keep meaning
+// capture is broken. They report only — no remedy here runs anything.
+
+/// Did a completed swap get rolled back?
+///
+/// A `.dira*.old.restore.<pid>` sidecar is written only by
+/// `update::replace::restore_from_backup`, so a leftover is proof of a specific
+/// past event rather than a tally — this is the one signal that survives across
+/// runs and needs no cache.
+pub(crate) fn update_rollback(f: &super::UpdateFacts) -> Check {
+    const ID: &str = "update.rollback";
+    match f.stale_sidecars.first() {
+        Some(name) => Check::warn(
+            ID,
+            format!("a previous update was rolled back — {name} is still here"),
+        )
+        .remedy("dira update — and if it fails again, file an issue with `dira doctor --json`")
+        .detail(json!({ "stale_sidecars": f.stale_sidecars })),
+        None => Check::ok(ID, "no rolled-back update left behind"),
+    }
+}
+
+/// Is an earlier `PATH` entry shadowing the binary updates install to?
+///
+/// The updater writes into the PATH entry it found; if this process came from
+/// somewhere else, a successful update writes a binary the user never executes.
+/// The "is there only one `dira` on PATH?" step, automated.
+pub(crate) fn update_shadowed(f: &super::UpdateFacts, current_exe: Option<&str>) -> Check {
+    const ID: &str = "update.shadowed";
+    // No install dir means `dira` is not on PATH, or this is a dev build the
+    // updater refuses outright — either way the question has no answer, and a
+    // guess is worse than a skip.
+    let (Some(dir), Some(exe)) = (&f.install_dir, current_exe) else {
+        return Check::skip(ID, "no install directory to compare against");
+    };
+    let Some(running_from) = Path::new(exe).parent() else {
+        return Check::skip(ID, "the running executable has no parent directory");
+    };
+    let detail = json!({
+        "install_dir": dir.display().to_string(),
+        "running_from": running_from.display().to_string(),
+    });
+    if running_from == dir.as_path() {
+        return Check::ok(ID, "updates install where this dira runs from").detail(detail);
+    }
+    Check::warn(
+        ID,
+        format!(
+            "updates install to {} but this dira runs from {} — an earlier PATH entry is shadowing it",
+            dir.display(),
+            running_from.display()
+        ),
+    )
+    .remedy("remove the shadowing copy, or put the install directory earlier on PATH")
+    .detail(detail)
+}
+
+/// Have recent `dira update` attempts been failing?
+///
+/// The threshold is the passive notice's own, not a second copy of it: the two
+/// report the same condition and must agree on when it becomes interesting.
+pub(crate) fn update_failures(f: &super::UpdateFacts) -> Check {
+    const ID: &str = "update.failures";
+    let Some(cache) = &f.cache else {
+        // No cache means no update check has ever run here. Absent evidence is
+        // a skip, never a verdict.
+        return Check::skip(ID, "no update check has run on this machine yet");
+    };
+    let detail = json!({
+        "update_failures": cache.update_failures,
+        "latest": cache.latest,
+        "checked_at": cache.checked_at,
+    });
+    if cache.update_failures >= crate::update::notice::ESCALATE_AFTER_FAILURES {
+        let n = cache.update_failures;
+        let latest = cache.latest.as_deref().unwrap_or("a newer version");
+        return Check::warn(
+            ID,
+            format!("{n} recent update attempts failed; still not on {latest}"),
+        )
+        .remedy("dira update — it prints why")
+        .detail(detail);
+    }
+    Check::ok(ID, "no recent update failures").detail(detail)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -655,6 +754,7 @@ pub(crate) mod tests {
             doctor_elevated: false,
             cwd: Some("/work/api".into()),
             project: Ok("github.com/acme/api".into()),
+            update: super::super::UpdateFacts::default(),
         }
     }
 
@@ -1047,5 +1147,127 @@ pub(crate) mod tests {
         let c = device_link(&rotating, Some("https://api.dira.sh"));
         assert_eq!(c.level, Level::Warn);
         assert_eq!(c.remedy.as_deref(), Some("dira device rotate-key"));
+    }
+
+    // --- update.* checks (#117) ----------------------------------------
+
+    fn cache(update_failures: u32, latest: Option<&str>) -> crate::update::notice::CacheFacts {
+        crate::update::notice::CacheFacts {
+            checked_at: 1_760_000_000,
+            latest: latest.map(str::to_string),
+            update_failures,
+        }
+    }
+
+    fn update_facts(cache: Option<crate::update::notice::CacheFacts>) -> super::super::UpdateFacts {
+        super::super::UpdateFacts {
+            cache,
+            install_dir: Some("/home/u/.local/bin".into()),
+            stale_sidecars: Vec::new(),
+        }
+    }
+
+    const RUNNING: &str = "/home/u/.local/bin/dira";
+    const ELSEWHERE: &str = "/usr/local/bin/dira";
+
+    /// DIRASH-0022's rule, on the commonest case there is: a machine that has
+    /// never run an update check has no evidence either way.
+    #[test]
+    fn no_update_cache_is_a_skip_not_a_verdict() {
+        assert_eq!(update_failures(&update_facts(None)).level, Level::Skip);
+    }
+
+    #[test]
+    fn a_healthy_install_is_ok_on_every_update_check() {
+        let f = update_facts(Some(cache(0, Some("9.9.9"))));
+        assert_eq!(update_rollback(&f).level, Level::Ok);
+        assert_eq!(update_shadowed(&f, Some(RUNNING)).level, Level::Ok);
+        assert_eq!(update_failures(&f).level, Level::Ok);
+    }
+
+    /// The `.dirad.exe.old.restore.11648` the #113 reporter found by hand. Only
+    /// the rollback path writes one, so it is proof a swap completed and was
+    /// then undone.
+    #[test]
+    fn a_leftover_restore_sidecar_reports_the_rollback() {
+        let mut f = update_facts(Some(cache(0, Some("9.9.9"))));
+        f.stale_sidecars = vec![".dirad.exe.old.restore.11648".into()];
+        let c = update_rollback(&f);
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.summary.contains("rolled back"),
+            "the summary must name what happened: {}",
+            c.summary
+        );
+        assert!(c.remedy.is_some(), "a warning must say what to do");
+    }
+
+    /// The other half of the manual diagnosis: `Get-Command dira.exe` proving
+    /// which copy actually runs. An update that installs somewhere the user
+    /// never executes from reports success and changes nothing they see.
+    #[test]
+    fn an_install_dir_that_is_not_where_dira_runs_from_is_shadowing() {
+        let c = update_shadowed(&update_facts(Some(cache(0, None))), Some(ELSEWHERE));
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.summary.contains("shadowing"),
+            "the summary must name the cause: {}",
+            c.summary
+        );
+        assert!(c.remedy.is_some());
+    }
+
+    /// The reason these are three ids and not one: a machine can have both, and
+    /// a single check reports a single level — so the user would fix the
+    /// rollback and only meet the shadowing on the next run.
+    #[test]
+    fn a_rollback_and_a_shadowed_install_are_both_reported_at_once() {
+        let mut f = update_facts(Some(cache(9, Some("9.9.9"))));
+        f.stale_sidecars = vec![".dira.old.restore.1".into()];
+        assert_eq!(update_rollback(&f).level, Level::Warn);
+        assert_eq!(update_shadowed(&f, Some(ELSEWHERE)).level, Level::Warn);
+        assert_eq!(update_failures(&f).level, Level::Warn);
+    }
+
+    #[test]
+    fn update_failures_warn_at_the_notices_own_threshold() {
+        let threshold = crate::update::notice::ESCALATE_AFTER_FAILURES;
+        let at = |n| update_failures(&update_facts(Some(cache(n, Some("9.9.9"))))).level;
+        assert_eq!(at(threshold - 1), Level::Ok);
+        assert_eq!(at(threshold), Level::Warn);
+        assert_eq!(at(threshold + 5), Level::Warn);
+    }
+
+    /// A stale binary is not broken capture, and doctor's exit code is a
+    /// contract an installer reads: `2` must keep meaning "capture is broken".
+    #[test]
+    fn no_update_state_is_ever_a_failure() {
+        let mut worst = update_facts(Some(cache(99, Some("9.9.9"))));
+        worst.stale_sidecars = vec![".dira.old.restore.1".into()];
+        for exe in [Some(ELSEWHERE), Some(RUNNING), None] {
+            for level in [
+                update_rollback(&worst).level,
+                update_shadowed(&worst, exe).level,
+                update_failures(&worst).level,
+            ] {
+                assert_ne!(
+                    level,
+                    Level::Fail,
+                    "an un-landed update must never claim capture is broken"
+                );
+            }
+        }
+    }
+
+    /// With no install directory (not on PATH, or a dev build the updater
+    /// refuses) the shadowing question has no answer — it must not be guessed.
+    #[test]
+    fn an_unknown_install_dir_never_claims_shadowing() {
+        let mut f = update_facts(Some(cache(0, Some("9.9.9"))));
+        f.install_dir = None;
+        assert_eq!(
+            update_shadowed(&f, Some("/anywhere/at/all/dira")).level,
+            Level::Skip
+        );
     }
 }

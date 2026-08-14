@@ -308,16 +308,66 @@ async fn ingest_hook(state: &AppState, harness: String, payload: serde_json::Val
     }
 }
 
+/// Where a resolved project name came from.
+///
+/// The distinction exists because it decides whether `cwd` may be registered
+/// against that name in `repo_dirs`: a name *derived from* a directory is
+/// evidence about that directory, a name the caller *asserted* is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectSource {
+    /// Derived from the directory by `project::resolve` — the name and the
+    /// directory are the same fact, so registering the pair is safe.
+    Cwd,
+    /// Supplied by the caller (`--project`). Says nothing about `cwd`.
+    Caller,
+}
+
 /// Resolve a project: explicit value wins, else resolve from cwd, else daemon cwd.
-fn resolve(project: Option<String>, cwd: Option<String>) -> (Option<String>, Option<String>) {
+fn resolve(
+    project: Option<String>,
+    cwd: Option<String>,
+) -> (Option<String>, Option<String>, ProjectSource) {
     if let Some(p) = project {
-        return (Some(p), None);
+        return (Some(p), None, ProjectSource::Caller);
     }
     let dir = cwd.map(std::path::PathBuf::from).unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf())
     });
     let r = project::resolve(&dir);
-    (r.project, r.identity_email)
+    (r.project, r.identity_email, ProjectSource::Cwd)
+}
+
+/// Whether `dir` may be registered in `repo_dirs` under `repo`.
+///
+/// A `Cwd`-sourced name is free: `resolve` derived it from this very directory,
+/// so the pair is a single fact and re-resolving would only repeat a git call.
+///
+/// A `Caller`-sourced name has to earn it. `dira start --project <repo>` is a
+/// legitimate feature — it tags a manual session against a repo you are not
+/// standing in — but the cwd it arrives with belongs to whatever checkout the
+/// user happened to run it from, and `resolve` returns that name without ever
+/// consulting the directory. Registering the pair puts a foreign directory into
+/// the map the idle ticker sweeps, and that repo's commits are then captured
+/// under the named repo's identity: the same poisoning DIRASH-0027 fixed for
+/// `zavet sync`, reached through a different entry point.
+///
+/// So a caller-supplied name trusts the cwd only when the cwd demonstrably
+/// resolves to it, mirroring `zavet::query_repo`'s `resolved.repo == requested`
+/// check. The git call is affordable precisely here and nowhere near the writer
+/// loop: `start` is an interactive command a human types, not an event. This is
+/// why the check lives here rather than inside `register_repo_dir`, which
+/// DIRASH-0027 requires to stay I/O-free.
+fn may_register_repo_dir(repo: &str, dir: &str, source: ProjectSource) -> bool {
+    match source {
+        ProjectSource::Cwd => true,
+        // `explain_project`, not `project::resolve`: `resolve`'s `.project` IS
+        // this call, but it additionally re-runs `rev-parse` and reads
+        // `user.email`/`user.name` — six git spawns to answer a question three
+        // answer, and the identity half is discarded here.
+        ProjectSource::Caller => {
+            project::explain_project(Path::new(dir)).ok().as_deref() == Some(repo)
+        }
+    }
 }
 
 async fn start(
@@ -328,11 +378,16 @@ async fn start(
     note: Option<String>,
     cwd: Option<String>,
 ) -> Response {
-    let (project, identity) = resolve(project, cwd.clone());
+    let (project, identity, source) = resolve(project, cwd.clone());
     // Register the dira's working dir against its repo so the idle-ticker commit
-    // poller can pick up commits made during a pure manual dira (no agent events).
+    // poller can pick up commits made during a pure manual dira (no agent
+    // events) — but only for a repo this cwd actually belongs to. An explicit
+    // `--project` naming somewhere else must not enrol the caller's checkout
+    // under that name; see `may_register_repo_dir`.
     if let (Some(p), Some(dir)) = (project.as_deref(), cwd.as_deref()) {
-        register_repo_dir(state, p, dir);
+        if may_register_repo_dir(p, dir, source) {
+            register_repo_dir(state, p, dir);
+        }
     }
     let session_id = Ulid::generate().to_string();
     let handle = handle_of(&session_id);
@@ -430,7 +485,9 @@ async fn log(
     label: Option<String>,
     cwd: Option<String>,
 ) -> Response {
-    let (project, identity) = resolve(project, cwd);
+    // The source is irrelevant here: a retroactive entry records time against a
+    // name, and never registers a directory for the ticker to sweep.
+    let (project, identity, _source) = resolve(project, cwd);
     let end = OffsetDateTime::now_utc();
     let start = end - Duration::seconds(duration_secs as i64);
     let session_id = Ulid::generate().to_string();

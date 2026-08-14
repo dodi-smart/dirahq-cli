@@ -965,10 +965,13 @@ main() {
 
     if [ "$want_service" = "1" ]; then
       # Best-effort stop of an unmanaged daemon that may or may not be
-      # running: `daemon install` never does this itself, and skipping it is
-      # what let the fresh service flap against a still-live bare process for
-      # the control socket. Silent -- "nothing was running" is not a
-      # warning-worthy outcome here, only a failed *install* is.
+      # running. `dira daemon install` now does this itself and waits for the
+      # process to exit, so this is belt-and-braces -- kept because the binary
+      # being installed here may be OLDER than that change, and on such a
+      # binary skipping it is what let the fresh service flap against a
+      # still-live bare process for the control socket. Silent -- "nothing was
+      # running" is not a warning-worthy outcome here, only a failed *install*
+      # is.
       "$bin_dir/dira" daemon stop >/dev/null 2>&1 || true
       info "installing the dirad service..."
       "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"

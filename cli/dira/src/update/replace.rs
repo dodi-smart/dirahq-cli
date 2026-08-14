@@ -32,7 +32,20 @@ pub enum Guard {
 
 /// True if `path`'s components contain `target` immediately followed by
 /// `release` or `debug` — a `just install`/`cargo build` output directory.
-fn under_target_release_or_debug(path: &Path) -> bool {
+///
+/// The single dev-install predicate: the D-0004 guard in [`discover_install`]
+/// and `notice::is_dev_build` both answer "is this a dev install?" with this
+/// one rule, so they cannot disagree about whether to nag versus whether to
+/// refuse (#124). Adjacency is why this is the surviving version — a looser
+/// "saw `target` anywhere and `release` anywhere" also matches
+/// `/home/target/x/release/dira`, and that mismatch is what made the notice
+/// advertise an upgrade the updater then refused.
+///
+/// Sharing the predicate does not share the *subject*, and must not: D-0004
+/// requires the install location itself to come from the PATH entry via
+/// `symlink_metadata` (below), never from `current_exe()`. The notice asks
+/// only what is running right now.
+pub(super) fn under_target_release_or_debug(path: &Path) -> bool {
     let comps: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
     comps
         .windows(2)
@@ -274,20 +287,41 @@ fn retry_rename(
 /// (the in-place rename-over-a-running-inode trick needs no such thing), so
 /// here it's a harmless sweep that simply never finds anything.
 pub fn cleanup_stale_old_files(dir: &Path) {
+    for path in stale_old_files(dir) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The `.{name}.old.*` sidecars in `dir`, as full paths.
+///
+/// Split out of [`cleanup_stale_old_files`] so `doctor` can *report* what that
+/// function *removes* without re-deriving the naming rule — and so the two can
+/// never disagree about what counts as a leftover.
+///
+/// A leftover is evidence, and the reason doctor cares: a
+/// `.{name}.old.restore.<pid>` is written only by [`restore_from_backup`], so
+/// its presence means a swap completed and was then rolled back. That is one of
+/// the ways an update reports success and still does not land.
+///
+/// Full paths, not bare filenames: the caller that deletes them needs something
+/// it can pass straight to `remove_file`, and a filename alone would resolve
+/// against the process's cwd instead of `dir`.
+pub(crate) fn stale_old_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
     let prefixes = [
         format!(".{}.old.", dira_ipc::DIRA_BIN),
         format!(".{}.old.", dira_ipc::DIRAD_BIN),
     ];
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            prefixes.iter().any(|p| name.starts_with(p.as_str()))
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 
 fn backup_path(bin_dir: &Path, name: &str) -> PathBuf {

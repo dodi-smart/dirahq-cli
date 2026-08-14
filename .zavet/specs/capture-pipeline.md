@@ -1,16 +1,16 @@
 ---
 title: Zavet capture pipeline
-version: 5
+version: 6
 origin: session
 verified: false
 confidence: high
-date: 2026-08-11
+date: 2026-08-14
 paths:
   - cli/dirad/src/capture.rs
   - cli/dirad/src/zavet.rs
   - cli/core/src/zavet.rs
   - cli/core/src/project.rs
-decisions: [D-0001, DIRASH-0027, DIRASH-0028]
+decisions: [D-0001, DIRASH-0026, DIRASH-0027, DIRASH-0028]
 ---
 
 ## Overview
@@ -26,10 +26,13 @@ commit poll — no filesystem watcher, no extra daemon.
   `spawn_blocking` under a 10 s budget — an overrun drops the capture and the
   next commit-bearing event retries.
 - When the repo is zavet-active (override > `modules.zavet` knob > `.zavet/`
-  dir probe), the same walk sweeps knowledge: one batched trailer parse over
-  the walked shas, then per commit (oldest first, so first-sight provenance
-  points at the introducing commit) the `.zavet/decisions/*.md` and
-  `.zavet/specs/*.md` blobs it touched are parsed and upserted.
+  dir probe), the same walk sweeps knowledge: a batched trailer parse
+  (`commit_trailers`, chunked at 1000 shas per `git log --no-walk` call to
+  stay under the OS argv ceiling — past ~25k shas in one call the spawn fails
+  and used to silently empty the whole result) over the walked shas, then per
+  commit (oldest first, so first-sight provenance points at the introducing
+  commit) the `.zavet/decisions/*.md` and `.zavet/specs/*.md` blobs it touched
+  are parsed and upserted.
 - Checks (`checks:`, both record types) bind an invariant to the command that
   proves it, as `label :: command`; an item with no separator IS the command
   and doubles as its own label, and an item with a label but no command
@@ -52,17 +55,26 @@ commit poll — no filesystem watcher, no extra daemon.
   clone whose `.zavet/` history predates the window indexes almost nothing and
   no later sweep revisits it — `zavet sync` included, since it honors the same
   baseline. `dira zavet reindex` is the explicit recovery: full history scoped
-  to a `.zavet/` pathspec for decisions and specs, a separately bounded pass
-  for trailers (`--all-trailers` lifts it), driving the same sweep. It skips
-  records whose content hash and path both already match, collapses each record
-  to its first and last sighting, attributes to no session, and never writes
-  `repo_baseline` — so a repeat run writes nothing and pushes nothing. This is
-  the deeper backfill DIRASH-0027 anticipates, not a `force` flag on sync.
-  See DIRASH-0028.
+  to a `.zavet/` pathspec for decisions and specs (`records`), a separately
+  bounded pass for trailers (`trailer_commits`; `--all-trailers` lifts it),
+  driving the same sweep. Because the two walks cover different windows, the
+  scoped one's OWN trailer stage (`sweep.trailers`, unbounded) is merged with
+  the wide one (`merge_trailer_windows`) before recording — a commit old enough
+  to sit past the trailer bound but that also touched `.zavet/` would otherwise
+  have its trailers silently dropped every run. It skips records whose content
+  hash and path both already match, collapses each record to its first and
+  last sighting, attributes to no session, and never writes `repo_baseline` —
+  so a repeat run writes nothing and pushes nothing. The trailer half of that
+  claim is counted, not assumed: `trailer_commits_recorded` is a before/after
+  `zavet_counts` delta on the actual row count (mirroring `sync`'s own
+  pattern), not a count of offers to `zavet_record_trailers` — the latter kept
+  a repeat run reporting non-zero and re-triggering knowledge sync even though
+  every write was a no-op (INSERT OR IGNORE). This is the deeper backfill
+  DIRASH-0027 anticipates, not a `force` flag on sync. See DIRASH-0028.
 - Spec staleness is never materialized: it is computed at query time as
   `git log <last_commit>..HEAD -- :(glob)<path>…` over the spec's declared
-  paths, in the repo dir the daemon last observed (else the caller's cwd;
-  with neither it reads *unknown*, never guessed).
+  paths, in the TRUSTED root `query_repo` resolves (see below); with none it
+  reads *unknown*, never guessed.
 
 - `dira zavet sync` (`Request::ZavetSync`) runs one sweep on demand and
   registers the repo dir (DIRASH-0027). Both halves matter: the idle ticker only
@@ -71,6 +83,20 @@ commit poll — no filesystem watcher, no extra daemon.
   repo had no user-side remedy at all. It reuses `capture_commits` rather than
   forcing a re-read, so an unchanged HEAD stays a no-op here too, and it can
   never pick up an uncommitted record.
+- Every `Zavet*` query command (`decisions`, `sync`, `wiki`, `why`, `spec_why`)
+  resolves its repo AND working directory together through one ladder,
+  `query_repo`: with no explicit `--project`, both come from `cwd`. With an
+  explicit `--project <repo>`, the daemon's remembered directory for that repo
+  wins if it has one; otherwise `cwd` is trusted as `repo`'s own tree ONLY IF
+  `project::resolve(cwd)` independently resolves to that exact repo — never
+  assumed. An unrelated `cwd` (or none) yields no root: `sync` returns its
+  honest "no working directory known" error rather than sweeping the wrong
+  checkout, and every read degrades to *unknown* the same way a missing
+  workdir already does (DIRASH-0026) — presence `None`, no uncaptured scan,
+  branch `None`. Before this, the fallback was unconditional: `--project
+  <repo-the-daemon-has-never-seen>` handed `sync` (and every read) the
+  CALLER'S checkout, which then got registered and captured under the NAMED
+  repo.
 
 ## Interfaces & data
 
@@ -146,13 +172,6 @@ commit poll — no filesystem watcher, no extra daemon.
   there is still no answer for a record that is genuinely gone rather than
   merely on another branch, and the resurrected row inflates the totals a drift
   figure would be computed from.
-- **`--all-trailers` has an argv ceiling.** `commit_trailers` passes one sha per
-  argument to a single `git log --no-walk`, so a large enough repo (order
-  25–50k commits, platform-dependent `ARG_MAX`) fails the spawn. `git()` maps
-  that to `None`, which becomes an empty trailer set — the command reports
-  success having recorded nothing. The default bound hides it; only the
-  documented escape hatch reaches it. Chunking the sha list, or feeding it via
-  `--stdin`, would remove the ceiling.
 - A dangling `corrected-by` is knowable here (the target may simply not be
   captured yet) but is only reported by the plugin's `zavet check`. Whether
   dira should surface it too — and how it would tell "not captured yet" from

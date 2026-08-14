@@ -69,6 +69,43 @@ fn user_agent() -> String {
     format!("dira/{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Ceiling on a declared `Content-Length` before [`download_once`] refuses to
+/// even start reading the body.
+///
+/// `resp.bytes()` below buffers the whole response into memory with nothing
+/// else bounding its size once the status check passes — wall clock was the
+/// only limit (at 1Gbps and the old 120s total-request timeout, ~15GB into
+/// RAM), and even the corrected inactivity timeout ([`retry::READ_TIMEOUT`])
+/// bounds a *stall*, not an implausibly large but steadily-streaming body.
+/// The largest artifact this project has ever published is ~20MB; 200MB is
+/// 10x headroom over that — enough for legitimate growth without coming
+/// anywhere near "unbounded".
+///
+/// A response with **no** `Content-Length` at all passes this check: GitHub's
+/// release CDN always sends one for these assets, so a missing header here
+/// is a proxy quirk, not evidence of an oversized artifact, and rejecting it
+/// would brick a working path over nothing this check can actually see.
+const MAX_ARTIFACT_BYTES: u64 = 200 * 1024 * 1024;
+
+/// True if a declared `Content-Length` is implausible for a release artifact.
+/// Strict `>`, not `>=` — a real artifact landing exactly on
+/// [`MAX_ARTIFACT_BYTES`] must not be refused for hitting a round number.
+/// Split out from [`download_once`] purely so the boundary is unit-testable
+/// without an actual (multi-hundred-megabyte) transfer.
+fn exceeds_artifact_size_cap(declared: u64) -> bool {
+    declared > MAX_ARTIFACT_BYTES
+}
+
+/// Fatal message for a declared `Content-Length` over [`MAX_ARTIFACT_BYTES`].
+/// Shared by [`download_once`] and its tests so the wording can't drift.
+fn oversized_content_length_message(url: &str, declared: u64) -> String {
+    format!(
+        "download failed: {url} declared a Content-Length of {declared} bytes, over the \
+         {MAX_ARTIFACT_BYTES}-byte cap for a release artifact — refusing to buffer it into \
+         memory (the largest published artifact is ~20MB)"
+    )
+}
+
 /// A failed attempt, tagged with whether another one could plausibly succeed.
 enum Attempt {
     /// Deterministic — surface it immediately, unchanged.
@@ -112,6 +149,9 @@ impl Attempt {
 /// retried. A single mid-stream abort on a lossy link used to fail the whole
 /// update; the installers have always retried (`install.ps1`, `install.sh`'s
 /// `curl --retry 3`) and this closes the gap.
+///
+/// A declared `Content-Length` over [`MAX_ARTIFACT_BYTES`] is fatal and never
+/// retried — see that constant's doc.
 pub async fn download(http: &reqwest::Client, asset: &AssetRef, dest: &Path) -> Result<()> {
     download_with(http, asset, dest, retry::Policy::download()).await
 }
@@ -203,6 +243,18 @@ async fn download_once(
             err,
             retry::parse_retry_after(resp.headers()),
         ));
+    }
+
+    // Refuse an implausibly large declared body before ever reading it — see
+    // `MAX_ARTIFACT_BYTES`'s doc. Deterministic: the server isn't going to
+    // declare a smaller length on the next attempt, so this is fatal, not
+    // retried.
+    if let Some(declared) = resp.content_length() {
+        if exceeds_artifact_size_cap(declared) {
+            return Err(Attempt::Fatal(anyhow::anyhow!(
+                oversized_content_length_message(url, declared)
+            )));
+        }
     }
 
     // The observed failure lands here: the body starts arriving and the stream
@@ -396,6 +448,16 @@ mod tests {
         /// ("connection closed before message completed"): the body starts
         /// arriving and the stream dies part-way through.
         Truncated,
+        /// A 200 declaring a `Content-Length` over [`MAX_ARTIFACT_BYTES`]. No
+        /// body needs to follow — the size cap must fire before any read is
+        /// attempted.
+        OversizedContentLength,
+        /// A well-formed 200 with a body but deliberately no `Content-Length`
+        /// header at all — terminated by closing the connection, the way a
+        /// real server without a known length would. The size cap must never
+        /// reject this: a missing declared length is not the same claim as
+        /// an oversized one.
+        NoContentLength(&'static str),
     }
 
     /// A raw HTTP server on an OS-assigned loopback port that serves `script`
@@ -445,6 +507,23 @@ mod tests {
                             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\nhalf")
                             .await;
                         // Dropping `sock` here closes mid-body.
+                    }
+                    Reply::OversizedContentLength => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                            MAX_ARTIFACT_BYTES + 1
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        // No body -- the cap must reject this before ever
+                        // trying to read one.
+                    }
+                    Reply::NoContentLength(body) => {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let _ = sock.write_all(body.as_bytes()).await;
+                        // Dropping `sock` here is how a Content-Length-less
+                        // response is framed: read until EOF.
                     }
                 }
                 let _ = sock.flush().await;
@@ -559,6 +638,46 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "a huge Retry-After must be capped, not slept through"
         );
+    }
+
+    // --- MAX_ARTIFACT_BYTES size cap -----------------------------------------
+
+    /// The regression this exists to prevent: nothing bounded `resp.bytes()`
+    /// except wall clock. An implausible declared length must fail before a
+    /// single body byte is read, and it must not burn the retry budget on a
+    /// server that will say the same implausible thing every time.
+    #[tokio::test]
+    async fn an_oversized_declared_length_is_fatal_and_not_retried() {
+        let (out, hits, _, _dir) = run_download(vec![Reply::OversizedContentLength], 4).await;
+        let err = out.expect_err("an implausible declared length must fail");
+        assert!(
+            format!("{err:#}").contains("Content-Length"),
+            "error should name the offending header, got: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains(&MAX_ARTIFACT_BYTES.to_string()),
+            "error should state the cap, got: {err:#}"
+        );
+        assert_eq!(hits, 1, "an oversized declared length must not be retried");
+    }
+
+    /// GitHub's release CDN always sends `Content-Length`, but the cap must
+    /// not brick a path that goes through something that doesn't (a proxy
+    /// quirk) — a missing header makes no claim about size, so it must pass.
+    #[tokio::test]
+    async fn a_missing_content_length_is_not_rejected_by_the_size_cap() {
+        let (out, hits, dest, _dir) =
+            run_download(vec![Reply::NoContentLength("payload-bytes")], 4).await;
+        out.expect("a response with no declared length must not be rejected by the size cap");
+        assert_eq!(hits, 1);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "payload-bytes");
+    }
+
+    #[test]
+    fn the_cap_boundary_is_strict_greater_than() {
+        assert!(!exceeds_artifact_size_cap(MAX_ARTIFACT_BYTES));
+        assert!(exceeds_artifact_size_cap(MAX_ARTIFACT_BYTES + 1));
+        assert!(!exceeds_artifact_size_cap(0));
     }
 
     // --- detect_target ------------------------------------------------------

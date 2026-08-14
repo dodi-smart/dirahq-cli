@@ -14,7 +14,7 @@ use dira_core::protocol::{
     ZavetPresence, ZavetSpecView, ZavetSpecWhyView, ZavetStatusView, ZavetSyncView,
     ZavetUncapturedView, ZavetWhyView,
 };
-use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
+use dira_core::store::{ZavetDecisionRow, ZavetKind, ZavetSpecRow};
 pub use dira_core::zavet::{
     canonical_decision_id, parse_config, parse_guard_event, GuardEventV1, ZavetConfig, CONFIG_PATH,
     ZAVET_DIR,
@@ -77,6 +77,30 @@ pub enum Kinds {
     Both,
 }
 
+/// The remedy-labeled reason a record on disk has no store row.
+///
+/// `in_head` is `Some` whenever `ls-tree` actually ran: membership decides
+/// `awaiting sweep` (committed, daemon hasn't walked it yet) vs `uncommitted`
+/// (never committed). `None` means it could not run, and `head_resolves` is
+/// what tells apart WHY: an unborn branch (no HEAD at all) makes `uncommitted`
+/// truthful — nothing genuinely is committed yet, the case a fresh `git init`
+/// needs this feature for. But a live HEAD whose `ls-tree` still failed (a git
+/// error unrelated to history) must not report `uncommitted` either — "commit
+/// it" is not usable advice when git itself is what broke — so that case reads
+/// `unknown` instead.
+fn uncaptured_reason(
+    in_head: Option<&std::collections::HashSet<String>>,
+    head_resolves: bool,
+    rel: &str,
+) -> &'static str {
+    match in_head {
+        Some(set) if set.contains(rel) => "awaiting sweep",
+        Some(_) => "uncommitted",
+        None if head_resolves => "unknown",
+        None => "uncommitted",
+    }
+}
+
 /// Record files in the working tree that the store has no row for.
 ///
 /// Files are matched against the store by id/slug, not by path, so a record
@@ -97,7 +121,8 @@ fn scan_uncaptured(
     kinds: Kinds,
     captured_keys: &std::collections::HashSet<String>,
     captured_paths: &std::collections::HashSet<String>,
-    in_head: &std::collections::HashSet<String>,
+    in_head: Option<&std::collections::HashSet<String>>,
+    head_resolves: bool,
 ) -> Vec<ZavetUncapturedView> {
     let mut out: Vec<ZavetUncapturedView> = Vec::new();
     let dirs: &[&str] = match kinds {
@@ -135,15 +160,7 @@ fn scan_uncaptured(
             }
             out.push(ZavetUncapturedView {
                 kind: if is_spec { "spec" } else { "decision" }.to_string(),
-                // Committed but absent from the store means the daemon has not
-                // walked that commit yet; absent from HEAD means it was never
-                // committed. Different remedies, so they stay distinct.
-                reason: if in_head.contains(&rel) {
-                    "awaiting sweep"
-                } else {
-                    "uncommitted"
-                }
-                .to_string(),
+                reason: uncaptured_reason(in_head, head_resolves, &rel).to_string(),
                 id,
                 title,
                 path: rel,
@@ -171,19 +188,23 @@ async fn working_tree_probe(
     };
     tokio::task::spawn_blocking(move || {
         let branch = dira_core::project::current_branch(&root);
-        // `None` = no HEAD (an unborn branch) or not a repo. That makes
-        // *presence* unknown — never guessed — but it does NOT make the
-        // on-disk scan unknown: the files are still right there. Bailing out
-        // here would report zero uncaptured records in a freshly-`git init`ed
-        // repo, which is the very case this feature exists to catch (the first
-        // decision of a project is written before the first commit).
-        //
-        // With no HEAD, nothing is committed, so an empty set is the truthful
-        // input and every record correctly reports `uncommitted`.
+        // `None` = no HEAD (an unborn branch), not a repo, or an unrelated git
+        // failure. That makes *presence* unknown — never guessed — but it does
+        // NOT make the on-disk scan unknown: the files are still right there.
+        // Bailing out here would report zero uncaptured records in a
+        // freshly-`git init`ed repo, which is the very case this feature
+        // exists to catch (the first decision of a project is written before
+        // the first commit).
         let in_head = dira_core::project::ls_tree_paths(
             &root,
             &[dira_core::zavet::DECISIONS_DIR, dira_core::zavet::SPECS_DIR],
         );
+        // Distinguishes WHY `in_head` came back `None`: an unborn branch (no
+        // HEAD to resolve) makes `uncommitted` truthful, since nothing is
+        // committed. A live HEAD whose `ls-tree` still failed is a DIFFERENT
+        // git error and must not read as the same thing — see
+        // `uncaptured_reason`.
+        let head_resolves = dira_core::project::head_sha(&root).is_some();
         let keys = captured.iter().map(|(_, k)| k.clone()).collect();
         let paths = captured.iter().map(|(p, _)| p.clone()).collect();
         let uncaptured = scan_uncaptured(
@@ -192,9 +213,8 @@ async fn working_tree_probe(
             kinds,
             &keys,
             &paths,
-            in_head
-                .as_ref()
-                .unwrap_or(&std::collections::HashSet::new()),
+            in_head.as_ref(),
+            head_resolves,
         );
         TreeProbe {
             branch,
@@ -350,12 +370,20 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
 
 /// Repo resolution ladder for the query commands: explicit repo wins, else
 /// resolve from `cwd` (or the daemon's own cwd). Also reports whether the
-/// resolved toplevel carries `.zavet/` when a directory was available.
+/// resolved toplevel carries `.zavet/` when a directory was available, and a
+/// TRUSTED toplevel to run every git probe (presence, staleness) and every
+/// write (`sync`) against.
+///
+/// The root is trusted, never assumed: every consumer used to fall back to the
+/// caller's raw `cwd` whenever the daemon had no directory on file for a named
+/// repo, which handed `sync` — and every read — the CALLER'S checkout under
+/// whatever name `--project` happened to name. A `cwd` is only ever a valid
+/// stand-in for `repo` when it demonstrably resolves to that same repo.
 async fn query_repo(
     state: &AppState,
     repo: Option<String>,
     cwd: Option<String>,
-) -> Result<(String, Option<bool>, ZavetConfig), Response> {
+) -> Result<(String, Option<bool>, ZavetConfig, Option<PathBuf>), Response> {
     // An explicit --project names a repo THIS PROCESS is not standing in — but
     // the daemon may well remember a directory for it, and that repo's id
     // conventions (`id-width`, the prefix set) still govern how a query id
@@ -366,17 +394,35 @@ async fn query_repo(
     // `dir_exists` stays `None`: it answers the `auto` probe for the tree this
     // process is standing in, and a named project is not that tree.
     if let Some(r) = repo {
-        let cfg = match repo_root(known_dir(state, &r)).await {
-            Some(root) => tokio::task::spawn_blocking(move || read_config(&root))
-                .await
-                .unwrap_or_default(),
-            None => ZavetConfig::default(),
+        if let Some(dir) = known_dir(state, &r) {
+            // The daemon already remembers a directory for `r` — trust it, and
+            // reuse the resolved toplevel as the root rather than discarding it
+            // once the config read is done.
+            let root = repo_root(Some(dir)).await;
+            let cfg = match root.clone() {
+                Some(root) => tokio::task::spawn_blocking(move || read_config(&root))
+                    .await
+                    .unwrap_or_default(),
+                None => ZavetConfig::default(),
+            };
+            return Ok((r, None, cfg, root));
+        }
+        // No directory on file for `r`. The caller's cwd is trusted ONLY IF it
+        // demonstrably belongs to `r` — its own remote resolves to the exact
+        // repo asked about — never assumed. Trusting an unrelated checkout is
+        // the data-poisoning bug: `--project some-other-repo` must not hand
+        // back whatever tree the caller happens to be standing in.
+        let resolved = resolve_repo(caller_dir(cwd)).await;
+        let (root, cfg) = if resolved.repo.as_deref() == Some(r.as_str()) {
+            (resolved.top, resolved.cfg)
+        } else {
+            (None, ZavetConfig::default())
         };
-        return Ok((r, None, cfg));
+        return Ok((r, None, cfg, root));
     }
     let r = resolve_repo(caller_dir(cwd)).await;
     match r.repo {
-        Some(repo) => Ok((repo, Some(r.dir_exists), r.cfg)),
+        Some(repo) => Ok((repo, Some(r.dir_exists), r.cfg, r.top)),
         None => Err(Response::Error {
             message: "not inside a repo with a recognizable remote; pass --project".into(),
         }),
@@ -403,13 +449,6 @@ fn spec_view(s: &ZavetSpecRow, stale_commits: Option<u64>) -> ZavetSpecView {
         stale_commits,
         presence: None,
     }
-}
-
-/// A working directory to ask git about `repo` in: the dir the daemon last
-/// observed for it, else the caller's `cwd`. `None` means staleness stays
-/// unknown — never guessed.
-fn repo_workdir(state: &AppState, repo: &str, cwd: Option<&str>) -> Option<PathBuf> {
-    known_dir(state, repo).or_else(|| cwd.map(PathBuf::from))
 }
 
 /// The directory the daemon last observed for `repo`, if any.
@@ -626,7 +665,7 @@ fn guard_stat_views(stats: Vec<dira_core::store::ZavetGuardStat>) -> Vec<ZavetGu
 
 /// `Request::ZavetStatus`.
 pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, dir_exists, _) = match query_repo(state, repo, cwd).await {
+    let (repo, dir_exists, _, _) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -658,7 +697,7 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
 
 /// `Request::ZavetDecisions`.
 pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
+    let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -673,7 +712,7 @@ pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<Strin
     let mut decisions: Vec<ZavetDecisionView> = rows.iter().map(decision_view).collect();
     attach_guard_stats(state, &repo, &mut decisions).await;
     let probe = working_tree_probe(
-        repo_root(repo_workdir(state, &repo, cwd.as_deref())).await,
+        root,
         cfg,
         // A spec on disk is not a decision — this view reports only its kind,
         // and scanning `.zavet/specs/` here would parse every spec to discard it.
@@ -711,13 +750,16 @@ pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<Strin
 /// record — capture reads git objects, not the worktree (DIRASH-0026). Those
 /// stay reported through `uncaptured`.
 pub async fn sync(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, dir_exists, cfg) = match query_repo(state, repo, cwd.clone()).await {
+    let (repo, dir_exists, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     // A sweep needs a real directory, not just a canonical name: `--project`
-    // alone can only work if the daemon already remembers a dir for it.
-    let Some(root) = repo_root(repo_workdir(state, &repo, cwd.as_deref())).await else {
+    // alone can only work if the daemon already remembers a dir for it, or the
+    // caller's own cwd demonstrably belongs to the named repo (`query_repo`).
+    // Never the caller's cwd unconditionally — that is what let an unknown
+    // `--project` register and capture a foreign checkout under the wrong name.
+    let Some(root) = root else {
         return Response::Error {
             message: format!(
                 "no working directory known for {repo}; run `dira zavet sync` from inside a checkout"
@@ -764,7 +806,7 @@ pub async fn wiki(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
+    let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -804,8 +846,8 @@ pub async fn wiki(
         .await
         .unwrap_or_default();
     // One working directory for every git probe, so staleness, branch and
-    // presence can never describe two different trees.
-    let root = repo_root(repo_workdir(state, &repo, cwd.as_deref())).await;
+    // presence can never describe two different trees — the trusted root
+    // `query_repo` resolved, never the caller's raw cwd.
     let staleness = spec_staleness(
         root.clone(),
         spec_rows.iter().map(staleness_input).collect(),
@@ -927,6 +969,16 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         }
     };
 
+    // `sweep.trailers` is that same walk's OWN trailer stage (see
+    // `zavet_sweep`) — computed over the `.zavet/`-scoped, UNBOUNDED `records`
+    // window — and was previously discarded in favor of the separately-walked
+    // `trailers` (the wide, by-default-BOUNDED `trailer_commits` window). The
+    // two windows disagree on old history: a commit that touched `.zavet/` and
+    // also carries an arbitrary `Decision:` trailer can sit past
+    // `REINDEX_TRAILER_LIMIT` and only ever show up in `sweep.trailers`. Merge
+    // both before recording rather than persisting only the bounded half.
+    let trailer_rows = merge_trailer_windows(trailers, &sweep.trailers);
+
     // Content-hash short-circuit. Every upsert bumps `touched_seq`, which is the
     // knowledge-sync cursor — without this, each reindex would re-stamp every
     // row and re-push the entire knowledge set. With it, a second run on an
@@ -942,11 +994,18 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         .await
         .unwrap_or_default();
     let by_key = |rows: Vec<dira_core::store::ZavetIdentity>| -> HashMap<String, Stored> {
-        rows.into_iter()
-            .map(|r| (r.key, (r.content_hash, r.path)))
-            .collect()
+        rows.into_iter().map(|r| (r.key.clone(), r)).collect()
     };
     let (known_decisions, known_specs) = (by_key(known_decisions), by_key(known_specs));
+
+    // Before/after delta rather than counting offers (mirrors `sync`'s own
+    // pattern): `zavet_record_trailers` is INSERT OR IGNORE, so a loop that
+    // counts every call it MADE — the previous behavior — counts every commit
+    // the walk still finds on a repeat run, even though every one of those
+    // calls is a no-op. Snapshotting the actual row count before and after is
+    // what makes a true no-op reindex report zero rather than "recorded" the
+    // same set again.
+    let before = state.store.zavet_counts(&repo).await.unwrap_or_default();
 
     let mut view = dira_core::protocol::ZavetReindexView {
         repo: repo.clone(),
@@ -957,12 +1016,27 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         ..Default::default()
     };
 
-    // No session attribution: a reindex replays other people's history, and
-    // stamping it with whatever session happens to be open here would invent
-    // provenance. The ambient path attributes because it captures live work.
+    // Ordinary writes carry no session attribution: a reindex replays other
+    // people's history, and stamping it with whatever session happens to be open
+    // here would invent provenance. The ambient path attributes because it
+    // captures live work. The one exception is the provenance REPAIR below,
+    // which reads attribution from the artifacts row for the introducing commit
+    // — a recorded fact keyed by the commit, not the ambient session
+    // (DIRASH-0032).
     for group in collapse(&sweep.decisions, |d| d.cap.id.as_str()) {
         let newest = group.newest;
         let stored = known_decisions.get(&newest.cap.id);
+        view.provenance_repaired += u64::from(
+            repair_provenance(
+                state,
+                &repo,
+                ZavetKind::Decision,
+                &newest.cap.id,
+                stored,
+                group.oldest,
+            )
+            .await,
+        );
         if unchanged(stored, &newest.cap.content_hash, &newest.cap.path) {
             view.decisions_skipped += 1;
             continue;
@@ -990,6 +1064,17 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
     for group in collapse(&sweep.specs, |s| s.cap.slug.as_str()) {
         let newest = group.newest;
         let stored = known_specs.get(&newest.cap.slug);
+        view.provenance_repaired += u64::from(
+            repair_provenance(
+                state,
+                &repo,
+                ZavetKind::Spec,
+                &newest.cap.slug,
+                stored,
+                group.oldest,
+            )
+            .await,
+        );
         if unchanged(stored, &newest.cap.content_hash, &newest.cap.path) {
             view.specs_skipped += 1;
             continue;
@@ -1011,17 +1096,19 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         }
     }
     // Trailers are keyed `(sha, seq)` and inserted OR IGNORE, so re-recording a
-    // sha already present is already a no-op — no hash check needed.
-    for (sha, ts) in &trailers {
-        match state
+    // sha already present is already a no-op — no hash check needed. The merged
+    // window (see above), not the bounded-by-default `trailers` walk alone.
+    for (sha, ts) in &trailer_rows {
+        if let Err(e) = state
             .store
             .zavet_record_trailers(Some(&repo), sha, ts)
             .await
         {
-            Ok(()) => view.trailer_commits_recorded += 1,
-            Err(e) => tracing::warn!("zavet reindex trailers for {sha} failed: {e}"),
+            tracing::warn!("zavet reindex trailers for {sha} failed: {e}");
         }
     }
+    let after = state.store.zavet_counts(&repo).await.unwrap_or_default();
+    view.trailer_commits_recorded = after.trailers.saturating_sub(before.trailers);
 
     if view.decisions_indexed > 0 || view.specs_indexed > 0 || view.trailer_commits_recorded > 0 {
         let _ = state.knowledge_sync.trigger.try_send(());
@@ -1033,6 +1120,28 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         "zavet reindex complete"
     );
     Response::ZavetReindex(Box::new(view))
+}
+
+/// Merge the reindex's two trailer windows into one map, keyed by sha.
+///
+/// `wide` is the general trailer walk (`trailer_commits`), bounded by default
+/// to `REINDEX_TRAILER_LIMIT`. `scoped` is `zavet_sweep`'s OWN trailer stage
+/// over the `.zavet/`-pathspec `records` walk, which is unbounded. A commit
+/// old enough to sit past the wide window's bound but that also touched
+/// `.zavet/` (and so was walked by the scoped pass) shows up ONLY in `scoped`
+/// — dropping it there, as the reindex used to, silently lost its trailers on
+/// every run. Either side wins on a collision: the parse of a given sha is the
+/// same regardless of which walk found it first.
+fn merge_trailer_windows(
+    wide: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
+    scoped: &[(String, Vec<dira_core::store::ZavetTrailer>)],
+) -> HashMap<String, Vec<dira_core::store::ZavetTrailer>> {
+    let mut merged: HashMap<String, Vec<dira_core::store::ZavetTrailer>> =
+        wide.into_iter().collect();
+    for (sha, ts) in scoped.iter().cloned() {
+        merged.entry(sha).or_insert(ts);
+    }
+    merged
 }
 
 /// One record's oldest and newest appearance across the walked history.
@@ -1088,9 +1197,8 @@ fn collapse<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> &'a str) -> Vec<Touche
     out
 }
 
-/// A stored record's identity for the skip check: its content hash and the
-/// path it was captured from.
-type Stored = (Option<String>, String);
+/// A stored record's identity for the skip check.
+type Stored = dira_core::store::ZavetIdentity;
 
 /// Whether a record already in the store matches the one just parsed.
 ///
@@ -1098,10 +1206,127 @@ type Stored = (Option<String>, String);
 /// unknown hash must never be read as "already current", or the record that
 /// most needs indexing is the one silently skipped. The path must match too:
 /// a renamed file keeps its blob oid, and `path`/`slug` come from the filename.
+///
+/// This answers "is the stored CONTENT current" and nothing else. Provenance is
+/// a separate question with its own answer ([`provenance_repair`]): a record can
+/// be content-current and still recorded against the wrong introducing commit,
+/// and treating the two as one question is what let that state survive every
+/// reindex forever.
 fn unchanged(stored: Option<&Stored>, fresh: &Option<String>, fresh_path: &str) -> bool {
     match (stored, fresh) {
-        (Some((Some(a), p)), Some(b)) => a == b && p == fresh_path,
+        (Some(s), Some(b)) => s.content_hash.as_deref() == Some(b.as_str()) && s.path == fresh_path,
         _ => false,
+    }
+}
+
+/// Parse a git author date (`%aI`, strict ISO 8601 *with the author's local
+/// offset*) into an instant.
+///
+/// Instants, never strings: two commits an hour apart can compare backwards
+/// lexicographically when their authors sat in different timezones
+/// (`2026-08-14T01:00+02:00` precedes `2026-08-14T00:30Z` in fact and follows
+/// it in ASCII).
+fn authored_instant(at: Option<&str>) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(at?, &time::format_description::well_known::Rfc3339).ok()
+}
+
+/// A record sighting's commit coordinates.
+///
+/// Exists so the repair step is written once rather than once per record kind:
+/// `ZavetDecisionAt` and `ZavetSpecAt` carry the same `(sha, authored_at)` pair
+/// and differ only in their `cap`, which the repair never reads.
+trait RecordOrigin {
+    fn sha(&self) -> &str;
+    fn authored_at(&self) -> Option<&str>;
+}
+
+macro_rules! impl_record_origin {
+    ($($t:ty),+) => {$(
+        impl RecordOrigin for $t {
+            fn sha(&self) -> &str {
+                &self.sha
+            }
+            fn authored_at(&self) -> Option<&str> {
+                self.authored_at.as_deref()
+            }
+        }
+    )+};
+}
+impl_record_origin!(crate::capture::ZavetDecisionAt, crate::capture::ZavetSpecAt);
+
+/// Apply [`provenance_repair_plan`] if it has anything to say. Returns whether
+/// a row was actually repaired, so the reindex can report it.
+///
+/// A failure is logged and swallowed rather than aborting the run: a record
+/// whose provenance could not be corrected is exactly as usable as it was a
+/// moment ago, and the next reindex will try again — the repair is idempotent.
+async fn repair_provenance<T: RecordOrigin>(
+    state: &AppState,
+    repo: &str,
+    kind: ZavetKind,
+    key: &str,
+    stored: Option<&Stored>,
+    oldest: &T,
+) -> bool {
+    let Some((sha, at)) = provenance_repair_plan(stored, oldest.sha(), oldest.authored_at()) else {
+        return false;
+    };
+    match state
+        .store
+        .zavet_repair_provenance(repo, kind, key, sha, at)
+        .await
+    {
+        Ok(repaired) => repaired,
+        Err(e) => {
+            tracing::warn!("zavet reindex could not repair provenance for {kind} {key}: {e}");
+            false
+        }
+    }
+}
+
+/// The `(sha, authored_at)` a stored record's first-sight fields should be
+/// repaired to, or `None` when they are already right.
+///
+/// Only ever moves a record's origin EARLIER. The reindex walk is unbounded over
+/// the `.zavet/` pathspec, so its oldest sighting is normally the true
+/// introducing commit — but a record whose file was moved into that pathspec
+/// later has history the walk cannot see, and pushing its origin *forward* would
+/// be worse than leaving it. "Earliest wins" also makes the repair monotone and
+/// therefore idempotent, which is what keeps the second reindex a true no-op and
+/// stops `touched_seq` re-pushing the whole knowledge set (DIRASH-0028).
+///
+/// Conservative in both unknowns. A stored row with no `created_at` is repaired
+/// regardless — there is nothing to be earlier than, and an unrecorded date is
+/// exactly what a reindex is for. A *walk* sighting with no parseable date is
+/// never used to overwrite a stored one: that would trade a wrong date for no
+/// date.
+fn provenance_repair_plan<'a>(
+    stored: Option<&Stored>,
+    oldest_sha: &'a str,
+    oldest_at: Option<&'a str>,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let stored = stored?;
+    if stored.first_commit.as_deref() == Some(oldest_sha) {
+        return None;
+    }
+    let repair = Some((oldest_sha, oldest_at));
+    // Nothing recorded to be earlier than — and no date to lose either.
+    if stored.created_at.is_none() {
+        return repair;
+    }
+    match (
+        authored_instant(stored.created_at.as_deref()),
+        authored_instant(oldest_at),
+    ) {
+        // `<=`, not `<`: git author dates have one-second resolution, so two
+        // commits made in the same second tie. On a tie the walk wins — it
+        // enumerates history in order and therefore knows which came first,
+        // which is exactly what the timestamp has lost. Still monotone: the
+        // early return above stops a second run repeating the write.
+        (Some(have), Some(found)) if found <= have => repair,
+        // Genuinely later, or either side unparseable: leave a dated record
+        // alone rather than trading a wrong date for no date.
+        _ => None,
     }
 }
 
@@ -1112,7 +1337,7 @@ pub async fn set_mode(
     repo: Option<String>,
     mode: String,
 ) -> Response {
-    let (repo, _, _) = match query_repo(state, repo, cwd).await {
+    let (repo, _, _, _) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1143,7 +1368,7 @@ pub async fn why(
     cwd: Option<String>,
     repo: Option<String>,
 ) -> Response {
-    let (repo, _, cfg) = match query_repo(state, repo, cwd.clone()).await {
+    let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1189,7 +1414,7 @@ pub async fn why(
             .await
             .unwrap_or(None)
         {
-            return spec_why(state, &repo, spec, None, cwd.as_deref()).await;
+            return spec_why(state, &repo, spec, None, root.clone()).await;
         }
     }
     // Free text ranks decisions AND specs with ONE confidence rule: the top
@@ -1221,7 +1446,7 @@ pub async fn why(
     if top > 0 && top >= own_second.max(other_top).max(best_trailer) * 2 {
         return if spec_wins {
             let (spec, _) = results.specs.remove(0);
-            spec_why(state, &repo, spec, Some(query), cwd.as_deref()).await
+            spec_why(state, &repo, spec, Some(query), root).await
         } else {
             let (decision, _) = results.decisions.remove(0);
             decision_why(state, &repo, decision, Some(query)).await
@@ -1341,7 +1566,7 @@ async fn spec_why(
     repo: &str,
     spec: ZavetSpecRow,
     matched_query: Option<String>,
-    cwd: Option<&str>,
+    root: Option<PathBuf>,
 ) -> Response {
     let commits = state
         .store
@@ -1353,7 +1578,12 @@ async fn spec_why(
         .zavet_sessions_for_spec(repo, &spec.slug)
         .await
         .unwrap_or_default();
-    let stale = spec_staleness(repo_workdir(state, repo, cwd), vec![staleness_input(&spec)])
+    // `root` is the trusted toplevel `query_repo` resolved — passing the raw
+    // cwd here used to feed a cwd-relative `:(glob)` pathspec from whatever
+    // subdirectory the caller happened to be in, reading staleness as `Some(0)`
+    // instead of the real count (the same class of bug `compute_repo_stats`
+    // fixes in `knowledge_sync.rs` by resolving to the toplevel before probing).
+    let stale = spec_staleness(root, vec![staleness_input(&spec)])
         .await
         .pop()
         .flatten();
@@ -1473,6 +1703,38 @@ mod tests {
         assert!(zavet_dir_exists(tmp.path()));
     }
 
+    /// The four-way split `uncaptured_reason` decides, pinned without a real
+    /// git repo: `ls-tree` succeeding beats everything, and the two ways to
+    /// come back `None` diverge on whether HEAD itself resolved.
+    #[test]
+    fn uncaptured_reason_distinguishes_an_unborn_head_from_a_live_one() {
+        let mut in_tree = std::collections::HashSet::new();
+        in_tree.insert(".zavet/decisions/D-0001-x.md".to_string());
+        const PATH: &str = ".zavet/decisions/D-0001-x.md";
+        const OTHER: &str = ".zavet/decisions/D-0002-y.md";
+
+        assert_eq!(
+            uncaptured_reason(Some(&in_tree), true, PATH),
+            "awaiting sweep",
+            "committed, daemon hasn't walked it yet"
+        );
+        assert_eq!(
+            uncaptured_reason(Some(&in_tree), true, OTHER),
+            "uncommitted",
+            "ls-tree ran and the path is simply not in HEAD's tree"
+        );
+        assert_eq!(
+            uncaptured_reason(None, false, PATH),
+            "uncommitted",
+            "an unborn branch: nothing is committed, so this is the truth"
+        );
+        assert_eq!(
+            uncaptured_reason(None, true, PATH),
+            "unknown",
+            "a live HEAD whose ls-tree still failed must not read as 'commit it'"
+        );
+    }
+
     /// `(id, content_hash)` standing in for a swept record.
     fn rec(id: &str, hash: &str) -> (String, String) {
         (id.to_string(), hash.to_string())
@@ -1532,13 +1794,160 @@ mod tests {
         assert_eq!(groups[0].writes(false).count(), 1);
     }
 
+    /// A stored row as the skip/repair checks see it.
+    fn identity(
+        content_hash: Option<&str>,
+        path: &str,
+        first_commit: Option<&str>,
+        created_at: Option<&str>,
+    ) -> Stored {
+        Stored {
+            key: "D-0001".to_string(),
+            content_hash: content_hash.map(String::from),
+            path: path.to_string(),
+            first_commit: first_commit.map(String::from),
+            created_at: created_at.map(String::from),
+        }
+    }
+
+    // --- provenance repair (#120 / DIRASH-0032) --------------------------
+
+    const P0: &str = ".zavet/decisions/D-0001-x.md";
+
+    /// The bug: the ambient poll first met the record on an EDIT commit, so
+    /// that edit's date became its recorded "decided at" permanently. Because
+    /// `zavet_sessions_for_decision` joins `artifacts` on `first_commit`, that
+    /// also bills `dira zavet why` to whoever made the edit.
+    #[test]
+    fn an_origin_earlier_than_the_stored_one_is_repaired() {
+        let stored = identity(
+            Some("abc"),
+            P0,
+            Some("edit-sha"),
+            Some("2026-08-10T12:00:00+00:00"),
+        );
+        assert_eq!(
+            provenance_repair_plan(
+                Some(&stored),
+                "intro-sha",
+                Some("2026-08-01T09:00:00+00:00")
+            ),
+            Some(("intro-sha", Some("2026-08-01T09:00:00+00:00")))
+        );
+    }
+
+    /// Idempotence, which is what keeps a repeat reindex a true no-op and stops
+    /// `touched_seq` re-pushing the whole knowledge set (DIRASH-0028).
+    #[test]
+    fn a_record_already_at_its_earliest_sighting_is_not_repaired() {
+        let stored = identity(
+            Some("abc"),
+            P0,
+            Some("intro-sha"),
+            Some("2026-08-01T09:00:00+00:00"),
+        );
+        assert_eq!(
+            provenance_repair_plan(
+                Some(&stored),
+                "intro-sha",
+                Some("2026-08-01T09:00:00+00:00")
+            ),
+            None
+        );
+    }
+
+    /// Monotone: a walk that cannot see a record's earlier history must never
+    /// push its origin forward.
+    #[test]
+    fn a_later_sighting_never_moves_the_origin_forward() {
+        let stored = identity(
+            Some("abc"),
+            P0,
+            Some("intro-sha"),
+            Some("2026-08-01T09:00:00+00:00"),
+        );
+        assert_eq!(
+            provenance_repair_plan(
+                Some(&stored),
+                "later-sha",
+                Some("2026-08-20T09:00:00+00:00")
+            ),
+            None,
+            "a later commit is not a better origin"
+        );
+    }
+
+    /// `%aI` carries the author's local offset, so a string compare gets this
+    /// pair backwards: `T01:00+02:00` is 23:00 the previous day in UTC, and so
+    /// genuinely earlier than `T00:30Z` despite sorting after it.
+    #[test]
+    fn dates_are_compared_as_instants_not_as_strings() {
+        let stored = identity(Some("abc"), P0, Some("edit"), Some("2026-08-14T00:30:00Z"));
+        assert_eq!(
+            provenance_repair_plan(Some(&stored), "intro", Some("2026-08-14T01:00:00+02:00")),
+            Some(("intro", Some("2026-08-14T01:00:00+02:00"))),
+            "an offset-aware comparison must see this as earlier"
+        );
+    }
+
+    /// Git author dates resolve to the second, so a record introduced and
+    /// edited in the same second ties. The walk enumerates history in order and
+    /// so knows which came first; the timestamp does not.
+    #[test]
+    fn a_tie_on_the_second_defers_to_walk_order() {
+        let same = "2026-08-14T12:00:00Z";
+        let stored = identity(Some("abc"), P0, Some("edit"), Some(same));
+        assert_eq!(
+            provenance_repair_plan(Some(&stored), "intro", Some(same)),
+            Some(("intro", Some(same)))
+        );
+        // And still idempotent once applied.
+        let repaired = identity(Some("abc"), P0, Some("intro"), Some(same));
+        assert_eq!(
+            provenance_repair_plan(Some(&repaired), "intro", Some(same)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_recorded_date_is_always_repairable() {
+        let stored = identity(Some("abc"), P0, Some("edit"), None);
+        assert_eq!(
+            provenance_repair_plan(Some(&stored), "intro", Some("2026-08-01T09:00:00+00:00")),
+            Some(("intro", Some("2026-08-01T09:00:00+00:00"))),
+            "there is nothing to be earlier than"
+        );
+    }
+
+    /// Never trade a wrong date for no date: a sighting we cannot place in time
+    /// is not evidence that it came first.
+    #[test]
+    fn an_undatable_sighting_leaves_a_dated_record_alone() {
+        let stored = identity(Some("abc"), P0, Some("edit"), Some("2026-08-10T12:00:00Z"));
+        assert_eq!(provenance_repair_plan(Some(&stored), "intro", None), None);
+        assert_eq!(
+            provenance_repair_plan(Some(&stored), "intro", Some("not-a-date")),
+            None
+        );
+    }
+
+    /// A record the store has never seen is inserted by the ordinary write
+    /// path, which sets first-sight fields itself. Nothing to repair.
+    #[test]
+    fn an_unknown_record_is_not_a_repair() {
+        assert_eq!(
+            provenance_repair_plan(None, "intro", Some("2026-08-01T09:00:00+00:00")),
+            None
+        );
+    }
+
     /// The skip check gates every write, so "unknown" must never read as
     /// "current" — otherwise the record most in need of indexing is the one
     /// silently passed over.
     #[test]
     fn only_two_present_and_equal_hashes_count_as_unchanged() {
         const P: &str = ".zavet/decisions/D-0001-x.md";
-        let stored = |h: Option<&str>| (h.map(String::from), P.to_string());
+        let stored = |h: Option<&str>| identity(h, P, None, None);
         let h = Some("abc".to_string());
 
         assert!(unchanged(Some(&stored(Some("abc"))), &h, P));
@@ -1566,14 +1975,366 @@ mod tests {
     /// would skip the one record whose stored `path`/`slug` just went stale.
     #[test]
     fn a_renamed_record_is_not_unchanged() {
-        let stored = (
-            Some("abc".to_string()),
-            ".zavet/decisions/D-0001-old-slug.md".to_string(),
+        let stored = identity(
+            Some("abc"),
+            ".zavet/decisions/D-0001-old-slug.md",
+            None,
+            None,
         );
         assert!(!unchanged(
             Some(&stored),
             &Some("abc".into()),
             ".zavet/decisions/D-0001-new-slug.md"
         ));
+    }
+
+    fn trailer(key: &str, value: &str) -> dira_core::store::ZavetTrailer {
+        dira_core::store::ZavetTrailer {
+            key: key.to_string(),
+            value: value.to_string(),
+            decision_id: None,
+        }
+    }
+
+    /// Pins the merge half of the reindex trailer fix: a sha the wide
+    /// (by-default-bounded) walk never saw, but that the unbounded
+    /// `.zavet/`-scoped walk did, must survive into the merged map — the
+    /// exact shape of an old commit sitting past `REINDEX_TRAILER_LIMIT` that
+    /// also touched `.zavet/`.
+    #[test]
+    fn merge_trailer_windows_keeps_a_scoped_only_sha() {
+        let wide = vec![("wide-only".to_string(), vec![trailer("why", "recent")])];
+        let scoped = vec![(
+            "scoped-only".to_string(),
+            vec![trailer("decision", "D-0001")],
+        )];
+
+        let merged = merge_trailer_windows(wide, &scoped);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.get("scoped-only").map(|ts| ts.len()),
+            Some(1),
+            "an old .zavet/-touching commit past the trailer bound must not be dropped"
+        );
+        assert_eq!(merged.get("wide-only").map(|ts| ts.len()), Some(1));
+    }
+
+    /// Either side wins on a collision — the parse of a given sha is identical
+    /// regardless of which walk found it, so the wide value surviving is fine.
+    #[test]
+    fn merge_trailer_windows_a_collision_keeps_either_side() {
+        let wide = vec![("both".to_string(), vec![trailer("why", "from-wide")])];
+        let scoped = vec![("both".to_string(), vec![trailer("why", "from-scoped")])];
+
+        let merged = merge_trailer_windows(wide, &scoped);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("both").map(|ts| ts.len()), Some(1));
+    }
+}
+
+/// `dira zavet reindex` end-to-end: a real temp git repo + `AppState`, driving
+/// the actual `reindex` handler rather than its pure helpers. Separate `mod`
+/// so `tempfile`/`Store`/`AppState` imports don't leak into the pure-logic
+/// tests above.
+#[cfg(test)]
+mod reindex_tests {
+    use super::*;
+    use dira_core::{Config, Store};
+    use std::process::Command;
+
+    async fn test_state() -> (AppState, tokio::sync::mpsc::Receiver<()>) {
+        let store = Store::open_in_memory().await.expect("in-memory store");
+        let (state, _rx, _sync_rx, knowledge_rx) = crate::build_state(store, Config::default())
+            .await
+            .expect("build_state");
+        (state, knowledge_rx)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    fn init_repo(root: &Path) {
+        git(root, &["init", "-q", "-b", "main"]);
+        git(
+            root,
+            &["remote", "add", "origin", "git@github.com:acme/api.git"],
+        );
+        git(root, &["config", "user.email", "t@t.dev"]);
+        git(root, &["config", "user.name", "T"]);
+    }
+
+    fn write_decision(root: &Path, id: &str, title: &str) {
+        let dir = root.join(".zavet/decisions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}-{}.md", title.replace(' ', "-"))),
+            format!(
+                "---\nid: {id}\ntitle: {title}\nstatus: active\nguards:\n  - src/**\n---\n\n## Decision\n{title}.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn run_reindex(state: &AppState, cwd: &str) -> dira_core::protocol::ZavetReindexView {
+        match reindex(state, Some(cwd.to_string()), false).await {
+            Response::ZavetReindex(v) => *v,
+            other => panic!("expected ZavetReindex, got {other:?}"),
+        }
+    }
+
+    /// The write-counted trigger, both halves: a real reindex writes something
+    /// and nudges the knowledge channel; an immediate repeat is a true no-op —
+    /// zero recorded trailers, zero re-indexed records — and does not nudge it
+    /// again. Before the fix, `trailer_commits_recorded` counted OFFERS, so the
+    /// repeat run reported the same non-zero count and re-triggered every time.
+    #[tokio::test]
+    async fn a_second_reindex_reports_no_trailer_writes_and_does_not_retrigger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        write_decision(root, "D-0001", "reindex twice");
+        git(root, &["add", "-A"]);
+        git(
+            root,
+            &["commit", "-qm", "docs: record D-0001\n\nRefs: D-0001"],
+        );
+
+        let (state, mut knowledge_rx) = test_state().await;
+        let cwd = root.display().to_string();
+
+        let first = run_reindex(&state, &cwd).await;
+        assert!(first.decisions_indexed >= 1, "first run indexes D-0001");
+        assert!(
+            first.trailer_commits_recorded > 0,
+            "the commit's own Refs: trailer is recorded"
+        );
+        assert!(
+            knowledge_rx.try_recv().is_ok(),
+            "a run that wrote something must nudge the knowledge channel"
+        );
+
+        let second = run_reindex(&state, &cwd).await;
+        assert_eq!(
+            second.trailer_commits_recorded, 0,
+            "repeat run writes no NEW trailer rows, not the same offer count again"
+        );
+        assert_eq!(second.decisions_indexed, 0, "content hash unchanged");
+        assert_eq!(second.specs_indexed, 0);
+        assert!(
+            knowledge_rx.try_recv().is_err(),
+            "a true no-op repeat must not re-trigger the knowledge sync"
+        );
+    }
+
+    /// What `init_repo`'s origin remote canonicalizes to.
+    const CANONICAL_TEST_REPO: &str = "github.com/acme/api";
+
+    /// Commit at a fixed author date. Without this two commits made in the same
+    /// second carry identical `%aI` values, and the test would silently exercise
+    /// the tie rule instead of the ordinary earlier-than case.
+    fn git_at(dir: &Path, date: &str, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    fn head_sha(root: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// #120 end to end. A record introduced long ago but first *seen* by the
+    /// ambient poll on a later edit keeps that edit as its recorded origin, and
+    /// no upsert can lower it — `ON CONFLICT` preserves first-sight fields by
+    /// design. Because `zavet_sessions_for_decision` joins `artifacts` on
+    /// `first_commit`, that also bills `dira zavet why` to whoever made the
+    /// edit. An explicit reindex must repair the whole triple, and attribution
+    /// must come from the introducing commit's own artifact row — never from
+    /// the session running the reindex (DIRASH-0032).
+    #[tokio::test]
+    async fn reindex_repairs_an_origin_the_ambient_poll_recorded_from_an_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+
+        const INTRO_AT: &str = "2026-01-01T00:00:00+00:00";
+
+        write_decision(root, "D-0001", "poll git");
+        git(root, &["add", "-A"]);
+        git_at(root, INTRO_AT, &["commit", "-qm", "docs: record D-0001"]);
+        let intro = head_sha(root);
+
+        write_decision(root, "D-0001", "poll git harder");
+        git(root, &["add", "-A"]);
+        git_at(
+            root,
+            "2026-06-01T00:00:00+00:00",
+            &["commit", "-qm", "docs: revise D-0001"],
+        );
+        let edit = head_sha(root);
+        assert_ne!(intro, edit);
+
+        let (state, mut knowledge_rx) = test_state().await;
+        let cwd = root.display().to_string();
+
+        // The ambient poll's window opened AFTER the introducing commit, so it
+        // only ever saw the edit — and attributed it to the session that was
+        // open at the time.
+        state
+            .store
+            .repo_baseline_set(CANONICAL_TEST_REPO, &intro)
+            .await
+            .unwrap();
+        crate::capture::capture_commits(&state, &cwd, CANONICAL_TEST_REPO).await;
+
+        // The introducing commit IS captured — by an earlier session, on some
+        // earlier run — it simply was not the one the record got bound to.
+        let intro_commit = dira_core::project::CapturedCommit {
+            sha: intro.clone(),
+            authored_at: Some(INTRO_AT.to_string()),
+            author_email: Some("t@t.dev".to_string()),
+            author_name: Some("T".to_string()),
+            message: "docs: record D-0001".to_string(),
+            additions: 1,
+            deletions: 0,
+            patch_id: None,
+        };
+        state
+            .store
+            .record_commit(
+                &intro_commit,
+                Some(CANONICAL_TEST_REPO),
+                None,
+                Some("session-that-decided-it"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let before = state
+            .store
+            .zavet_decision_get(CANONICAL_TEST_REPO, "D-0001")
+            .await
+            .unwrap()
+            .expect("captured");
+        assert_eq!(
+            before.first_commit.as_deref(),
+            Some(edit.as_str()),
+            "the fixture must actually reproduce the bug: origin bound to the edit"
+        );
+
+        while knowledge_rx.try_recv().is_ok() {}
+
+        let v = run_reindex(&state, &cwd).await;
+        assert_eq!(v.provenance_repaired, 1, "the record's origin was wrong");
+
+        let after = state
+            .store
+            .zavet_decision_get(CANONICAL_TEST_REPO, "D-0001")
+            .await
+            .unwrap()
+            .expect("still captured");
+        assert_eq!(
+            after.first_commit.as_deref(),
+            Some(intro.as_str()),
+            "origin moves back to the commit that introduced the record"
+        );
+        // Compared as an instant, not a string: git renders a `+00:00` offset
+        // as `Z`, and the point is the moment, not its spelling.
+        assert_eq!(
+            authored_instant(after.created_at.as_deref()),
+            authored_instant(Some(INTRO_AT)),
+            "and takes that commit's author date with it, got {:?}",
+            after.created_at
+        );
+        assert_eq!(
+            after.source_session.as_deref(),
+            Some("session-that-decided-it"),
+            "attribution follows first_commit, read from its artifact row — \
+             leaving it pointing at the edit's session would be a row that \
+             contradicts itself, and that row ships to the cloud"
+        );
+
+        // Idempotent: the repair is monotone, so a second run finds nothing and
+        // must not re-stamp `touched_seq` and re-push the knowledge set.
+        while knowledge_rx.try_recv().is_ok() {}
+        let second = run_reindex(&state, &cwd).await;
+        assert_eq!(second.provenance_repaired, 0, "already at its earliest");
+        assert_eq!(second.decisions_indexed, 0);
+        assert!(
+            knowledge_rx.try_recv().is_err(),
+            "a true no-op repeat must not re-trigger the knowledge sync"
+        );
+    }
+
+    /// Pins the merge half end-to-end: a commit that touches `.zavet/` sits
+    /// inside the unbounded record walk regardless of how far back it is, so
+    /// its own `Refs:` trailer is recovered even with the wide trailer walk
+    /// bounded down to a single commit — the shape of a commit older than
+    /// `REINDEX_TRAILER_LIMIT` that the wide-only walk would have missed.
+    #[tokio::test]
+    async fn an_old_zavet_touching_commits_trailer_survives_a_bounded_wide_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        write_decision(root, "D-0001", "old decision with a trailer");
+        git(root, &["add", "-A"]);
+        git(
+            root,
+            &["commit", "-qm", "docs: record D-0001\n\nRefs: D-0001"],
+        );
+        // A newer, non-`.zavet/` commit so the wide trailer walk (newest-first)
+        // has something to prefer over the old one once bounded to 1.
+        std::fs::write(root.join("code.rs"), "fn main() {}\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "feat: unrelated change"]);
+
+        let cwd = root.display().to_string();
+
+        // Force the wide window down to the single newest commit — which
+        // carries no trailer — so only the merge can recover D-0001's.
+        let r = resolve_repo(cwd.clone()).await;
+        let top = r.top.expect("resolved toplevel");
+        let cfg = r.cfg.clone();
+        let records = dira_core::project::log_commit_refs(&top, &REINDEX_PATHS, None);
+        let trailer_commits = dira_core::project::log_commit_refs(&top, &[], Some(1));
+        assert_eq!(
+            trailer_commits.len(),
+            1,
+            "bounded to the newest commit only"
+        );
+        let sweep = crate::capture::zavet_sweep(&top, &records);
+        let trailers = crate::capture::zavet_trailers(&top, &trailer_commits, &cfg);
+        assert!(
+            trailers.is_empty(),
+            "the newest commit alone carries no trailer"
+        );
+
+        let merged = merge_trailer_windows(trailers, &sweep.trailers);
+        assert_eq!(
+            merged.len(),
+            1,
+            "D-0001's introducing commit is recovered from the scoped window"
+        );
     }
 }

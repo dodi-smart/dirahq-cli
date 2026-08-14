@@ -159,7 +159,7 @@ pub(crate) fn probe_harness(
     }
 }
 
-/// Which harnesses already carry dira hooks.
+/// Which harnesses already carry dira hooks, at **global** scope.
 ///
 /// Reuses `doctor`'s reader (`read_harness_wiring`) rather than re-parsing
 /// config files, so "wired" means exactly what `dira doctor` means by it. A
@@ -167,9 +167,27 @@ pub(crate) fn probe_harness(
 /// config (new events added by an upgrade) must still be offered, since
 /// re-running `init` is what fills the gap.
 pub(crate) fn wired_harness_ids() -> Vec<&'static str> {
-    crate::doctor::checks::read_harness_wiring()
+    globally_wired(crate::doctor::checks::read_harness_wiring())
+}
+
+/// Filter a wiring report down to the fully-wired, **global**-scope entries.
+///
+/// `read_harness_wiring()` reports project scope too — Claude Code's own
+/// precedence puts it first — but onboarding wires at user scope
+/// (DIRASH-0029's "why user scope": a machine-setup command, not a per-repo
+/// one). Counting a project-scope wiring here meant a user who had run a bare
+/// `dira init` inside one repo got `AlreadyDone` from onboarding's harness
+/// step, and every other repo on the machine stayed silently uncaptured with
+/// no signal why — the exact silent-undercapture failure DIRASH-0029 exists
+/// to prevent.
+///
+/// Split out from [`wired_harness_ids`] so the scope filter is testable
+/// without a real `$HOME`: `read_harness_wiring()` has no injection point,
+/// it always reads the process's real config paths.
+fn globally_wired(wiring: Vec<crate::doctor::checks::HarnessWiring>) -> Vec<&'static str> {
+    wiring
         .into_iter()
-        .filter(|w| w.missing.is_empty())
+        .filter(|w| w.missing.is_empty() && w.scope == "global")
         .map(|w| w.harness)
         .collect()
 }
@@ -204,10 +222,20 @@ pub(crate) fn repo(cwd: &Path) -> (Option<PathBuf>, bool) {
 
 /// The full detection pass.
 pub(crate) async fn run(config: &dira_core::Config, cwd: &Path) -> State {
-    let home = dira_core::config::home_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (repo_root, has_zavet_dir) = repo(cwd);
+    let detected_harnesses = match dira_core::config::home_dir() {
+        Ok(home) => harnesses(&home),
+        // No resolvable `$HOME`: the old fallback probed `.` (cwd) instead,
+        // which reads cwd's own *project*-scope config directories (a
+        // `./.claude` committed to the repo you happen to be standing in) as
+        // if they were the user's real, global harness installs — a false
+        // "Claude Code detected" in any repo that merely has one. Reporting
+        // no harnesses is the safe direction: the wizard offers nothing
+        // instead of offering, and possibly wiring, the wrong thing.
+        Err(_) => Vec::new(),
+    };
     State {
-        harnesses: harnesses(&home),
+        harnesses: detected_harnesses,
         supervision: crate::daemon::detect_supervision(config).await,
         repo_root,
         has_zavet_dir,
@@ -222,11 +250,16 @@ pub(crate) async fn run(config: &dira_core::Config, cwd: &Path) -> State {
 
 /// Whether a device id is recorded in the store.
 ///
-/// **Never creates the store.** `Store::open` would happily create the
-/// database and run migrations, which would make detection a write — and
+/// **Never creates the store, and never writes even when it exists.**
+/// `Store::open` would create the database and run migrations on a missing
+/// file, and — the part an existence check alone missed — `Store::open` on
+/// an *existing* WAL-mode database still calls `Store::open`'s writable
+/// path, which creates `-wal`/`-shm` sidecars and can run a pending
+/// migration under an older running daemon. Both are writes, and
 /// `dira onboard --print` promises to change nothing, a promise the whole
-/// dry-run mode rests on. An absent database also cannot contain a device
-/// id, so short-circuiting on the file's existence loses no information.
+/// dry-run mode rests on. `Store::open_readonly` opens read-only and
+/// immutable, and never migrates; an absent database still short-circuits
+/// first since an absent file cannot contain a device id.
 ///
 /// Otherwise best-effort: a store that will not open reports "not linked",
 /// which makes the wizard *offer* the link step. Offering a step that turns
@@ -237,7 +270,7 @@ async fn device_linked(config: &dira_core::Config) -> bool {
     if !config.db_path.exists() {
         return false;
     }
-    let Ok(store) = dira_core::Store::open(&config.db_path).await else {
+    let Ok(store) = dira_core::Store::open_readonly(&config.db_path).await else {
         return false;
     };
     matches!(dira_core::identity::device_id(&store).await, Ok(Some(_)))
@@ -291,6 +324,39 @@ mod tests {
         assert!(h.wired);
         let h = probe_harness(claude(), &home, &["gemini"], true);
         assert!(!h.wired);
+    }
+
+    /// A project-scope wiring (a bare `dira init` run inside one repo) must
+    /// not count as "done" for onboarding, which wires user/global scope —
+    /// otherwise a user who ran `dira init` in one repo gets `AlreadyDone`
+    /// from the harness step and every other repo on the machine stays
+    /// silently uncaptured (DIRASH-0029's "why user scope").
+    #[test]
+    fn only_global_scope_counts_as_wired_for_onboarding() {
+        use crate::doctor::checks::HarnessWiring;
+        let wiring = vec![
+            HarnessWiring {
+                harness: "claude",
+                scope: "project",
+                path: "./.claude/settings.json".to_string(),
+                expected: 5,
+                missing: Vec::new(),
+                commands: Vec::new(),
+            },
+            HarnessWiring {
+                harness: "gemini",
+                scope: "global",
+                path: "/home/x/.gemini/settings.json".to_string(),
+                expected: 5,
+                missing: Vec::new(),
+                commands: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            globally_wired(wiring),
+            vec!["gemini"],
+            "the fully-wired project-scope claude entry must not count"
+        );
     }
 
     /// An already-wired harness is not offered again — that is what makes a

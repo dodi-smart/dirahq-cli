@@ -105,7 +105,10 @@ impl Options {
 /// `dira onboard`.
 pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let state = detect::run(config, &cwd).await;
+    // Mutable: `steps::device` writes `device_linked` back on a successful
+    // link, so the knowledge step's "pending" caveat and the closing
+    // dashboard hint — both later in this same run — see it.
+    let mut state = detect::run(config, &cwd).await;
 
     opts.resolve_defaults();
 
@@ -140,7 +143,7 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
     ));
     results.push((
         "device".into(),
-        steps::device(config, &state, ui.as_mut()).await,
+        steps::device(config, &mut state, ui.as_mut()).await,
     ));
     results.push((
         "zavet".into(),
@@ -161,7 +164,9 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
     // says so when a restart is still needed.
     results.push((
         "knowledge".into(),
-        steps::knowledge(config, &state, &opts, ui.as_mut()),
+        steps::knowledge(&state, &opts, ui.as_mut(), &|raw: &str| {
+            crate::config_cmd::set_quiet(config, "sync.knowledge", raw)
+        }),
     ));
 
     print_summary(&results);

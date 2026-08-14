@@ -72,7 +72,7 @@ struct Cache {
 /// (`update::artifact`), so a single one that still surfaced is worth
 /// mentioning but not alarming. Two in a row means the retries aren't covering
 /// it and the user deserves to know before they lose a week to it.
-const ESCALATE_AFTER_FAILURES: u32 = 2;
+pub(crate) const ESCALATE_AFTER_FAILURES: u32 = 2;
 
 /// Re-check at most once a day after a successful check.
 const SUCCESS_TTL_SECS: i64 = 24 * 60 * 60;
@@ -98,6 +98,35 @@ fn cache_path() -> Option<PathBuf> {
 fn read_cache(path: &Path) -> Option<Cache> {
     let bytes = fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// What the update cache knows, for a reader outside this module.
+///
+/// A flattened copy rather than exposing [`Cache`]: the on-disk shape is this
+/// module's business, and the only other consumer — `doctor`'s `update.lands`
+/// — wants a snapshot to judge, not a file format to maintain.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CacheFacts {
+    /// Unix seconds of the last check.
+    pub checked_at: i64,
+    /// Latest version the last successful check resolved, if any.
+    pub latest: Option<String>,
+    /// Consecutive `dira update` failures — see [`Cache::update_failures`].
+    pub update_failures: u32,
+}
+
+/// Read the update-check cache, or `None` when nothing has ever written it.
+///
+/// Read-only and network-free, so it is safe on any path D-0006 governs.
+/// `None` means "no evidence", which every caller must treat as a skip rather
+/// than as a healthy answer.
+pub(crate) fn cache_facts() -> Option<CacheFacts> {
+    let cache = read_cache(&cache_path()?)?;
+    Some(CacheFacts {
+        checked_at: cache.checked_at,
+        latest: cache.latest,
+        update_failures: cache.update_failures,
+    })
 }
 
 /// True once `cache` is old enough to warrant a refresh. `checked_at: 0`
@@ -164,22 +193,48 @@ impl Env {
 /// path has a `target/{release,debug}` ancestor. Nagging someone running
 /// straight out of `just install` (which symlinks into `target/release`) is
 /// pure noise.
-///
-/// Duplication note for T4: `update::replace::discover_install` (plan §A3)
-/// does the same detection more precisely — via `symlink_metadata` on the
-/// *PATH entry* rather than `current_exe()`, distinguishing a dev symlink
-/// from a dev build outright — because it must decide install *behavior*
-/// (refuse a dev symlink unless `--force`; always refuse a dev build), not
-/// just whether to print a notice. This copy is deliberately independent so
-/// T5 doesn't have to land after T4; unify them once both exist.
 fn is_dev_build() -> bool {
     let Ok(exe) = env::current_exe() else {
         return false;
     };
-    let mut components = exe.components().map(|c| c.as_os_str());
-    let saw_target = components.clone().any(|c| c == "target");
-    let saw_profile_dir = components.any(|c| c == "release" || c == "debug");
-    saw_target && saw_profile_dir
+    is_dev_build_path(&exe)
+}
+
+/// The path-comparison half of [`is_dev_build`], split out so it is testable
+/// against an arbitrary path instead of only the test binary's own
+/// `current_exe()` (which — being built by `cargo test` — always resolves
+/// under `target/debug` regardless of what this function does).
+///
+/// The predicate is
+/// [`replace::under_target_release_or_debug`](super::replace::under_target_release_or_debug),
+/// shared with the D-0004 install guard so the two cannot disagree.
+///
+/// They did. This side matched a `target` component and a `release`/`debug`
+/// component *anywhere* in the path; the guard requires them *adjacent*. So
+/// `/home/target/x/release/dira` read as a dev build here and as an ordinary
+/// install there — the passive notice nagging about an upgrade `dira update`
+/// would then refuse, which is precisely the disagreement D-0006's directive
+/// anticipated. Sharing the predicate is that directive's own escape clause
+/// (unify if the detection rule changes) taken up.
+///
+/// What is deliberately NOT shared is the subject. The guard reads the *PATH
+/// entry* via `symlink_metadata`, because it must tell a dev symlink from a
+/// dev build to decide install behaviour (refuse a symlink unless `--force`,
+/// always refuse a build). This only needs to know what is running now.
+///
+/// Canonicalizing first is load-bearing and stays here: `current_exe()` does
+/// not resolve symlinks consistently across platforms — on Linux it reads
+/// `/proc/self/exe`, already fully resolved, but on macOS it can return the
+/// path as invoked. A `just install` PATH entry (`~/.local/bin/dira` ->
+/// `target/release/dira`) therefore carries no literal `target`/`release`
+/// component on macOS until this resolves it, and without that the notice
+/// recognizes strictly fewer dev installs than the D-0004 guard does.
+/// `canonicalize` failing (a dangling symlink, a removed exe) falls back to
+/// the raw path rather than erroring — "no signal" here, same as everywhere
+/// else in this module.
+fn is_dev_build_path(exe: &Path) -> bool {
+    let resolved = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    super::replace::under_target_release_or_debug(&resolved)
 }
 
 /// Decide whether a notice should be printed, and if so, its exact text.
@@ -219,6 +274,20 @@ fn should_notify(cache: &Cache, env: &Env, is_tty: bool, current_version: &str) 
 /// on-disk shape is produced in exactly one place (the previous split between
 /// this module and `mod.rs`'s hand-rolled `json!` is what made it easy to add
 /// a field in one and silently drop it in the other).
+///
+/// Writes to a same-directory temp file, then `rename`s it onto `path` —
+/// same D-0003 spirit as the binary swap, applied to a 100-byte JSON file
+/// instead of an executable. A bare `fs::write` truncates in place, and this
+/// file has a genuine writer race: `dira update`'s own `record_update_failure`
+/// / `clear_update_failures` can run concurrently with the *detached*
+/// `dira update --check` this same module spawns (`spawn_refresh`) reading
+/// and rewriting the very same path from a separate process. A reader mid-way
+/// through a truncated write sees a torn, unparseable file — harmless here
+/// only because [`read_cache`] already treats corrupt JSON as "no cache", but
+/// that silently drops whatever the truncated writer was recording (e.g. a
+/// bumped failure count) rather than actually losing nothing. `rename` makes
+/// every reader see either the old, complete file or the new, complete file,
+/// never a partial one.
 fn write_cache(path: &Path, cache: &Cache) {
     let Some(parent) = path.parent() else {
         return;
@@ -226,8 +295,19 @@ fn write_cache(path: &Path, cache: &Cache) {
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    if let Ok(bytes) = serde_json::to_vec(cache) {
-        let _ = fs::write(path, bytes);
+    let Ok(bytes) = serde_json::to_vec(cache) else {
+        return;
+    };
+    // `ulid` is already a direct dependency (see `mod.rs`'s `Workdir`), so a
+    // per-write unique suffix costs nothing new and rules out two concurrent
+    // writers colliding on the same staging path.
+    let staging = path.with_extension(format!("json.tmp.{}", ulid::Ulid::generate()));
+    if fs::write(&staging, bytes).is_err() {
+        let _ = fs::remove_file(&staging);
+        return;
+    }
+    if fs::rename(&staging, path).is_err() {
+        let _ = fs::remove_file(&staging);
     }
 }
 
@@ -565,6 +645,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `write_cache` must land the final file via `rename`, not a bare
+    /// truncating `fs::write` — and must leave no `.tmp.<ulid>` staging file
+    /// behind on the successful path (the detached-checker race this exists
+    /// for is exactly what would otherwise litter the cache directory over
+    /// time).
+    #[test]
+    fn write_cache_lands_atomically_and_leaves_no_staging_file_behind() {
+        let dir = std::env::temp_dir().join(format!("dira-notice-{}", ulid::Ulid::generate()));
+        let path = dir.join("update-check.json");
+        let c = cache_with_failures("0.5.0", 2);
+
+        write_cache(&path, &c);
+
+        let read_back = read_cache(&path).expect("write_cache must produce a readable file");
+        assert_eq!(read_back, c);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![std::ffi::OsString::from("update-check.json")],
+            "no staging file should survive a successful write: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second write must fully replace the first, not merge with it —
+    /// pins that `rename` (not an append or a partial overwrite) is really
+    /// what lands the file.
+    #[test]
+    fn write_cache_a_second_write_fully_replaces_the_first() {
+        let dir = std::env::temp_dir().join(format!("dira-notice-{}", ulid::Ulid::generate()));
+        let path = dir.join("update-check.json");
+
+        write_cache(&path, &cache(1, Some("0.1.0"), None));
+        write_cache(&path, &cache(2, Some("0.2.0"), None));
+
+        let read_back = read_cache(&path).unwrap();
+        assert_eq!(read_back.checked_at, 2);
+        assert_eq!(read_back.latest.as_deref(), Some("0.2.0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Old cache files predate both fields; they must still parse.
     #[test]
     fn a_cache_without_the_failure_fields_still_reads() {
@@ -733,6 +859,111 @@ mod tests {
             ..allow_env()
         }
         .checking_disabled());
+    }
+
+    // --- is_dev_build_path (symlink canonicalization) ------------------------
+
+    #[test]
+    fn dev_build_path_matches_a_plain_target_debug_path() {
+        assert!(is_dev_build_path(Path::new(
+            "/home/dev/dirahq-cli/target/debug/dira"
+        )));
+        assert!(is_dev_build_path(Path::new(
+            "/home/dev/dirahq-cli/target/release/dira"
+        )));
+    }
+
+    #[test]
+    fn dev_build_path_does_not_match_an_installed_path() {
+        assert!(!is_dev_build_path(Path::new("/home/user/.local/bin/dira")));
+    }
+
+    /// #124: the notice and the D-0004 install guard must answer the same
+    /// question the same way. They did not — this side matched `target` and
+    /// `release` as *separate* components anywhere in the path, so a user
+    /// whose home happened to sit under a `target/` directory got nagged
+    /// about an upgrade `dira update` would then refuse (or, with the paths
+    /// reversed, silently never got told). Both now go through
+    /// `replace::under_target_release_or_debug`, which requires adjacency.
+    #[test]
+    fn dev_build_path_agrees_with_the_install_guards_predicate() {
+        for path in [
+            // The trap: `target` and `release` both present, not adjacent.
+            "/home/target/projects/release/dira",
+            "/target/x/debug/dira",
+            "/home/user/.local/bin/dira",
+            "/home/dev/dirahq-cli/target/debug/dira",
+            "/home/dev/dirahq-cli/target/release/dira",
+        ] {
+            let p = Path::new(path);
+            assert_eq!(
+                is_dev_build_path(p),
+                super::super::replace::under_target_release_or_debug(p),
+                "the notice and the install guard disagree about {path}"
+            );
+        }
+    }
+
+    /// The concrete case the shared predicate fixes, pinned on its own so a
+    /// regression names the behaviour rather than just "they disagree".
+    #[test]
+    fn a_non_adjacent_target_and_release_is_not_a_dev_build() {
+        assert!(!is_dev_build_path(Path::new(
+            "/home/target/projects/release/dira"
+        )));
+    }
+
+    /// The regression this exists to fix: on macOS `current_exe()` can return
+    /// the path as invoked — a `just install` symlink, unresolved — which
+    /// carries no `target`/`release` component at all until canonicalized.
+    /// Builds a real symlink chain (`bin/dira` -> `target/release/dira`) and
+    /// confirms `is_dev_build_path` still recognizes it via the *unresolved*
+    /// symlink path, exactly the shape `current_exe()` can hand back.
+    #[cfg(unix)]
+    #[test]
+    fn dev_build_path_resolves_a_symlink_into_target_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("target").join("release");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_exe = real_dir.join("dira");
+        fs::write(&real_exe, b"fake").unwrap();
+
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let symlink_path = bin_dir.join("dira");
+        std::os::unix::fs::symlink(&real_exe, &symlink_path).unwrap();
+
+        assert!(
+            is_dev_build_path(&symlink_path),
+            "an unresolved symlink into target/release must still canonicalize to a dev build"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_build_path_falls_back_to_the_raw_path_on_a_dangling_symlink() {
+        // canonicalize() fails on a dangling symlink; this must not panic or
+        // error, and must not lose the signal either — fall back to judging
+        // the unresolved path itself, which is still under target/release
+        // here even though the symlink's *target* does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        let release_dir = dir.path().join("target").join("release");
+        fs::create_dir_all(&release_dir).unwrap();
+        let symlink_path = release_dir.join("dira");
+        std::os::unix::fs::symlink(dir.path().join("nonexistent-target-binary"), &symlink_path)
+            .unwrap();
+        assert!(
+            fs::canonicalize(&symlink_path).is_err(),
+            "the fixture must actually be dangling for this test to mean anything"
+        );
+
+        assert!(
+            is_dev_build_path(&symlink_path),
+            "a dangling symlink whose own path is under target/release must still fall back to matching"
+        );
+
+        let installed_like = dir.path().join("bin").join("dira-does-not-exist");
+        assert!(!is_dev_build_path(&installed_like));
     }
 
     // --- Env::from_process wiring -------------------------------------------

@@ -265,47 +265,68 @@ async fn still_up_after(config: &Config, attempts: u32, interval: std::time::Dur
     true
 }
 
-/// Ask a bare (non-service-managed) windows dirad to shut down gracefully over
-/// the pipe, wait for the PROCESS to exit, then escalate to `taskkill /F` and
-/// wait again. Windows has no unix-style signal a process can trap for a clean
-/// shutdown, so this asks nicely first via the same in-band `Request::Shutdown`
-/// `dirad` already answers with `Response::Ok` before winding itself down. A
-/// plain `taskkill` (no `/F`) can't reliably stop a windowless background
-/// process, so the escalation goes straight to the force flag rather than
-/// trying a graceful `taskkill` first. Shared by `stop`'s and `restart_bare`'s
-/// windows branches — same escalation order both places.
+/// Ask a bare (non-service-managed) dirad to shut down, wait for the PROCESS to
+/// exit, then escalate to a forced kill and wait again.
 ///
 /// Returns whether the process is confirmed gone. Callers that are about to
-/// start a replacement MUST NOT proceed on `false`: the single-instance guard is
-/// the pipe bind, and the pipe name stays taken until the old process's handles
-/// are released, so spawning early races a guard that cannot yet refuse.
-async fn graceful_then_force_windows(
+/// start a replacement MUST NOT proceed on `false` — the single-instance guard
+/// is the socket/pipe bind, and the name stays taken until the old process's
+/// handles are released, so spawning early races a guard that cannot yet refuse
+/// (D-0019).
+///
+/// One function with the platform seam inside, matching how `pid_is_alive`,
+/// `wait_for_exit` and `alive_pid_at` already take `os`. Only the ask and the
+/// force differ; the sequence — parse, wait, escalate, re-wait on the capped
+/// budget — is the invariant, and two copies of it would be two copies to keep
+/// identical by hand. That is the same reasoning DIRASH-0031 applied to the
+/// backoff ladder.
+///
+/// **Windows** has no unix-style signal a process can trap, so it asks nicely
+/// via the in-band `Request::Shutdown` that `dirad` answers with `Response::Ok`
+/// before winding down, and escalates straight to `taskkill /F` — a plain
+/// `taskkill` cannot reliably stop a windowless background process. **Unix**
+/// sends SIGTERM and escalates to SIGKILL.
+async fn graceful_then_force(
     config: &Config,
     pid: &str,
     runner: &dyn Runner,
+    os: Os,
     attempts: u32,
     interval: std::time::Duration,
 ) -> bool {
-    let _ = client::send(&config.socket_path, &Request::Shutdown).await;
+    let windows = os == Os::Windows;
+    if windows {
+        let _ = client::send(&config.socket_path, &Request::Shutdown).await;
+    } else {
+        let _ = runner.run("kill", &[pid]);
+    }
 
-    // Without a parseable pid there is no process to wait on; fall back to the
-    // old channel-based probe and report honestly that exit was not confirmed.
+    // Without a parseable pid there is no process to wait on. Windows falls back
+    // to the channel-based probe first — it is the platform where a lingering
+    // pipe handle is the whole hazard — but both report honestly that exit was
+    // not confirmed.
     let Ok(parsed) = pid.trim().parse::<u32>() else {
-        let _ = still_up_after(config, attempts, interval).await;
+        if windows {
+            let _ = still_up_after(config, attempts, interval).await;
+        }
         return false;
     };
 
-    if wait_for_exit(parsed, runner, Os::Windows, attempts, interval).await {
+    if wait_for_exit(parsed, runner, os, attempts, interval).await {
         return true;
     }
-    let _ = runner.run("taskkill", &["/PID", pid, "/F"]);
+    if windows {
+        let _ = runner.run("taskkill", &["/PID", pid, "/F"]);
+    } else {
+        let _ = runner.run("kill", &["-9", pid]);
+    }
     // Cap the post-kill confirmation at the production budget, but never exceed
     // the caller's own — a test injecting a few milliseconds must not then block
     // on a five-second reap.
     wait_for_exit(
         parsed,
         runner,
-        Os::Windows,
+        os,
         attempts.min(KILL_CONFIRM_ATTEMPTS),
         interval,
     )
@@ -313,10 +334,27 @@ async fn graceful_then_force_windows(
 }
 
 pub async fn stop(config: &Config) -> Result<()> {
-    stop_with(config, &SystemRunner, current_os()).await
+    stop_with(
+        config,
+        &SystemRunner,
+        current_os(),
+        STOP_GRACE_ATTEMPTS,
+        STOP_GRACE_INTERVAL,
+    )
+    .await
 }
 
-async fn stop_with(config: &Config, runner: &dyn Runner, os: Os) -> Result<()> {
+/// `attempts`/`interval` are parameters for the same reason `restart_*` take
+/// them: so the "will not die" branch runs on a millisecond budget in tests
+/// instead of spending the real 15s grace window. Every production call site
+/// passes [`STOP_GRACE_ATTEMPTS`]/[`STOP_GRACE_INTERVAL`].
+async fn stop_with(
+    config: &Config,
+    runner: &dyn Runner,
+    os: Os,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> Result<()> {
     let pf = pidfile(config);
     let pid = match std::fs::read_to_string(&pf) {
         Ok(s) => s.trim().to_string(),
@@ -326,31 +364,14 @@ async fn stop_with(config: &Config, runner: &dyn Runner, os: Os) -> Result<()> {
         }
     };
 
-    if os == Os::Windows {
-        let stopped = graceful_then_force_windows(
-            config,
-            &pid,
-            runner,
-            STOP_GRACE_ATTEMPTS,
-            STOP_GRACE_INTERVAL,
-        )
-        .await;
-        if !stopped {
-            // The pidfile stays: it is the only handle left on a process we
-            // could not stop. Printing "stopped" here would be a plain lie, and
-            // the common cause is a `taskkill` refused against an elevated
-            // daemon from a non-elevated shell.
-            anyhow::bail!(
-                "could not confirm dirad (pid {pid}) exited — it may be running with \
-                 different privileges (e.g. started from an Administrator terminal). \
-                 Stop it from a terminal at the same privilege level:\n  \
-                 taskkill /PID {pid} /F"
-            );
-        }
-        std::fs::remove_file(&pf).ok();
-    } else {
-        let _ = Command::new("kill").arg(&pid).status();
-        std::fs::remove_file(&pf).ok();
+    // One escalation sequence, one call. The pidfile is released only once exit
+    // is CONFIRMED: it is the last handle on a process we could not stop, and
+    // printing "stopped" over it would be a plain lie.
+    if !graceful_then_force(config, &pid, runner, os, attempts, interval).await {
+        anyhow::bail!("{}", unconfirmed_exit_advice(&pid, os));
+    }
+    std::fs::remove_file(&pf).ok();
+    if os != Os::Windows {
         // A named pipe isn't a filesystem object, so there is nothing to unlink
         // on windows — `run()`'s own teardown already gates this the same way.
         std::fs::remove_file(&config.socket_path).ok();
@@ -358,6 +379,25 @@ async fn stop_with(config: &Config, runner: &dyn Runner, os: Os) -> Result<()> {
 
     println!("stopped dirad (pid {pid})");
     Ok(())
+}
+
+/// What to tell a user whose daemon would not die. The cause is almost always a
+/// privilege mismatch, and the command that fixes it is per-OS — which is why
+/// this stays split while the escalation itself does not.
+fn unconfirmed_exit_advice(pid: &str, os: Os) -> String {
+    if os == Os::Windows {
+        format!(
+            "could not confirm dirad (pid {pid}) exited — it may be running with \
+             different privileges (e.g. started from an Administrator terminal). \
+             Stop it from a terminal at the same privilege level:\n  \
+             taskkill /PID {pid} /F"
+        )
+    } else {
+        format!(
+            "could not confirm dirad (pid {pid}) exited — it may be running as another \
+             user. Stop it from a terminal with the same privileges:\n  kill -9 {pid}"
+        )
+    }
 }
 
 /// The `dirad: down` line, plus — when a daemon is still answering on the
@@ -641,7 +681,87 @@ async fn status_with(config: &Config, legacy_sock: &Path) -> Result<bool> {
 }
 
 /// Write and load an OS service so the daemon survives reboots.
-pub fn install(config: &Config) -> Result<()> {
+///
+/// Stops an unmanaged daemon first, and waits for it to actually exit.
+///
+/// This is not a convenience — it is the only ordering that works. D-0009 makes
+/// the control socket the single-instance guard, so a service installed while a
+/// bare-started daemon holds it cannot bind: launchd (`KeepAlive=true`), systemd
+/// (`Restart=always`) and the windows logon task all then restart the loser, in
+/// a loop, for as long as the old process lives.
+///
+/// It used to live in the callers, which meant it lived in *three* of them —
+/// the onboard step, `install.sh` and `install.ps1` — and not in the fourth. A
+/// bare `dira daemon install` on a machine with a hand-started `dirad` walked
+/// straight into the flap, and that is the documented path a user following the
+/// old "run `dira daemon start`" advice was on. Centralising it here is what
+/// makes every caller correct by construction; the installers keep their own
+/// best-effort `dira daemon stop` only because they may be driving an older
+/// binary that lacks this.
+///
+/// A daemon under a service manager already is left alone: stopping it would
+/// just make its supervisor restart it mid-install.
+pub async fn install(config: &Config) -> Result<()> {
+    install_with_supervision(config, detect_supervision(config).await).await
+}
+
+/// [`install`] for a caller that has already probed supervision.
+///
+/// `detect_supervision` is not cheap — a `launchctl list` / `schtasks /Query`
+/// plus `reg query` subprocess, a pidfile probe and a socket round-trip — and
+/// `onboard` holds the answer already. Same guarantee either way: the pre-stop
+/// is inside, not at the call site.
+pub async fn install_with_supervision(config: &Config, supervision: Supervision) -> Result<()> {
+    stop_unmanaged_before_install(
+        config,
+        supervision,
+        &SystemRunner,
+        current_os(),
+        STOP_GRACE_ATTEMPTS,
+        STOP_GRACE_INTERVAL,
+    )
+    .await?;
+    install_service(config)
+}
+
+/// Stop a bare-started daemon so [`install`] can bind the control socket.
+///
+/// Silent and inert when there is nothing to do, which is the common case: no
+/// pidfile, or the daemon already supervised. A stop that cannot confirm the
+/// process exited is a hard error — installing on top of it would produce
+/// exactly the flap this exists to prevent, and D-0019 forbids proceeding to
+/// start a replacement without that confirmation.
+async fn stop_unmanaged_before_install(
+    config: &Config,
+    supervision: Supervision,
+    runner: &dyn Runner,
+    os: Os,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> Result<()> {
+    // Only the states that mean "running, and nothing is supervising it". A
+    // daemon a service manager already owns is left alone — stopping it would
+    // just make its supervisor restart it mid-install — and `NotRunning` has
+    // nothing to stop.
+    //
+    // `supervision` is a parameter rather than probed here so the three arms are
+    // unit-testable without a live daemon, the same seam `restart_*` already use
+    // for their grace budgets.
+    let running_unmanaged = matches!(
+        supervision,
+        Supervision::Pidfile(_) | Supervision::Socket(_) | Supervision::LegacySocket { .. }
+    );
+    if !running_unmanaged {
+        return Ok(());
+    }
+    println!("stopping the unsupervised daemon first (it holds the control socket)");
+    stop_with(config, runner, os, attempts, interval)
+        .await
+        .context("could not stop the running daemon, so the service cannot bind the socket")
+}
+
+/// The service-manager half of [`install`], with no daemon handling of its own.
+fn install_service(config: &Config) -> Result<()> {
     let bin = locate_dirad();
     // `dunce::canonicalize` behaves exactly like `std::fs::canonicalize` on
     // unix, but on windows it strips the `\\?\` verbatim-prefix windows'
@@ -992,7 +1112,63 @@ fn pid_is_alive(pid: u32, runner: &dyn Runner, os: Os) -> bool {
     let Some(out) = runner.run("kill", &["-0", &pid.to_string()]) else {
         return false;
     };
+    if !out.status.success() {
+        return false;
+    }
+    // `kill -0` answers "does this PID exist", which is not the same question as
+    // "is this process running". A pid stays allocated after exit until its
+    // parent reaps it, and `kill -0` succeeds on that zombie — SIGKILL included,
+    // since there is nothing left to kill.
+    //
+    // `dira daemon start` spawns `dirad` and exits, so `dirad` is orphaned onto
+    // pid 1. Any init reaps it immediately and this never shows. A container
+    // whose pid 1 is not a reaper (`tail -f /dev/null`, the shape GitHub
+    // Actions' container jobs use) never does, so the process reads as alive
+    // forever: `stop` burned its whole grace budget, force-killed a corpse, and
+    // then reported it could not confirm exit.
+    //
+    // A zombie IS exited for every purpose a caller here has: the kernel closed
+    // its fds at exit, so D-0009's flock and the control socket are already
+    // released and a replacement can bind. Treating it as alive is the bug.
+    !pid_is_zombie(pid, runner, os)
+}
+
+/// True if `pid` exists but has already exited and is only awaiting reaping.
+///
+/// Two probes because there is no one portable answer. Linux — including the
+/// musl/BusyBox images this matters most on — has `/proc`, which needs no
+/// subprocess at all. macOS has no `/proc` and needs `ps`; that is also why
+/// `ps` cannot be the single implementation, since BusyBox's `ps` supports
+/// neither `-p` nor `-o`.
+///
+/// Anything unreadable answers `false`: a probe that cannot see is not evidence
+/// of death, and over-reporting "exited" would let a replacement start against
+/// a daemon that is genuinely still running (D-0019).
+fn pid_is_zombie(pid: u32, runner: &dyn Runner, os: Os) -> bool {
+    if os == Os::Linux {
+        return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| proc_stat_state(&stat))
+            == Some('Z');
+    }
+    let Some(out) = runner.run("ps", &["-o", "state=", "-p", &pid.to_string()]) else {
+        return false;
+    };
     out.status.success()
+        && String::from_utf8_lossy(&out.stdout)
+            .trim_start()
+            .starts_with('Z')
+}
+
+/// The process-state field of a `/proc/<pid>/stat` line.
+///
+/// The format is `pid (comm) state ...`, and `comm` is the raw executable name:
+/// it can contain spaces *and* parentheses, so neither splitting on whitespace
+/// nor finding the first `)` is safe. The kernel's own documented parse is to
+/// anchor on the LAST `)`, which is what this does.
+fn proc_stat_state(stat: &str) -> Option<char> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().next()?.chars().next()
 }
 
 /// Poll until `pid` is gone, up to `attempts × interval`. Returns whether exit
@@ -1217,8 +1393,15 @@ async fn restart_scheduled_task_with(
 
     match pid {
         Some(pid) => {
-            if !graceful_then_force_windows(config, &pid.to_string(), runner, attempts, interval)
-                .await
+            if !graceful_then_force(
+                config,
+                &pid.to_string(),
+                runner,
+                Os::Windows,
+                attempts,
+                interval,
+            )
+            .await
             {
                 anyhow::bail!(
                     "dirad (pid {pid}) did not exit — refusing to start a second daemon \
@@ -1283,7 +1466,7 @@ async fn restart_scheduled_task_with(
 /// real daemon — starting one is still the part no test here attempts.
 ///
 /// Unix shape (`kill`, files beside the socket): windows bare daemons go
-/// through [`graceful_then_force_windows`] in [`restart_bare`] instead — a
+/// through [`graceful_then_force`] in [`restart_bare`] instead — a
 /// pipe endpoint has no files to clean, and windows has no `kill`.
 async fn reap(pid: u32, sock: &Path, runner: &dyn Runner) {
     let _ = runner.run("kill", &[&pid.to_string()]);
@@ -1333,7 +1516,7 @@ async fn restart_bare(
 /// [`restart_bare`] with an injectable grace budget, so tests can exercise the
 /// refuse-to-spawn branch on a few milliseconds instead of the real 15 s window
 /// — the same seam, and for the same reason, as
-/// [`graceful_then_force_windows`]'s parameters.
+/// [`graceful_then_force`]'s parameters.
 async fn restart_bare_with(
     config: &Config,
     pid: u32,
@@ -1350,7 +1533,15 @@ async fn restart_bare_with(
         // it lingers races a guard that cannot yet refuse, and the replacement
         // either dies on `first_pipe_instance` (leaving zero daemons) or, on the
         // scheduled-task path, lands beside a live one.
-        if !graceful_then_force_windows(config, &pid.to_string(), runner, attempts, interval).await
+        if !graceful_then_force(
+            config,
+            &pid.to_string(),
+            runner,
+            Os::Windows,
+            attempts,
+            interval,
+        )
+        .await
         {
             // Deliberately leave the pidfile: it is the only remaining handle on
             // a process we could not stop, and deleting it would make the
@@ -1607,6 +1798,23 @@ mod tests {
             )
         }
 
+        /// The container case: `kill -0` keeps succeeding because the pid is a
+        /// zombie nobody has reaped, and `ps` reports state `Z`.
+        fn zombie_unix(self) -> Self {
+            self.returning("kill", &["-0", "4242"], 0, "").returning(
+                "ps",
+                &["-o", "state=", "-p", "4242"],
+                0,
+                "Z+\n",
+            )
+        }
+
+        /// The unix twin of [`Self::always_alive`]: `kill -0` keeps succeeding,
+        /// so the process is never confirmed gone however hard it is signalled.
+        fn always_alive_unix(self) -> Self {
+            self.returning("kill", &["-0", "4242"], 0, "")
+        }
+
         fn called(&self, prog: &str, args: &[&str]) -> bool {
             self.calls.borrow().contains(&key(prog, args))
         }
@@ -1626,6 +1834,20 @@ mod tests {
             // responses can't express that, and the whole point of the restart
             // sequence is the transition — "still listed" before the kill,
             // "gone" after it.
+            // The unix liveness probe, with the same transition: `kill -0`
+            // succeeds until the process has been signalled, then fails.
+            if self.dies_when_killed && prog == "kill" && args.first() == Some(&"-0") {
+                let signalled = self
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|c| c.starts_with("kill ") && !c.starts_with("kill -0 "));
+                return Some(Output {
+                    status: fake_exit_status(i32::from(signalled)),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
             if self.dies_when_killed && prog == "tasklist" {
                 let killed = self
                     .calls
@@ -2351,24 +2573,239 @@ mod tests {
         assert!(err.to_string().contains("schtasks /Run /TN DiraDaemon"));
     }
 
-    // -- windows stop/restart escalation (`graceful_then_force_windows`) ----
+    // -- windows stop/restart escalation (`graceful_then_force`) ------------
 
     #[tokio::test]
-    async fn graceful_then_force_windows_skips_taskkill_when_the_process_exits() {
+    async fn graceful_then_force_skips_the_kill_when_the_process_exits() {
         let config = test_config("win-stop-graceful");
         // `tasklist` has no stub, so the probe reports the process gone on the
         // first poll — a dirad that honoured the graceful `Shutdown`.
         let runner = FakeRunner::default();
-        let stopped = graceful_then_force_windows(
+        let stopped = graceful_then_force(
             &config,
             "4242",
             &runner,
+            Os::Windows,
             2,
             std::time::Duration::from_millis(5),
         )
         .await;
         assert!(stopped, "an exited process must be reported as stopped");
         assert!(!runner.called("taskkill", &["/PID", "4242", "/F"]));
+    }
+
+    // --- a zombie pid is exited, not alive ---------------------------------
+
+    /// The alpine smoke-leg regression. `kill -0` answers "does this pid exist",
+    /// and a pid stays allocated after exit until its parent reaps it — so on a
+    /// container whose pid 1 is not a reaper, an exited `dirad` read as alive
+    /// forever. `stop` burned its full grace budget, force-killed a corpse, and
+    /// then refused to confirm the exit that had already happened.
+    #[tokio::test]
+    async fn a_zombie_pid_is_not_alive() {
+        let runner = FakeRunner::default().zombie_unix();
+        assert!(
+            !pid_is_alive(4242, &runner, Os::Macos),
+            "a reaped-pending process has already released its fds, flock and socket"
+        );
+    }
+
+    /// …and the whole stop sequence therefore succeeds instead of erroring out
+    /// after the full 20s budget.
+    #[tokio::test]
+    async fn stopping_a_zombie_confirms_the_exit_it_already_made() {
+        let config = test_config("unix-stop-zombie");
+        let pf = pidfile(&config);
+        std::fs::write(&pf, "4242").unwrap();
+        let runner = FakeRunner::default().zombie_unix();
+
+        stop_with(&config, &runner, Os::Macos, 2, FAST)
+            .await
+            .expect("an exited-but-unreaped daemon is stopped");
+
+        assert!(
+            !runner.called("kill", &["-9", "4242"]),
+            "there is nothing left to force-kill"
+        );
+        assert!(!pf.exists(), "the pidfile is released");
+    }
+
+    /// A live process must still read as live — the fix must not make every
+    /// `kill -0` hit answer "gone", which would let a replacement start against
+    /// a daemon that is genuinely running (D-0019).
+    #[tokio::test]
+    async fn a_running_pid_is_still_alive() {
+        let runner = FakeRunner::default()
+            .returning("kill", &["-0", "4242"], 0, "")
+            .returning("ps", &["-o", "state=", "-p", "4242"], 0, "S\n");
+        assert!(pid_is_alive(4242, &runner, Os::Macos));
+    }
+
+    /// An unreadable probe is not evidence of death. `ps` missing or failing
+    /// must leave the verdict at "alive", never flip it.
+    #[tokio::test]
+    async fn an_unanswerable_zombie_probe_leaves_the_pid_alive() {
+        // `kill -0` succeeds, `ps` is not scripted at all -> runner returns None.
+        let runner = FakeRunner::default().returning("kill", &["-0", "4242"], 0, "");
+        assert!(pid_is_alive(4242, &runner, Os::Macos));
+    }
+
+    /// `comm` is the raw executable name: it can contain spaces and parentheses,
+    /// so the state field is only findable by anchoring on the LAST `)`.
+    #[test]
+    fn proc_stat_state_survives_a_hostile_comm() {
+        assert_eq!(proc_stat_state("154 (dirad) Z 1 154 154 0 -1"), Some('Z'));
+        assert_eq!(proc_stat_state("154 (dirad) S 1 154"), Some('S'));
+        assert_eq!(
+            proc_stat_state("154 (weird (name) with ) spaces) Z 1 154"),
+            Some('Z'),
+            "the last ')' ends comm, not the first"
+        );
+        assert_eq!(proc_stat_state("garbage with no parens"), None);
+        assert_eq!(proc_stat_state(""), None);
+    }
+
+    // --- unix stop confirms exit, and install stops first (#123 / D-0019) ---
+
+    /// A grace budget short enough that the "will not die" branch costs
+    /// milliseconds instead of the real 15s window.
+    const FAST: std::time::Duration = std::time::Duration::from_millis(5);
+
+    /// A `kill` is a request, not an outcome. Unix used to signal, unlink the
+    /// pidfile and the socket, and print "stopped" without ever asking whether
+    /// the process had gone — so every caller that pre-stopped before
+    /// `daemon install` was racing D-0009's socket guard, and unlinking the
+    /// socket out from under a live daemon made it worse.
+    #[tokio::test]
+    async fn unix_stop_waits_for_the_process_to_actually_exit() {
+        let config = test_config("unix-stop-graceful");
+        let pf = pidfile(&config);
+        std::fs::write(&pf, "4242").unwrap();
+        let runner = FakeRunner::default().dying_when_killed();
+
+        stop_with(&config, &runner, Os::Macos, 2, FAST)
+            .await
+            .expect("a process that exits on SIGTERM stops cleanly");
+
+        assert!(
+            runner.called("kill", &["-0", "4242"]),
+            "exit must be confirmed by probing the process, not assumed"
+        );
+        assert!(
+            !runner.called("kill", &["-9", "4242"]),
+            "a daemon that honoured SIGTERM must never be force-killed"
+        );
+        assert!(
+            !pf.exists(),
+            "the pidfile is released once exit is confirmed"
+        );
+    }
+
+    /// The unix twin of `escalation_keys_on_the_process_not_the_control_channel`.
+    /// A daemon that will not die (another user's, say) must escalate and then
+    /// report failure — never claim success, because the caller uses that answer
+    /// to decide whether it may install a service over the top.
+    #[tokio::test]
+    async fn unix_stop_escalates_then_refuses_to_claim_an_unconfirmed_exit() {
+        let config = test_config("unix-stop-stubborn");
+        let pf = pidfile(&config);
+        std::fs::write(&pf, "4242").unwrap();
+        let runner = FakeRunner::default().always_alive_unix();
+
+        let err = stop_with(&config, &runner, Os::Macos, 2, FAST)
+            .await
+            .expect_err("a surviving process must not report as stopped");
+
+        assert!(
+            runner.called("kill", &["-9", "4242"]),
+            "SIGTERM being ignored must escalate to SIGKILL"
+        );
+        assert!(
+            format!("{err:#}").contains("4242"),
+            "the error must name the surviving pid: {err:#}"
+        );
+        assert!(
+            pf.exists(),
+            "the pidfile is the only handle left on a process we could not stop"
+        );
+    }
+
+    /// #123: the pre-stop lived in three callers and not in the fourth. A bare
+    /// `dira daemon install` walked into the flap — install now owns it.
+    #[tokio::test]
+    async fn install_stops_a_bare_daemon_before_registering_the_service() {
+        let config = test_config("install-stops-bare");
+        std::fs::write(pidfile(&config), "4242").unwrap();
+        let runner = FakeRunner::default().dying_when_killed();
+
+        stop_unmanaged_before_install(
+            &config,
+            Supervision::Pidfile(4242),
+            &runner,
+            Os::Macos,
+            2,
+            FAST,
+        )
+        .await
+        .expect("a stoppable daemon is stopped");
+
+        assert!(
+            runner.called("kill", &["4242"]),
+            "an unmanaged daemon holds the socket the service is about to bind"
+        );
+    }
+
+    /// D-0019's directive applied to this path: never proceed to start a
+    /// replacement — which `launchctl load` / `systemctl --now` / `schtasks
+    /// /Run` all are — while the old pid is still alive. Installing anyway is
+    /// precisely how the supervisor ends up restarting a loser in a loop.
+    #[tokio::test]
+    async fn install_refuses_when_the_old_daemon_cannot_be_confirmed_gone() {
+        let config = test_config("install-stubborn");
+        std::fs::write(pidfile(&config), "4242").unwrap();
+        let runner = FakeRunner::default().always_alive_unix();
+
+        stop_unmanaged_before_install(
+            &config,
+            Supervision::Pidfile(4242),
+            &runner,
+            Os::Macos,
+            2,
+            FAST,
+        )
+        .await
+        .expect_err("installing over a live daemon is the flap this prevents");
+    }
+
+    /// A daemon a service manager already owns must be left alone: stopping it
+    /// only makes its supervisor restart it in the middle of the install.
+    #[tokio::test]
+    async fn install_leaves_an_already_supervised_daemon_running() {
+        let config = test_config("install-supervised");
+        std::fs::write(pidfile(&config), "4242").unwrap();
+
+        for supervision in [
+            Supervision::Launchd,
+            Supervision::SystemdUser,
+            Supervision::ScheduledTask,
+            Supervision::NotRunning,
+        ] {
+            let runner = FakeRunner::default().dying_when_killed();
+            stop_unmanaged_before_install(
+                &config,
+                supervision.clone(),
+                &runner,
+                Os::Macos,
+                2,
+                FAST,
+            )
+            .await
+            .expect("nothing to do");
+            assert!(
+                !runner.called("kill", &["4242"]),
+                "{supervision:?} must not be stopped by install"
+            );
+        }
     }
 
     /// A daemon that stops ANSWERING is not a daemon that has exited.
@@ -2387,10 +2824,11 @@ mod tests {
             0,
             "",
         );
-        let stopped = graceful_then_force_windows(
+        let stopped = graceful_then_force(
             &config,
             "4242",
             &runner,
+            Os::Windows,
             2,
             std::time::Duration::from_millis(5),
         )
@@ -2415,10 +2853,11 @@ mod tests {
             0,
             "",
         );
-        let stopped = graceful_then_force_windows(
+        let stopped = graceful_then_force(
             &config,
             "4242",
             &runner,
+            Os::Windows,
             2,
             std::time::Duration::from_millis(5),
         )
@@ -2492,7 +2931,9 @@ mod tests {
         // Nothing listening → graceful attempt "succeeds" (there's nothing to
         // force-kill), so `taskkill` must not be invoked.
         let runner = FakeRunner::default();
-        assert!(stop_with(&config, &runner, Os::Windows).await.is_ok());
+        assert!(stop_with(&config, &runner, Os::Windows, 2, FAST)
+            .await
+            .is_ok());
         assert!(!pidfile(&config).exists());
         assert!(!runner.called("taskkill", &["/PID", "4242", "/F"]));
     }

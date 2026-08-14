@@ -940,27 +940,49 @@ main() {
   # 14. daemon handling: default do nothing. If one was already running,
   # always restart it -- otherwise the user is left with a new CLI nagging
   # about an old daemon. --no-daemon opts all the way out.
+  #
+  # The service question is decided FIRST, before anything else touches the
+  # daemon. `dira daemon install` (launchd KeepAlive=true / systemd
+  # Restart=always) never stops an already-running unmanaged daemon itself,
+  # so restarting or starting one and THEN installing the service left the
+  # freshly-installed service racing an already-live bare process for
+  # D-0009's single-instance control-socket flock -- both sides losing the
+  # race in turn and respawning indefinitely. Deciding first and taking
+  # exactly one of the three arms below removes the race instead of papering
+  # over it.
   if [ "$no_daemon" != "1" ]; then
-    if [ "$daemon_was_running" = "1" ]; then
-      info "restarting dirad..."
-      "$bin_dir/dira" daemon restart || warn "could not restart dirad automatically -- run '$bin_dir/dira daemon restart' yourself"
-    elif [ "$start_daemon" = "1" ]; then
-      info "starting dirad..."
-      "$bin_dir/dira" daemon start || warn "could not start dirad automatically -- run '$bin_dir/dira daemon start' yourself"
-    fi
+    want_service=0
     if [ "$install_service" = "1" ]; then
-      info "installing the dirad service..."
-      "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
+      want_service=1
     # Installing a launchd/systemd agent is a persistent system change, so it
     # is still never done silently. But the old rationale for not asking --
     # "curl | sh has no usable stdin" -- was only half true, and /dev/tty is
     # exactly the escape hatch for it. Default yes on a terminal, no without
     # one, so CI keeps the historical hands-off behaviour.
     elif _confirm "Install dirad as a login service so it survives reboots?" yes no; then
+      want_service=1
+    fi
+
+    if [ "$want_service" = "1" ]; then
+      # Best-effort stop of an unmanaged daemon that may or may not be
+      # running. `dira daemon install` now does this itself and waits for the
+      # process to exit, so this is belt-and-braces -- kept because the binary
+      # being installed here may be OLDER than that change, and on such a
+      # binary skipping it is what let the fresh service flap against a
+      # still-live bare process for the control socket. Silent -- "nothing was
+      # running" is not a warning-worthy outcome here, only a failed *install*
+      # is.
+      "$bin_dir/dira" daemon stop >/dev/null 2>&1 || true
       info "installing the dirad service..."
       "$bin_dir/dira" daemon install || warn "could not install the dirad service automatically -- run '$bin_dir/dira daemon install' yourself"
+    elif [ "$daemon_was_running" = "1" ]; then
+      info "restarting dirad..."
+      "$bin_dir/dira" daemon restart || warn "could not restart dirad automatically -- run '$bin_dir/dira daemon restart' yourself"
+    elif [ "$start_daemon" = "1" ]; then
+      info "starting dirad..."
+      "$bin_dir/dira" daemon start || warn "could not start dirad automatically -- run '$bin_dir/dira daemon start' yourself"
     else
-      debug_log "skipping the dirad service"
+      debug_log "no daemon action requested -- skipping"
     fi
   fi
 

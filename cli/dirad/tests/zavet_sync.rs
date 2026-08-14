@@ -202,6 +202,64 @@ async fn sync_without_a_known_directory_is_an_honest_error() {
     }
 }
 
+/// The critical fix this file exists for: `--project` naming a repo the
+/// daemon has no directory for must NOT fall back to whatever tree the caller
+/// happens to be standing in when that tree belongs to a DIFFERENT repo — or
+/// `sync` registers and captures a foreign checkout under the wrong name.
+/// Same honest error as no cwd at all, and nothing gets registered.
+#[tokio::test]
+async fn sync_with_a_mismatched_cwd_is_refused_and_registers_nothing() {
+    let state = test_state().await;
+    let repo = setup_repo(); // remoted to CANONICAL, github.com/acme/api
+    let cwd = repo.path().display().to_string();
+    const OTHER: &str = "github.com/acme/other";
+
+    let resp = dirad::control::dispatch(
+        &state,
+        Request::ZavetSync {
+            cwd: Some(cwd),
+            repo: Some(OTHER.to_string()),
+        },
+    )
+    .await;
+    match resp {
+        Response::Error { message } => assert!(
+            message.contains("no working directory known"),
+            "unexpected message: {message}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    assert!(
+        dirad::control::lock_recover_map(&state.repo_dirs)
+            .get(OTHER)
+            .is_none(),
+        "the mismatched repo must never be registered"
+    );
+    assert!(
+        dirad::control::lock_recover_map(&state.repo_dirs)
+            .get(CANONICAL)
+            .is_none(),
+        "nor may the repo the cwd actually belongs to, since it was never named"
+    );
+
+    let resp = dirad::control::dispatch(
+        &state,
+        Request::ZavetDecisions {
+            cwd: None,
+            repo: Some(OTHER.to_string()),
+        },
+    )
+    .await;
+    match resp {
+        Response::ZavetDecisions(v) => assert!(
+            v.decisions.is_empty(),
+            "nothing was ever captured for {OTHER}"
+        ),
+        other => panic!("expected ZavetDecisions, got {other:?}"),
+    }
+}
+
 /// `--project` names a repo this process is not standing in, but the daemon
 /// usually remembers a directory for it — and that repo's `id-width` decides
 /// how a shorthand id canonicalizes. Falling back to the defaults re-padded

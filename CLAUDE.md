@@ -10,7 +10,7 @@ and is not part of this project.
 ## Conventional commits (required)
 
 Every commit message MUST follow Conventional Commits and is enforced by the `commit-lint`
-CI job (`.commitlintrc.json`, `wagoid/commitlint-github-action`).
+CI job (`commitlint.config.mjs`, `wagoid/commitlint-github-action`).
 
 ```
 type(scope): subject

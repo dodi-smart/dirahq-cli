@@ -36,3 +36,12 @@ agent context at session start — keep it short and non-negotiable.
 - Knowledge-content consent is asked by its own prompt naming what it sends,
   never implied by device linking or billing. Changing what `full` transmits
   changes `KNOWLEDGE_DISCLOSURE` in the same commit. See DIRASH-0030.
+- One backoff ladder: `dira_core::sync::Backoff`. Never re-add a local
+  seed/double/cap; attempt budgets stay with the caller. See DIRASH-0031.
+- A record's `first_commit`/`created_at`/`source_session` are repaired as a
+  unit and only ever earlier, with attribution read from the `artifacts` row
+  for the introducing commit — never from the session doing the repair. See
+  DIRASH-0032.
+- Nothing enters `repo_dirs` unless the directory demonstrably belongs to the
+  repo it is filed under, and `register_repo_dir` stays I/O-free.
+  See DIRASH-0027.

@@ -1,10 +1,10 @@
 ---
 title: Distribution and self-update
-version: 6
+version: 9
 origin: session
 verified: false
 confidence: high
-date: 2026-08-09
+date: 2026-08-14
 paths:
   - install.sh
   - install.ps1
@@ -12,7 +12,7 @@ paths:
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0021, DIRASH-0024, DIRASH-0029]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0024, DIRASH-0029, DIRASH-0031]
 ---
 
 ## Overview
@@ -48,6 +48,49 @@ both executables and restarts whatever is supervising the daemon.
   branch keeps precedence and never prompts: a service installed from an
   elevated shell is the broken setup that branch exists to warn about
   (DIRASH-0029).
+  Both installers decide the service question **before** touching the daemon
+  at all, then take exactly one of three arms: want-service (flag or a "yes"
+  answer) does a best-effort, silent `dira daemon stop` followed by
+  `dira daemon install`; otherwise a daemon that was already running gets
+  restarted; otherwise `--daemon`/`-Daemon` starts one. The old
+  restart/start-then-install ordering left a freshly-installed launchd
+  (`KeepAlive=true`) / systemd (`Restart=always`) / scheduled-task service
+  racing an already-live bare process for D-0009's single-instance
+  control-socket flock — both sides losing the race in turn and respawning
+  indefinitely. Deciding the question first and taking a single arm removes the
+  race rather than papering over it; the silent best-effort stop is deliberate,
+  since "nothing was running" is not a warning-worthy outcome there, only a
+  failed *install* is.
+  `dira daemon install` now does the stop **itself**, and waits for the process
+  to exit. The pre-stop used to live in three callers — the onboard step and
+  both installers — and not in the fourth, so a bare `dira daemon install` on a
+  machine with a hand-started `dirad` walked straight into the flap, which is
+  the documented path anyone following the old `daemon start` advice was on. It
+  stops only a daemon nothing is supervising; stopping a supervised one would
+  just make its supervisor restart it mid-install. The installers keep their
+  own best-effort stop because they may be driving a binary older than this.
+  Unix `stop` confirms the exit rather than assuming it: SIGTERM, wait for the
+  process, escalate to SIGKILL, wait again, and only then release the pidfile
+  and socket. It previously signalled, unlinked both immediately and printed
+  "stopped" — so even the callers that did pre-stop were racing the guard, and
+  unlinking the socket under a live daemon made it worse. D-0019's directive is
+  not platform-scoped; unix was exempt only because the flock makes a duplicate
+  *safe*, which is not the same as unnecessary. A stop that cannot confirm exit
+  is a hard error naming the pid, and `install` refuses rather than registering
+  a service over it.
+  "Confirmed exited" means the *process* is gone, and `kill -0` does not answer
+  that — it answers whether the pid still exists, which stays true for a zombie
+  until its parent reaps it, force-kill included. `dira daemon start` orphans
+  `dirad` onto pid 1, so on a container whose pid 1 is not a reaper (`tail -f
+  /dev/null`, the shape CI container jobs use) an exited daemon read as alive
+  forever and `stop` burned its whole budget before refusing. A zombie is
+  exited for every purpose here — the kernel closed its fds, so the flock and
+  socket are already free — so the liveness probe checks for it: `/proc` on
+  Linux (no subprocess, and the musl/BusyBox images are where this bites),
+  `ps -o state=` on macOS, which cannot be the single implementation because
+  BusyBox `ps` has neither `-p` nor `-o`. A probe that cannot answer reports
+  *alive*: absence of evidence is not exit, and over-reporting exit is the one
+  direction D-0019 forbids.
 - **Next steps are one command.** Both installers end on `dira onboard`. The
   previous three-line block (`--version` / `daemon start` / `status`) omitted
   `dira init`, so following it produced a daemon that captured nothing, and it
@@ -80,37 +123,92 @@ both executables and restarts whatever is supervising the daemon.
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
   is safe in a script.
-- Every network step is time-bounded; the artifact download is also retried.
-  The download makes up to 4 attempts on a 500ms-seeded ladder capped at 4s,
+- Every network step is time-bounded, both by inactivity and by total
+  duration, and the artifact download is also retried and size-capped. The
+  download makes up to 4 attempts on a 500ms-seeded ladder capped at 4s,
   retrying transport failures, timeouts, 5xx and 429 (honouring `Retry-After`,
   itself capped);
   a 4xx is **never** retried, because it is deterministic — the 404 keeps its
   "asset not found on that release" wording and fails on the first attempt.
-  Timeouts are per-request rather than client-wide (a small JSON API response
-  and a ~20MB artifact want very different budgets), plus a shared 10s
-  `connect_timeout`. Both installers already retried (`install.ps1`'s 3-attempt
-  loop, `install.sh`'s `curl --retry 3`); the updater was the one downloader
-  that did not, so a single mid-stream abort — routine on a lossy or
+  Two independent time bounds apply: a client-wide 30s `read_timeout` (an
+  *inactivity* timeout — resets on every read that makes progress, shared
+  safely across every call regardless of payload size) catches a connection
+  that has genuinely stalled, while each per-request `.timeout()` — 30s for
+  the small JSON API calls, 600s for the archive download — is a *total*
+  backstop, sized per call because a tiny JSON response and a ~20MB artifact
+  want very different budgets. Both sit behind a shared 10s `connect_timeout`.
+  The 600s download backstop is deliberately generous (comfortably covers a
+  ~20MB artifact down to ~0.3 Mbps): it used to be the *only* bound, at 120s,
+  which was the regression — `reqwest`'s per-request `.timeout()` covers the
+  whole request including the body read, so any working link slower than
+  ~1.4 Mbps blew that budget on every one of the 4 attempts and failed
+  deterministically, even though nothing had actually stalled. The
+  `read_timeout` addition is what now catches a genuine stall quickly (30s)
+  while the backstop only fires on the pathological case a `read_timeout`
+  can't (a trickle just fast enough to keep resetting it).
+  Both installers already retried (`install.ps1`'s 3-attempt loop,
+  `install.sh`'s `curl --retry 3`); the updater was the one downloader that
+  did not, so a single mid-stream abort — routine on a lossy or
   TLS-inspecting corporate link — failed the whole update. This is not
   platform-specific: it fails identically on macOS, Linux and Windows.
   The `.sha256` companion rides the same ladder with a per-attempt timeout
   sized to ~100 bytes rather than to the archive, so a stall there costs
   seconds, not minutes.
-  *Known gaps:* the body is buffered whole (`resp.bytes()`), so a retry
-  re-pulls the entire archive rather than resuming with a `Range` request; and
-  `resolve::gh_get` — the first of the two network hops — is bounded by a
-  timeout but not retried, so a transient abort there still fails the update.
-- A failed `dira update` is recorded, not just returned. The passive notice's
-  cache carries a consecutive-failure count next to the resolve half, and after
-  2 failures the notice escalates from "run `dira update`" to naming how many
-  attempts failed. The two halves are independent on purpose: a resolve that
-  succeeds says nothing about whether installing works, and that exact
-  combination — a healthy check advertising a version every update attempt
-  fails to install — is what let a user lose a week to a retryable blip with no
-  signal anywhere. The count survives `write_sentinel`'s TTL rollover, or it
-  would silently un-escalate about once a day. Writing happens only in
-  `update::run`; the foreground notice path stays read-only and network-free
-  per D-0006.
+  A declared `Content-Length` over 200MB (10x the ~20MB largest real
+  artifact) is fatal and never retried, before a single body byte is read —
+  `resp.bytes()` buffers the whole response into memory with nothing else
+  bounding its size once the status check passes, and the size cap is what
+  actually bounds that rather than wall clock alone. A response with no
+  declared length at all still passes (GitHub's release CDN always sends
+  one; this exists to catch an implausible *declared* size, not to enforce a
+  hard cap through every possible proxy).
+  **Both** network hops ride this ladder. `resolve::gh_get` used to be bounded
+  by a timeout and never retried, so a transient abort on the resolve hop
+  failed the whole update — the same stranded state one step earlier. It runs
+  on `Policy::api()` (3 attempts, 30s per attempt): fewer than the download's
+  four because it is a small JSON GET that also runs on `--check`'s foreground
+  path, where a long ladder is worse than a miss. It is the hop most exposed to
+  a 429, anonymous API calls being capped at 60/hr per IP.
+  The retried unit is "request **and** fully read the body", not "send the
+  request": the reported failure surfaces from the body read, after `send()`
+  has already returned `Ok`, so a driver wrapped around `send()` alone would
+  not retry the failure it exists for. One driver, `retry::with_retry`, serves
+  both hops; the status→error mapping stays per-caller, which is what keeps the
+  download's bespoke 404 text and the API hop's typed `Unauthorized` intact. A
+  4xx stays fatal, so the authenticated→anonymous token fallback is unaffected.
+  The ladder itself is `dira_core::sync::Backoff`, shared with the daemon
+  (DIRASH-0031); the attempt budget stays with each caller.
+  *Known gap:* the body is buffered whole (`resp.bytes()`) up to that cap, so a
+  retry re-pulls the entire archive rather than resuming with a `Range` request
+  (#116 — deliberately not taken: the retry already makes the reported incident
+  invisible, and streaming-to-file is what the size cap and the sha256 gate
+  currently rest on).
+- A failed `dira update` is recorded, not just returned — **except** a
+  deterministic, permanent-by-design refusal (the D-0004 dev-install guard, or
+  an implicit channel downgrade), which never counts. Those two error paths
+  are tagged with an internal `Refusal` marker `update::run` downcasts for,
+  because no amount of retrying `dira update` changes their answer — only the
+  user acting on it does (`--force`, `--version`, `--channel`). Before this, a
+  `just install` contributor who ran an ordinary `dira update` against their
+  dev symlink got the refusal *and* a bumped failure counter, and two such
+  runs alone triggered the escalated notice below for a condition retrying
+  could never resolve. Every other failure still counts. The passive notice's
+  cache carries this consecutive-failure count next to the resolve half, and
+  after 2 (countable) failures the notice escalates from "run `dira update`"
+  to naming how many attempts failed. The two halves are independent on
+  purpose: a resolve that succeeds says nothing about whether installing
+  works, and that exact combination — a healthy check advertising a version
+  every update attempt fails to install — is what let a user lose a week to a
+  retryable blip with no signal anywhere. The count survives
+  `write_sentinel`'s TTL rollover, or it would silently un-escalate about once
+  a day. Writing happens only in `update::run`; the foreground notice path
+  stays read-only and network-free per D-0006. The passive notice's own
+  dev-build suppression (`notice::is_dev_build`) canonicalizes the running
+  executable's path before checking for a `target/{release,debug}` ancestor —
+  `current_exe()` does not canonicalize consistently across platforms (notably
+  macOS), so without this a symlinked dev install could pass D-0004's own,
+  more precise PATH-entry check unnoticed by this cheaper heuristic and still
+  get nagged.
 - Every comparison of a resolved release against the **running** version goes
   through `resolve::compare_versions` (SemVer 2.0 §11), never string equality.
   Three callers share it — `--check`'s message, the passive notice, and the
@@ -192,9 +290,21 @@ both executables and restarts whatever is supervising the daemon.
   inconclusive detection is a silent no-op.
 - The installers prompt only where a terminal exists, and a non-interactive
   run is byte-for-byte the behaviour that shipped before the prompt existed.
-  In `install.sh`'s `_can_prompt`, `2>/dev/null` must precede `>/dev/tty`:
-  redirections apply left to right, so the other order prints
-  `/dev/tty: Device not configured` on every CI run.
+  `install.sh`'s single prompt helper is `_confirm <prompt> [default]
+  [notty]`: it reads from `/dev/tty`, never stdin (under `curl | sh` stdin is
+  the script being read, so testing or reading it is meaningless — `/dev/tty`
+  is the controlling terminal regardless of how stdin is plumbed). It answers
+  immediately, without ever touching `/dev/tty`, when
+  `no_interactive=1`, `! _is_tty` (`[ -t 1 ]`), or `/dev/tty` is unreadable —
+  in which case it returns `notty`'s answer (default `yes`). `default`
+  (default `no`) is separately the answer to a bare Enter once a real prompt
+  is shown. The two knobs are deliberately independent, not one shared
+  fallback: a scripted `--uninstall` wants unattended runs to proceed
+  (`_confirm`'s own default call has `notty=yes`), while installing a
+  persistent service must never happen unattended (the service prompt is
+  `_confirm "..." yes no` — `notty=no`). Every call site is a single
+  `_confirm` invocation; there is no second hand-rolled `/dev/tty` read
+  anywhere in the script.
 - Checksum verification is mandatory and has no override flag. An
   unverifiable download is a pipeline bug, not a user decision.
 - The binary being replaced is never opened for writing — only renamed onto

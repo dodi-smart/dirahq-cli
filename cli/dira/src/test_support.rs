@@ -4,6 +4,11 @@
 //! successful rotation's `identity::promote_pending_key` — which installs the
 //! new key via the same keychain-or-meta-fallback path production uses — never
 //! touches the real OS keychain during a test run.
+//!
+//! Also [`scripted_server`], the raw-TCP mock both of `dira update`'s network
+//! hops are retry-tested against. It lives here rather than in either caller's
+//! test module because the two hops now share one retry driver, and testing
+//! them against two different servers would be testing two different things.
 
 #![cfg(test)]
 
@@ -13,7 +18,100 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// One scripted response for [`scripted_server`].
+#[derive(Clone)]
+pub enum Reply {
+    /// A complete, well-formed 200.
+    Body(&'static str),
+    /// A status line with no body (plus optional extra headers, each already
+    /// `\r\n`-terminated).
+    Status(u16, &'static str),
+    /// Announce a `Content-Length` far larger than what is actually sent, then
+    /// drop the connection — the exact shape of the reported failure
+    /// ("connection closed before message completed"): the body starts
+    /// arriving and the stream dies part-way through.
+    Truncated,
+    /// A 200 declaring `Content-Length: n` and sending no body at all. For
+    /// asserting a size cap fires before any read is attempted.
+    DeclaredLength(u64),
+    /// A well-formed 200 with a body but deliberately no `Content-Length`
+    /// header at all — terminated by closing the connection, the way a real
+    /// server without a known length would. A size cap must never reject this:
+    /// a missing declared length is not the same claim as an oversized one.
+    NoContentLength(&'static str),
+}
+
+/// A raw HTTP server on an OS-assigned loopback port that serves `script` in
+/// order (the last entry repeats once exhausted), counting connections so a
+/// test can assert exactly how many attempts were made. Returns the base URL
+/// (no trailing slash) and that counter.
+///
+/// Deliberately not [`MockCloud`]: axum cannot express a half-written body,
+/// which is the whole point of [`Reply::Truncated`].
+pub async fn scripted_server(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind scripted server");
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+
+            // Drain the request head so the client sees a well-formed exchange
+            // rather than a connection reset on write.
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+
+            let reply = script
+                .get(n)
+                .or_else(|| script.last())
+                .cloned()
+                .unwrap_or(Reply::Status(500, ""));
+            match reply {
+                Reply::Body(body) => {
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                }
+                Reply::Status(code, extra) => {
+                    let head = format!("HTTP/1.1 {code} X\r\n{extra}Content-Length: 0\r\n\r\n");
+                    let _ = sock.write_all(head.as_bytes()).await;
+                }
+                Reply::Truncated => {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\nhalf")
+                        .await;
+                    // Dropping `sock` here closes mid-body.
+                }
+                Reply::DeclaredLength(n) => {
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n");
+                    let _ = sock.write_all(head.as_bytes()).await;
+                }
+                Reply::NoContentLength(body) => {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                        .await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    // Dropping `sock` here is how a Content-Length-less
+                    // response is framed: read until EOF.
+                }
+            }
+            let _ = sock.flush().await;
+        }
+    });
+
+    (format!("http://{addr}"), hits)
+}
 
 /// One canned HTTP response.
 #[derive(Clone)]

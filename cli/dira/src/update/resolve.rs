@@ -18,6 +18,7 @@
 //! own precedence). This also happens to be exactly what a test needs to
 //! redirect resolution at a local mock server without touching the network.
 
+use super::retry;
 use super::Channel;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -160,40 +161,90 @@ pub fn is_unauthorized(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| cause.is::<Unauthorized>())
 }
 
+/// `GET` a GitHub Releases API path and return its body, retrying transport
+/// failures, 5xx and 429 on the bounded ladder in [`retry::Policy::api`].
+///
+/// This hop used to be bounded by a timeout but never retried, so a single
+/// transient abort here failed the whole update — the same stranded state the
+/// download's retry was added to fix, one step earlier. It is also the hop
+/// most exposed to a 429: anonymous API calls are capped at 60/hr per IP, and
+/// on shared corporate egress that budget can be spent by other people.
+///
+/// A 4xx is never retried ([`retry::classify_status`]), so the
+/// authenticated→anonymous fallback in [`resolve`] is unaffected: a 401 is
+/// `Fatal`, surfaces immediately, and is caught there exactly as before.
 async fn gh_get(http: &reqwest::Client, ctx: &GhContext, path: &str) -> Result<String> {
     let url = format!("{}{path}", ctx.api_url.trim_end_matches('/'));
+    let policy = retry::Policy::api();
+    retry::with_retry(policy, "release lookup", &url, || {
+        gh_get_once(http, ctx, &url, policy.timeout)
+    })
+    .await
+}
+
+/// One attempt: request, status check, body read. Every failure is classified
+/// here so [`gh_get`] only has to decide whether to wait.
+async fn gh_get_once(
+    http: &reqwest::Client,
+    ctx: &GhContext,
+    url: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, retry::Attempt> {
     // Per-request budget rather than a client-wide one: this is a small JSON
     // response, unlike the artifact download sharing the same client. `--check`
     // also runs speculatively from a detached background refresh, where hanging
-    // is worse than missing a check.
+    // is worse than missing a check. Rebuilt per attempt — a `RequestBuilder`
+    // is consumed by `send`.
     let mut req = http
-        .get(&url)
-        .timeout(super::retry::API_TIMEOUT)
+        .get(url)
+        .timeout(timeout)
         .header(reqwest::header::USER_AGENT, user_agent())
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28");
     if let Some(token) = &ctx.token {
         req = req.bearer_auth(token);
     }
-    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| retry::Attempt::from_transport(e, format!("GET {url}")))?;
+
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        // Typed, so `resolve` can drop the token and retry anonymously. Only
-        // meaningful when we actually sent one: a 401 with no credential would
-        // be a genuine server-side problem, so leave that as a plain error.
-        if ctx.token.is_some() {
-            return Err(anyhow::Error::new(Unauthorized)
-                .context(format!("GitHub API request failed (401) for {url}")));
-        }
-    }
     if !status.is_success() {
-        anyhow::bail!(
-            "GitHub API request failed ({status}) for {url}: {}",
-            text.chars().take(300).collect::<String>()
-        );
+        let retry_after = retry::parse_retry_after(resp.headers());
+        // Best-effort: the body is only wanted for the message here, so a
+        // failed read costs a less specific error, not a retry.
+        let text = resp.text().await.unwrap_or_default();
+        let err = if status == reqwest::StatusCode::UNAUTHORIZED && ctx.token.is_some() {
+            // Typed, so `resolve` can drop the token and retry anonymously.
+            // Only meaningful when we actually sent one: a 401 with no
+            // credential is a genuine server-side problem, so that stays a
+            // plain error.
+            anyhow::Error::new(Unauthorized)
+                .context(format!("GitHub API request failed (401) for {url}"))
+        } else {
+            anyhow::anyhow!(
+                "GitHub API request failed ({status}) for {url}: {}",
+                text.chars().take(300).collect::<String>()
+            )
+        };
+        return Err(retry::Attempt::new(
+            retry::classify_status(status),
+            err,
+            retry_after,
+        ));
     }
-    Ok(text)
+
+    // The body read is inside the retried unit on purpose. #113's reported
+    // failure — `connection closed before message completed` — surfaces here,
+    // after `send()` has already returned `Ok`. This used to be
+    // `unwrap_or_default()`, which turned a truncated response into an empty
+    // body and then into a confusing downstream JSON parse error; a truncated
+    // success is exactly what deserves another attempt.
+    resp.text()
+        .await
+        .map_err(|e| retry::Attempt::from_transport(e, format!("read response body for {url}")))
 }
 
 /// Where to `GET` an asset from, and which headers that `GET` needs.
@@ -706,5 +757,110 @@ mod tests {
         assert_eq!(ctx.token.as_deref(), Some("gh-wins"));
         std::env::remove_var("GH_TOKEN");
         std::env::remove_var("GITHUB_TOKEN");
+    }
+
+    // --- gh_get retry (#115) -------------------------------------------
+    //
+    // The API hop was bounded by a timeout but never retried, so one transient
+    // abort here failed the whole update — the stranded state the download's
+    // retry was added to fix, one step earlier. These drive the real `gh_get`
+    // against the same raw-TCP server the download tests use, because axum
+    // cannot express a half-written body.
+
+    use crate::test_support::{scripted_server, Reply};
+    use std::sync::atomic::Ordering;
+
+    /// A minimal well-formed releases array, enough for `gh_get` to return it
+    /// verbatim (parsing is asserted separately, against the real fixture).
+    const ONE_RELEASE: &str =
+        r#"[{"tag_name":"v1.2.3","prerelease":false,"draft":false,"assets":[]}]"#;
+
+    async fn get_against(script: Vec<Reply>, token: Option<&str>) -> (Result<String>, usize) {
+        let (base, hits) = scripted_server(script).await;
+        let ctx = GhContext {
+            api_url: base,
+            repo: DEFAULT_REPO.to_string(),
+            download_base: None,
+            token: token.map(str::to_string),
+        };
+        let http = reqwest::Client::builder().build().unwrap();
+        let out = gh_get(&http, &ctx, "/releases").await;
+        (out, hits.load(Ordering::SeqCst))
+    }
+
+    /// The #113 mechanism, at the hop #115 is about: the stream dies part-way
+    /// through a body that had already started arriving, *after* `send()`
+    /// returned `Ok`. A driver wrapped around `send()` alone would not catch
+    /// this, which is why the body read is inside the retried unit.
+    #[tokio::test]
+    async fn a_truncated_api_body_is_retried_and_the_next_attempt_succeeds() {
+        let (out, hits) = get_against(vec![Reply::Truncated, Reply::Body(ONE_RELEASE)], None).await;
+        assert_eq!(
+            out.expect("a transient abort on the API hop should be retried"),
+            ONE_RELEASE
+        );
+        assert_eq!(hits, 2, "should have taken exactly one retry");
+    }
+
+    /// The failure this hop is most exposed to: anonymous API calls are capped
+    /// at 60/hr per IP, so on shared egress the budget can be spent by other
+    /// people entirely.
+    #[tokio::test]
+    async fn a_429_is_retried() {
+        let (out, hits) = get_against(
+            vec![
+                Reply::Status(429, "Retry-After: 0\r\n"),
+                Reply::Body(ONE_RELEASE),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(out.expect("429 should be retried"), ONE_RELEASE);
+        assert_eq!(hits, 2);
+    }
+
+    #[tokio::test]
+    async fn a_5xx_is_retried_until_the_budget_is_spent() {
+        let (out, hits) = get_against(vec![Reply::Status(503, "")], None).await;
+        let err = out.expect_err("an unrelenting 503 must eventually fail");
+        assert!(
+            format!("{err:#}").contains("release lookup failed after 3 attempts"),
+            "error should name the exhausted budget, got: {err:#}"
+        );
+        assert_eq!(hits, retry::Policy::api().attempts as usize);
+    }
+
+    /// A 4xx is deterministic. Retrying it only delays a clear message — and
+    /// for a 401 it would also delay the anonymous fallback below.
+    #[tokio::test]
+    async fn client_errors_fail_on_the_first_attempt() {
+        for status in [404, 403, 400] {
+            let (out, hits) = get_against(vec![Reply::Status(status, "")], None).await;
+            out.expect_err("a 4xx must fail");
+            assert_eq!(hits, 1, "{status} must not be retried");
+        }
+    }
+
+    /// The token fallback is unaffected by the new ladder: a 401 classifies as
+    /// `Fatal`, so it surfaces immediately and still carries the typed
+    /// `Unauthorized` marker `resolve` downcasts to drop the token.
+    #[tokio::test]
+    async fn a_rejected_token_is_fatal_and_still_typed_for_the_fallback() {
+        let (out, hits) = get_against(vec![Reply::Status(401, "")], Some("bad-token")).await;
+        let err = out.expect_err("401 must fail");
+        assert!(
+            is_unauthorized(&err),
+            "the typed marker must survive so resolve can retry anonymously: {err:#}"
+        );
+        assert_eq!(hits, 1, "a retried 401 would only delay the fallback");
+    }
+
+    /// Without a token, a 401 is a genuine server-side problem rather than a
+    /// credential to drop — it must not masquerade as the fallback signal.
+    #[tokio::test]
+    async fn an_anonymous_401_is_not_the_typed_fallback_marker() {
+        let (out, _) = get_against(vec![Reply::Status(401, "")], None).await;
+        let err = out.expect_err("401 must fail");
+        assert!(!is_unauthorized(&err), "got: {err:#}");
     }
 }

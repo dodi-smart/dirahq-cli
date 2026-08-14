@@ -473,10 +473,15 @@ fn coverage_globs(decisions: &[ZavetDecisionRow], specs: &[ZavetSpecRow]) -> Vec
 }
 
 async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
-    let dirs: Vec<(String, String)> = match state.repo_dirs.lock() {
-        Ok(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        Err(_) => return Vec::new(),
-    };
+    // `lock_recover_map`, not a bare `lock()`: a poisoned mutex here used to
+    // return an empty snapshot, which reads downstream as "this device knows of
+    // no repos" — a confident wrong answer rather than a stale one. Every other
+    // reader of this map recovers the guard and serves what it has; see
+    // `control::lock_recover`'s note on staying stale-but-serving.
+    let dirs: Vec<(String, String)> = crate::control::lock_recover_map(&state.repo_dirs)
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let now = time::OffsetDateTime::now_utc();
     let now_str = crate::heartbeat::fmt_rfc3339(now);
     let mut out = Vec::new();

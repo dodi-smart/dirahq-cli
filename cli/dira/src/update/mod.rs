@@ -32,8 +32,42 @@ mod retry;
 use crate::daemon;
 use anyhow::{Context, Result};
 use dira_core::Config;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Marks an update failure that is deterministic and permanent-by-design —
+/// the D-0004 dev-install guard ([`guard_to_bin_dir`]'s `DevSymlink`-without-
+/// `--force` and `DevBuild` arms) or an implicit channel downgrade
+/// ([`downgrade_refusal`]) — so [`run`] can tell it apart from a transient
+/// failure a retry might actually fix.
+///
+/// Both refusals are generated before either binary is touched, purely from
+/// information already in hand (the resolved version, the PATH entry, the
+/// running executable's own path) — no amount of re-running `dira update`
+/// changes the answer until the *user* acts on it (passes `--force`, `--version`,
+/// or `--channel`). Counting them toward [`notice::record_update_failure`]'s
+/// consecutive-failure counter is what escalated the passive notice's "N
+/// recent update attempts failed" line for a condition retrying can never
+/// resolve — see this module's `run` for where the marker is checked.
+#[derive(Debug)]
+struct Refusal(String);
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// Lift a refusal message into an [`anyhow::Error`] carrying the [`Refusal`]
+/// marker, so `run`'s `outcome.downcast_ref::<Refusal>()` can find it again —
+/// `anyhow::bail!`/`anyhow!` on a bare string does not produce a distinctly
+/// downcastable type.
+fn refusal(message: String) -> anyhow::Error {
+    anyhow::Error::new(Refusal(message))
+}
 
 /// Release channel to resolve a version against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,15 +150,29 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
         None => resolve::default_channel(),
     };
 
-    // `connect_timeout` only — no client-wide `.timeout(...)`, following the
-    // convention `dirad/src/lib.rs` states explicitly ("No default timeout —
-    // callers set a per-request timeout sized to that call"). The two calls
-    // here want very different budgets: a small JSON API response versus a
-    // ~20MB artifact, so each sets its own (see `retry::API_TIMEOUT` and
-    // `retry::Policy::download`). Without the connect bound, a link that
-    // stalls instead of closing hangs `dira update` forever.
+    // `connect_timeout` bounds the TCP+TLS handshake; `read_timeout` bounds
+    // the gap between successful body reads (an inactivity timeout — it
+    // resets on every read that makes progress, so it is safe to share
+    // across every call this client makes regardless of payload size: a
+    // stalled connection is stalled whether it is serving a tiny JSON
+    // response or a 20MB archive). Still no client-wide `.timeout(...)`,
+    // following the convention `dirad/src/lib.rs` states explicitly ("No
+    // default timeout — callers set a per-request timeout sized to that
+    // call") — that call bounds the WHOLE request including the body read,
+    // so its budget genuinely differs per call (a small JSON API response
+    // versus a ~20MB artifact) and stays a per-request `.timeout()` set by
+    // the caller (see `retry::API_TIMEOUT` and
+    // `retry::Policy::download`/`checksum`). Without `connect_timeout`, a
+    // link that stalls instead of closing hangs `dira update` forever at the
+    // connect phase; without `read_timeout`, the same stall mid-body used to
+    // go uncaught until the per-request `.timeout()` fired — which is
+    // exactly what made a 20MB download over a merely-slow (not stalled)
+    // link fail deterministically, since that timeout used to bound the
+    // whole transfer rather than just a stall (see `retry::Policy::download`'s
+    // doc for that fix).
     let http = reqwest::Client::builder()
         .connect_timeout(retry::CONNECT_TIMEOUT)
+        .read_timeout(retry::READ_TIMEOUT)
         .build()
         .context("build HTTP client")?;
 
@@ -148,6 +196,15 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
     if !pinned {
         match &outcome {
             Ok(()) => notice::clear_update_failures(),
+            // A deterministic, permanent-by-design refusal (see [`Refusal`])
+            // — most commonly the D-0004 dev-install guard tripping on a
+            // `just install` symlink. Retrying cannot fix it, so it must not
+            // count toward the escalated "N recent update attempts failed"
+            // notice: before this, a `just install` contributor who ran an
+            // ordinary `dira update` got the refusal AND the counter, and two
+            // such runs alone triggered the escalation for a condition that
+            // was never going away on its own.
+            Err(e) if e.downcast_ref::<Refusal>().is_some() => {}
             Err(_) => notice::record_update_failure(),
         }
     }
@@ -173,13 +230,13 @@ async fn run_update(
     // release (see `check_message` / `notice::should_notify`), and this is the
     // matching guard on the command they point at: a prerelease user on the
     // default stable channel would otherwise be moved silently backwards.
-    if let Some(refusal) = downgrade_refusal(
+    if let Some(msg) = downgrade_refusal(
         &resolved.version,
         env!("CARGO_PKG_VERSION"),
         channel,
         args.version.is_some(),
     ) {
-        anyhow::bail!(refusal);
+        return Err(refusal(msg));
     }
 
     let guard = replace::discover_install(args.bin_dir.as_deref())?;
@@ -284,13 +341,13 @@ fn guard_to_bin_dir(guard: replace::Guard, force: bool) -> Result<PathBuf> {
             link_target,
         } => {
             if !force {
-                anyhow::bail!(
+                return Err(refusal(format!(
                     "{} is a symlink into a `just install` dev build ({}) — refusing to \
                      overwrite it. Re-run with --force, or use `just install` to update a dev \
                      setup.",
                     bin_dir.join(dira_ipc::DIRA_BIN).display(),
                     link_target.display()
-                );
+                )));
             }
             eprintln!(
                 "warning: overwriting dev symlink at {} (--force)",
@@ -298,14 +355,12 @@ fn guard_to_bin_dir(guard: replace::Guard, force: bool) -> Result<PathBuf> {
             );
             Ok(bin_dir)
         }
-        replace::Guard::DevBuild { current_exe } => {
-            anyhow::bail!(
-                "this `dira` ({}) is itself an unlinked target/{{release,debug}} build, not an \
-                 installed copy — `dira update` refuses to touch it (not overridable by \
-                 --force). Use `just install` for a dev setup.",
-                current_exe.display()
-            );
-        }
+        replace::Guard::DevBuild { current_exe } => Err(refusal(format!(
+            "this `dira` ({}) is itself an unlinked target/{{release,debug}} build, not an \
+             installed copy — `dira update` refuses to touch it (not overridable by \
+             --force). Use `just install` for a dev setup.",
+            current_exe.display()
+        ))),
     }
 }
 
@@ -518,6 +573,68 @@ mod tests {
             guard_to_bin_dir(guard, true).is_err(),
             "--force must never override a DevBuild refusal"
         );
+    }
+
+    // --- the Refusal marker (#101 / D-0004 vs. the update-failure counter) --
+    //
+    // A D-0004 dev-install refusal or an implicit downgrade refusal is
+    // deterministic and permanent-by-design: no amount of retrying `dira
+    // update` fixes it, so `run` must recognise it via `downcast_ref` and
+    // skip `record_update_failure` — see `run`'s match arm.
+
+    #[test]
+    fn guard_to_bin_dir_dev_symlink_refusal_carries_the_refusal_marker() {
+        let guard = replace::Guard::DevSymlink {
+            bin_dir: PathBuf::from("/home/dev/.local/bin"),
+            link_target: PathBuf::from("/home/dev/dirahq-cli/target/debug/dira"),
+        };
+        let err = guard_to_bin_dir(guard, false).unwrap_err();
+        assert!(
+            err.downcast_ref::<Refusal>().is_some(),
+            "a DevSymlink refusal without --force must be marked as a Refusal"
+        );
+    }
+
+    #[test]
+    fn guard_to_bin_dir_dev_build_refusal_carries_the_refusal_marker() {
+        let guard = replace::Guard::DevBuild {
+            current_exe: PathBuf::from("/home/dev/dirahq-cli/target/debug/dira"),
+        };
+        let err = guard_to_bin_dir(guard, false).unwrap_err();
+        assert!(
+            err.downcast_ref::<Refusal>().is_some(),
+            "a DevBuild refusal must be marked as a Refusal"
+        );
+    }
+
+    #[test]
+    fn guard_to_bin_dir_dev_symlink_with_force_is_not_a_refusal() {
+        // The success path (Ok) obviously carries no error to downcast — this
+        // just pins that overriding with --force does not produce one.
+        let guard = replace::Guard::DevSymlink {
+            bin_dir: PathBuf::from("/home/dev/.local/bin"),
+            link_target: PathBuf::from("/home/dev/dirahq-cli/target/debug/dira"),
+        };
+        assert!(guard_to_bin_dir(guard, true).is_ok());
+    }
+
+    #[test]
+    fn refusal_helper_round_trips_the_message_and_downcasts() {
+        let err = refusal("refusing to downgrade: example".to_string());
+        assert_eq!(err.to_string(), "refusing to downgrade: example");
+        let marker = err
+            .downcast_ref::<Refusal>()
+            .expect("refusal() must produce a downcastable Refusal");
+        assert_eq!(marker.0, "refusing to downgrade: example");
+    }
+
+    #[test]
+    fn an_ordinary_anyhow_error_does_not_downcast_to_refusal() {
+        // The negative case: a plain transport/IO-shaped error (what a
+        // transient failure looks like) must NOT be mistaken for a Refusal,
+        // or `run` would silently stop counting real failures too.
+        let err = anyhow::anyhow!("connection closed before message completed");
+        assert!(err.downcast_ref::<Refusal>().is_none());
     }
 
     // --- version comparison (#63) -------------------------------------------

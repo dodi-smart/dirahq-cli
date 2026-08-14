@@ -48,7 +48,7 @@ the block by hand.
 - **attestation-sync** — Attestation sync and session rollups (session, high, 2026-08-09)
 - **capture-pipeline** — Zavet capture pipeline (session, high, 2026-08-11)
 - **daemon-lifecycle** — Daemon startup and ingress lifecycle (session, high, 2026-08-09)
-- **distribution-and-update** — Distribution and self-update (session, high, 2026-08-09)
+- **distribution-and-update** — Distribution and self-update (session, high, 2026-08-14)
 - **doctor** — Diagnostics — dira doctor and the capture probe (session, high, 2026-08-09)
 - **harness-sources** — Harness sources and hook ingestion (session, high, 2026-08-09)
 - **knowledge-sync** — Knowledge sync — the consent-gated second channel (session, medium, 2026-08-11)

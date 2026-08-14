@@ -242,6 +242,20 @@ fn should_notify(cache: &Cache, env: &Env, is_tty: bool, current_version: &str) 
 /// on-disk shape is produced in exactly one place (the previous split between
 /// this module and `mod.rs`'s hand-rolled `json!` is what made it easy to add
 /// a field in one and silently drop it in the other).
+///
+/// Writes to a same-directory temp file, then `rename`s it onto `path` —
+/// same D-0003 spirit as the binary swap, applied to a 100-byte JSON file
+/// instead of an executable. A bare `fs::write` truncates in place, and this
+/// file has a genuine writer race: `dira update`'s own `record_update_failure`
+/// / `clear_update_failures` can run concurrently with the *detached*
+/// `dira update --check` this same module spawns (`spawn_refresh`) reading
+/// and rewriting the very same path from a separate process. A reader mid-way
+/// through a truncated write sees a torn, unparseable file — harmless here
+/// only because [`read_cache`] already treats corrupt JSON as "no cache", but
+/// that silently drops whatever the truncated writer was recording (e.g. a
+/// bumped failure count) rather than actually losing nothing. `rename` makes
+/// every reader see either the old, complete file or the new, complete file,
+/// never a partial one.
 fn write_cache(path: &Path, cache: &Cache) {
     let Some(parent) = path.parent() else {
         return;
@@ -249,8 +263,19 @@ fn write_cache(path: &Path, cache: &Cache) {
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    if let Ok(bytes) = serde_json::to_vec(cache) {
-        let _ = fs::write(path, bytes);
+    let Ok(bytes) = serde_json::to_vec(cache) else {
+        return;
+    };
+    // `ulid` is already a direct dependency (see `mod.rs`'s `Workdir`), so a
+    // per-write unique suffix costs nothing new and rules out two concurrent
+    // writers colliding on the same staging path.
+    let staging = path.with_extension(format!("json.tmp.{}", ulid::Ulid::generate()));
+    if fs::write(&staging, bytes).is_err() {
+        let _ = fs::remove_file(&staging);
+        return;
+    }
+    if fs::rename(&staging, path).is_err() {
+        let _ = fs::remove_file(&staging);
     }
 }
 
@@ -585,6 +610,52 @@ mod tests {
         assert_eq!(after.checked_at, 1_770_000_123);
         assert_eq!(after.latest, None, "the resolve half is deliberately reset");
         assert_eq!(after.update_failures, 4, "the failure half must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_cache` must land the final file via `rename`, not a bare
+    /// truncating `fs::write` — and must leave no `.tmp.<ulid>` staging file
+    /// behind on the successful path (the detached-checker race this exists
+    /// for is exactly what would otherwise litter the cache directory over
+    /// time).
+    #[test]
+    fn write_cache_lands_atomically_and_leaves_no_staging_file_behind() {
+        let dir = std::env::temp_dir().join(format!("dira-notice-{}", ulid::Ulid::generate()));
+        let path = dir.join("update-check.json");
+        let c = cache_with_failures("0.5.0", 2);
+
+        write_cache(&path, &c);
+
+        let read_back = read_cache(&path).expect("write_cache must produce a readable file");
+        assert_eq!(read_back, c);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![std::ffi::OsString::from("update-check.json")],
+            "no staging file should survive a successful write: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second write must fully replace the first, not merge with it —
+    /// pins that `rename` (not an append or a partial overwrite) is really
+    /// what lands the file.
+    #[test]
+    fn write_cache_a_second_write_fully_replaces_the_first() {
+        let dir = std::env::temp_dir().join(format!("dira-notice-{}", ulid::Ulid::generate()));
+        let path = dir.join("update-check.json");
+
+        write_cache(&path, &cache(1, Some("0.1.0"), None));
+        write_cache(&path, &cache(2, Some("0.2.0"), None));
+
+        let read_back = read_cache(&path).unwrap();
+        assert_eq!(read_back.checked_at, 2);
+        assert_eq!(read_back.latest.as_deref(), Some("0.2.0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -29,18 +29,25 @@ what happened.
 
 ## Behavior
 
-Six steps, in dependency order. Each returns a `StepOutcome` — `Done`,
-`AlreadyDone`, `Skipped(reason)` or `Failed(err)` — and none of them abort the
-run.
+Detection (step 1, in `detect::run`) plus seven steps that each return a
+`StepOutcome` — `Done`, `AlreadyDone`, `Skipped(reason)` or `Failed(err)` —
+none of which abort the run, in the dependency order `mod::run` calls them:
 
 | Step | Does | Skips when |
 |---|---|---|
-| detect | Probes harnesses, daemon supervision, repo, device link, plugin | never |
-| harnesses | Wires every confirmed harness at user scope, one pass | none detected, or all wired |
+| harnesses | Wires every confirmed harness at **global** scope, one pass | none detected at global scope, or all wired |
 | daemon | Stops a bare daemon, then `daemon install` | `--no-service`, already supervised, declined |
-| device | Prompts for a link code; blank skips | already linked, blank input |
-| zavet | Plugin install, `.zavet/` scaffold, knowledge tier | `--no-zavet`, no repo, no `claude`, Windows (scaffold only) |
-| verify | Prints the summary and what is still open | never |
+| device | Prompts for a link code; blank skips. A successful link updates `State` in place, so every later step in the same run sees it linked | already linked, blank input |
+| zavet | Installs the zavet Claude Code plugin | `--no-zavet`, `claude` not on `PATH`, already installed |
+| zavet:repo | Scaffolds `.zavet/` in the current repo via the plugin's own `bin/zavet` | `--no-zavet`, not a git repo, `.zavet/` already present, Windows |
+| knowledge | Asks (or applies `--knowledge`) the content-sync tier — last, so the value is on disk before the daemon's next start | tier already matches |
+
+Knowledge is last on purpose (see "Knowledge consent" below); zavet's two
+steps run before it. After all seven, `run()` prints a closing summary (one
+line per `StepOutcome`) and an open-items block. **Neither is a step**:
+neither returns a `StepOutcome` nor appears in the `results` vec the summary
+renders from — they are `print_summary`/`print_open_items` in `mod.rs`, not
+entries the wizard iterates.
 
 ### Detection
 
@@ -51,17 +58,26 @@ Cursor being the case that motivated it, since the app writes `~/.cursor` and
 ships no `cursor-agent` by default. Requiring both would silently skip real
 installs; requiring either costs a deselect.
 
-"Already wired" is read from `doctor::checks::read_harness_wiring`, so it means
-exactly what `dira doctor` means by it. A partially wired harness (new events
-added by an upgrade) still counts as wirable, since re-running `init` is what
-closes that gap.
+"Already wired" is read from `doctor::checks::read_harness_wiring`, **filtered
+to global scope** (`detect::globally_wired`), so it means what `dira doctor`
+means by it minus project-scope entries — a bare `dira init` run inside one
+repo must not read as "this harness is done" for a command that wires the
+whole machine (DIRASH-0029's "why user scope"). A partially wired harness (new
+events added by an upgrade) still counts as wirable, since re-running `init`
+is what closes that gap.
 
-**Detection performs no writes.** Two probes were changed to hold this
-property: `device_linked` short-circuits on the database file's existence
-rather than calling `Store::open` (which creates and migrates), and plugin
-presence uses `zavet_install::plugin_root_offline()`, which reads
-`installed_plugins.json` rather than spawning `claude` (which bootstraps
-`~/.claude.json`). See DIRASH-0029.
+When `$HOME` cannot be resolved, detection reports zero harnesses rather than
+falling back to probing the current directory — a repo whose own tree happens
+to carry a `.claude/` would otherwise read as "Claude Code detected".
+
+**Detection performs no writes**, including against a database that already
+exists. `device_linked` short-circuits on the file's absence, and — for a
+present file — opens it with `Store::open_readonly` (`read_only(true)` +
+`immutable(true)`; a bare `read_only(true)` alone still creates `-wal`/`-shm`
+sidecars on a WAL-mode database), never `Store::open`, which would migrate and
+write. Plugin presence uses `zavet_install::plugin_root_offline()`, which
+reads `installed_plugins.json` rather than spawning `claude` (which
+bootstraps `~/.claude.json`). See DIRASH-0029.
 
 ### Modes
 
@@ -97,10 +113,15 @@ carries a placeholder — and the summary says so, pointing at `/zavet:init`.
 
 ### Knowledge consent
 
-Its own step, its own prompt, naming the content `full` sends. Defaults to
-`full`, declines to `metadata`, never bundled into linking or billing consent.
-Reported as pending when the device is unlinked, since the daemon's flush is
-gated on the link. See DIRASH-0030.
+Its own step, its own prompt, naming the content `full` sends. The disclosure
+prints on **every** path — interactive, `--yes`, and an explicit
+`--knowledge <tier>` — not only the one that stops to ask; a non-interactive
+run must not act on content consent silently. Defaults to `full`, declines to
+`metadata`, never bundled into linking or billing consent. Reported as pending
+when the device is unlinked, since the daemon's flush is gated on the link —
+and, because `device`'s successful link updates `State` in the same run, a
+device linked earlier in that run is correctly reported as linked here rather
+than stale-pending. See DIRASH-0030.
 
 ## Interfaces & data
 
@@ -117,7 +138,14 @@ gated on the link. See DIRASH-0030.
   report wording; `init::OnUnparseable` — the corrupt-config policy
   (`Overwrite` for `dira init`, `Refuse` for onboard).
 - `which::on_path` — shared with `zavet_install`'s `claude` probe.
-- `config_cmd::set_quiet` — `set` without the report, same validation.
+- `config_cmd::set_quiet` / `set_quiet_at` — `set` without the report, same
+  validation; `set_quiet` resolves the real XDG path and delegates to
+  `set_quiet_at`, which holds the whole write body. `steps::knowledge` takes
+  the write as an injected `&dyn Fn(&str) -> Result<PathBuf>` rather than
+  calling `set_quiet` directly, so an in-process test can substitute a
+  recording stub instead of touching the developer's real `config.toml`.
+- `Store::open_readonly` — read-only, immutable, never migrates; what
+  detection's device-link probe opens an existing db with.
 
 ## Invariants
 
@@ -129,7 +157,12 @@ gated on the link. See DIRASH-0030.
 - Onboarding never sets `core.hooksPath`.
 - A harness accepted by `--harness` is one `init::wire` can actually wire, so
   a bad id fails before any step runs rather than mid-run.
-- The knowledge tier is restated in the summary on every path.
+- "Already wired" is judged at global scope only; a project-scope wiring never
+  counts as done for onboarding.
+- The knowledge tier is restated in the summary on every path, including the
+  disclosure of what `full` sends.
+- A device linked earlier in a run is treated as linked by every step that
+  runs later in that same run.
 
 ## Open Questions
 

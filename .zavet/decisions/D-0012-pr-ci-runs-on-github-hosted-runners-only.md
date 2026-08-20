@@ -17,7 +17,7 @@ fallback were removed from this workflow. `build-release.yml` keeps both.
 ## Why
 
 `ci.yml` triggers on `pull_request` and its `rust` job compiles and runs the
-contributor's code — `cargo test`, `build.rs`, proc-macro expansion. On a public
+contributor's code: `cargo test`, `build.rs`, proc-macro expansion. On a public
 repo that is arbitrary code execution by anyone who gets a PR approved. The
 `self-hosted,build` pool is persistent and sits inside our network, so one
 poisoned PR buys lateral access plus a foothold that survives into later
@@ -30,9 +30,9 @@ radius at a throwaway VM.
 
 ## Rejected
 
-- **Keep the fallback, rely on approval gates** — approval is per-contributor,
+- **Keep the fallback, rely on approval gates**. Approval is per-contributor,
   not per-diff; it stops drive-by PRs, not a patient one.
-- **Split fork vs same-repo PRs across runner pools** — doubles the job matrix
+- **Split fork vs same-repo PRs across runner pools**. Doubles the job matrix
   to protect a runner-minutes optimization that public repos make free anyway.
 
 ## Agent directives

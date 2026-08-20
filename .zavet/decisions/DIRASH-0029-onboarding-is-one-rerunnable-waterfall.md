@@ -17,8 +17,8 @@ verified: false
 ## Decision
 
 `dira onboard` is the single entry point for setting a machine up. It runs six
-steps in dependency order — detect, harnesses, daemon service, device link,
-zavet, verify — and three rules govern all of them:
+steps in dependency order: detect, harnesses, daemon service, device link,
+zavet, verify. Three rules govern all of them:
 
 1. **Skip, don't fail.** No step aborts the run. A step that cannot proceed
    returns `StepOutcome::Skipped`/`Failed`, the wizard continues, and the
@@ -29,8 +29,8 @@ zavet, verify — and three rules govern all of them:
 3. **Detection never writes.** The detection pass may not create files or
    spawn anything that does, because `--print` promises to change nothing.
 
-`install.sh` and `install.ps1` ask — on `/dev/tty` and on an unredirected
-console respectively — whether to register the daemon as a login service, and
+`install.sh` and `install.ps1` ask, on `/dev/tty` and on an unredirected
+console respectively, whether to register the daemon as a login service, and
 their Next-steps collapse to `dira onboard`. With no terminal, or with
 `--no-interactive`/`-NoInteractive`, the historical hands-off behaviour is
 unchanged byte for byte.
@@ -39,18 +39,19 @@ Onboarding wires harnesses at **user scope**, unlike a bare `dira init`.
 
 ## Why
 
-Four surfaces used to state four different getting-started sequences: the root
+Four places used to state four different getting-started sequences: the root
 `--help`, `README.md`, `install.sh:942` and `install.ps1:1048`. The two most
-users actually saw — the installers — omitted `dira init` entirely, so anyone
+users actually saw, the installers, omitted `dira init` entirely, so anyone
 who followed them ended up with a running daemon that captured nothing,
 silently and indefinitely. They also recommended `dira daemon start`, which
 takes the control socket and thereby blocks the `dira daemon install` that was
 the actually-correct step (D-0009 makes that socket the single-instance
 guard). The documented path led directly into a trap.
 
-**Why the installer may now prompt.** The old rationale — "`curl | sh` has no
-usable stdin to ask with anyway", written at `install.sh:936` — was only half
-true. Under `curl … | sh` stdin *is* the script being read, but `/dev/tty` is
+**Why the installer may now prompt.** The old rationale, quoted from
+`install.sh:936`, was only half true: "`curl | sh` has no usable stdin to ask
+with anyway". Under `curl … | sh` stdin *is* the script being read, but
+`/dev/tty` is
 the controlling terminal regardless of how stdin is plumbed, which is exactly
 what it exists for. The half that was true is preserved: installing a
 launchd/systemd agent is a persistent system change and is still never done
@@ -59,7 +60,7 @@ silently.
 **Why user scope.** `dira init` defaults to project scope because you run it
 inside the repo you want tracked. Onboarding sets up a *machine*; project
 scope would wire only whichever directory the user happened to be standing in
-and leave every other repo uncaptured with no signal why — the same
+and leave every other repo uncaptured with no signal why. That is the same
 silent-undercapture failure the command exists to prevent.
 
 **Why detection may not write.** Two probes had to be changed to hold this.
@@ -72,7 +73,7 @@ detection reads `installed_plugins.json` directly via `plugin_root_offline()`.
 
 **Why skip-don't-fail.** The steps are independent. A harness config that will
 not parse should not cost the user their daemon service or their device link,
-and an early `?` would make the failure order — not the severity — decide how
+and an early `?` would make the failure order, not the severity, decide how
 much of the setup happened.
 
 ## Rejected
@@ -104,7 +105,7 @@ much of the setup happened.
   offline variant and use that (see `plugin_root_offline`).
 - Both `dira init` and onboarding dispatch through `init::wire`; do not add a
   second per-harness match. Onboarding passes `global: true` and
-  `OnUnparseable::Refuse`, `dira init` passes `Overwrite` — the user named
+  `OnUnparseable::Refuse`, `dira init` passes `Overwrite`. The user named
   that exact file there; onboard did not.
 - Validate a user-supplied harness against `init::is_wirable`, never against
   `canonical_harness_id` alone: the latter also resolves `generic`, which has
@@ -112,7 +113,7 @@ much of the setup happened.
   `detect::HARNESSES`; `the_three_harness_tables_agree` pins them together.
 - A bare-started daemon is stopped before `daemon install`, and never reordered:
   the socket is the single-instance guard. The stop now lives *inside*
-  `daemon::install` rather than in this step — see the amendment below. Do not
+  `daemon::install` rather than in this step. See the amendment below. Do not
   re-add it here, and do not remove it from there.
 - Never run `zavet hooks install` and never write `core.hooksPath`
   (DIRASH-0024 governs this; onboarding inherits it).
@@ -135,11 +136,11 @@ detection bugs; the idempotency test asserts the settings file's mtime is
 unchanged on a second run, not merely that the output says "already wired".
 
 Unit tests in `cli/dira/src/onboard/` cover the decision logic behind a
-scripted `Ui` — including that the knowledge disclosure names the content it
+scripted `Ui`, including that the knowledge disclosure names the content it
 sends.
 
 `install.sh` is verified with `sh -n` and by exercising `_can_prompt` with
-stdin closed, stdin piped, and detached — all three take the silent path.
+stdin closed, stdin piped, and detached. All three take the silent path.
 `install.ps1` parses clean under pwsh 7.4.6 (arm64 tarball; the Microsoft
 container images are amd64-only and crash under qemu), and `Test-CanPrompt`
 returns false in the piped/CI shape.
@@ -156,8 +157,8 @@ returns false in the piped/CI shape.
 ## Amendment: the pre-stop moved into `daemon::install` (2026-08-14)
 
 The ordering above was right and stayed right; the *placement* was the bug.
-"The daemon step stops a bare-started daemon" described three callers — this
-step, `install.sh` and `install.ps1` — and silently excused the fourth. A bare
+"The daemon step stops a bare-started daemon" described three callers: this
+step, `install.sh` and `install.ps1`. It silently excused the fourth. A bare
 `dira daemon install` never stopped anything, so on a machine with a
 hand-started `dirad` it installed a launchd `KeepAlive` / systemd
 `Restart=always` / logon-task service that could not bind D-0009's socket, lost
@@ -176,6 +177,6 @@ Two things came with it, both required rather than incidental:
   instead of signalling, unlinking the pidfile and socket, and printing
   "stopped". D-0019's directive is not platform-scoped; unix was exempt only
   because D-0009's `flock` makes a duplicate *safe*. Safe is not the same as
-  unnecessary — a supervisor still flaps against a socket it cannot take.
+  unnecessary. A supervisor still flaps against a socket it cannot take.
 - `install` is now `async`, and only stops a daemon nothing is supervising.
   Stopping a supervised one would just make its supervisor restart it mid-install.

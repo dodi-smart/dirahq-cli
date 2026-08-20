@@ -39,14 +39,14 @@ against is therefore *a diagnosis nobody can act on*, and both rules target it.
 **Why no `--fix`.** Every remedy doctor prints is either destructive
 (`daemon restart`, `device rotate-key`, `dira init` overwriting a config) or a
 one-liner the user should run knowingly. And in the incident that produced this
-command, the plausible automatic fix was `dira daemon start` — precisely the
-action that makes an elevated-daemon situation worse, and which `daemon::start`
-already refuses for that reason (D-0016). A doctor that guesses wrong while
-acting is worse than no doctor.
+command, the plausible automatic fix was `dira daemon start`. That is
+precisely the action that makes an elevated-daemon situation worse, and
+`daemon::start` already refuses it for that reason (D-0016). A doctor that
+guesses wrong while acting is worse than no doctor.
 
 **Why skip rather than fail.** With the daemon down, five checks lose their
 input at once. Failing all five produces a wall of red in which the one line
-that matters — `daemon.reachable` — is indistinguishable from its own
+that matters, `daemon.reachable`, is indistinguishable from its own
 consequences. That is the same "everything looks equally broken" experience the
 command was written to replace.
 
@@ -81,14 +81,14 @@ tweak bumping the attestation wire version.
 - A new check whose inputs are unavailable MUST return `Check::skip`. Reserve
   `fail` for evidence that something is actually broken.
 - Never let `doctor::run` (or anything it calls) return `Result` to `main`.
-- Every new check id goes in `CHECK_IDS` in registry order — it is both the
+- Every new check id goes in `CHECK_IDS` in registry order. It is both the
   `--check` allow-list and the documented `--json` key set, and a test pins the
   runner against it.
 - `daemon.reachable`'s `Denied` arm must never advise a bare
   `dira daemon start`. This arm is unreachable from CI on every platform we
   build on; the unit test is the only guard it has.
 - In `--json` mode, stdout carries exactly one object. Nothing else may print
-  there — including `hook_health::maybe_warn` and the update notice.
+  there, including `hook_health::maybe_warn` and the update notice.
 - Bump the `--json` `schema` only for a removal, a rename, or a changed level
   meaning. Additions are free.
 
@@ -106,4 +106,4 @@ absent (exit 2, four skips, store checks still reporting), and for
 
 **Not verified on Windows**, which is where the motivating incident happened.
 The `Denied` path and the elevation advice are covered by pure judge tests
-only — `elevation::is_elevated()` gives any CI runner exactly one token.
+only. `elevation::is_elevated()` gives any CI runner exactly one token.

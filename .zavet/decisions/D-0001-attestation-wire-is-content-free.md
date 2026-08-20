@@ -19,13 +19,13 @@ through a separate `KnowledgeEnvelope` with its own cursor and consent gate.
 ## Why
 
 The billing attestation channel is trusted because it is provably policy-free
-and content-free — `wire_contract_carries_no_content_fields` denylists content
+and content-free. `wire_contract_carries_no_content_fields` denylists content
 tokens on every wire field name. Mixing knowledge prose into it would poison
 that guarantee and every privacy claim built on it.
 
 ## Rejected
 
-- Additive optional fields on `AttestationBatch` — breaks the invariant test by
+- Additive optional fields on `AttestationBatch`. Breaks the invariant test by
   design, and couples knowledge consent to billing consent.
 
 ## Agent directives

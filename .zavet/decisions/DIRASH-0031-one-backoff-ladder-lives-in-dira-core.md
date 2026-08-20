@@ -28,7 +28,7 @@ local mirror.
 The mirror's reasoning was that `dira` does not depend on `dirad` and the two
 want different caps. Both are still true and neither argues for a second
 implementation: the caps are *values*, and both crates already depend on
-`dira_core` — `update/retry.rs` was importing `parse_retry_after_secs` from the
+`dira_core`. `update/retry.rs` was importing `parse_retry_after_secs` from the
 very module the ladder now lives in.
 
 The mirror had also already failed at the one thing it was for. "Keeping the
@@ -36,7 +36,7 @@ shape identical is the point" was the stated rationale, and the shapes had
 drifted: the daemon capped both branches of `transient_wait`
 (`unwrap_or_else(ladder).min(MAX)`), the updater capped only the `Retry-After`
 one (`map_or_else(ladder, |a| a.min(max))`). Equivalent solely because the
-ladder is pre-capped — so the day someone returns an uncapped value from the
+ladder is pre-capped. So the day someone returns an uncapped value from the
 ladder, one caller is wedged by a hostile `Retry-After` and the other is not.
 A copy that must be kept identical by hand is not a shape guarantee.
 
@@ -45,15 +45,15 @@ safe reading of the two.
 
 ## Rejected
 
-- **Keep the mirror, fix the drift in place** — restores the invariant for
+- **Keep the mirror, fix the drift in place**: restores the invariant for
   exactly as long as nobody edits either copy again. The drift is the evidence
   that hand-synchronised copies do not stay synchronised.
-- **Share the retry loop as well, not just the ladder** — the two loops are not
+- **Share the retry loop as well, not just the ladder**: the two loops are not
   the same thing. The daemon dispatches on typed `SyncError` variants with arms
   that slam to the cap or hard-stop; the updater has a binary retry/fatal split
   and an attempt budget. Unifying those would mean inventing a shape neither
   caller wants.
-- **Put `Backoff` in a new `dira_core::retry` module** — `sync::ratelimit`
+- **Put `Backoff` in a new `dira_core::retry` module**: `sync::ratelimit`
   already owns `Retry-After` parsing, which is the input to the very function
   being shared. A second module would split one concern across two.
 
@@ -71,13 +71,13 @@ safe reading of the two.
 
 `cargo test -p dira-core --lib sync::ratelimit` (9 tests) covers seed/double/cap
 on both callers' real numbers, `Retry-After` override and clamping, and asserts
-directly that *both* arms are capped for every input — the property the two
-copies disagreed on.
+directly that *both* arms are capped for every input. That is the property the
+two copies disagreed on.
 
 `cargo test -p dira --bin dira update::retry` asserts the updater still carries
 500ms/4s after the move: the ladder became a value, and a value can be changed
 without breaking a compile.
 
-`cargo test -p dirad --lib sync::` (54 tests) is unchanged and still green —
+`cargo test -p dirad --lib sync::` (54 tests) is unchanged and still green.
 `next_backoff`/`transient_wait` were kept as named wrappers, so no daemon call
 site moved.

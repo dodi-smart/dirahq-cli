@@ -28,7 +28,7 @@ It reports that the git-hook floor is inactive and stops there.
 
 `dira zavet install` is machine-scope: user scope by default, valid to run from
 `$HOME`, and it neither knows nor cares which repo you are standing in.
-`zavet adapters` is the exact opposite — it writes *tracked, committed* files
+`zavet adapters` is the exact opposite. It writes *tracked, committed* files
 into whatever working tree it finds. Folding one into the other unconditionally
 means a global install command silently rewriting committed files in an
 unrelated repo.
@@ -41,9 +41,9 @@ binaries rather than inferred:
   missing** and exits 1. Without dira's own repo gate, a `--update` from `$HOME`
   would treat that as "stale" and write adapter files into the home directory.
 - zavet **1.2.0 has no `adapters` subcommand at all**. Asked for
-  `adapters --check` it prints its general usage text and exits **1** — the same
-  exit code 1.3.0 uses for "stale". Exit codes therefore cannot feature-detect
-  here, and a version guard is the only correct discriminator.
+  `adapters --check` it prints its general usage text and exits **1**. That is
+  the same exit code 1.3.0 uses for "stale". Exit codes therefore cannot
+  feature-detect here, and a version guard is the only correct discriminator.
 
 The binary must be the *plugin root's* `bin/zavet`, never the repo's vendored
 `.zavet/bin/zavet`: the vendored copy is precisely the artifact being
@@ -56,26 +56,26 @@ strictly worse than the tool that owns the feature.
 
 ## Rejected
 
-- **Refresh adapters unconditionally after a successful install** — turns a
+- **Refresh adapters unconditionally after a successful install**: turns a
   machine-scope command into one that mutates whichever repo you happen to be
   standing in. The saved step is not worth a surprise diff in an unrelated tree.
-- **Feature-detect `adapters` by exit code** — 1.2.0 and "stale" are both exit
+- **Feature-detect `adapters` by exit code**: 1.2.0 and "stale" are both exit
   1, so this silently treats every pre-1.3.0 install as a repo needing a write.
-- **Let `zavet adapters` do its own repo detection** — it does, and it still
+- **Let `zavet adapters` do its own repo detection**: it does, and it still
   reports everything missing outside a repo. Its contract is "generate here",
   not "decide whether here is appropriate"; that judgement belongs to the
   machine-scope caller.
-- **Run `zavet hooks install` too, to finish the job** — silently seizes
+- **Run `zavet hooks install` too, to finish the job**: silently seizes
   `core.hooksPath` from whatever hook manager the repo already uses.
 
 ## Agent directives
 
 - Never invoke `zavet adapters` (or any repo-writing zavet subcommand) without
   first passing the three-part gate above. `RepoGate` exists to make that
-  unskippable — construct it, do not hand-roll the check.
+  unskippable. Construct it, do not hand-roll the check.
 - Never call `zavet hooks install` from dira, and never write `core.hooksPath`.
   Reporting the floor as inactive is the whole contract.
 - Resolve the zavet binary from the plugin root, never from `.zavet/bin/zavet`.
 - Any new repo-scoped zavet capability inherits this gate. If a test can pass
-  with zero commands stubbed on a `NotGit` gate, keep it that way — that
+  with zero commands stubbed on a `NotGit` gate, keep it that way. That
   property is what proves nothing was spawned.

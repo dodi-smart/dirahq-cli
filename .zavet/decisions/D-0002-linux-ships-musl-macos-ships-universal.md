@@ -21,7 +21,7 @@ no separate Intel and Apple Silicon macOS artifacts, no Windows.
 
 A `-gnu` binary links against the *build* host's glibc and imposes that
 version as a floor on every user. Built on ubuntu-24.04 that floor is 2.39,
-which excludes Ubuntu 22.04, Debian 12, RHEL 9 and Amazon Linux 2023 — the
+which excludes Ubuntu 22.04, Debian 12, RHEL 9 and Amazon Linux 2023. The
 failure surfaces as `GLIBC_2.39 not found`, which reads to a user as "your
 installer is broken". Worse, the x86_64 leg runs on a self-hosted runner
 whose glibc version is unknown and can change without notice, so the floor
@@ -30,18 +30,18 @@ entirely and makes Alpine and containers supported rather than rejected.
 
 The macOS side is a `lipo` fat binary that the packaging action assembles
 itself. One artifact covers both architectures, which is why `install.sh`
-has no arch branch on Darwin and needs no Rosetta detection — a translated
+has no arch branch on Darwin and needs no Rosetta detection. A translated
 x86 shell on Apple Silicon simply works.
 
 ## Rejected
 
-- **Keeping gnu alongside musl as an escape hatch** — doubles the Linux
+- **Keeping gnu alongside musl as an escape hatch**. Doubles the Linux
   matrix to publish an artifact whose whole problem is that its
   compatibility floor is invisible until a user hits it.
-- **Separate `x86_64-apple-darwin` and `aarch64-apple-darwin`** — an extra
+- **Separate `x86_64-apple-darwin` and `aarch64-apple-darwin`**. An extra
   leg, an extra artifact, and an arch-detection branch in the installer, to
   produce something the universal binary already covers.
-- **musl via the packaging action's implicit `cross` fallthrough** — it works,
+- **musl via the packaging action's implicit `cross` fallthrough**. It works,
   but it is inferred from that action's `main.sh` rather than documented, and
   it pulls in Docker. `taiki-e/setup-cross-toolchain-action` is explicit.
 

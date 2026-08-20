@@ -30,7 +30,7 @@ reintroduce a header.
 A Vercel rewrite to `raw.githubusercontent.com` was the obvious design and
 does not work. `@astrojs/vercel` writes `.vercel/output/config.json` itself
 via the Build Output API, so a root `vercel.json` is read only to warn about
-a `trailingSlash` conflict — its routing and headers are silently ignored.
+a `trailingSlash` conflict. Its routing and headers are silently ignored.
 The rewrite would appear configured and do nothing.
 
 Even if it worked it would be wrong here: it fails entirely while this repo
@@ -39,18 +39,18 @@ githubusercontent's availability and rate limits in the install path; and it
 serves whatever is on the branch right now, so a bad commit is live with no
 deploy gate and no rollback.
 
-The copy is byte-identical — the "vendored, do not edit" notice lives in a
-sibling README, not a header comment — specifically so the drift check is a
-plain `diff` with nothing to normalize. A header would mean defining "drift
+The copy is byte-identical. The "vendored, do not edit" notice lives in a
+sibling README, not a header comment. That keeps the drift check a plain
+`diff` with nothing to normalize. A header would mean defining "drift
 modulo N lines", which is a rule that eventually gets it wrong.
 
 ## Rejected
 
-- **Vercel rewrite or proxy to raw.githubusercontent.com** — silently
+- **Vercel rewrite or proxy to raw.githubusercontent.com**. Silently
   ignored by the adapter, and broken while the repo is private.
-- **Astro fetching the script at build time** — same private-repo problem,
+- **Astro fetching the script at build time**. Same private-repo problem,
   and it makes the landing build depend on a GitHub fetch.
-- **A vendored copy with an added provenance header** — breaks byte equality
+- **A vendored copy with an added provenance header**. Breaks byte equality
   and complicates the drift check for a comment.
 
 ## Agent directives
@@ -59,6 +59,6 @@ modulo N lines", which is a rule that eventually gets it wrong.
 - Keep the two files byte-identical; provenance notes go in
   `scripts/README.md` on the landing side.
 - Do not add routing or headers to a `vercel.json` in the landing repo and
-  expect them to apply — the adapter owns the output config.
+  expect them to apply. The adapter owns the output config.
 - The release also attaches `install.sh` as an asset, so
   `releases/latest/download/install.sh` stays a permanent fallback URL.

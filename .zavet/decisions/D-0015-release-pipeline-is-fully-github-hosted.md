@@ -19,7 +19,7 @@ plain `ubuntu-latest`.
 
 The org's Default runner group sets `allows_public_repositories: false`. Once
 this repo went public, GitHub simply stopped scheduling any job requesting
-those labels — it **queues forever rather than failing**, which is the worst
+those labels. It **queues forever rather than failing**, which is the worst
 shape of breakage: no error, no timeout, a release that never finishes.
 
 Observed directly: a dry-run dispatch had every other leg green while
@@ -27,7 +27,7 @@ Observed directly: a dry-run dispatch had every other leg green while
 online, idle, correctly-labelled runners available.
 
 `runner-fallback-action` cannot rescue this. It selects on whether runners are
-online and idle — they are — and has no visibility into the group policy, so
+online and idle, they are, and has no visibility into the group policy, so
 it confidently picks a pool that will never accept the job. A fallback that
 only triggers on "no runner online" is the wrong guard for "runner exists but
 policy forbids it."
@@ -39,14 +39,14 @@ there is nothing to buy back.
 
 ## Rejected
 
-- **Set `allows_public_repositories: true`** — trades a security boundary for
+- **Set `allows_public_repositories: true`**. Trades a security boundary for
   runner minutes that are already free.
-- **Keep the fallback, add a policy probe** — more moving parts guarding a
+- **Keep the fallback, add a policy probe**. More moving parts guarding a
   pool we no longer have a reason to use.
 
 ## Agent directives
 
 - Never reintroduce `self-hosted` labels into a workflow in this repo while it
-  is public — they queue silently instead of failing loudly.
+  is public. They queue silently instead of failing loudly.
 - If a job hangs in `queued` with runners visibly idle, check the runner
   group's `allows_public_repositories` before debugging the workflow.

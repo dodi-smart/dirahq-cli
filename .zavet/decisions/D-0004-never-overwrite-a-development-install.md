@@ -16,7 +16,7 @@ verified: true
 If the `dira` on the install path is a symlink into `target/release` or
 `target/debug`, or the running executable itself lives under `target/`, both
 `install.sh` and `dira update` refuse. `--force` overrides the symlink case
-only — never a build-tree binary.
+only. Never a build-tree binary.
 
 ## Why
 
@@ -24,7 +24,7 @@ only — never a build-tree binary.
 a contributor's PATH entry points into their build tree. Silently replacing
 that symlink with a released binary destroys their dev loop in a way that is
 confusing to diagnose: `cargo build` keeps succeeding, the binary on PATH
-just stops changing. Overwriting a file *inside* `target/` is worse — the
+just stops changing. Overwriting a file *inside* `target/` is worse. The
 next `cargo build` clobbers it, so the update never sticks.
 
 Detection has to work from the PATH entry, not `current_exe()`.
@@ -35,10 +35,10 @@ sees it.
 
 ## Rejected
 
-- **Overwrite and print a warning** — the warning scrolls past in a `curl | sh`
+- **Overwrite and print a warning**. The warning scrolls past in a `curl | sh`
   and the damage is silent thereafter.
-- **Detect via `current_exe()`** — cannot see the symlink at all.
-- **Let `--force` override a `target/` binary** — there is no coherent meaning
+- **Detect via `current_exe()`**. Cannot see the symlink at all.
+- **Let `--force` override a `target/` binary**. There is no coherent meaning
   to installing into a build directory.
 
 ## Agent directives

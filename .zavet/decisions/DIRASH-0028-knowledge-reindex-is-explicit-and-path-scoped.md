@@ -18,8 +18,8 @@ The ambient git poll keeps its bounded first-sight walk
 (`COMMIT_BACKFILL_LIMIT`). Recovering the knowledge history that bound skips is
 a separate, user-initiated command, `dira zavet reindex`, which:
 
-1. walks **full history scoped to a `.zavet/` pathspec** for decisions and specs
-   — unbounded, because the pathspec is what keeps it cheap;
+1. walks **full history scoped to a `.zavet/` pathspec** for decisions and
+   specs: unbounded, because the pathspec is what keeps it cheap;
 2. walks commit trailers under a **default bound** (`REINDEX_TRAILER_LIMIT`),
    liftable with `--all-trailers`, because trailers ride arbitrary commits and
    that walk is whole-history by nature;
@@ -28,7 +28,7 @@ a separate, user-initiated command, `dira zavet reindex`, which:
 4. **never writes `repo_baseline`**, and never runs on the ambient path.
 
 The record walk drives the same `zavet_sweep` as the poll. The trailer walk
-drives `zavet_trailers` — that function *is* `zavet_sweep`'s own first stage,
+drives `zavet_trailers`. That function *is* `zavet_sweep`'s own first stage,
 extracted and called by both, not a copy of it. There is one parser for
 trailers and one for records, and the record parser is never invoked over the
 trailer window (see Why).
@@ -41,7 +41,7 @@ record names `reindex`, not `sync`, whenever sync cannot reach it.
 ## Why
 
 The mirror in SQLite is populated as a side effect of commit capture, which
-bounds a repo's first walk and then sets the baseline — so history older than
+bounds a repo's first walk and then sets the baseline. So history older than
 that window is never revisited. On a fresh clone that is not an edge case but
 the normal outcome: this repo carries 21 decisions and 5 specs across 161
 commits, of which a 15-commit first-sight walk indexes almost none. Every query
@@ -52,12 +52,12 @@ whole distribution model (D-0001), and it was silently only half-working.
 
 The bound stays on the ambient path because it is load-bearing there: that walk
 runs inside `CAPTURE_TIMEOUT` on a path that must never stall the writer. A
-user-initiated command has no such constraint — it is off the hot path, the
+user-initiated command has no such constraint. It is off the hot path, the
 accept loop spawns per connection, and it may take seconds.
 
 The pathspec is what makes "full history" affordable rather than reckless: git
-returns only commits that touched `.zavet/decisions` or `.zavet/specs` — 30 of
-161 in this repo — so depth costs almost nothing. Trailers have no such scope,
+returns only commits that touched `.zavet/decisions` or `.zavet/specs`, 30 of
+161 in this repo, so depth costs almost nothing. Trailers have no such scope,
 which is why they are the one bounded half, and why the renderer says so
 out loud instead of letting a partial scan read as exhaustive.
 
@@ -67,7 +67,7 @@ rev-parse` per touched record; trailers cost one batched `git log --no-walk`
 for the entire set. Measured on this repo, running the record parser across a
 189-commit trailer window spends 2.4s and 189 subprocesses to produce results
 that are then discarded, against 0.05s and one subprocess for the trailers
-actually wanted — and that gap grows linearly with `--all-trailers`. Sharing
+actually wanted, and that gap grows linearly with `--all-trailers`. Sharing
 one function across both windows would mean paying the record parser's price
 on the window that by design never needs it.
 
@@ -76,51 +76,51 @@ which is the knowledge-sync cursor (D-0001's separate channel), so a reindex
 that re-stamps every row re-pushes the entire knowledge set on each run.
 Collapsing to first-and-last sighting is the same argument: the store preserves
 first-sight fields on conflict and overwrites the living ones, so replaying a
-record's middle revisions cannot change the final row — it can only churn the
+record's middle revisions cannot change the final row. It can only churn the
 cursor, and a middle revision's hash never matches the stored latest one, so
 without collapsing, *every* run would re-push.
 
 ## Rejected
 
-- **Raise or drop `COMMIT_BACKFILL_LIMIT`** — makes every first sight of every
+- **Raise or drop `COMMIT_BACKFILL_LIMIT`**: makes every first sight of every
   repo pay full-history cost inside the capture timeout, on the path that must
   not stall the writer. It also cannot be scoped: commit capture genuinely wants
   recent commits, knowledge wants all of `.zavet/`.
-- **Reindex automatically on first sight** — same timeout problem, and it turns
+- **Reindex automatically on first sight**: same timeout problem, and it turns
   an explicit recovery into ambient behavior that fires on every new repo.
-- **A second, knowledge-specific watermark that the poll walks backwards** —
-  the strongest alternative, and NOT refuted by the timeout argument above: a
+- **A second, knowledge-specific watermark that the poll walks backwards.**
+  The strongest alternative, and NOT refuted by the timeout argument above: a
   `zavet_baseline` recording how far back the `.zavet/`-scoped walk has reached,
   advanced a bounded number of commits per tick, converges on its own, stays
   inside `CAPTURE_TIMEOUT`, and terminates (the scoped walk is small and
-  finite). DIRASH-0027 blesses exactly this shape — "a change to the capture
+  finite). DIRASH-0027 blesses exactly this shape: "a change to the capture
   window with its own decision". It is rejected here only on sequencing, not on
   merit: this command is the smaller change, it is the one a user can run today
   on a clone that is already wrong, and a converging poll still wants a manual
   trigger for the trailer half, which has no pathspec to bound it. If the
   watermark is built, this command should become its escape hatch rather than
-  the primary remedy — and `uncaptured_hint` should stop naming two commands
+  the primary remedy, and `uncaptured_hint` should stop naming two commands
   (see below).
-- **Read the working tree instead of git history** — cheap, but it has no
+- **Read the working tree instead of git history**: cheap, but it has no
   `first_commit`, no `created_at`, and no trailers. Provenance is most of what
   `why` answers with; an index that knows *what* was decided but not *when* or
   *in which commit* is not the same index.
-- **Let `--project` name a repo to reindex** — the walk reads git history off a
+- **Let `--project` name a repo to reindex**: the walk reads git history off a
   working tree, so a repo the caller is not standing in has nothing to walk.
   The other `Zavet*` queries take `--project`; this one deliberately does not.
-- **Attribute reindexed records to the current session** — a reindex replays
+- **Attribute reindexed records to the current session**: a reindex replays
   other people's history. Stamping it with whichever session happens to be open
   would invent provenance the ambient path earns honestly.
-- **Have `dira zavet status` reindex when it detects drift** — reporting and
+- **Have `dira zavet status` reindex when it detects drift**: reporting and
   repairing stay separate (DIRASH-0022).
-- **Count `*.md` on disk against indexed rows for a drift figure on `status`**
-  — built first, then dropped. Two counts subtracted from each other must share
+- **Count `*.md` on disk against indexed rows for a drift figure on `status`**:
+  built first, then dropped. Two counts subtracted from each other must share
   one definition of "a record", or the difference is noise: a `README.md`, a
   dot-prefixed template, or a record whose frontmatter does not parse all read
   as permanently missing, and no reindex can clear them. DIRASH-0026's
   per-record probe answers this off `git ls-tree` and splits by remedy, which
   is strictly better; two overlapping signals on one subject is worse than one.
-- **A `--force` flag on `dira zavet sync`** — forbidden by DIRASH-0027, and it
+- **A `--force` flag on `dira zavet sync`.** Forbidden by DIRASH-0027, and it
   would not work regardless: forcing a re-read still walks `baseline..HEAD`.
   Reaching behind the baseline needs a different walk, which is this command.
   DIRASH-0027 anticipates exactly this ("a deeper backfill ... with its own
@@ -130,7 +130,7 @@ without collapsing, *every* run would re-push.
 
 - Never add a second implementation of decision/spec/trailer parsing. The poll
   and the reindex both reach it through `capture::zavet_sweep` /
-  `capture::zavet_trailers`, and the latter is the former's own stage — extract
+  `capture::zavet_trailers`, and the latter is the former's own stage. Extract
   and share, never copy. A reindex that disagrees with the ambient poll is
   worse than the under-indexing it fixes.
 - Never run the record parser over the trailer window. It costs a `diff-tree`
@@ -140,7 +140,7 @@ without collapsing, *every* run would re-push.
   bound on the poll and the absence of one here are the same decision.
 - Never drop the `content_hash` skip or the first-and-last collapse: together
   they are what make a repeat run write nothing and push nothing.
-- Never let the reindex write `repo_baseline` — commit capture owns that
+- Never let the reindex write `repo_baseline`. Commit capture owns that
   watermark and its own bound.
 - If a walk is bounded, say so in the output. A silent bound is the bug this
   record exists for.
@@ -152,7 +152,7 @@ spec's Open Questions:
 
 - **The hint names two commands.** `uncaptured_hint` tells a user to run
   `sync`, "or `reindex` if it stays". That hedge exists because the renderer
-  cannot tell a record ahead of the baseline from one behind it — but the
+  cannot tell a record ahead of the baseline from one behind it, but the
   daemon can (compare `repo_baseline` against HEAD, or test ancestry of the
   record's introducing commit) and should, as a third `reason` value in
   `ZavetUncapturedView`. DIRASH-0026's design is one remedy per reason; this is
@@ -160,7 +160,7 @@ spec's Open Questions:
 - **`writes()` can publish an old revision.** For a record not yet stored, the
   oldest sighting is written first and the newest second. Between those two
   awaits the row holds the introducing commit's body, and the knowledge channel
-  debounces at 3 s — a flush landing in that window ships the old body as
+  debounces at 3 s. A flush landing in that window ships the old body as
   current. Harmless in practice (the next flush corrects it) but it is a real
   window, and it disappears if the store accepts an explicit first-seen pair
   instead.

@@ -20,8 +20,8 @@ runs. Prerelease artifacts are produced only by an explicit
 Every merge to `develop` cuts a `-develop.N` prerelease. Building the full
 matrix plus the smoke legs on each one is real billed runner time while the
 repository is private, and nobody consumes those artifacts yet. Dispatch
-keeps the pipeline exercisable on demand — which is how it gets proven
-before the first public release — without paying for it on every merge.
+keeps the pipeline exercisable on demand, which is how it gets proven
+before the first public release, without paying for it on every merge.
 
 This is a cost decision tied to a temporary state, not an architectural one.
 Once the repo is public and runners are free, removing the skip makes every
@@ -30,10 +30,10 @@ dogfooding path. The line carries a `TODO(public)` marker for that.
 
 ## Rejected
 
-- **Remove the skip now** — the original plan. Reversed once the billing
+- **Remove the skip now**. The original plan. Reversed once the billing
   implication was weighed against the fact that nothing consumes prerelease
   artifacts yet.
-- **Build prereleases but skip the smoke job** — the smoke job is the only
+- **Build prereleases but skip the smoke job**. The smoke job is the only
   thing that proves the artifacts are usable; keeping the expensive half and
   dropping the valuable half is the wrong trade.
 
@@ -44,7 +44,7 @@ dogfooding path. The line carries a `TODO(public)` marker for that.
 - `workflow_dispatch` with `dry_run: true` is the safe way to exercise the
   full matrix from any branch; it must stay wired to the packaging action's
   own dry-run input.
-- The artifact facts this pipeline produces — checksum filename, flat tarball
-  root, both slices in the universal binary — are hardcoded assumptions in
-  `install.sh` and `update/artifact.rs`. Confirm them on a real dispatch
-  before the first public release.
+- The artifact facts this pipeline produces are hardcoded assumptions in
+  `install.sh` and `update/artifact.rs`: the checksum filename, the flat
+  tarball root, and both slices in the universal binary. Confirm them on a
+  real dispatch before the first public release.

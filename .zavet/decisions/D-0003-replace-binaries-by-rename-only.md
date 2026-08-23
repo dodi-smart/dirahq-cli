@@ -38,7 +38,7 @@ production on exactly the platform most users are on.
 
 Staging must happen in the destination directory, not `$TMPDIR`, so the
 rename is same-filesystem and therefore atomic. A cross-device `fs::rename`
-fails `EXDEV`, and the natural copy fallback is not atomic — it can leave a
+fails `EXDEV`, and the natural copy fallback is not atomic. It can leave a
 half-written binary where a working one used to be.
 
 Order matters for the same reason: dying between the two renames leaves a
@@ -47,11 +47,11 @@ detects and warns about. The reverse looks like success.
 
 ## Rejected
 
-- **Write directly to the target path** — `ETXTBSY` on Linux, and
+- **Write directly to the target path**. `ETXTBSY` on Linux, and
   non-atomic everywhere.
-- **Stage in `$TMPDIR` and rename across filesystems** — `EXDEV`, and the
+- **Stage in `$TMPDIR` and rename across filesystems**. `EXDEV`, and the
   fallback copy reintroduces the torn-write window.
-- **Stop the daemon first, then write** — makes the update path depend on a
+- **Stop the daemon first, then write**. Makes the update path depend on a
   successful shutdown, and still leaves `dira` replacing itself.
 
 ## Agent directives
@@ -62,4 +62,4 @@ detects and warns about. The reverse looks like success.
 - Preserve the `dirad`-then-`dira` order, and keep the hard-linked `.bak`
   copies until the post-restart health check passes.
 - Verify by running the installed binary's `--version` as a subprocess before
-  tearing down the daemon — it catches a wrong-target download early.
+  tearing down the daemon. It catches a wrong-target download early.

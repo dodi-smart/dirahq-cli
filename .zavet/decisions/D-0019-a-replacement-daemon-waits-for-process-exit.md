@@ -15,8 +15,8 @@ verified: false
 
 ## Decision
 
-Every windows restart path — bare (`restart_bare`) and scheduled-task
-(`restart_scheduled_task`) alike — sequences as:
+Every windows restart path, bare (`restart_bare`) and scheduled-task
+(`restart_scheduled_task`) alike, sequences as:
 
 ```
 send Shutdown → wait for PROCESS EXIT → if alive: taskkill /F
@@ -32,7 +32,7 @@ duplicate that gets started anyway is refused before it can touch the database.
 
 ## Why
 
-The single-instance guard is real and works — a duplicate is refused in 0.13 s
+The single-instance guard is real and works. A duplicate is refused in 0.13 s
 while the pipe is held. The restart path started the replacement in the one
 window the guard cannot cover.
 
@@ -41,23 +41,23 @@ is true, and the difference matters: `serve_control` spawns a detached accept
 loop that nothing cancels, and `handle_conn` fires the shutdown notify only
 *after* writing its response. The pipe therefore answers `Ping` for the whole of
 teardown. Meanwhile worst-case teardown is ~8 s (3 s offline beat + 5 s WAL
-checkpoint) against a 5 s grace window — so `still_up_after` returned `true` and
-`taskkill /F` fired into a daemon that was shutting down exactly as designed,
-mid `wal_checkpoint_truncate`, after which the replacement was spawned into a
-pipe whose handles had not been released. Outcome: frequently *zero* daemons and
-a truncated checkpoint, not two.
+checkpoint) against a 5 s grace window. So `still_up_after` returned `true`,
+and `taskkill /F` fired into a daemon that was shutting down exactly as
+designed, mid `wal_checkpoint_truncate`, after which the replacement was
+spawned into a pipe whose handles had not been released. Outcome: frequently
+*zero* daemons and a truncated checkpoint, not two.
 
 The reported *two* daemons come from `restart_scheduled_task`, which was worse
 and not a race: it sent `Shutdown`, waited, **discarded the result**, and ran
 `schtasks /Run` unconditionally with no force-kill on that path at all. It is
 the branch every user who ran `dira daemon install` takes, and
 `detect_supervision` returns `ScheduledTask` on mere *registration*, returning
-before the pidfile probe — so it structurally never learned the pid and could
+before the pidfile probe. So it structurally never learned the pid and could
 not have force-killed anything.
 
 Underneath both: "the control channel stopped answering" and "the process
 exited" are different questions, and only the second one licenses starting a
-replacement. Nothing in the tree asked the second one — a repo-wide search for
+replacement. Nothing in the tree asked the second one. A repo-wide search for
 `OpenProcess`/`WaitForSingleObject` finds only unrelated elevation checks.
 
 Unix is not exposed to the same failure because `bind_control_socket` holds a
@@ -70,7 +70,7 @@ the guard is only as good as the ordering that precedes it.
 - **Cancel the accept loop at the start of teardown** so the channel stops
   answering and the existing probe becomes accurate. Tempting and smaller, but
   it makes a shutting-down daemon indistinguishable from a crashed one for every
-  *other* client too, and still answers the wrong question — a process can
+  *other* client too, and still answers the wrong question. A process can
   outlive its listener for reasons other than an orderly shutdown.
 - **Just raise the grace window.** Necessary (5 s → 15 s) but not sufficient: it
   makes the force-kill rarer without ever establishing that the process is gone,
@@ -87,7 +87,7 @@ the guard is only as good as the ordering that precedes it.
 - Keep the stop grace budget above `dirad`'s worst-case teardown. If a teardown
   step gains a timeout, raise the budget in the same change.
 - Route restart decisions through the tri-state `reach`, not the boolean
-  `answers` — collapsing `ERROR_ACCESS_DENIED` to "down" is the mapping D-0016
+  `answers`. Collapsing `ERROR_ACCESS_DENIED` to "down" is the mapping D-0016
   forbids, and these are the functions that then kill and respawn.
 - Do not move `Store::open` back above `bind_control_socket`.
 
@@ -101,13 +101,13 @@ reaches `schtasks /Run` while the pid is listed. The refusal test was confirmed
 to fail when the guard is stubbed out.
 
 `restart_bare`/`restart_scheduled_task` gained injectable grace budgets purely
-so these run in milliseconds — the same seam, for the same reason, as
+so these run in milliseconds. That is the same seam, for the same reason, as
 `graceful_then_force`'s existing parameters.
 
 Since 2026-08-14 that is **one** function taking `os`, not a per-platform pair:
 the sequence above is the invariant, only the ask (`Request::Shutdown` vs
 SIGTERM) and the force (`taskkill /F` vs SIGKILL) differ, and two hand-synced
-copies of an invariant are not a guarantee. Unix now runs it too — see the
+copies of an invariant are not a guarantee. Unix now runs it too. See the
 amendment in DIRASH-0029 for why the flock made that optional but not
 unnecessary.
 
@@ -115,6 +115,6 @@ unnecessary.
 `tasklist` output shape, and the bind-before-store reorder under a contended
 database all need a manual pass before this record flips to `verified: true`.
 Local cross-compilation could not stand in: `ring` needs MSVC headers this
-machine does not have. No new `cfg(windows)` code was added — every branch
+machine does not have. No new `cfg(windows)` code was added. Every branch
 routes through the existing `Os`/`Runner` seam, so all of it is compiled and
 exercised on macOS.

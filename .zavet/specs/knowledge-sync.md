@@ -15,9 +15,9 @@ decisions: [D-0001, D-0020, DIRASH-0028, DIRASH-0030]
 
 How captured zavet knowledge reaches the cloud: a channel entirely separate
 from attestation sync, with its own endpoint, its own four cursors, and a
-double consent gate. It exists because the attestation wire is content-free by
-tested invariant (D-0001) — knowledge could not ride it, and coupling knowledge
-consent to billing consent was the thing that decision refused.
+double consent gate. It exists because the attestation wire is content-free
+by tested invariant (D-0001). Knowledge could not ride it, and coupling
+knowledge consent to billing consent was the thing that decision refused.
 
 Written at `confidence: medium` and `verified: false`: this documents an
 existing implementation that had no spec, so it is reverse-engineered from the
@@ -26,12 +26,12 @@ code rather than recorded as it was built.
 ## Behavior
 
 - Nothing runs unless `[sync] knowledge` is `metadata` or `full`. The default
-  is **`off`**, and the cloud independently enforces the workspace's tier — two
-  consents, either of which alone ships nothing.
+  is **`off`**, and the cloud independently enforces the workspace's tier.
+  That is two consents, either of which alone ships nothing.
 - **How the tier gets set.** `dira config set sync.knowledge off|metadata|full`,
   or `DIRA_SYNC__KNOWLEDGE`. The knob was absent from `config_cmd`'s `KNOBS`
   table until DIRASH-0030, so the only routes in were hand-editing
-  `config.toml` or the env var — which made a consent prompt impossible to
+  `config.toml` or the env var. That made a consent prompt impossible to
   offer honestly.
 - **Where consent is asked.** `dira onboard`'s knowledge step, in a prompt of
   its own that names what `full` sends (record bodies, trailer values, guard
@@ -48,9 +48,9 @@ code rather than recorded as it was built.
   repo-stats snapshot ride the final chunk, mirroring how artifacts ride the
   last attestation chunk.
 - Two channel-specific error paths, neither of which wedges the channel:
-  - **`knowledge_disabled` (403)** — the workspace opted out. Back off at the
+  - **`knowledge_disabled` (403)**: the workspace opted out. Back off at the
     ceiling with a distinct health kind; nothing is wrong locally.
-  - **`content_not_allowed` (400)** — the batch carried content the workspace
+  - **`content_not_allowed` (400)**: the batch carried content the workspace
     has not opted into. `KnowledgeBatch::strip_content()` downgrades the same
     window to the metadata tier and retries **once**.
   - A **404** means the cloud predates the endpoint: quietly skipped
@@ -58,7 +58,7 @@ code rather than recorded as it was built.
 - The per-repo coverage snapshot rides a throttle (`knowledge_stats_at:<repo>`)
   so the git pass behind it is not repeated per flush. Its window is
   `STATS_WINDOW_DAYS` (90), clamped down to the period `.zavet/` has actually
-  existed in the repo — a rolling window must not span history that predates
+  existed in the repo. A rolling window must not span history that predates
   the practice it measures.
 
 ## Interfaces & data
@@ -73,7 +73,7 @@ code rather than recorded as it was built.
   | `knowledge_cursor_guard_event_id` | `zavet_guard_events.id` (ULID) | ULID-keyed, monotonic |
 
   All four blank together on a `dataEpoch` change, on `nuke`, and on
-  `dira device resync` — wipe-and-resync reproduces cloud state because the
+  `dira device resync`. Wipe-and-resync reproduces cloud state because the
   cloud is idempotent by natural key.
 - `touched_seq` (migration 0004) is bumped by every decision/spec upsert. That
   makes it the channel's change signal, and it is why any bulk re-ingest has to
@@ -83,8 +83,8 @@ code rather than recorded as it was built.
 - The tier boundary is a field-level split, not a per-record one.
   `strip_content()` is the exact definition: it clears decision and spec
   `body_md`, every check's `command`, and every trailer ref's `value`, then
-  relabels the batch `metadata`. Everything else — ids, titles, statuses,
-  guards, check labels, record shas, counts — is metadata and always rides.
+  relabels the batch `metadata`. Everything else is metadata and always
+  rides: ids, titles, statuses, guards, check labels, record shas, counts.
 - Derivation (`cli/core/src/sync/knowledge.rs`) is pure and unit-testable; the
   daemon (`cli/dirad/src/knowledge_sync.rs`) owns scheduling, signing and
   transport. The split mirrors `sync/batch.rs` vs `dirad/sync.rs`.
@@ -92,7 +92,7 @@ code rather than recorded as it was built.
 ## Invariants
 
 - The default is `off`. Knowledge never leaves the machine because someone
-  linked a device — that is the attestation channel's consent, not this one
+  linked a device. That is the attestation channel's consent, not this one
   (D-0001).
 - Content requires BOTH consents. A producer at `full` against a workspace that
   has not opted in ships metadata, never content.
@@ -115,7 +115,7 @@ code rather than recorded as it was built.
   out.
 - The `content_not_allowed` retry downgrades the window once. Whether a
   producer stuck at `full` against a metadata-only workspace should also
-  self-demote its local knob — rather than re-learning this on every flush — is
+  self-demote its local knob, rather than re-learning this on every flush, is
   open.
 - Coverage stats are computed per repo on a throttle, but the throttle key is
   time-based only. A repo whose `.zavet/` changed heavily inside the throttle

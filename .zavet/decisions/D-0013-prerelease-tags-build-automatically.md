@@ -21,7 +21,7 @@ D-0005 skipped them to avoid paying for billed runner minutes on a private
 repo, and said so explicitly: a cost decision tied to a temporary state, to be
 reverted once the repo went public. It went public on 2026-07-28.
 
-The cost is now zero — GitHub-hosted minutes are free for public repos, and
+The cost is now zero. GitHub-hosted minutes are free for public repos, and
 D-0015 moved every leg onto them. The benefit is real and was just demonstrated:
 the first stable release was also the first time this pipeline had ever run,
 and it surfaced two defects immediately (#57, #58). Exercising packaging on
@@ -30,7 +30,7 @@ makes `--channel prerelease` a genuine dogfooding path.
 
 ## Rejected
 
-- **Keep the skip, dispatch manually** — that is what let an untested pipeline
+- **Keep the skip, dispatch manually**. That is what let an untested pipeline
   reach a GA tag.
 
 ## Agent directives
@@ -38,4 +38,4 @@ makes `--channel prerelease` a genuine dogfooding path.
 - Prerelease and stable tags now follow the same path; do not reintroduce a
   tag-shape branch in `resolve`.
 - The idempotency guard (skip when the release already has assets) is now the
-  only thing preventing duplicate builds — keep it.
+  only thing preventing duplicate builds. Keep it.

@@ -379,11 +379,17 @@ pub async fn ingest(state: &AppState, payload: serde_json::Value) -> Response {
 /// repo, which handed `sync` — and every read — the CALLER'S checkout under
 /// whatever name `--project` happened to name. A `cwd` is only ever a valid
 /// stand-in for `repo` when it demonstrably resolves to that same repo.
+/// The error is boxed for the same reason `Response::Status` is: `Response`
+/// carries a ~160-byte `DaemonInfo` arm, and an unboxed `Err` of it trips
+/// `clippy::result_large_err`, which `-D warnings` turns into a build failure.
+/// This is the only `Result<_, Response>` in the workspace, so boxing here is
+/// the whole fix. Shrinking `DaemonInfo` itself would be the deeper one.
+/// One allocation on an error path that returns straight to the client.
 async fn query_repo(
     state: &AppState,
     repo: Option<String>,
     cwd: Option<String>,
-) -> Result<(String, Option<bool>, ZavetConfig, Option<PathBuf>), Response> {
+) -> Result<(String, Option<bool>, ZavetConfig, Option<PathBuf>), Box<Response>> {
     // An explicit --project names a repo THIS PROCESS is not standing in — but
     // the daemon may well remember a directory for it, and that repo's id
     // conventions (`id-width`, the prefix set) still govern how a query id
@@ -423,9 +429,9 @@ async fn query_repo(
     let r = resolve_repo(caller_dir(cwd)).await;
     match r.repo {
         Some(repo) => Ok((repo, Some(r.dir_exists), r.cfg, r.top)),
-        None => Err(Response::Error {
+        None => Err(Box::new(Response::Error {
             message: "not inside a repo with a recognizable remote; pass --project".into(),
-        }),
+        })),
     }
 }
 
@@ -667,7 +673,7 @@ fn guard_stat_views(stats: Vec<dira_core::store::ZavetGuardStat>) -> Vec<ZavetGu
 pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
     let (repo, dir_exists, _, _) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let override_ = state.store.zavet_override_get(&repo).await.unwrap_or(None);
     let active = effective_mode(
@@ -699,7 +705,7 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
 pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
     let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let rows = match state.store.zavet_decisions_list(&repo).await {
         Ok(rows) => rows,
@@ -752,7 +758,7 @@ pub async fn decisions(state: &AppState, cwd: Option<String>, repo: Option<Strin
 pub async fn sync(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
     let (repo, dir_exists, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     // A sweep needs a real directory, not just a canonical name: `--project`
     // alone can only work if the daemon already remembers a dir for it, or the
@@ -808,7 +814,7 @@ pub async fn wiki(
 ) -> Response {
     let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     if let Some(topic) = topic.filter(|t| !t.trim().is_empty()) {
         let results = search(state, &repo, &topic).await;
@@ -1339,7 +1345,7 @@ pub async fn set_mode(
 ) -> Response {
     let (repo, _, _, _) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let value = match mode.as_str() {
         "on" => Some(true),
@@ -1370,7 +1376,7 @@ pub async fn why(
 ) -> Response {
     let (repo, _, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     // Direct addressing first: a decision id, or an exact spec slug (slugs
     // are the spec's identity, like ids — a whitespace-free query is checked

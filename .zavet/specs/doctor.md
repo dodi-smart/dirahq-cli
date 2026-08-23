@@ -20,17 +20,18 @@ all: **is capture actually working?**
 
 Every signal it reports already existed somewhere. None of them composed, and
 each printed from its own module and returned nothing. That is not a cosmetic
-problem. A machine ran for days with a completely dead capture channel — 303
-events, every one from a manual timer, zero agent events — while
-`dira daemon status` reported a healthy daemon, the loopback ingress was
-listening, commit capture worked, and cloud sync was green. The one broken link
-was the hook shim's connect to the control channel, and nothing exercised it.
+problem. A machine ran for days with a completely dead capture channel. It
+logged 303 events, every one from a manual timer, and zero agent events,
+while `dira daemon status` reported a healthy daemon, the loopback ingress
+was listening, commit capture worked, and cloud sync was green. The one
+broken link was the hook shim's connect to the control channel, and nothing
+exercised it.
 
 The command has two halves. Sixteen **static checks** read the daemon, the
 store, the harness configs, the cloud state and whether self-update is landing.
 One opt-in **capture probe** (`--probe`) injects a synthetic hook through the
-command string the harness config actually invokes and verifies a row lands —
-the only check that would have caught the incident above.
+command string the harness config actually invokes and verifies a row lands.
+It is the only check that would have caught the incident above.
 
 ## Behavior
 
@@ -38,10 +39,10 @@ the only check that would have caught the incident above.
   self-report, then the store, then hook wiring, then the cloud. A user reading
   top to bottom meets the root cause before its consequences.
 - Facts are gathered once (one `DaemonInfo` round-trip, one supervision probe,
-  one `Store::open`), then judged by pure `fn`s. The checks are not independent
-  — version skew needs the same round-trip reachability made — so a registry of
-  independent async closures would force either N round-trips or shared mutable
-  state.
+  one `Store::open`), then judged by pure `fn`s. The checks are not
+  independent. Version skew needs the same round-trip reachability made. So a
+  registry of independent async closures would force either N round-trips or
+  shared mutable state.
 - A check whose inputs could not be gathered reports `skip`, never `fail`. With
   the daemon down the report is one red line and four greyed-out skips, not five
   failures competing for attention.
@@ -52,12 +53,12 @@ the only check that would have caught the incident above.
   stderr warning and the update notice are both suppressed there.
 - Human output uses four distinct glyphs (`●▲✕·`), not four colours, because
   `theme::stdout_color()` is false for pipes and a redirected report must stay
-  readable — that is the form people paste into an issue.
+  readable. That is the form people paste into an issue.
 - `daemon.reachable` distinguishes `Denied` from `Down`. A daemon that is
   running and refusing us must never be answered with a bare
   `dira daemon start`; the remedy is `elevation::access_denied_advice`.
 - `hooks.config` asks whether *a* dira hook entry exists, not whether it names
-  *this* binary — matched on the command's suffix, because the pre-upgrade
+  *this* binary. It matches on the command's suffix, because the pre-upgrade
   unquoted form can contain spaces. Binary identity is `hooks.exe_path`'s
   question, and it expands `$HOME`/`~` before testing existence, reporting
   anything else as unverifiable rather than as a false alarm.
@@ -66,15 +67,15 @@ the only check that would have caught the incident above.
   saw. `update.rollback` reports a leftover `.dira*.old.restore.<pid>` sidecar,
   written only by the rollback path, so its presence proves a swap completed and
   was undone. `update.shadowed` reports an install directory that is not where
-  the running `dira` came from — an earlier `PATH` entry shadowing the updated
+  the running `dira` came from. An earlier `PATH` entry shadows the updated
   binary. `update.failures` reports the counter, at the passive notice's own
   threshold rather than a second copy of it. Together they are the manual
   diagnosis from the #113 report.
   Three ids rather than one because they can co-occur and a check reports a
   single level: bundled, a machine with both a rollback and a shadowing PATH
   entry would be told about the rollback, act on it, and only meet the shadowing
-  on the next run — the two-round diagnosis they exist to end. Adding ids is free
-  under the schema rule above; growing one id's meaning is not.
+  on the next run. That is the two-round diagnosis they exist to end. Adding
+  ids is free under the schema rule above; growing one id's meaning is not.
   None ever returns `fail`. They share one `UpdateFacts` gather, and reuse
   `update::replace`'s own PATH-entry probe and sidecar listing rather than
   re-deriving either, so they cannot disagree with what the updater does.
@@ -119,12 +120,12 @@ pub fn admit(state, session_id) -> Result<(), String>;   // the ingress guard
 pub fn note_landed(state, session_id);                   // called by the writer
 ```
 
-`doctor::run` returns `i32`, never `Result`. An `Err` out of `main` exits 1 —
-which is doctor's "warnings" code — so a broken probe could otherwise
+`doctor::run` returns `i32`, never `Result`. An `Err` out of `main` exits 1,
+which is doctor's "warnings" code, so a broken probe could otherwise
 masquerade as a warning to an install script. The signature is what enforces it.
 
 `--json` carries its own `schema` integer (currently `1`), deliberately not
-`dira_contract::SCHEMA_VERSION`: doctor is a local CLI surface, not the
+`dira_contract::SCHEMA_VERSION`: doctor is a local CLI interface, not the
 drift-gated attestation wire. Adding a check id, a `detail` key, or a top-level
 field is additive and does not bump it; removing or renaming a field, or
 changing what a level means for an existing id, does.
@@ -138,8 +139,8 @@ changing what a level means for an existing id, does.
 - **The daemon mints the probe session id, never the CLI**, and admits it only
   while its own arm is live and unexpired.
 - **The daemon never spawns the probe child.** It may be the elevated process,
-  and a forked child would inherit that token — the probe would pass on exactly
-  the machine the bug is on.
+  and a forked child would inherit that token. The probe would pass on
+  exactly the machine the bug is on.
 - **`verify` reaps unconditionally**, including on the failure path.
 - **Every `Store` read filters the reserved prefix**, except `max_event_id`,
   which is only an upper bound and is documented as deliberately unfiltered.
@@ -156,7 +157,7 @@ changing what a level means for an existing id, does.
 ## Open Questions
 
 - The `Reach::Denied` and elevated-daemon paths cannot be exercised by CI on any
-  platform we build on — `elevation::is_elevated()` gives a runner exactly one
+  platform we build on. `elevation::is_elevated()` gives a runner exactly one
   token. Both are covered by pure judge tests only, following `elevation.rs`'s
   own testability rule, and neither has been verified on a real Windows host.
 - Only Claude Code is probed. The other five harnesses are covered by

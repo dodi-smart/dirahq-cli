@@ -28,6 +28,7 @@ pub mod jitter;
 pub mod knowledge_sync;
 pub mod logfile;
 pub mod probe;
+pub mod repo_visibility;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
@@ -124,6 +125,9 @@ pub async fn build_state(
         sync: sync_handle,
         knowledge_sync: knowledge_handle,
         telemetry_sync: telemetry_handle,
+        visibility_cache: Arc::new(crate::repo_visibility::VisibilityCache::new()),
+        github_api_base: Arc::from(crate::repo_visibility::GITHUB_API_BASE),
+        gitlab_api_base: Arc::from(crate::repo_visibility::GITLAB_API_BASE),
         device_key: Arc::new(tokio::sync::RwLock::new(None)),
         progress: Arc::new(ProgressTracker::default()),
         hydrated: Arc::new(AtomicBool::new(false)),

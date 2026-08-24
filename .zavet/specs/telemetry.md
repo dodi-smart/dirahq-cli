@@ -10,7 +10,7 @@ paths:
   - cli/dira/src/telemetry.rs
   - cli/dirad/src/telemetry_sync.rs
   - cli/dirad/src/repo_visibility.rs
-decisions: [DIRASH-0033, DIRASH-0030, DIRASH-0031, D-0006, D-0011, D-0020]
+decisions: [DIRASH-0033, DIRASH-0034, DIRASH-0030, DIRASH-0031, D-0006, D-0011, D-0020]
 ---
 
 ## Overview

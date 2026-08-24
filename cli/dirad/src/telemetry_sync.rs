@@ -394,8 +394,18 @@ async fn meta_put(state: &AppState, key: &str, value: &str) -> Result<(), TError
 /// [`dira_core::protocol::Request::IngestTelemetry`]'s doc): it is salt-hashed
 /// here via [`identity::load_or_mint`] + [`repo_facts::compute`], and only the
 /// resulting host class, visibility, and hash are written onto `event` before
-/// it is queued. The plaintext ref itself is never persisted. Visibility is
-/// always `Unknown` — WP1/WP2 have no visibility source of their own yet.
+/// it is queued. The plaintext ref itself is never persisted, and never sent
+/// to Dira's own cloud — the one place it travels beyond this control socket
+/// is [`crate::repo_visibility`]'s anonymous probe to the forge's own public
+/// API (DIRASH-0034), which resolves the `visibility` computed below.
+///
+/// Visibility (WP3) comes from [`crate::repo_visibility::resolve`], which is
+/// cache-first and never blocks this call on the network: a cache hit answers
+/// with the real, already-known visibility; a miss answers `Unknown` for THIS
+/// event and kicks off a detached background probe that fills the cache for
+/// next time. So a never-before-seen repo's first event always reports
+/// `unknown`, and only a later event for the SAME repo (once the probe lands)
+/// reports the real answer — this row is never retro-updated once written.
 pub(crate) async fn ingest(
     state: &AppState,
     mut event: TelemetryEventWire,
@@ -407,10 +417,23 @@ pub(crate) async fn ingest(
     if let Some(canonical) = repo_canonical {
         match identity::load_or_mint(&state.store).await {
             Ok(identity) => {
+                // Visibility is resolved separately below (it needs the
+                // salted hash to key the cache); `compute` here is only for
+                // the host class + hash, so its own `visibility` input is a
+                // throwaway placeholder.
                 let facts =
                     repo_facts::compute(&canonical, &identity.salt, RepoVisibility::Unknown);
+                let visibility = crate::repo_visibility::resolve(
+                    &state.visibility_cache,
+                    &state.http,
+                    &state.github_api_base,
+                    &state.gitlab_api_base,
+                    facts.host_class,
+                    &canonical,
+                    &facts.repo_hash,
+                );
                 event.repo_host_class = Some(facts.host_class.as_str().to_string());
-                event.repo_visibility = Some(facts.visibility.as_str().to_string());
+                event.repo_visibility = Some(visibility.as_str().to_string());
                 event.repo_hash = Some(facts.repo_hash);
             }
             Err(e) => {

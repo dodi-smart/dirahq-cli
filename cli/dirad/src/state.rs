@@ -57,6 +57,20 @@ pub struct AppState {
     /// this holds its receiver internally rather than threading it out of
     /// [`crate::build_state`] alongside `sync`/`knowledge_sync`'s.
     pub telemetry_sync: crate::telemetry_sync::TelemetrySyncHandle,
+    /// Cache + in-flight bookkeeping for [`crate::repo_visibility`]'s
+    /// GitHub/GitLab visibility probe (WP3), keyed by the salted `repo_hash`
+    /// so it carries the same privacy property as the telemetry pipeline
+    /// itself. Lives on `AppState` (rather than a lazy static) so tests can
+    /// construct an isolated daemon and inspect/seed it directly.
+    pub visibility_cache: Arc<crate::repo_visibility::VisibilityCache>,
+    /// Base URL for [`crate::repo_visibility`]'s GitHub probe. Not a config
+    /// knob — every production daemon gets [`crate::repo_visibility::GITHUB_API_BASE`]
+    /// from `build_state` — this exists purely so a test can point `ingest`'s
+    /// whole visibility pipeline at a mock instead of the real network.
+    pub github_api_base: Arc<str>,
+    /// Base URL for [`crate::repo_visibility`]'s GitLab probe; see
+    /// [`Self::github_api_base`].
+    pub gitlab_api_base: Arc<str>,
     /// This device's signing key, used to sign attestation batches. Loaded
     /// **lazily** off the startup critical path: the key is only needed for
     /// sync/signing, never to answer a control request, and loading it can block

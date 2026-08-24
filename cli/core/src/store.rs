@@ -2178,6 +2178,85 @@ impl Store {
             specs_total: s.get::<i64, _>("n") as u64,
         })
     }
+
+    // ---- telemetry (WP1) ----
+
+    /// Append one telemetry event to the local queue. `id` is a caller-minted
+    /// ULID (monotonic), matching every other channel's id-cursor idiom.
+    pub async fn insert_telemetry_event(
+        &self,
+        id: &str,
+        created_at: &str,
+        name: &str,
+        props_json: &str,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO telemetry_events (id, created_at, name, props_json)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(id)
+        .bind(created_at)
+        .bind(name)
+        .bind(props_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The largest `telemetry_events.id`, or `None` when the queue is empty —
+    /// the snapshot upper bound for a sync window (`until`), same role as
+    /// [`Self::max_event_id`].
+    pub async fn telemetry_max_event_id(&self) -> Result<Option<String>, Error> {
+        let row = sqlx::query("SELECT MAX(id) AS m FROM telemetry_events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<Option<String>, _>("m"))
+    }
+
+    /// Load telemetry events in the id window `(cursor, until]`, ordered by id —
+    /// the un-synced telemetry backlog for a flush. `cursor = None` means "from
+    /// the beginning". Mirrors [`Self::events_between`]'s id-cursor idiom.
+    pub async fn telemetry_events_since(
+        &self,
+        cursor: Option<&str>,
+        until: &str,
+        limit: i64,
+    ) -> Result<Vec<TelemetryEventRow>, Error> {
+        let rows = match cursor {
+            Some(c) => {
+                sqlx::query(
+                    "SELECT id, created_at, name, props_json FROM telemetry_events \
+                     WHERE id > ?1 AND id <= ?2 ORDER BY id ASC LIMIT ?3",
+                )
+                .bind(c)
+                .bind(until)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, created_at, name, props_json FROM telemetry_events \
+                     WHERE id <= ?1 ORDER BY id ASC LIMIT ?2",
+                )
+                .bind(until)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows.iter().map(row_to_telemetry_event).collect())
+    }
+
+    /// Delete telemetry events with id ≤ `id` — retention/pruning for rows
+    /// already acked by the cloud. Returns the number of rows removed.
+    pub async fn delete_telemetry_events_through(&self, id: &str) -> Result<u64, Error> {
+        let res = sqlx::query("DELETE FROM telemetry_events WHERE id <= ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 /// Tighten `path` (and its SQLite `-wal`/`-shm` sidecars) to owner-only `0600`
@@ -2308,6 +2387,20 @@ pub struct ZavetSpecCapture {
     pub body_md: Option<String>,
     /// Git blob sha of the file at the capturing commit.
     pub content_hash: Option<String>,
+}
+
+/// One stored telemetry event, as read from `telemetry_events`. Mirrors the
+/// columns 1:1 (see migration `0006_telemetry.sql`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryEventRow {
+    /// ULID, monotonic — also the sync-window cursor value.
+    pub id: String,
+    /// RFC 3339 timestamp string, stored verbatim.
+    pub created_at: String,
+    /// Wire event name, e.g. `cli_command_executed`.
+    pub name: String,
+    /// Serialized `TelemetryEventWire` JSON.
+    pub props_json: String,
 }
 
 /// A stored decision row plus its guard globs.
@@ -2618,6 +2711,15 @@ fn row_to_token_row(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRow, Error> {
         est_cost_usd: row.get::<Option<f64>, _>("est_cost"),
         at: row.get("at"),
     })
+}
+
+fn row_to_telemetry_event(row: &sqlx::sqlite::SqliteRow) -> TelemetryEventRow {
+    TelemetryEventRow {
+        id: row.get("id"),
+        created_at: row.get("created_at"),
+        name: row.get("name"),
+        props_json: row.get("props_json"),
+    }
 }
 
 fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
@@ -4084,5 +4186,102 @@ mod tests {
         assert_eq!(totals.cache_read, 0);
         assert_eq!(totals.cache_create, 0);
         assert_eq!(totals.est_cost_usd, 0.0);
+    }
+
+    // ---- telemetry (WP1) ----
+
+    #[tokio::test]
+    async fn telemetry_events_since_empty_queue_is_empty() {
+        let store = Store::open_in_memory().await.unwrap();
+        assert_eq!(store.telemetry_max_event_id().await.unwrap(), None);
+        let rows = store
+            .telemetry_events_since(None, "01ZZZZZZZZZZZZZZZZZZZZZZZZ", 100)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn telemetry_insert_and_read_back_round_trips() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_telemetry_event("01A", "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+            .await
+            .unwrap();
+        store
+            .insert_telemetry_event(
+                "01B",
+                "2026-01-01T00:00:01Z",
+                "cli_command_executed",
+                r#"{"command":"status"}"#,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.telemetry_max_event_id().await.unwrap(),
+            Some("01B".to_string())
+        );
+
+        let rows = store
+            .telemetry_events_since(None, "01B", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "01A");
+        assert_eq!(rows[0].name, "cli_daemon_started");
+        assert_eq!(rows[1].id, "01B");
+        assert_eq!(rows[1].props_json, r#"{"command":"status"}"#);
+    }
+
+    #[tokio::test]
+    async fn telemetry_events_since_respects_cursor_and_until_window() {
+        let store = Store::open_in_memory().await.unwrap();
+        for id in ["01A", "01B", "01C", "01D"] {
+            store
+                .insert_telemetry_event(id, "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+                .await
+                .unwrap();
+        }
+        // (01A, 01C] -> 01B, 01C.
+        let rows = store
+            .telemetry_events_since(Some("01A"), "01C", 100)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["01B", "01C"]);
+    }
+
+    #[tokio::test]
+    async fn telemetry_events_since_respects_limit() {
+        let store = Store::open_in_memory().await.unwrap();
+        for id in ["01A", "01B", "01C"] {
+            store
+                .insert_telemetry_event(id, "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+                .await
+                .unwrap();
+        }
+        let rows = store.telemetry_events_since(None, "01C", 2).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["01A", "01B"]);
+    }
+
+    #[tokio::test]
+    async fn delete_telemetry_events_through_prunes_only_up_to_id() {
+        let store = Store::open_in_memory().await.unwrap();
+        for id in ["01A", "01B", "01C"] {
+            store
+                .insert_telemetry_event(id, "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+                .await
+                .unwrap();
+        }
+        let deleted = store.delete_telemetry_events_through("01B").await.unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = store
+            .telemetry_events_since(None, "01C", 100)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = remaining.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["01C"]);
     }
 }

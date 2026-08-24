@@ -5,6 +5,7 @@
 //! many bytes of JSON. One request, one response, per connection.
 
 use crate::report::Report;
+use crate::telemetry::wire::TelemetryEventWire;
 use dira_contract::{Harness, SessionKind};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,15 @@ pub enum Request {
     /// the repo from the payload's `cwd` and never trusts a caller-supplied
     /// repo identity.
     IngestZavet { payload: serde_json::Value },
+    /// Enqueue one anonymous usage-telemetry event onto the daemon's local
+    /// queue (`dira_core::telemetry`, WP1/WP2), from a CLI-side
+    /// [`crate::telemetry::event::TelemetryEvent`] already flattened to its
+    /// wire shape. The daemon re-checks `[telemetry] enabled` itself (belt and
+    /// braces — a CLI/daemon version skew must never let a disabled knob leak
+    /// events through), stamps `id`/`created_at`, and nudges the telemetry
+    /// sync task. Fire-and-forget, like `IngestZavet`: acked with
+    /// [`Response::Ok`] whether or not telemetry is enabled.
+    IngestTelemetry { event: TelemetryEventWire },
     /// Zavet activation + capture health for a repo (resolved from `repo`, or
     /// `cwd`, or the daemon's own cwd — same ladder as `Start`).
     ZavetStatus {

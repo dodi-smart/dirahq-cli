@@ -31,6 +31,7 @@ pub mod probe;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
+pub mod telemetry_sync;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod writer;
@@ -96,6 +97,9 @@ pub async fn build_state(
     )));
     let (sync_handle, sync_rx) = sync::channel();
     let (knowledge_handle, knowledge_rx) = knowledge_sync::channel();
+    // No receiver returned alongside it (unlike the two channels above) — see
+    // `telemetry_sync::TelemetrySyncHandle`'s doc for why.
+    let telemetry_handle = telemetry_sync::channel();
 
     // One pooled HTTP client for every device→cloud task. Keep-alive so repeat
     // POSTs (heartbeat/sync/billing) to the same cloud host reuse the connection
@@ -119,6 +123,7 @@ pub async fn build_state(
         bearer: Arc::new(bearer),
         sync: sync_handle,
         knowledge_sync: knowledge_handle,
+        telemetry_sync: telemetry_handle,
         device_key: Arc::new(tokio::sync::RwLock::new(None)),
         progress: Arc::new(ProgressTracker::default()),
         hydrated: Arc::new(AtomicBool::new(false)),
@@ -454,6 +459,10 @@ pub async fn run() -> anyhow::Result<()> {
     // Knowledge sync (M2): consent-gated, no-ops until [sync] knowledge is
     // enabled AND the device is linked.
     knowledge_sync::spawn(state.clone(), knowledge_rx);
+    // Telemetry sync (WP2): consent-gated, no-ops until [telemetry] enabled
+    // AND cloud_url is set — deliberately NOT gated on device linkage, unlike
+    // the two tasks above (see `telemetry_sync`'s module doc).
+    telemetry_sync::spawn(state.clone());
     // Live-presence heartbeat (ephemeral; no-ops until linked + cloud_url set).
     heartbeat::spawn(state.clone());
     // Cloud billing-summary fetch (best-effort; no-ops until linked + cloud_url set).
@@ -473,6 +482,16 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
+    // Startup is complete — every background task is wired and both ingress
+    // surfaces are live. Fire-and-forget local telemetry event (WP2); a
+    // consent-disabled install queues nothing (`enqueue_local` re-checks the
+    // knob itself).
+    telemetry_sync::enqueue_local(
+        &state,
+        dira_core::telemetry::event::TelemetryEvent::DaemonStarted,
+    )
+    .await;
+
     serve_control(state.clone(), listener);
 
     // Block until shutdown. The accept loop runs detached in `serve_control`.
@@ -485,6 +504,19 @@ pub async fn run() -> anyhow::Result<()> {
     // restart overlap unreadable after the fact.
     let teardown_started = std::time::Instant::now();
     tracing::info!("shutting down");
+    // WP2: queue the lifecycle event as early in teardown as possible — the
+    // rest of this function only gets a bounded budget (the WAL checkpoint
+    // below is itself time-boxed), and a local store append is cheap enough
+    // not to compete for it. `started_at` is the same `Instant` `DaemonInfo`
+    // already reports uptime from, so this event and `dira version`'s number
+    // for the same process never disagree.
+    telemetry_sync::enqueue_local(
+        &state,
+        dira_core::telemetry::event::TelemetryEvent::DaemonStopped {
+            uptime_secs: state.started_at.elapsed().as_secs(),
+        },
+    )
+    .await;
     // Graceful offline: tell the cloud this device is going offline with one
     // best-effort empty-sessions beat (short timeout, errors ignored) so it
     // doesn't wait out the presence TTL.

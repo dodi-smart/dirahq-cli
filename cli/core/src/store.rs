@@ -470,6 +470,13 @@ impl Store {
         sqlx::query("DELETE FROM meta WHERE key LIKE 'token_fp:%'")
             .execute(&mut *tx)
             .await?;
+        // The telemetry queue (WP1/WP2) is a stat too — wipe it so a nuked slate
+        // reports no backlog rather than re-sending pre-nuke events under a
+        // blanked cursor (which would otherwise look like a burst of brand-new
+        // activity to the cloud).
+        sqlx::query("DELETE FROM telemetry_events")
+            .execute(&mut *tx)
+            .await?;
         // Reset the sync cursors in the same transaction so they can't point past
         // the wiped tables. We blank them rather than delete the keys to keep reads
         // simple.
@@ -480,6 +487,9 @@ impl Store {
         // For `token_usage` that would re-create the exact defect
         // `META_TOKEN_CURSOR` exists to fix, since `nuke` also clears the
         // `token_offset:%` watermarks above and thus guarantees a full re-import.
+        // Same reasoning applies to `telemetry_events`' ULID cursor: the table
+        // above is now empty, so a stale cursor would silently skip every event
+        // re-queued after the nuke.
         for key in [
             crate::sync::META_SYNC_CURSOR,
             crate::sync::META_ARTIFACTS_CURSOR,
@@ -490,6 +500,8 @@ impl Store {
             crate::sync::knowledge::META_KNOWLEDGE_SPEC_CURSOR,
             crate::sync::knowledge::META_KNOWLEDGE_TRAILER_CURSOR,
             crate::sync::knowledge::META_KNOWLEDGE_GUARD_CURSOR,
+            crate::telemetry::META_TELEMETRY_CURSOR,
+            crate::telemetry::META_TELEMETRY_HEALTH,
         ] {
             sqlx::query(
                 "INSERT INTO meta (key, value) VALUES (?1, '')
@@ -3168,6 +3180,54 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("")
+        );
+    }
+
+    #[tokio::test]
+    async fn nuke_clears_the_telemetry_queue_and_its_cursor_and_health() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_telemetry_event("01A", "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+            .await
+            .unwrap();
+        store
+            .meta_set(crate::telemetry::META_TELEMETRY_CURSOR, "01A")
+            .await
+            .unwrap();
+        store
+            .meta_set(
+                crate::telemetry::META_TELEMETRY_HEALTH,
+                r#"{"consecutiveFailures":3}"#,
+            )
+            .await
+            .unwrap();
+
+        store.nuke().await.unwrap();
+
+        assert_eq!(store.telemetry_max_event_id().await.unwrap(), None);
+        assert_eq!(
+            store
+                .telemetry_events_since(None, "01ZZZZZZZZZZZZZZZZZZZZZZZZ", 100)
+                .await
+                .unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            store
+                .meta_get(crate::telemetry::META_TELEMETRY_CURSOR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "a stale cursor over an emptied queue would skip every re-queued event"
+        );
+        assert_eq!(
+            store
+                .meta_get(crate::telemetry::META_TELEMETRY_HEALTH)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(""),
         );
     }
 

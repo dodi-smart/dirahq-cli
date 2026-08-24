@@ -52,6 +52,11 @@ pub struct AppState {
     pub sync: SyncHandle,
     /// Handle to the knowledge sync task (M2; consent-gated, own cursors).
     pub knowledge_sync: crate::knowledge_sync::KnowledgeSyncHandle,
+    /// Handle to the telemetry sync task (WP2; consent-gated, unsigned
+    /// batches). See [`crate::telemetry_sync::TelemetrySyncHandle`] for why
+    /// this holds its receiver internally rather than threading it out of
+    /// [`crate::build_state`] alongside `sync`/`knowledge_sync`'s.
+    pub telemetry_sync: crate::telemetry_sync::TelemetrySyncHandle,
     /// This device's signing key, used to sign attestation batches. Loaded
     /// **lazily** off the startup critical path: the key is only needed for
     /// sync/signing, never to answer a control request, and loading it can block

@@ -23,6 +23,11 @@ pub const META_TELEMETRY_SALT: &str = "telemetry_salt";
 
 /// A device's telemetry identity: the id events are tagged with, and the salt
 /// [`crate::telemetry::repo_facts::compute`] HMACs canonical repo remotes with.
+///
+/// `Clone` so a caller can cache one instance (e.g. `dirad`'s
+/// `AppState::telemetry_identity`, behind a `tokio::sync::OnceCell`) and hand
+/// out cheap copies instead of every caller re-reading the store.
+#[derive(Clone)]
 pub struct TelemetryIdentity {
     pub install_id: String,
     pub salt: [u8; 32],
@@ -31,6 +36,16 @@ pub struct TelemetryIdentity {
 /// Load the telemetry identity, minting + persisting whatever is missing on
 /// first use. Idempotent: repeated calls against the same store return
 /// identical values, mirroring [`crate::identity::load_or_create_unlinked`].
+///
+/// Not itself race-free under concurrent callers on a fresh store: two calls
+/// that both race the initial "nothing in `meta` yet" read could each mint
+/// and persist a *different* salt, the later write winning silently, and
+/// each call's returned identity would keep reflecting the salt it minted
+/// rather than the one that ended up persisted. `dirad` never calls this
+/// directly on a live daemon for exactly that reason — see
+/// `dirad::state::AppState::telemetry_identity`, which serializes every
+/// caller through a single `OnceCell` so this runs at most once per daemon
+/// lifetime.
 pub async fn load_or_mint(store: &Store) -> Result<TelemetryIdentity, Error> {
     let install_id = match store.meta_get(META_TELEMETRY_INSTALL_ID).await? {
         Some(id) => id,

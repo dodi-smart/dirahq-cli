@@ -315,7 +315,8 @@ Anonymous product analytics, on by default — its own channel, separate from
 knowledge sync and billing consent.
   sent   command name, duration, success/failure kind; inside a repo: host
          type (github/gitlab/bitbucket/self-hosted), public/private when
-         determinable, and a one-way salted hash of the repo identity
+         determinable (checked with the repo's own host — github/gitlab —
+         never with Dira), and a one-way salted hash of the repo identity
   never  repo names, git identity or email, file paths, command arguments,
          error text
 Tagged by a random install id, not your device key. Sent to Dira's EU
@@ -782,6 +783,10 @@ mod tests {
             "hash",
             "DO_NOT_TRACK",
             "telemetry.enabled",
+            // DIRASH-0034: the disclosure must name that visibility is
+            // checked with the repo's own host, never with Dira — not just
+            // that a `public`/`private` value is sent.
+            "never with Dira",
         ] {
             assert!(
                 t.contains(phrase),

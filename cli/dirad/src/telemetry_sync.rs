@@ -50,7 +50,7 @@ use crate::sync::{
 use dira_core::protocol::Response;
 use dira_core::telemetry::repo_facts::{self, RepoVisibility};
 use dira_core::telemetry::wire::{batch_id, TelemetryBatch, TelemetryEventWire};
-use dira_core::telemetry::{identity, META_TELEMETRY_CURSOR, META_TELEMETRY_HEALTH};
+use dira_core::telemetry::{META_TELEMETRY_CURSOR, META_TELEMETRY_HEALTH};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
@@ -197,8 +197,13 @@ enum TError {
     Fatal(String),
 }
 
-/// One telemetry flush. Re-reads the knob + `cloud_url` every call so a
-/// config change takes effect without a daemon restart.
+/// One telemetry flush. Reads `[telemetry] enabled` and `cloud_url` off
+/// `state.config`, which is loaded once at daemon startup and never updated
+/// in place — so, despite reading it fresh on every call, a config change
+/// only takes effect on the NEXT daemon restart, exactly as
+/// `docs/TELEMETRY.md` already documents. This function does no polling of
+/// its own; "every call" only means every flush this already-running daemon
+/// happens to perform.
 ///
 /// Deliberately does NOT gate on device linkage (see the module doc) — only
 /// `cloud_url` + `[telemetry] enabled`.
@@ -228,8 +233,10 @@ async fn flush_telemetry(state: &AppState) -> Result<Outcome, TError> {
         return Ok(Outcome::Nothing); // already caught up to the snapshot bound
     }
 
-    // Minted at most once per flush — install id + salt never change between
-    // this flush's chunks, and `load_or_mint` is a store round-trip.
+    // Fetched at most once per flush — install id + salt never change between
+    // this flush's chunks. `AppState::telemetry_identity` mints at most once
+    // per daemon lifetime regardless, so this local `Option` only saves the
+    // cheap `OnceCell::get_or_try_init` fast-path call, not a store round-trip.
     let mut install_id: Option<String> = None;
     let mut synced_any = false;
     let mut any_poison = false;
@@ -266,7 +273,8 @@ async fn flush_telemetry(state: &AppState) -> Result<Outcome, TError> {
 
         if !events.is_empty() {
             if install_id.is_none() {
-                let identity = identity::load_or_mint(&state.store)
+                let identity = state
+                    .telemetry_identity()
                     .await
                     .map_err(|e| TError::Fatal(format!("load telemetry identity: {e}")))?;
                 install_id = Some(identity.install_id);
@@ -392,7 +400,7 @@ async fn meta_put(state: &AppState, key: &str, value: &str) -> Result<(), TError
 ///
 /// `repo_canonical`, when present, crossed only the local control socket (see
 /// [`dira_core::protocol::Request::IngestTelemetry`]'s doc): it is salt-hashed
-/// here via [`identity::load_or_mint`] + [`repo_facts::compute`], and only the
+/// here via [`AppState::telemetry_identity`] + [`repo_facts::compute`], and only the
 /// resulting host class, visibility, and hash are written onto `event` before
 /// it is queued. The plaintext ref itself is never persisted, and never sent
 /// to Dira's own cloud — the one place it travels beyond this control socket
@@ -415,7 +423,7 @@ pub(crate) async fn ingest(
         return Response::Ok;
     }
     if let Some(canonical) = repo_canonical {
-        match identity::load_or_mint(&state.store).await {
+        match state.telemetry_identity().await {
             Ok(identity) => {
                 // Visibility is resolved separately below (it needs the
                 // salted hash to key the cache); `compute` here is only for
@@ -427,7 +435,7 @@ pub(crate) async fn ingest(
                     &state.visibility_cache,
                     &state.http,
                     &state.github_api_base,
-                    &state.gitlab_api_base,
+                    crate::repo_visibility::GITLAB_API_BASE,
                     facts.host_class,
                     &canonical,
                     &facts.repo_hash,
@@ -453,7 +461,7 @@ pub(crate) async fn ingest(
 /// id, minting it on first use. Never gated on `[telemetry] enabled` — see
 /// the request's own doc comment for why.
 pub(crate) async fn install_id(state: &AppState) -> Response {
-    match identity::load_or_mint(&state.store).await {
+    match state.telemetry_identity().await {
         Ok(identity) => Response::TelemetryInstallId {
             install_id: identity.install_id,
         },

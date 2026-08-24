@@ -23,22 +23,36 @@ anything not listed below.
 
 | Event | Sent when | Properties |
 |---|---|---|
-| `cli_command_executed` | a CLI or daemon-served command finishes | `command` (e.g. `"status"`, `"config set"` — never raw argv), `duration_ms`, `success`, `error_kind` (one of a fixed set: `daemon_unreachable`, `daemon_error`, `invalid_input`, `io_error`, `timeout`, `internal`), and — only when cwd is inside a git repository — `repo_host_class` (`github`/`gitlab`/`bitbucket`/`self_hosted`), `repo_visibility` (`public`/`private`/`unknown`), `repo_hash` |
+| `cli_command_executed` | a CLI or daemon-served command finishes | `command` (e.g. `"status"`, `"config"` — the top-level name only, never a sub-action and never raw argv), `duration_ms`, `success`, `error_kind` (one of a fixed set: `daemon_unreachable`, `daemon_error`, `invalid_input`, `io_error`, `timeout`, `internal`), and — only when cwd is inside a git repository — `repo_host_class` (`github`/`gitlab`/`bitbucket`/`self_hosted`), `repo_visibility` (`public`/`private`/`unknown`), `repo_hash` |
 | `cli_daemon_started` | `dirad` finishes starting up | none beyond the base fields below |
 | `cli_daemon_stopped` | `dirad` shuts down | `duration_ms` (uptime in ms) |
-| `cli_consent_recorded` | the telemetry toggle changes, including its initial default | `telemetry_enabled`, `consent_source` (`prompt`/`yes_flag`/`env`/`config_set`/`default`) |
+| `cli_consent_recorded` | the telemetry toggle changes | `telemetry_enabled`, `consent_source` (`prompt`/`yes_flag`/`config_set`) |
 
 Every event also carries a timestamp, the running `dira`/`dirad` version, OS, and CPU
 architecture.
 
 ## What is never sent
 
-- Repo names, owners, or URLs
+- Repo names, owners, or URLs — never to Dira. (Working out `repo_visibility` sends
+  the plaintext `owner/repo` to the repo's own host, not to Dira — see the next
+  section.)
 - Git identity — author name or email
 - File paths, file contents, or diffs
 - Command arguments or flag values
 - Error messages or any other free text
 - Anything that identifies you as a person, as opposed to an anonymous install
+
+## How public/private is determined
+
+To resolve `repo_visibility`, the daemon asks the forge that already hosts the
+repo — an unauthenticated GitHub or GitLab API lookup of `owner/repo` — because
+that forge already knows the repo exists; the lookup discloses nothing to it
+that it doesn't already have. The plaintext name goes only to that provider,
+never to Dira's servers, and the request carries no auth token, cookie, or
+install/device identifier — a generic `dirad/<version>` user agent is the only
+thing beyond the bare lookup. Any other host (Bitbucket, self-hosted) is
+reported as `unknown`, with no request made at all. See DIRASH-0034 for the
+full rationale.
 
 ## The repo hash
 

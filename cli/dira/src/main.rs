@@ -995,11 +995,24 @@ async fn main() -> Result<()> {
     let started = std::time::Instant::now();
     let result = run(cli, config.clone()).await;
     // Every exit-path inside `run` that calls `std::process::exit` directly
-    // (skewed-daemon hints, a render failure, `dira doctor`'s own exit code,
-    // `dira nuke`'s two direct exits) bypasses this recording entirely — see
-    // the doc comment on `run` for the full list. That is accepted: those
-    // paths terminate the process before control ever returns here.
+    // (skewed-daemon hints, `dira doctor`'s own exit code, `dira nuke`'s two
+    // direct exits) still bypasses this recording entirely — see the doc
+    // comment on `run` for the full list. That is accepted: those paths
+    // terminate the process before control ever returns here.
+    //
+    // The generic daemon-request path's former `std::process::exit(1)` is
+    // NOT on that list any more: it now returns `Err(SilentExit)` instead, so
+    // this call sees (and reports) it like any other failure. `SilentExit`
+    // carries no message of its own — the failure was already printed by
+    // `render::print_with`/`print_json` before `run` returned — so once
+    // telemetry has been recorded, exit silently rather than let `anyhow`'s
+    // default `Debug` formatting print a redundant second line.
     telemetry::record_command(&config, name, started.elapsed(), &result).await;
+    if let Err(e) = &result {
+        if e.downcast_ref::<telemetry::SilentExit>().is_some() {
+            std::process::exit(1);
+        }
+    }
     result
 }
 
@@ -1015,15 +1028,20 @@ async fn main() -> Result<()> {
 /// - `dira hook <harness>` under `dira doctor --probe`, on a transport
 ///   failure (`HOOK_PROBE_FAILURE_EXIT`).
 /// - `dira doctor` always exits via its own computed code, success or not.
-/// - the generic daemon-request path's `if !ok { std::process::exit(1) }`,
-///   reached by `sessions`/`start`/`stop`/`log`/`report`/the `zavet`
-///   subactions when rendering the response reports failure.
+/// - the generic daemon-request path's skewed-daemon hint (a version-skew
+///   response gets its own message printed, then exits immediately).
 /// - `dira nuke`'s two direct exits (daemon unreachable; a failed response
 ///   render).
 ///
 /// None of these are worth restructuring just to be observed: each already
 /// terminates the process on its own terms, and forcing a `Result` return
 /// through them would change behavior this refactor is not meant to touch.
+///
+/// The generic daemon-request path's *other* failure — `if !ok { .. }` when
+/// rendering the response reports failure, reached by `sessions`/`start`/
+/// `stop`/`log`/`report`/the `zavet` subactions — is deliberately NOT on this
+/// list: it returns `Err(telemetry::SilentExit)` instead of exiting directly,
+/// so `main` still records it before exiting (see `main`'s own doc comment).
 async fn run(cli: Cli, config: Config) -> Result<()> {
     let cwd = std::env::current_dir()
         .ok()
@@ -1063,13 +1081,7 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
                 .transpose()?;
             let telemetry = telemetry
                 .as_deref()
-                .map(|v| match v {
-                    "on" => Ok(true),
-                    "off" => Ok(false),
-                    other => Err(anyhow::anyhow!(
-                        "invalid --telemetry '{other}' (expected: on, off)"
-                    )),
-                })
+                .map(onboard::parse_telemetry)
                 .transpose()?;
             return onboard::run(
                 &config,
@@ -1475,7 +1487,13 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
         }
     }
     if !ok {
-        std::process::exit(1);
+        // The failure is already on stderr (`print_with`/`print_json` just
+        // printed it) — returning `SilentExit` rather than exiting here
+        // directly lets it flow back through `main`'s `record_command` call
+        // before the process actually exits (see `main`'s and `run`'s doc
+        // comments), instead of skipping telemetry the way a bare
+        // `std::process::exit(1)` used to.
+        return Err(telemetry::SilentExit.into());
     }
     Ok(())
 }

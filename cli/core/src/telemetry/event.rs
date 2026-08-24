@@ -13,8 +13,10 @@ use super::wire::TelemetryEventWire;
 pub enum TelemetryEvent {
     /// A CLI (or daemon-served) command finished running.
     CommandExecuted {
-        /// The command name, e.g. `"status"`, `"config set"`. Never raw argv —
-        /// no path, no flag value, no user text.
+        /// The command name, e.g. `"status"`, `"config"`. Always the
+        /// top-level command name — never a sub-action (`config set` reports
+        /// as `"config"`) — and never raw argv: no path, no flag value, no
+        /// user text.
         command: &'static str,
         duration_ms: u64,
         success: bool,
@@ -60,18 +62,22 @@ impl ErrorKind {
 }
 
 /// How a [`TelemetryEvent::ConsentRecorded`] came about.
+///
+/// Deliberately closed to the ways the knob can actually change: there is no
+/// `Env` variant because the environment kill switches (`DO_NOT_TRACK`,
+/// `DIRA_TELEMETRY_ENABLED=0`) trip `TelemetryGate::hard_disabled` before
+/// `record_consent` ever runs, so a production caller can never construct
+/// this from an env override — and no `Default` variant, because the knob's
+/// initial default is never itself an event (see `docs/TELEMETRY.md`:
+/// accepting the default writes nothing and reports nothing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentSource {
     /// The interactive onboarding prompt.
     Prompt,
     /// A non-interactive `--yes`-style flag.
     YesFlag,
-    /// An environment variable override.
-    Env,
     /// `dira config set telemetry.enabled ...`.
     ConfigSet,
-    /// No explicit choice was ever made; this is the knob's own default.
-    Default,
 }
 
 impl ConsentSource {
@@ -80,9 +86,7 @@ impl ConsentSource {
         match self {
             ConsentSource::Prompt => "prompt",
             ConsentSource::YesFlag => "yes_flag",
-            ConsentSource::Env => "env",
             ConsentSource::ConfigSet => "config_set",
-            ConsentSource::Default => "default",
         }
     }
 }
@@ -252,7 +256,7 @@ mod tests {
         assert_eq!(
             TelemetryEvent::ConsentRecorded {
                 enabled: true,
-                source: ConsentSource::Default
+                source: ConsentSource::Prompt
             }
             .name(),
             "cli_consent_recorded"
@@ -279,9 +283,7 @@ mod tests {
         let cases = [
             (ConsentSource::Prompt, "prompt"),
             (ConsentSource::YesFlag, "yes_flag"),
-            (ConsentSource::Env, "env"),
             (ConsentSource::ConfigSet, "config_set"),
-            (ConsentSource::Default, "default"),
         ];
         for (source, want) in cases {
             assert_eq!(source.as_str(), want);

@@ -744,29 +744,34 @@ mod tests {
             Some("github.com/acme/api".to_string()),
         )
         .await;
+        // Two ULIDs minted in the same millisecond are not guaranteed to sort
+        // in insertion order, so identify the rows by their payload
+        // (duration_ms 1 vs 2) rather than by an id window.
         let after_second = state.store.telemetry_max_event_id().await.unwrap().unwrap();
-        let rows2 = state
+        let all_rows = state
             .store
-            .telemetry_events_since(Some(&after_first), &after_second, 10)
+            .telemetry_events_since(None, &after_second, 10)
             .await
             .unwrap();
-        assert_eq!(rows2.len(), 1);
-        let second: dira_core::telemetry::wire::TelemetryEventWire =
-            serde_json::from_str(&rows2[0].props_json).unwrap();
+        assert_eq!(all_rows.len(), 2);
+        let by_duration = |want: u64| {
+            all_rows
+                .iter()
+                .map(|r| {
+                    serde_json::from_str::<dira_core::telemetry::wire::TelemetryEventWire>(
+                        &r.props_json,
+                    )
+                    .unwrap()
+                })
+                .find(|w| w.duration_ms == Some(want))
+                .expect("row with the expected duration_ms")
+        };
         assert_eq!(
-            second.repo_visibility.as_deref(),
+            by_duration(2).repo_visibility.as_deref(),
             Some("public"),
             "once the cache is warm, the next event for the same repo carries the real answer"
         );
-
         // The first row is untouched — nothing retro-updates it.
-        let rows_again = state
-            .store
-            .telemetry_events_since(None, &after_first, 10)
-            .await
-            .unwrap();
-        let first_again: dira_core::telemetry::wire::TelemetryEventWire =
-            serde_json::from_str(&rows_again[0].props_json).unwrap();
-        assert_eq!(first_again.repo_visibility.as_deref(), Some("unknown"));
+        assert_eq!(by_duration(1).repo_visibility.as_deref(), Some("unknown"));
     }
 }

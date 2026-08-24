@@ -23,11 +23,40 @@ use std::time::Duration;
 /// Total wall-clock a telemetry send may spend end to end. Short and
 /// unconditional: nothing about `dira`'s own responsiveness may ever depend
 /// on the daemon or the network being fast, or even reachable.
-const TOTAL_BUDGET: Duration = Duration::from_millis(150);
+///
+/// `pub(crate)` so [`crate::device::fetch_install_id`]'s best-effort socket
+/// round-trip shares this exact budget instead of carrying its own copy of
+/// the same two literals.
+pub(crate) const TOTAL_BUDGET: Duration = Duration::from_millis(150);
 /// How long the connect itself may retry a busy endpoint — strictly inside
 /// [`TOTAL_BUDGET`], mirroring the hook shim's `HOOK_CONNECT_BUDGET`/
-/// `HOOK_TOTAL_BUDGET` split in `main.rs`.
-const CONNECT_BUDGET: Duration = Duration::from_millis(100);
+/// `HOOK_TOTAL_BUDGET` split in `main.rs`. See [`TOTAL_BUDGET`] for why this
+/// is `pub(crate)`.
+pub(crate) const CONNECT_BUDGET: Duration = Duration::from_millis(100);
+
+/// Sentinel error for the generic daemon-response path at the bottom of
+/// `main::run`'s big match: `render::print_with`/`print_json` has already
+/// rendered the failure (`error: {message}` on stderr) by the time this is
+/// constructed, so it carries no message of its own — printing one here would
+/// repeat what the user already saw. `main`'s thin wrapper recognizes it
+/// *after* `record_command` has fired and exits 1 silently instead of letting
+/// `anyhow`'s default `Debug` formatting land a second, redundant line on top.
+///
+/// Its whole reason to exist is that the path it replaces used to call
+/// `std::process::exit(1)` directly, which returned control to the OS before
+/// `main` ever got to record telemetry for the command — see
+/// [`classify_error`], which maps this straight to [`ErrorKind::DaemonError`]
+/// without inspecting any text.
+#[derive(Debug)]
+pub(crate) struct SilentExit;
+
+impl std::fmt::Display for SilentExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "command failed (already reported)")
+    }
+}
+
+impl std::error::Error for SilentExit {}
 
 /// Whether telemetry may be emitted **from this process**, folding together
 /// every kill switch `docs/TELEMETRY.md` documents plus the two the docs
@@ -84,6 +113,17 @@ impl TelemetryGate {
 pub(crate) fn classify_error(result: &anyhow::Result<()>) -> Option<ErrorKind> {
     let err = result.as_ref().err()?;
 
+    // The generic daemon-response path's sentinel: by the time this exists,
+    // the daemon has already answered and the answer was rendered as a
+    // failure — see `SilentExit`'s own doc. A type check, not a string one,
+    // so it is exact rather than a guess from wording.
+    if err
+        .chain()
+        .any(|c| c.downcast_ref::<SilentExit>().is_some())
+    {
+        return Some(ErrorKind::DaemonError);
+    }
+
     // A transport-level `std::io::Error` anywhere in the chain: a genuine I/O
     // failure (permissions, disk, a broken pipe), not an application-level
     // rejection.
@@ -113,15 +153,10 @@ pub(crate) fn classify_error(result: &anyhow::Result<()>) -> Option<ErrorKind> {
         return Some(ErrorKind::DaemonUnreachable);
     }
 
-    // A `Response::Error { message }` a caller wrapped and propagated —
-    // every such site's wording pairs a verb with "failed" (`link failed`,
-    // `resync failed`, `key rotation failed`, ...).
-    if lower.contains("failed") {
-        return Some(ErrorKind::DaemonError);
-    }
-
     // clap/validation-shaped `bail!`s: they name what the user typed, not
-    // anything the daemon or transport did.
+    // anything the daemon or transport did. Checked before the daemon-error
+    // markers below so a message that happens to contain both (unlikely, but
+    // this is the more specific — and more common — classification) wins.
     const INVALID_INPUT_MARKERS: &[&str] = &[
         "must be",
         "unknown ",
@@ -131,6 +166,21 @@ pub(crate) fn classify_error(result: &anyhow::Result<()>) -> Option<ErrorKind> {
     ];
     if INVALID_INPUT_MARKERS.iter().any(|m| lower.contains(m)) {
         return Some(ErrorKind::InvalidInput);
+    }
+
+    // A narrow, closed set of wording that appears ONLY once the daemon has
+    // actually answered over the control socket with a `Response::Error`
+    // (`device::resync`'s `"resync failed: {message}"`, or the generic
+    // fallback's `"unexpected daemon response: {other:?}"`). Deliberately not
+    // a bare `.contains("failed")`: that used to swallow any `bail!` or
+    // wrapped subprocess/cloud-HTTP error that happens to say "failed"
+    // without the daemon being involved at all — e.g. zavet_install's
+    // "failed to run `zavet` — is `zavet` still on PATH?", or a direct
+    // `device link`/`rotate-key` cloud-HTTP failure, neither of which ever
+    // touches `dirad`'s own protocol.
+    const DAEMON_ERROR_MARKERS: &[&str] = &["resync failed", "unexpected daemon response"];
+    if DAEMON_ERROR_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Some(ErrorKind::DaemonError);
     }
 
     Some(ErrorKind::Internal)
@@ -167,12 +217,31 @@ async fn send_fire_and_forget(config: &Config, req: Request) {
 /// `repo_canonical` so the daemon can salt-hash it; see
 /// [`dira_core::protocol::Request::IngestTelemetry`]'s doc for why that never
 /// happens CLI-side.
+///
+/// `config` is the copy `main` loaded BEFORE `run()` executed the command —
+/// stale by the time this runs for the one command that can change
+/// `telemetry.enabled` mid-run: `dira config set telemetry.enabled off`.
+/// Gating on the stale copy would let that disabling command's own
+/// `cli_command_executed` sneak through the gate it just closed, which
+/// `docs/TELEMETRY.md` promises never happens ("no partial mode, no events
+/// queued while off"). So for `name == "config"` (and only then — no other
+/// command can touch this knob) this re-loads the config fresh, falling back
+/// to the caller's stale copy if the reload itself errors rather than
+/// dropping the event over an unrelated disk problem.
 pub(crate) async fn record_command(
     config: &Config,
     name: &'static str,
     elapsed: Duration,
     result: &anyhow::Result<()>,
 ) {
+    let reloaded;
+    let config = if name == "config" {
+        reloaded = Config::load().unwrap_or_else(|_| config.clone());
+        &reloaded
+    } else {
+        config
+    };
+
     let gate = TelemetryGate::from_process(config);
     if !gate.allows_emission() {
         return;
@@ -204,8 +273,10 @@ pub(crate) async fn record_command(
     .await;
 }
 
-/// Record one `cli_consent_recorded` event — the telemetry toggle changing,
-/// including its initial default.
+/// Record one `cli_consent_recorded` event — the telemetry toggle changing.
+/// Never fires for the knob's own initial default (accepting it writes
+/// nothing and reports nothing; see `docs/TELEMETRY.md`) — only for an
+/// explicit choice, which is also why there is no `ConsentSource::Default`.
 ///
 /// Deliberately NOT gated on `knob_off`: the caller passes `enabled` as the
 /// value *just* decided (onboarding's prompt, `--telemetry`, or `dira config
@@ -252,6 +323,13 @@ fn should_show(marker_exists: bool, is_interactive_session: bool, gate: &Telemet
 /// stdout not a TTY) — and never twice on the same machine.
 pub(crate) fn maybe_show_first_run_notice(config: &Config) {
     let gate = TelemetryGate::from_process(config);
+    // Checked before anything that touches the filesystem or a terminal: a
+    // disabled gate (CI, a dev build, the knob off, ...) is the common case
+    // on every single invocation, so it must be the cheapest possible no-op
+    // rather than paying for a marker-file stat and two TTY checks first.
+    if !gate.allows_emission() {
+        return;
+    }
     let Some(path) = marker_path() else {
         return;
     };
@@ -424,6 +502,39 @@ mod tests {
 
         let internal: anyhow::Result<()> = Err(anyhow::anyhow!("something unexpected happened"));
         assert_eq!(classify_error(&internal), Some(ErrorKind::Internal));
+    }
+
+    /// The regression this restructuring exists to fix: a subprocess `bail!`
+    /// that happens to contain "failed" — but never touched the daemon at
+    /// all — must not be misreported as a daemon protocol error.
+    #[test]
+    fn a_subprocess_failure_containing_failed_is_not_a_daemon_error() {
+        let zavet_install: anyhow::Result<()> = Err(anyhow::anyhow!(
+            "failed to run `zavet` — is `zavet` still on PATH?"
+        ));
+        assert_eq!(classify_error(&zavet_install), Some(ErrorKind::Internal));
+    }
+
+    /// `device::resync`'s other daemon-answered-with-an-error shape.
+    #[test]
+    fn an_unexpected_daemon_response_is_a_daemon_error() {
+        let err: anyhow::Result<()> = Err(anyhow::anyhow!("unexpected daemon response: Pong"));
+        assert_eq!(classify_error(&err), Some(ErrorKind::DaemonError));
+    }
+
+    /// `SilentExit` (the generic daemon-response path's sentinel) is
+    /// recognized by type, not by its `Display` text — so a message that
+    /// mentions neither "resync" nor "unexpected daemon response" still
+    /// classifies correctly.
+    #[test]
+    fn silent_exit_is_a_daemon_error() {
+        let err: anyhow::Result<()> = Err(SilentExit.into());
+        assert_eq!(classify_error(&err), Some(ErrorKind::DaemonError));
+
+        // Still recognized wrapped in additional context, same as the
+        // `std::io::Error` chain-walk above.
+        let wrapped: anyhow::Result<()> = Err(anyhow::Error::new(SilentExit).context("run"));
+        assert_eq!(classify_error(&wrapped), Some(ErrorKind::DaemonError));
     }
 
     #[test]

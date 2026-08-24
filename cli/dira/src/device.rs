@@ -175,11 +175,11 @@ async fn fetch_install_id(config: &Config) -> Option<String> {
         return None;
     }
     let resp = tokio::time::timeout(
-        std::time::Duration::from_millis(150),
+        crate::telemetry::TOTAL_BUDGET,
         client::send_with_budget(
             &config.socket_path,
             &Request::TelemetryInstallId,
-            std::time::Duration::from_millis(100),
+            crate::telemetry::CONNECT_BUDGET,
         ),
     )
     .await

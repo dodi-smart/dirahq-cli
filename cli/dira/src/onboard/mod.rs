@@ -84,13 +84,10 @@ pub(crate) struct Options {
     pub knowledge: Option<KnowledgeSyncMode>,
     /// The choice from an explicit `--telemetry <on|off>`. `None` means ask.
     ///
-    /// Not yet parsed from argv: the `Onboard` command's clap definition and
-    /// its `Options { .. }` construction both live in `cli/dira/src/main.rs`,
-    /// which is out of this package's scope (see the doc comment on
-    /// `steps::telemetry`). The field is added now so wiring the flag through
-    /// is a one-line change there — `telemetry: telemetry_flag,` alongside
-    /// the existing fields — once that package adds the `--telemetry`
-    /// argument and parses its `on`/`off` value into an `Option<bool>`.
+    /// Parsed from argv by [`parse_telemetry`], called from the `Onboard`
+    /// arm of `main.rs`'s `run()` — the clap definition and the
+    /// `Options { .. }` construction both live there, alongside the
+    /// equivalent `--knowledge`/`parse_knowledge` wiring.
     pub telemetry: Option<bool>,
 }
 
@@ -388,6 +385,19 @@ pub(crate) fn parse_knowledge(raw: &str) -> Result<KnowledgeSyncMode> {
     }
 }
 
+/// Parse `--telemetry`. Mirrors [`parse_knowledge`]'s shape; `main.rs`'s own
+/// inline `match` used to duplicate this exact logic before the flag was
+/// threaded through to [`Options::telemetry`].
+pub(crate) fn parse_telemetry(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(anyhow::anyhow!(
+            "--telemetry must be one of: on, off (got `{other}`)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +411,14 @@ mod tests {
         );
         assert_eq!(parse_knowledge(" full ").unwrap(), KnowledgeSyncMode::Full);
         assert!(parse_knowledge("everything").is_err());
+    }
+
+    #[test]
+    fn telemetry_parses_on_and_off_and_rejects_others() {
+        assert!(parse_telemetry("on").unwrap());
+        assert!(!parse_telemetry("off").unwrap());
+        assert!(!parse_telemetry(" OFF ").unwrap());
+        assert!(parse_telemetry("maybe").is_err());
     }
 
     /// The four outcomes must be visually distinct without colour, because

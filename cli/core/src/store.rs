@@ -2193,8 +2193,24 @@ impl Store {
 
     // ---- telemetry (WP1) ----
 
+    /// Hard cap on the local telemetry queue. An install with no `cloud_url`
+    /// configured (or a linked one whose flush task has been broken for a
+    /// long time) never runs `delete_telemetry_events_through` at all — WP2's
+    /// sync task is the only pruner — so without a cap this table would grow
+    /// without bound for the lifetime of the install. The queue exists to
+    /// bridge a short outage, not to serve as an unbounded local log; well
+    /// above anything a healthy flush cadence would ever let accumulate, so
+    /// it only ever bites the pathological case.
+    pub(crate) const TELEMETRY_QUEUE_CAP: i64 = 5000;
+
     /// Append one telemetry event to the local queue. `id` is a caller-minted
     /// ULID (monotonic), matching every other channel's id-cursor idiom.
+    ///
+    /// Trims the tail to [`Self::TELEMETRY_QUEUE_CAP`] after every insert —
+    /// see its doc comment for why. Oldest-first by `id` (ULIDs sort
+    /// lexically by mint time), and folded into the same statement as the
+    /// trim decision so a burst of concurrent inserts can't race a separate
+    /// read-then-delete into over- or under-trimming.
     pub async fn insert_telemetry_event(
         &self,
         id: &str,
@@ -2210,6 +2226,13 @@ impl Store {
         .bind(created_at)
         .bind(name)
         .bind(props_json)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM telemetry_events WHERE id NOT IN \
+             (SELECT id FROM telemetry_events ORDER BY id DESC LIMIT ?1)",
+        )
+        .bind(Self::TELEMETRY_QUEUE_CAP)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4343,5 +4366,39 @@ mod tests {
             .unwrap();
         let ids: Vec<&str> = remaining.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["01C"]);
+    }
+
+    /// A no-cloud-linked install (or one whose flush is stuck) never runs
+    /// `delete_telemetry_events_through` — nothing else prunes this table —
+    /// so `insert_telemetry_event` itself must cap it, oldest-first.
+    #[tokio::test]
+    async fn insert_telemetry_event_caps_the_queue_and_evicts_the_oldest() {
+        let store = Store::open_in_memory().await.unwrap();
+        let cap = Store::TELEMETRY_QUEUE_CAP;
+        let total = cap + 5;
+        for i in 0..total {
+            let id = format!("{i:010}"); // zero-padded so lexical order == insertion order
+            store
+                .insert_telemetry_event(&id, "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+                .await
+                .unwrap();
+        }
+
+        let until = store.telemetry_max_event_id().await.unwrap().unwrap();
+        let rows = store
+            .telemetry_events_since(None, &until, total + 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            cap as usize,
+            "the queue must never exceed the cap"
+        );
+        // The oldest 5 ids (0000000000..0000000004) were evicted; the newest
+        // `cap` rows survive.
+        let oldest_surviving: i64 = rows[0].id.parse().unwrap();
+        assert_eq!(oldest_surviving, total - cap);
+        let newest_surviving: i64 = rows[rows.len() - 1].id.parse().unwrap();
+        assert_eq!(newest_surviving, total - 1);
     }
 }

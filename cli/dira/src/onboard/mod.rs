@@ -82,6 +82,16 @@ pub(crate) struct Options {
     pub harness: Vec<String>,
     /// The tier from `--knowledge`. `None` means ask.
     pub knowledge: Option<KnowledgeSyncMode>,
+    /// The choice from an explicit `--telemetry <on|off>`. `None` means ask.
+    ///
+    /// Not yet parsed from argv: the `Onboard` command's clap definition and
+    /// its `Options { .. }` construction both live in `cli/dira/src/main.rs`,
+    /// which is out of this package's scope (see the doc comment on
+    /// `steps::telemetry`). The field is added now so wiring the flag through
+    /// is a one-line change there — `telemetry: telemetry_flag,` alongside
+    /// the existing fields — once that package adds the `--telemetry`
+    /// argument and parses its `on`/`off` value into an `Option<bool>`.
+    pub telemetry: Option<bool>,
 }
 
 impl Options {
@@ -98,6 +108,13 @@ impl Options {
     pub fn resolve_defaults(&mut self) {
         if self.yes && self.knowledge.is_none() {
             self.knowledge = Some(KnowledgeSyncMode::Full);
+        }
+        // Same fold, for the same reason: without it, `--print --yes` could
+        // only say "leave telemetry on (after asking)" for a run that will
+        // never ask. `true` is telemetry's own default answer, mirroring
+        // `full` above.
+        if self.yes && self.telemetry.is_none() {
+            self.telemetry = Some(true);
         }
     }
 }
@@ -168,6 +185,20 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
             crate::config_cmd::set_quiet(config, "sync.knowledge", raw)
         }),
     ));
+    // After knowledge, not before: the two consent prompts read as a pair in
+    // the transcript, and `telemetry.enabled` is (like `sync.knowledge`)
+    // config the daemon reads at startup — the same restart-ordering
+    // reasoning applies.
+    results.push((
+        "telemetry".into(),
+        steps::telemetry(&state, &opts, ui.as_mut(), &|enabled: bool| {
+            crate::config_cmd::set_quiet(
+                config,
+                "telemetry.enabled",
+                if enabled { "on" } else { "off" },
+            )
+        }),
+    ));
 
     print_summary(&results);
     print_open_items(&state, &results);
@@ -229,6 +260,13 @@ fn print_plan(state: &detect::State, opts: &Options) {
         None => "full (after asking)",
     };
     println!("  · set knowledge sync to {tier}");
+
+    match opts.telemetry {
+        Some(true) => println!("  · leave anonymous telemetry on"),
+        Some(false) => println!("  · turn anonymous telemetry off"),
+        None => println!("  · leave anonymous telemetry on (after asking)"),
+    }
+
     println!("\nNothing was changed.");
 }
 
@@ -394,5 +432,40 @@ mod tests {
         let mut opts = Options::default();
         opts.resolve_defaults();
         assert_eq!(opts.knowledge, None);
+    }
+
+    /// `--yes` must resolve telemetry to `Some(true)` up front too, so
+    /// `--print --yes` can state the concrete answer instead of "(after
+    /// asking)" for a run that will never ask.
+    #[test]
+    fn yes_resolves_telemetry_to_on_up_front() {
+        let mut opts = Options {
+            yes: true,
+            ..Options::default()
+        };
+        assert_eq!(opts.telemetry, None, "unset before resolution");
+        opts.resolve_defaults();
+        assert_eq!(opts.telemetry, Some(true));
+    }
+
+    /// An explicit `--telemetry off` survives `--yes`: the more specific flag
+    /// wins, exactly like `--knowledge` does.
+    #[test]
+    fn an_explicit_telemetry_choice_is_not_overridden_by_yes() {
+        let mut opts = Options {
+            yes: true,
+            telemetry: Some(false),
+            ..Options::default()
+        };
+        opts.resolve_defaults();
+        assert_eq!(opts.telemetry, Some(false));
+    }
+
+    /// Without `--yes` telemetry stays unset, so the step asks.
+    #[test]
+    fn without_yes_telemetry_is_left_to_the_prompt() {
+        let mut opts = Options::default();
+        opts.resolve_defaults();
+        assert_eq!(opts.telemetry, None);
     }
 }

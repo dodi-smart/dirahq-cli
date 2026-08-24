@@ -192,6 +192,36 @@ fn the_knowledge_tier_is_written_to_config_toml() {
     assert!(text.contains("knowledge = \"full\""), "got:\n{text}");
 }
 
+/// Telemetry is on by default, and `--yes` accepts that default — so unlike
+/// `--knowledge full` (which always writes something settable), a `--yes` run
+/// must leave `telemetry.enabled` entirely absent from `config.toml`. Writing
+/// the default back would defeat the point of `TelemetryKnobs::default()`
+/// resolving to `true` for every pre-existing config that lacks the table.
+#[test]
+fn yes_leaves_telemetry_enabled_absent_from_config_toml() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+    let out = run_onboard(home, &["--yes", "--no-zavet", "--knowledge", "off"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--knowledge off` still writes `[sync] knowledge = "off"`, so a
+    // config.toml does exist by this point — the assertion below is on its
+    // *content*, not on the file's absence.
+    if let Some(config) = find_config_toml(home) {
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !text.contains("[telemetry]") && !text.contains("telemetry.enabled"),
+            "a --yes run accepting the default must not write telemetry.enabled; got:\n{text}"
+        );
+    }
+}
+
 /// A non-interactive run without `--yes` must not hang and must not act. CI
 /// invoking `dira onboard` by accident should be a no-op, not a wedged job or
 /// a machine that quietly grew a service.

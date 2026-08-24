@@ -27,7 +27,8 @@ effective-dated policy.
   /dirad     resident daemon (tokio): ingress (loopback HTTP + UDS), accounting, store
   /dira      thin CLI client over the daemon's Unix domain socket
   /sources    per-harness hook normalization (claude_code, …)
-/docs         docs/install.md (installer reference), docs/zavet.md (knowledge module)
+/docs         docs/install.md (installer reference), docs/zavet.md (knowledge module),
+              docs/TELEMETRY.md (what's collected and how to turn it off)
 install.sh    curl | sh installer for dira + dirad (see docs/install.md)
 mise.toml     toolchain pins (rust, just)
 justfile      task runner
@@ -140,6 +141,19 @@ so pointing a checkout at a local or self-hosted cloud is one line:
 DIRA_CLOUD_URL=http://localhost:3000 dira device link --code LOCALDEV1   # per-invocation
 dira config set cloud_url http://localhost:3000                          # persistent
 ```
+
+## Telemetry
+
+Dira collects anonymous product-usage analytics, on by default — never repo names, git
+identity, file paths, command arguments, or error text. `dira onboard` asks about it
+explicitly, on its own terms. Turn it off anytime:
+
+```sh
+dira config set telemetry.enabled false
+```
+
+`DIRA_TELEMETRY_ENABLED=0` and `DO_NOT_TRACK=1` also work; dev builds and CI never send.
+See [docs/TELEMETRY.md](docs/TELEMETRY.md) for exactly what is (and is never) collected.
 
 ## Contract
 

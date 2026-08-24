@@ -139,6 +139,9 @@ Examples:
         /// Knowledge sync tier: off, metadata, or full. Skips the consent prompt.
         #[arg(long, value_name = "TIER")]
         knowledge: Option<String>,
+        /// Anonymous telemetry: on or off. Skips the consent prompt.
+        #[arg(long, value_name = "ON|OFF")]
+        telemetry: Option<String>,
     },
     /// Today's summary: engaged / agent / compute + the unbilled value.
     #[command(
@@ -965,6 +968,7 @@ async fn main() -> Result<()> {
             no_zavet,
             harness,
             knowledge,
+            telemetry,
         } => {
             // Resolve harness aliases up front so a typo fails before any
             // step runs, rather than five steps in.
@@ -987,6 +991,16 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(onboard::parse_knowledge)
                 .transpose()?;
+            let telemetry = telemetry
+                .as_deref()
+                .map(|v| match v {
+                    "on" => Ok(true),
+                    "off" => Ok(false),
+                    other => Err(anyhow::anyhow!(
+                        "invalid --telemetry '{other}' (expected: on, off)"
+                    )),
+                })
+                .transpose()?;
             return onboard::run(
                 &config,
                 onboard::Options {
@@ -996,6 +1010,7 @@ async fn main() -> Result<()> {
                     no_zavet: *no_zavet,
                     harness: ids,
                     knowledge,
+                    telemetry,
                 },
             )
             .await;

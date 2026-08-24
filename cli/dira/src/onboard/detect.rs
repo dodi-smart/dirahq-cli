@@ -115,6 +115,8 @@ pub(crate) struct State {
     pub device_linked: bool,
     /// The currently resolved knowledge sync tier.
     pub knowledge: dira_core::config::KnowledgeSyncMode,
+    /// The currently resolved telemetry consent (`Config.telemetry.enabled`).
+    pub telemetry_enabled: bool,
 }
 
 impl State {
@@ -245,6 +247,7 @@ pub(crate) async fn run(config: &dira_core::Config, cwd: &Path) -> State {
         zavet_installed: crate::zavet_install::plugin_root_offline().is_some(),
         device_linked: device_linked(config).await,
         knowledge: config.sync.knowledge,
+        telemetry_enabled: config.telemetry.enabled,
     }
 }
 
@@ -382,6 +385,7 @@ mod tests {
             zavet_installed: false,
             device_linked: false,
             knowledge: dira_core::config::KnowledgeSyncMode::Off,
+            telemetry_enabled: true,
         };
 
         let ids: Vec<_> = state.wirable().iter().map(|h| h.probe.id).collect();
@@ -402,6 +406,7 @@ mod tests {
             zavet_installed: false,
             device_linked: false,
             knowledge: dira_core::config::KnowledgeSyncMode::Off,
+            telemetry_enabled: true,
         };
         assert!(base.daemon_running());
         assert!(!base.supervised(), "a pidfile daemon dies with the session");

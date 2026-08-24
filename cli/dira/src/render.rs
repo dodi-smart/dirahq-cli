@@ -280,6 +280,13 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
             eprintln!("unexpected capture-probe response outside `dira doctor --probe`");
             false
         }
+        // Fetched directly by `device::fetch_install_id`, which matches on it
+        // itself and never routes it through the generic printer. Reaching
+        // here means a request was built somewhere else by mistake.
+        Response::TelemetryInstallId { .. } => {
+            eprintln!("unexpected telemetry-install-id response outside `dira device link`");
+            false
+        }
     }
 }
 

@@ -189,15 +189,37 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
     // the transcript, and `telemetry.enabled` is (like `sync.knowledge`)
     // config the daemon reads at startup — the same restart-ordering
     // reasoning applies.
+    //
+    // The consent source follows the same DIRASH-0030-flavored fold every
+    // other onboarding choice does: an explicit `--telemetry <on|off>` and a
+    // `--yes`-resolved default both arrive here as `Some(_)` (see
+    // `Options::resolve_defaults`) and are indistinguishable from each other
+    // by the time this step runs — both are "a non-interactive flag decided
+    // this", which is exactly what `ConsentSource::YesFlag` means. Only a
+    // genuinely unset `opts.telemetry` means the interactive prompt ran.
+    let telemetry_source = if opts.telemetry.is_some() {
+        dira_core::telemetry::event::ConsentSource::YesFlag
+    } else {
+        dira_core::telemetry::event::ConsentSource::Prompt
+    };
     results.push((
         "telemetry".into(),
-        steps::telemetry(&state, &opts, ui.as_mut(), &|enabled: bool| {
-            crate::config_cmd::set_quiet(
-                config,
-                "telemetry.enabled",
-                if enabled { "on" } else { "off" },
-            )
-        }),
+        steps::telemetry(
+            &state,
+            &opts,
+            ui.as_mut(),
+            &|enabled: bool| {
+                crate::config_cmd::set_quiet(
+                    config,
+                    "telemetry.enabled",
+                    if enabled { "on" } else { "off" },
+                )
+            },
+            |enabled: bool| async move {
+                crate::telemetry::record_consent(config, enabled, telemetry_source).await;
+            },
+        )
+        .await,
     ));
 
     print_summary(&results);

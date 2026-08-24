@@ -48,6 +48,7 @@ use crate::sync::{
     next_backoff, record_channel_health, retry_after_from_headers, transient_wait, HealthChannel,
 };
 use dira_core::protocol::Response;
+use dira_core::telemetry::repo_facts::{self, RepoVisibility};
 use dira_core::telemetry::wire::{batch_id, TelemetryBatch, TelemetryEventWire};
 use dira_core::telemetry::{identity, META_TELEMETRY_CURSOR, META_TELEMETRY_HEALTH};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -388,14 +389,55 @@ async fn meta_put(state: &AppState, key: &str, value: &str) -> Result<(), TError
 /// [`Response::Ok`] either way — this is a fire-and-forget ingress, like
 /// `IngestZavet`, so a disabled knob is a silent no-op, not an error the CLI
 /// needs to see.
-pub(crate) async fn ingest(state: &AppState, event: TelemetryEventWire) -> Response {
+///
+/// `repo_canonical`, when present, crossed only the local control socket (see
+/// [`dira_core::protocol::Request::IngestTelemetry`]'s doc): it is salt-hashed
+/// here via [`identity::load_or_mint`] + [`repo_facts::compute`], and only the
+/// resulting host class, visibility, and hash are written onto `event` before
+/// it is queued. The plaintext ref itself is never persisted. Visibility is
+/// always `Unknown` — WP1/WP2 have no visibility source of their own yet.
+pub(crate) async fn ingest(
+    state: &AppState,
+    mut event: TelemetryEventWire,
+    repo_canonical: Option<String>,
+) -> Response {
     if !state.config.telemetry.enabled {
         return Response::Ok;
+    }
+    if let Some(canonical) = repo_canonical {
+        match identity::load_or_mint(&state.store).await {
+            Ok(identity) => {
+                let facts =
+                    repo_facts::compute(&canonical, &identity.salt, RepoVisibility::Unknown);
+                event.repo_host_class = Some(facts.host_class.as_str().to_string());
+                event.repo_visibility = Some(facts.visibility.as_str().to_string());
+                event.repo_hash = Some(facts.repo_hash);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "telemetry: could not derive repo facts (identity load failed): {e}"
+                );
+            }
+        }
     }
     if let Err(e) = store_event(state, &event).await {
         tracing::debug!("telemetry: drop event that failed to queue: {e}");
     }
     Response::Ok
+}
+
+/// `Request::TelemetryInstallId`: hand back this daemon's telemetry install
+/// id, minting it on first use. Never gated on `[telemetry] enabled` — see
+/// the request's own doc comment for why.
+pub(crate) async fn install_id(state: &AppState) -> Response {
+    match identity::load_or_mint(&state.store).await {
+        Ok(identity) => Response::TelemetryInstallId {
+            install_id: identity.install_id,
+        },
+        Err(e) => Response::Error {
+            message: format!("load telemetry identity: {e}"),
+        },
+    }
 }
 
 /// Enqueue one daemon-local lifecycle event (`DaemonStarted`/`DaemonStopped`),
@@ -627,7 +669,7 @@ mod tests {
         let state = state_with(&cloud, false).await;
         let wire =
             TelemetryEvent::DaemonStarted.into_wire("2026-01-01T00:00:00Z".into(), "0.0.0-test");
-        let resp = ingest(&state, wire).await;
+        let resp = ingest(&state, wire, None).await;
         assert!(matches!(resp, Response::Ok));
         assert_eq!(state.store.telemetry_max_event_id().await.unwrap(), None);
     }
@@ -638,7 +680,7 @@ mod tests {
         let state = state_with(&cloud, true).await;
         let wire =
             TelemetryEvent::DaemonStarted.into_wire("2026-01-01T00:00:00Z".into(), "0.0.0-test");
-        let resp = ingest(&state, wire).await;
+        let resp = ingest(&state, wire, None).await;
         assert!(matches!(resp, Response::Ok));
         assert!(state
             .store
@@ -646,5 +688,80 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// `repo_canonical` never reaches the store verbatim: `ingest` hashes it
+    /// (salted) and classifies its host, and only those derived fields land
+    /// in the queued row's `props_json`.
+    #[tokio::test]
+    async fn ingest_with_a_repo_canonical_stores_hashed_facts_never_the_plaintext() {
+        let cloud = MockCloud::start(&["/api/v1/pulse"]).await;
+        let state = state_with(&cloud, true).await;
+        let wire = TelemetryEvent::CommandExecuted {
+            command: "status",
+            duration_ms: 12,
+            success: true,
+            error_kind: None,
+            repo: None,
+        }
+        .into_wire("2026-01-01T00:00:00Z".into(), "0.0.0-test");
+
+        let resp = ingest(&state, wire, Some("github.com/acme/api".to_string())).await;
+        assert!(matches!(resp, Response::Ok));
+
+        let until = state.store.telemetry_max_event_id().await.unwrap().unwrap();
+        let rows = state
+            .store
+            .telemetry_events_since(None, &until, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].props_json.contains("github.com/acme/api"),
+            "the plaintext canonical ref must never be persisted: {}",
+            rows[0].props_json
+        );
+        let stored: TelemetryEventWire = serde_json::from_str(&rows[0].props_json).unwrap();
+        assert_eq!(stored.repo_host_class.as_deref(), Some("github"));
+        assert_eq!(stored.repo_visibility.as_deref(), Some("unknown"));
+        assert!(stored.repo_hash.as_deref().is_some_and(|h| h.len() == 64));
+
+        // Deterministic under this install's own salt: hashing the same
+        // canonical again (a second ingest) reproduces the same hash —
+        // `repo_facts::compute` itself already pins salt-keyed determinism;
+        // this only pins that `ingest` actually calls it that way.
+        let wire2 = TelemetryEvent::CommandExecuted {
+            command: "status",
+            duration_ms: 1,
+            success: true,
+            error_kind: None,
+            repo: None,
+        }
+        .into_wire("2026-01-01T00:00:01Z".into(), "0.0.0-test");
+        ingest(&state, wire2, Some("github.com/acme/api".to_string())).await;
+        let until2 = state.store.telemetry_max_event_id().await.unwrap().unwrap();
+        let rows2 = state
+            .store
+            .telemetry_events_since(Some(&until), &until2, 10)
+            .await
+            .unwrap();
+        let stored2: TelemetryEventWire = serde_json::from_str(&rows2[0].props_json).unwrap();
+        assert_eq!(stored.repo_hash, stored2.repo_hash);
+    }
+
+    #[tokio::test]
+    async fn install_id_mints_and_returns_the_same_id_across_calls() {
+        let cloud = MockCloud::start(&["/api/v1/pulse"]).await;
+        let state = state_with(&cloud, true).await;
+        let first = match install_id(&state).await {
+            Response::TelemetryInstallId { install_id } => install_id,
+            other => panic!("expected TelemetryInstallId, got {other:?}"),
+        };
+        assert!(!first.is_empty());
+        let second = match install_id(&state).await {
+            Response::TelemetryInstallId { install_id } => install_id,
+            other => panic!("expected TelemetryInstallId, got {other:?}"),
+        };
+        assert_eq!(first, second);
     }
 }

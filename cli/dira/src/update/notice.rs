@@ -162,7 +162,7 @@ struct Env {
 /// lets `DIRA_NO_UPDATE_CHECK=0` explicitly mean "not disabled", distinct
 /// from the var being merely absent (both leave checking enabled, but for
 /// different reasons worth being able to state).
-fn is_truthy_env_value(v: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_truthy_env_value(v: &std::ffi::OsStr) -> bool {
     v != std::ffi::OsStr::new("0")
 }
 
@@ -193,7 +193,7 @@ impl Env {
 /// path has a `target/{release,debug}` ancestor. Nagging someone running
 /// straight out of `just install` (which symlinks into `target/release`) is
 /// pure noise.
-fn is_dev_build() -> bool {
+pub(crate) fn is_dev_build() -> bool {
     let Ok(exe) = env::current_exe() else {
         return false;
     };

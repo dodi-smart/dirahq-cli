@@ -123,7 +123,11 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
         Request::DaemonInfo => daemon_info(state),
         Request::ResyncCursor { from } => resync_cursor(state, from).await,
         Request::IngestZavet { payload } => crate::zavet::ingest(state, payload).await,
-        Request::IngestTelemetry { event } => crate::telemetry_sync::ingest(state, event).await,
+        Request::IngestTelemetry {
+            event,
+            repo_canonical,
+        } => crate::telemetry_sync::ingest(state, event, repo_canonical).await,
+        Request::TelemetryInstallId => crate::telemetry_sync::install_id(state).await,
         Request::ZavetStatus { cwd, repo } => crate::zavet::status(state, cwd, repo).await,
         Request::ZavetWhy { query, cwd, repo } => crate::zavet::why(state, query, cwd, repo).await,
         Request::ZavetWiki { topic, cwd, repo } => {

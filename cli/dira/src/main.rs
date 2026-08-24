@@ -12,6 +12,7 @@ mod hook_health;
 mod init;
 mod onboard;
 mod render;
+mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod theme;
@@ -948,13 +949,82 @@ fn zavet_status_is_cwd_scoped(command: &Command) -> bool {
     )
 }
 
+/// This `dira`'s top-level command name, for telemetry's `command` field —
+/// coarse, never a sub-action (`Config { action: Set { .. } }` is `"config"`,
+/// not `"config set"`), and never raw argv. A non-wildcard match so adding a
+/// new top-level [`Command`] variant fails the build here rather than
+/// silently going unreported.
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Onboard { .. } => "onboard",
+        Command::Status { .. } => "status",
+        Command::Watch { .. } => "watch",
+        Command::Start { .. } => "start",
+        Command::Stop { .. } => "stop",
+        Command::Sessions => "sessions",
+        Command::Log { .. } => "log",
+        Command::Report { .. } => "report",
+        Command::Init { .. } => "init",
+        Command::Daemon { .. } => "daemon",
+        Command::Config { .. } => "config",
+        Command::Device { .. } => "device",
+        Command::Hook { .. } => "hook",
+        Command::Nuke { .. } => "nuke",
+        Command::Completions { .. } => "completions",
+        Command::Version => "version",
+        Command::Doctor { .. } => "doctor",
+        Command::Update { .. } => "update",
+        Command::Zavet { .. } => "zavet",
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Before anything prints: legacy Windows consoles need to be told to
     // interpret ANSI escapes, or every painted line leaks its SGR bytes.
     theme::enable_ansi();
     let cli = Cli::parse();
-    let config = Config::load().map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => return Err(anyhow::anyhow!("config: {e}")),
+    };
+    // Best-effort and read-only (see its own doc): never in CI, a dev build,
+    // a disabled knob, or a non-interactive session, and never twice.
+    telemetry::maybe_show_first_run_notice(&config);
+    let name = command_name(&cli.command);
+    let started = std::time::Instant::now();
+    let result = run(cli, config.clone()).await;
+    // Every exit-path inside `run` that calls `std::process::exit` directly
+    // (skewed-daemon hints, a render failure, `dira doctor`'s own exit code,
+    // `dira nuke`'s two direct exits) bypasses this recording entirely — see
+    // the doc comment on `run` for the full list. That is accepted: those
+    // paths terminate the process before control ever returns here.
+    telemetry::record_command(&config, name, started.elapsed(), &result).await;
+    result
+}
+
+/// The former body of `main`. Every early `return` below is unchanged from
+/// when it lived there — this split exists solely so `main` can wrap the
+/// whole run with timing + telemetry (see [`command_name`]) without
+/// disturbing this function's control flow.
+///
+/// A handful of paths inside here call `std::process::exit` directly rather
+/// than returning a `Result`, and so bypass `main`'s telemetry recording
+/// entirely:
+/// - `dira daemon status` when no daemon answers (exit 1).
+/// - `dira hook <harness>` under `dira doctor --probe`, on a transport
+///   failure (`HOOK_PROBE_FAILURE_EXIT`).
+/// - `dira doctor` always exits via its own computed code, success or not.
+/// - the generic daemon-request path's `if !ok { std::process::exit(1) }`,
+///   reached by `sessions`/`start`/`stop`/`log`/`report`/the `zavet`
+///   subactions when rendering the response reports failure.
+/// - `dira nuke`'s two direct exits (daemon unreachable; a failed response
+///   render).
+///
+/// None of these are worth restructuring just to be observed: each already
+/// terminates the process on its own terms, and forcing a `Result` return
+/// through them would change behavior this refactor is not meant to touch.
+async fn run(cli: Cli, config: Config) -> Result<()> {
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
@@ -1072,7 +1142,27 @@ async fn main() -> Result<()> {
         Command::Config { action } => {
             return match action {
                 ConfigAction::Get { key } => config_cmd::get(&config, key.as_deref()),
-                ConfigAction::Set { key, value } => config_cmd::set(&config, key, value),
+                ConfigAction::Set { key, value } => {
+                    let outcome = config_cmd::set(&config, key, value);
+                    // Fire a consent-recorded event on a successful
+                    // `telemetry.enabled` set — the one config knob whose
+                    // change is itself a telemetry-relevant fact. `config`
+                    // here is the process-start snapshot, so the gate is
+                    // deliberately not re-derived from it; see
+                    // `telemetry::record_consent`'s doc for why the write
+                    // (on OR off) is reported regardless.
+                    if outcome.is_ok() {
+                        if let Some(enabled) = config_cmd::telemetry_enabled_value(key, value) {
+                            telemetry::record_consent(
+                                &config,
+                                enabled,
+                                dira_core::telemetry::event::ConsentSource::ConfigSet,
+                            )
+                            .await;
+                        }
+                    }
+                    outcome
+                }
                 ConfigAction::Path => config_cmd::path(),
             };
         }

@@ -148,6 +148,22 @@ fn knob(key: &str) -> Option<&'static Knob> {
     KNOBS.iter().find(|k| k.key == key)
 }
 
+/// Whether `key`/`raw` is a `telemetry.enabled` set that `set()` would accept,
+/// and if so, the resolved bool — for the caller to fire a
+/// `cli_consent_recorded` telemetry event after a successful set. `None` for
+/// any other key or an unparseable value (already rejected by `set` itself
+/// before this would ever be consulted).
+pub(crate) fn telemetry_enabled_value(key: &str, raw: &str) -> Option<bool> {
+    if key != "telemetry.enabled" {
+        return None;
+    }
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// The "Settable keys" help block, rendered from [`KNOBS`] so `dira config set
 /// --help` can never drift from what [`set`] actually validates: adding a knob
 /// to the table updates the help (and the error message) in one place.
@@ -455,6 +471,20 @@ mod tests {
             coalesce_seconds: 45,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn telemetry_enabled_value_resolves_on_off_and_nothing_else() {
+        assert_eq!(
+            telemetry_enabled_value("telemetry.enabled", "on"),
+            Some(true)
+        );
+        assert_eq!(
+            telemetry_enabled_value("telemetry.enabled", "OFF"),
+            Some(false)
+        );
+        assert_eq!(telemetry_enabled_value("telemetry.enabled", "maybe"), None);
+        assert_eq!(telemetry_enabled_value("idle_seconds", "on"), None);
     }
 
     #[test]

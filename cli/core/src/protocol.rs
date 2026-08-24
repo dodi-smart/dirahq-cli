@@ -75,7 +75,26 @@ pub enum Request {
     /// events through), stamps `id`/`created_at`, and nudges the telemetry
     /// sync task. Fire-and-forget, like `IngestZavet`: acked with
     /// [`Response::Ok`] whether or not telemetry is enabled.
-    IngestTelemetry { event: TelemetryEventWire },
+    ///
+    /// `repo_canonical` is the CLI-resolved canonical repo ref (e.g.
+    /// `github.com/acme/api`) for a `CommandExecuted` event run inside a
+    /// repo, or `None` otherwise. It crosses only this local socket, never
+    /// the network: the daemon salt-hashes it via
+    /// `dira_core::telemetry::repo_facts` and fills `event`'s `repo_*`
+    /// fields before enqueuing, so the plaintext ref itself is never
+    /// persisted or shipped. `#[serde(default)]` so an older `dira`
+    /// (pre-dating this field) still deserializes against a newer daemon.
+    IngestTelemetry {
+        event: TelemetryEventWire,
+        #[serde(default)]
+        repo_canonical: Option<String>,
+    },
+    /// Fetch this install's telemetry id (minting it on first use), for
+    /// `dira device link` to attach as best-effort context on the claim.
+    /// Never gated on `[telemetry] enabled` here — the CLI itself already
+    /// skips this request when its own gate denies emission, and an id with
+    /// no events behind it identifies nothing on its own.
+    TelemetryInstallId,
     /// Zavet activation + capture health for a repo (resolved from `repo`, or
     /// `cwd`, or the daemon's own cwd — same ladder as `Start`).
     ZavetStatus {
@@ -367,6 +386,9 @@ pub enum Response {
     /// Same new-variant skew posture as `ZavetSpec`, and harmless here: only a
     /// CLI new enough to send `CaptureProbe` can ever receive this.
     CaptureProbe(Box<CaptureProbeView>),
+    /// `TelemetryInstallId`: this daemon's telemetry install id, minted on
+    /// first use — see [`Request::TelemetryInstallId`].
+    TelemetryInstallId { install_id: String },
 }
 
 /// A live or recent session as shown by `status` / `sessions`.

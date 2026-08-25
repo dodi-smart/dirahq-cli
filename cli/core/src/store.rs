@@ -65,7 +65,23 @@ impl Store {
         #[cfg(unix)]
         restrict_to_owner_0600(path);
 
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        // Strict migration validation is deliberate (DIRASH-0035): a database
+        // last written by a NEWER binary records migrations this one has never
+        // heard of, and running against that schema anyway trades a clean
+        // startup refusal for undefined behavior on the billing-critical event
+        // log. We keep the refusal but make it actionable — the raw sqlx
+        // `VersionMissing` names a bare number and nothing else, and under
+        // launchd that cryptic line is all a respawn-looping daemon leaves
+        // behind.
+        if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
+            if let sqlx::migrate::MigrateError::VersionMissing(v) = e {
+                return Err(Error::SchemaNewer {
+                    version: v,
+                    db: path.display().to_string(),
+                });
+            }
+            return Err(e.into());
+        }
         Ok(Self { pool })
     }
 
@@ -2719,6 +2735,55 @@ mod tests {
             before, after,
             "open_readonly must not create any sidecar file"
         );
+    }
+
+    /// A database last written by a NEWER binary records a migration this one
+    /// has never heard of. `Store::open` must refuse — strict validation is
+    /// deliberate (DIRASH-0035) — but with an error that names the recovery
+    /// path, not sqlx's bare `VersionMissing(<number>)`.
+    #[tokio::test]
+    async fn opening_a_newer_schema_refuses_with_an_actionable_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "dira-newer-schema-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+
+        // Migrate a real store, then stamp a future migration version into
+        // `_sqlx_migrations` the way a newer binary would have.
+        let store = Store::open(&path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (99999999999999, 'from the future', CURRENT_TIMESTAMP, 1, x'00', 0)",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        store.wal_checkpoint_truncate().await.unwrap();
+        drop(store);
+
+        let err = match Store::open(&path).await {
+            Ok(_) => panic!("must refuse to open a newer schema"),
+            Err(e) => e,
+        };
+        match &err {
+            Error::SchemaNewer { version, db } => {
+                assert_eq!(*version, 99_999_999_999_999);
+                assert!(db.contains("test.db"));
+            }
+            other => panic!("expected SchemaNewer, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("newer dira"), "names the cause: {msg}");
+        assert!(msg.contains("dira update"), "names the recovery: {msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A missing file must fail, not be created — `open` creates on demand,

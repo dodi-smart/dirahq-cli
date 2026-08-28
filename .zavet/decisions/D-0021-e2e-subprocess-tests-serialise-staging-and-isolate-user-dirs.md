@@ -5,7 +5,7 @@ status: active
 guards:
   - cli/dira/tests/update_e2e.rs
 checks:
-  - the exec-staging lock still exists :: grep -qF 'static EXEC_STAGING: Mutex<()>' cli/dira/tests/update_e2e.rs
+  - the exec-staging lock still exists :: grep -qF 'static EXEC_STAGING: Mutex<()>' cli/dira/tests/common/mod.rs
   - staging still holds the lock :: grep -qF 'let _staging = lock_staging();' cli/dira/tests/update_e2e.rs
   - no fork bypasses the lock :: sh -c '! grep -nE "\.(output|status)\(\)" cli/dira/tests/update_e2e.rs'
   - the suite is clean and repeatable :: cargo test -p dira --test update_e2e

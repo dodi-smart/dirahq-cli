@@ -1,0 +1,36 @@
+# Thin caller, copy to <repo>/.github/workflows/zavet-check.yml
+#
+# ONLY for repos that carry a `.zavet/` knowledge layer.
+#
+# Severity mirrors the local git hooks: decision checks and guard trailers fail
+# the PR, spec staleness only warns. Local hooks hold only as long as every
+# contributor has them installed and never passes --no-verify, which is what
+# this workflow exists to backstop.
+name: Zavet Check
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: zavet-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  zavet:
+    uses: dodi-smart/.github/.github/workflows/zavet-check.yml@v1
+    secrets: inherit
+    with:
+      # The decision checks are `cargo test`, so the Rust toolchain has to be
+      # here. Cargo resolves dependencies on demand, so there is no install step.
+      stack: rust
+      install: ""
+
+      # HOSTED, DELIBERATELY, and do not "optimise" this to a weight preset.
+      # D-0012 forbids self-hosted on any `pull_request` workflow in this repo:
+      # this is a public repo and the checks compile and run the contributor's
+      # own code, so a persistent in-network runner would turn one approved pull
+      # request into lateral access. The org runner group also refuses public
+      # repos outright, so a self-hosted selector here would queue until it timed
+      # out and read as a hang rather than a refusal.
+      runner-weight: hosted
+    #   audit: true      # add the report-only health sweep

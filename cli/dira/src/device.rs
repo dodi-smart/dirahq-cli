@@ -91,8 +91,21 @@ pub async fn link(config: &Config, code: Option<String>, label: Option<String>) 
     // device stays unlinked until the cloud hands back an authoritative id.
     let client_nonce = Ulid::generate().to_string();
 
+    // Best-effort telemetry install id, attached purely as context for the
+    // "device linked" alias the cloud performs at claim time — never required:
+    // a link must not fail, or even slow down noticeably, because telemetry
+    // couldn't be reached. Skipped outright when the CLI's own gate would
+    // refuse to emit anyway (CI, a dev build, DO_NOT_TRACK, ...).
+    let install_id = fetch_install_id(config).await;
+
     let url = format!("{}/api/v1/devices/claim", base.trim_end_matches('/'));
-    let body = claim_request_body(&code, &key.public_base64(), label.as_deref(), &client_nonce);
+    let body = claim_request_body(
+        &code,
+        &key.public_base64(),
+        label.as_deref(),
+        &client_nonce,
+        install_id.as_deref(),
+    );
 
     let client = reqwest::Client::new();
     let resp = client
@@ -128,18 +141,54 @@ pub async fn link(config: &Config, code: Option<String>, label: Option<String>) 
 /// without a network or store. Carries the link `code`, our `ed25519Pubkey`, an
 /// optional `label`, and a `clientNonce` for idempotency — but **never** a
 /// client-chosen `deviceId`: the cloud assigns the identity (see the module docs).
+///
+/// `install_id`, when present, is this machine's telemetry install id — pure
+/// best-effort context for the cloud's own device/telemetry alias at claim
+/// time (see `docs/TELEMETRY.md`'s "linking a device" section), never a
+/// second identity the client asserts.
 fn claim_request_body(
     code: &str,
     pubkey_b64: &str,
     label: Option<&str>,
     client_nonce: &str,
+    install_id: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "code": code,
         "ed25519Pubkey": pubkey_b64,
         "label": label,
         "clientNonce": client_nonce,
+        "installId": install_id,
     })
+}
+
+/// Best-effort fetch of this daemon's telemetry install id, for
+/// [`claim_request_body`]'s `installId`. Skipped outright when the CLI's own
+/// telemetry gate would refuse to emit (CI, a dev build, `DO_NOT_TRACK`,
+/// `DIRA_TELEMETRY_ENABLED=0`, or the knob off) — no point asking the daemon
+/// for an id this process would never report anyway. Any failure — no
+/// daemon, a timeout, an unexpected response — collapses to `None`: a device
+/// link must never fail, or even meaningfully slow down, because telemetry
+/// couldn't be reached.
+async fn fetch_install_id(config: &Config) -> Option<String> {
+    if !crate::telemetry::TelemetryGate::from_process(config).allows_emission() {
+        return None;
+    }
+    let resp = tokio::time::timeout(
+        crate::telemetry::TOTAL_BUDGET,
+        client::send_with_budget(
+            &config.socket_path,
+            &Request::TelemetryInstallId,
+            crate::telemetry::CONNECT_BUDGET,
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    match resp {
+        Response::TelemetryInstallId { install_id } if !install_id.is_empty() => Some(install_id),
+        _ => None,
+    }
 }
 
 /// Extract the cloud-assigned `deviceId` from a successful claim response body.
@@ -808,11 +857,18 @@ mod tests {
     fn claim_body_carries_no_client_chosen_device_id() {
         // The claim request must NOT smuggle a client-chosen device id under any
         // name. Identity is server-assigned; we only send a clearly-named nonce.
-        let body = claim_request_body("CODE-123", "PUBKEYb64", Some("laptop"), "01NONCE");
+        let body = claim_request_body(
+            "CODE-123",
+            "PUBKEYb64",
+            Some("laptop"),
+            "01NONCE",
+            Some("01INSTALLID"),
+        );
         assert_eq!(body["code"], "CODE-123");
         assert_eq!(body["ed25519Pubkey"], "PUBKEYb64");
         assert_eq!(body["label"], "laptop");
         assert_eq!(body["clientNonce"], "01NONCE");
+        assert_eq!(body["installId"], "01INSTALLID");
         // No `deviceId` field at all — the cloud owns the id.
         assert!(
             body.get("deviceId").is_none(),
@@ -822,9 +878,18 @@ mod tests {
 
     #[test]
     fn claim_body_omits_label_as_null_when_absent() {
-        let body = claim_request_body("CODE", "PK", None, "01NONCE");
+        let body = claim_request_body("CODE", "PK", None, "01NONCE", None);
         assert!(body["label"].is_null());
         assert!(body.get("deviceId").is_none());
+    }
+
+    /// A link must never fail — or even carry a required field — because
+    /// telemetry couldn't be reached: `installId` is optional and null when
+    /// there is none to attach.
+    #[test]
+    fn claim_body_omits_install_id_as_null_when_absent() {
+        let body = claim_request_body("CODE", "PK", None, "01NONCE", None);
+        assert!(body["installId"].is_null());
     }
 
     #[test]

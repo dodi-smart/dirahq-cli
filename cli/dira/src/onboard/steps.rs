@@ -305,6 +305,93 @@ pub(crate) fn knowledge(
     }
 }
 
+/// The consent text for the telemetry prompt.
+///
+/// Named, and asserted on by a test, for the same reason
+/// [`KNOWLEDGE_DISCLOSURE`] is: this is the only consent UX for the channel,
+/// so if this sentence is wrong or missing, nothing else catches it.
+pub(crate) const TELEMETRY_DISCLOSURE: &str = "\
+Anonymous product analytics, on by default — its own channel, separate from
+knowledge sync and billing consent.
+  sent   command name, duration, success/failure kind; inside a repo: host
+         type (github/gitlab/bitbucket/self-hosted), public/private when
+         determinable (checked with the repo's own host — github/gitlab —
+         never with Dira), and a one-way salted hash of the repo identity
+  never  repo names, git identity or email, file paths, command arguments,
+         error text
+Tagged by a random install id, not your device key. Sent to Dira's EU
+analytics (PostHog EU, via the Dira cloud); once this device is linked,
+later usage may be associated with your workspace account. Silent in dev
+builds and CI.
+Turn off anytime: `dira config set telemetry.enabled false`,
+DIRA_TELEMETRY_ENABLED=0, or DO_NOT_TRACK=1.";
+
+/// Step 8 — the telemetry consent.
+///
+/// Last of the mutating steps: same reasoning as [`knowledge`] for running
+/// after the daemon step (a restart it may have just done should not race
+/// this write), and after knowledge itself so the two consent prompts read
+/// as a pair in the transcript rather than being split by the zavet steps.
+///
+/// `write_enabled` is injected for the same reason [`knowledge`]'s
+/// `write_tier` is: `config_cmd::set_quiet` resolves its target via
+/// `project_dirs()` regardless of the `Config` it is handed, so an
+/// in-process unit test calling it directly would write the developer's real
+/// `config.toml`. `mod::run` passes a closure over the real `set_quiet`
+/// (translating the bool to the `"on"`/`"off"` spelling `telemetry.enabled`
+/// expects); tests pass a recording stub.
+///
+/// `record_consent` is injected for the same client-agnosticism reason: the
+/// real one (bound by `mod::run`) is `telemetry::record_consent`, a fire-
+/// and-forget send over the control socket, which no unit test in this
+/// module may perform. It is only ever called after `write_enabled`
+/// succeeds — a `cli_consent_recorded` event must report what was actually
+/// persisted, never an attempted write that failed.
+pub(crate) async fn telemetry<F, Fut>(
+    state: &State,
+    opts: &Options,
+    ui: &mut dyn Ui,
+    write_enabled: &dyn Fn(bool) -> anyhow::Result<PathBuf>,
+    record_consent: F,
+) -> StepOutcome
+where
+    F: FnOnce(bool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Unconditional, and above the `opts.telemetry` match on purpose — the
+    // same DIRASH-0030 rule `knowledge` follows: every consent path
+    // (interactive, `--yes`, an explicit `--telemetry` flag) has to see
+    // exactly what is sent before this step acts, not just the one that
+    // stops to ask.
+    ui.say(TELEMETRY_DISCLOSURE);
+
+    let want = match opts.telemetry {
+        Some(explicit) => explicit,
+        None => ui.confirm("Keep anonymous telemetry on?", true),
+    };
+
+    if state.telemetry_enabled == want {
+        return StepOutcome::AlreadyDone(format!(
+            "telemetry already {}",
+            if want { "on" } else { "off" }
+        ));
+    }
+
+    match write_enabled(want) {
+        Ok(_) => {
+            record_consent(want).await;
+            if want {
+                StepOutcome::Done(
+                    "telemetry stays on — anonymous usage analytics will be sent".into(),
+                )
+            } else {
+                StepOutcome::Done("telemetry turned off — nothing will be sent".into())
+            }
+        }
+        Err(e) => StepOutcome::Failed(format!("could not set telemetry.enabled: {e}")),
+    }
+}
+
 /// Step 5 — install the zavet plugin.
 pub(crate) fn zavet_plugin(state: &State, opts: &Options, ui: &mut dyn Ui) -> StepOutcome {
     if opts.no_zavet {
@@ -451,6 +538,7 @@ mod tests {
             zavet_installed: false,
             device_linked: false,
             knowledge: KnowledgeSyncMode::Off,
+            telemetry_enabled: true,
         }
     }
 
@@ -647,6 +735,188 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    /// A `set_quiet`-style stand-in for `telemetry()`'s `write_enabled`
+    /// closure — same `RecordingWriter` shape, `bool` in place of the raw
+    /// TOML string, and the same DIRASH-0030 justification for why tests
+    /// never call `config_cmd::set_quiet` directly.
+    struct BoolRecorder(std::cell::RefCell<Vec<bool>>);
+
+    impl BoolRecorder {
+        fn new() -> Self {
+            Self(std::cell::RefCell::new(Vec::new()))
+        }
+
+        fn calls(&self) -> Vec<bool> {
+            self.0.borrow().clone()
+        }
+
+        fn as_fn(&self) -> impl Fn(bool) -> anyhow::Result<PathBuf> + '_ {
+            move |enabled: bool| {
+                self.0.borrow_mut().push(enabled);
+                Ok(PathBuf::from("/dev/null/recording-writer-stub"))
+            }
+        }
+    }
+
+    /// The disclosure has to name the content, not just the toggle. Same
+    /// justification as `the_knowledge_prompt_names_what_it_sends`: this is
+    /// the only place the user is told what telemetry sends.
+    #[tokio::test]
+    async fn the_telemetry_prompt_names_what_it_sends() {
+        let mut ui = ScriptedUi::new();
+        let recorder = BoolRecorder::new();
+        let _ = telemetry(
+            &state(),
+            &Options::default(),
+            &mut ui,
+            &recorder.as_fn(),
+            |_| async {},
+        )
+        .await;
+        let t = ui.transcript();
+        for phrase in [
+            "command",
+            "public",
+            "private",
+            "hash",
+            "DO_NOT_TRACK",
+            "telemetry.enabled",
+            // DIRASH-0034: the disclosure must name that visibility is
+            // checked with the repo's own host, never with Dira — not just
+            // that a `public`/`private` value is sent.
+            "never with Dira",
+        ] {
+            assert!(
+                t.contains(phrase),
+                "consent text must mention {phrase:?}; got:\n{t}"
+            );
+        }
+    }
+
+    /// An explicit `--telemetry` answer is not re-asked.
+    #[tokio::test]
+    async fn an_explicit_telemetry_flag_skips_the_prompt() {
+        let mut ui = ScriptedUi::new();
+        let opts = Options {
+            telemetry: Some(false),
+            ..Options::default()
+        };
+        let recorder = BoolRecorder::new();
+        let _ = telemetry(&state(), &opts, &mut ui, &recorder.as_fn(), |_| async {}).await;
+        assert!(
+            !ui.transcript().contains("Keep anonymous telemetry on?"),
+            "an explicit --telemetry must not re-ask"
+        );
+    }
+
+    /// Telemetry is on by default (`state().telemetry_enabled == true`), so
+    /// accepting the default answer must not write `config.toml` at all —
+    /// only a *change* from the effective value is worth persisting.
+    #[tokio::test]
+    async fn keeping_the_default_on_does_not_write() {
+        let mut ui = ScriptedUi::new();
+        let recorder = BoolRecorder::new();
+        let outcome = telemetry(
+            &state(),
+            &Options::default(),
+            &mut ui,
+            &recorder.as_fn(),
+            |_| async {},
+        )
+        .await;
+        assert!(
+            recorder.calls().is_empty(),
+            "must not write the default back"
+        );
+        assert!(
+            matches!(&outcome, StepOutcome::AlreadyDone(m) if m.contains("already on")),
+            "got {outcome:?}"
+        );
+    }
+
+    /// Declining writes `false` and says so plainly — no partial "some data
+    /// still leaves" hedging.
+    #[tokio::test]
+    async fn declining_writes_false_and_says_nothing_will_be_sent() {
+        let mut ui = ScriptedUi::new().with_confirms(&[false]);
+        let recorder = BoolRecorder::new();
+        let outcome = telemetry(
+            &state(),
+            &Options::default(),
+            &mut ui,
+            &recorder.as_fn(),
+            |_| async {},
+        )
+        .await;
+        assert_eq!(recorder.calls(), vec![false]);
+        match &outcome {
+            StepOutcome::Done(m) => assert!(m.contains("nothing will be sent"), "got {m}"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// `record_consent` must fire exactly once, and only after a successful
+    /// write — never on an `AlreadyDone` no-op, and never before the write is
+    /// confirmed to have landed.
+    #[tokio::test]
+    async fn record_consent_fires_once_and_only_after_a_successful_write() {
+        let recorded = std::cell::RefCell::new(Vec::new());
+        let mut ui = ScriptedUi::new().with_confirms(&[false]);
+        let recorder = BoolRecorder::new();
+        let outcome = telemetry(
+            &state(),
+            &Options::default(),
+            &mut ui,
+            &recorder.as_fn(),
+            |enabled: bool| {
+                recorded.borrow_mut().push(enabled);
+                async {}
+            },
+        )
+        .await;
+        assert!(matches!(outcome, StepOutcome::Done(_)));
+        assert_eq!(recorded.into_inner(), vec![false]);
+
+        // Unchanged (already on): neither the write nor the consent event
+        // fires.
+        let recorded_noop = std::cell::RefCell::new(Vec::new());
+        let mut ui = ScriptedUi::new();
+        let recorder = BoolRecorder::new();
+        let outcome = telemetry(
+            &state(),
+            &Options::default(),
+            &mut ui,
+            &recorder.as_fn(),
+            |enabled: bool| {
+                recorded_noop.borrow_mut().push(enabled);
+                async {}
+            },
+        )
+        .await;
+        assert!(matches!(outcome, StepOutcome::AlreadyDone(_)));
+        assert!(recorded_noop.into_inner().is_empty());
+    }
+
+    /// A `--yes`-shaped run (after `Options::resolve_defaults` folds it to
+    /// `Some(true)`) must still show the disclosure, per the same rule the
+    /// knowledge step's `a_yes_shaped_run_still_shows_the_disclosure` pins.
+    #[tokio::test]
+    async fn a_yes_shaped_telemetry_run_still_shows_the_disclosure() {
+        let mut ui = ScriptedUi::new();
+        let opts = Options {
+            telemetry: Some(true),
+            ..Options::default()
+        };
+        let recorder = BoolRecorder::new();
+        let _ = telemetry(&state(), &opts, &mut ui, &recorder.as_fn(), |_| async {}).await;
+        let t = ui.transcript();
+        assert!(t.contains("Anonymous product analytics"), "got:\n{t}");
+        assert!(
+            !t.contains("Keep anonymous telemetry on?"),
+            "an already-resolved answer must still not re-ask"
+        );
     }
 
     /// Empty input means skip, and the skip must be first-class: the run

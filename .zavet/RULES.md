@@ -45,3 +45,9 @@ agent context at session start. Keep it short and non-negotiable.
 - Nothing enters `repo_dirs` unless the directory demonstrably belongs to the
   repo it is filed under, and `register_repo_dir` stays I/O-free.
   See DIRASH-0027.
+- Telemetry ships only the closed `TelemetryEvent` enum — never argv, paths,
+  repo names, git identity, or error text. Plaintext repo refs are hashed
+  daemon-side with the per-install salt; the analytics id is never derived
+  from the device key; the flush gate is consent, never `cloud_link`.
+  Changing what ships changes `TELEMETRY_DISCLOSURE` and `docs/TELEMETRY.md`
+  in the same commit. See DIRASH-0033.

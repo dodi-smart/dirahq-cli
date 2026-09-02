@@ -12,10 +12,11 @@
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::any;
 use axum::Router;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// One canned HTTP response.
 #[derive(Clone)]
@@ -23,6 +24,10 @@ pub struct MockResp {
     pub status: u16,
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// Sleep this long before answering — lets a test exercise a caller's
+    /// own request timeout without a real network stall (repo-visibility's
+    /// probe tests use this for its 2s-in-prod/short-in-test probe timeout).
+    pub delay: Option<Duration>,
 }
 
 impl MockResp {
@@ -31,6 +36,7 @@ impl MockResp {
             status: 200,
             body: body.into(),
             headers: vec![],
+            delay: None,
         }
     }
 
@@ -39,11 +45,19 @@ impl MockResp {
             status,
             body: body.into(),
             headers: vec![],
+            delay: None,
         }
     }
 
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Answer this response only after `delay` — for exercising a caller's
+    /// request timeout.
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
         self
     }
 }
@@ -60,7 +74,10 @@ pub struct MockCloud {
 }
 
 impl MockCloud {
-    /// Start the mock server with POST handlers for each of `paths`.
+    /// Start the mock server with a handler for each of `paths` that answers
+    /// any HTTP method (`POST` for the cloud-sync channels' bodies; `GET` for
+    /// repo-visibility's probe requests) — the canned-response queue and
+    /// recorded-bodies list don't care which method arrived.
     pub async fn start(paths: &[&'static str]) -> Self {
         let mut routes = HashMap::new();
         let mut recorded = HashMap::new();
@@ -72,7 +89,7 @@ impl MockCloud {
             recorded.insert(path, rec.clone());
             router = router.route(
                 path,
-                post(move |headers: HeaderMap, body: Bytes| {
+                any(move |headers: HeaderMap, body: Bytes| {
                     let q = q.clone();
                     let rec = rec.clone();
                     async move {
@@ -85,6 +102,9 @@ impl MockCloud {
                             .unwrap()
                             .pop_front()
                             .unwrap_or_else(|| MockResp::ok("{}"));
+                        if let Some(d) = resp.delay {
+                            tokio::time::sleep(d).await;
+                        }
                         let mut builder =
                             Response::builder().status(StatusCode::from_u16(resp.status).unwrap());
                         for (k, v) in &resp.headers {

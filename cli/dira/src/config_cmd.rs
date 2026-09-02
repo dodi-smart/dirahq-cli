@@ -132,10 +132,36 @@ const KNOBS: &[Knob] = &[
         kind: Kind::Enum(&["on", "off"]),
         help: "passive update-available notice after status/version/daemon status: on, off",
     },
+    // `Config.telemetry.enabled` is a plain `bool` (see
+    // `dira_core::config::TelemetryKnobs`), exactly like `update.check` above —
+    // same bespoke `parse_and_validate` arm, same `get()` rendering, for the
+    // same reason (no `Deserialize`/`Serialize` impl maps "on"/"off" to a bare
+    // `bool` for free).
+    Knob {
+        key: "telemetry.enabled",
+        kind: Kind::Enum(&["on", "off"]),
+        help: "anonymous usage telemetry; off disables collection and sync entirely: on, off",
+    },
 ];
 
 fn knob(key: &str) -> Option<&'static Knob> {
     KNOBS.iter().find(|k| k.key == key)
+}
+
+/// Whether `key`/`raw` is a `telemetry.enabled` set that `set()` would accept,
+/// and if so, the resolved bool — for the caller to fire a
+/// `cli_consent_recorded` telemetry event after a successful set. `None` for
+/// any other key or an unparseable value (already rejected by `set` itself
+/// before this would ever be consulted).
+pub(crate) fn telemetry_enabled_value(key: &str, raw: &str) -> Option<bool> {
+    if key != "telemetry.enabled" {
+        return None;
+    }
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// The "Settable keys" help block, rendered from [`KNOBS`] so `dira config set
@@ -213,12 +239,13 @@ fn render_json_scalar(v: &serde_json::Value) -> String {
 }
 
 /// Like [`render_json_scalar`], but lets a dotted-key lookup render in the
-/// vocabulary its `set` counterpart accepts. Only `update.check` needs this:
-/// its backing field is a plain `bool` (see `UpdateKnobs`), but `set` speaks
-/// "on"/"off" like the enum knobs do, so `get` echoes the same words rather
-/// than leaking the wire representation.
+/// vocabulary its `set` counterpart accepts. `update.check` and
+/// `telemetry.enabled` need this: their backing fields are plain `bool`s (see
+/// `UpdateKnobs`/`TelemetryKnobs`), but `set` speaks "on"/"off" like the enum
+/// knobs do, so `get` echoes the same words rather than leaking the wire
+/// representation.
 fn render_scalar(key: &str, v: &serde_json::Value) -> String {
-    if key == "update.check" {
+    if key == "update.check" || key == "telemetry.enabled" {
         if let Some(b) = v.as_bool() {
             return if b { "on" } else { "off" }.to_string();
         }
@@ -348,6 +375,13 @@ fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_ed
             "off" => Ok(value(false)),
             _ => bail!("update.check must be one of: on, off (got `{raw}`)"),
         },
+        // Same "on"/"off" -> real `bool` bridge as `update.check`, onto
+        // `Config.telemetry.enabled`.
+        "telemetry.enabled" => match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Ok(value(true)),
+            "off" => Ok(value(false)),
+            _ => bail!("telemetry.enabled must be one of: on, off (got `{raw}`)"),
+        },
         key => match knob.kind {
             Kind::U64 => {
                 let n: u64 = raw
@@ -437,6 +471,20 @@ mod tests {
             coalesce_seconds: 45,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn telemetry_enabled_value_resolves_on_off_and_nothing_else() {
+        assert_eq!(
+            telemetry_enabled_value("telemetry.enabled", "on"),
+            Some(true)
+        );
+        assert_eq!(
+            telemetry_enabled_value("telemetry.enabled", "OFF"),
+            Some(false)
+        );
+        assert_eq!(telemetry_enabled_value("telemetry.enabled", "maybe"), None);
+        assert_eq!(telemetry_enabled_value("idle_seconds", "on"), None);
     }
 
     #[test]
@@ -639,6 +687,47 @@ mod tests {
         let v = serde_json::to_value(&resolved).unwrap();
         let got = v.get("update").and_then(|u| u.get("check")).unwrap();
         assert_eq!(render_scalar("update.check", got), "off");
+    }
+
+    #[test]
+    fn telemetry_enabled_accepts_only_on_off() {
+        let knob = knob("telemetry.enabled").unwrap();
+        assert!(parse_and_validate(&cfg(), knob, "on").is_ok());
+        assert!(parse_and_validate(&cfg(), knob, "OFF").is_ok()); // case-folded
+        assert!(parse_and_validate(&cfg(), knob, "true").is_err());
+        assert!(parse_and_validate(&cfg(), knob, "maybe").is_err());
+    }
+
+    #[test]
+    fn telemetry_enabled_writes_a_real_toml_bool_not_a_string() {
+        let knob = knob("telemetry.enabled").unwrap();
+        let item = parse_and_validate(&cfg(), knob, "off").unwrap();
+        assert_eq!(item.as_bool(), Some(false));
+        let item = parse_and_validate(&cfg(), knob, "on").unwrap();
+        assert_eq!(item.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn telemetry_enabled_round_trips_through_set_and_get() {
+        let original = "idle_seconds = 300\n";
+        let mut doc: DocumentMut = original.parse().unwrap();
+        let item = parse_and_validate(&cfg(), knob("telemetry.enabled").unwrap(), "off").unwrap();
+        assign(&mut doc, "telemetry.enabled", item);
+        let out = doc.to_string();
+        assert!(out.contains("[telemetry]"));
+        assert!(out.contains("enabled = false"));
+
+        use figment::providers::Format as _;
+        let resolved: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(figment::providers::Toml::string(&out))
+                .extract()
+                .unwrap();
+        assert!(!resolved.telemetry.enabled);
+
+        let v = serde_json::to_value(&resolved).unwrap();
+        let got = v.get("telemetry").and_then(|t| t.get("enabled")).unwrap();
+        assert_eq!(render_scalar("telemetry.enabled", got), "off");
     }
 
     #[test]

@@ -486,6 +486,13 @@ impl Store {
         sqlx::query("DELETE FROM meta WHERE key LIKE 'token_fp:%'")
             .execute(&mut *tx)
             .await?;
+        // The telemetry queue (WP1/WP2) is a stat too — wipe it so a nuked slate
+        // reports no backlog rather than re-sending pre-nuke events under a
+        // blanked cursor (which would otherwise look like a burst of brand-new
+        // activity to the cloud).
+        sqlx::query("DELETE FROM telemetry_events")
+            .execute(&mut *tx)
+            .await?;
         // Reset the sync cursors in the same transaction so they can't point past
         // the wiped tables. We blank them rather than delete the keys to keep reads
         // simple.
@@ -496,6 +503,9 @@ impl Store {
         // For `token_usage` that would re-create the exact defect
         // `META_TOKEN_CURSOR` exists to fix, since `nuke` also clears the
         // `token_offset:%` watermarks above and thus guarantees a full re-import.
+        // Same reasoning applies to `telemetry_events`' ULID cursor: the table
+        // above is now empty, so a stale cursor would silently skip every event
+        // re-queued after the nuke.
         for key in [
             crate::sync::META_SYNC_CURSOR,
             crate::sync::META_ARTIFACTS_CURSOR,
@@ -506,6 +516,8 @@ impl Store {
             crate::sync::knowledge::META_KNOWLEDGE_SPEC_CURSOR,
             crate::sync::knowledge::META_KNOWLEDGE_TRAILER_CURSOR,
             crate::sync::knowledge::META_KNOWLEDGE_GUARD_CURSOR,
+            crate::telemetry::META_TELEMETRY_CURSOR,
+            crate::telemetry::META_TELEMETRY_HEALTH,
         ] {
             sqlx::query(
                 "INSERT INTO meta (key, value) VALUES (?1, '')
@@ -2194,6 +2206,108 @@ impl Store {
             specs_total: s.get::<i64, _>("n") as u64,
         })
     }
+
+    // ---- telemetry (WP1) ----
+
+    /// Hard cap on the local telemetry queue. An install with no `cloud_url`
+    /// configured (or a linked one whose flush task has been broken for a
+    /// long time) never runs `delete_telemetry_events_through` at all — WP2's
+    /// sync task is the only pruner — so without a cap this table would grow
+    /// without bound for the lifetime of the install. The queue exists to
+    /// bridge a short outage, not to serve as an unbounded local log; well
+    /// above anything a healthy flush cadence would ever let accumulate, so
+    /// it only ever bites the pathological case.
+    pub(crate) const TELEMETRY_QUEUE_CAP: i64 = 5000;
+
+    /// Append one telemetry event to the local queue. `id` is a caller-minted
+    /// ULID (monotonic), matching every other channel's id-cursor idiom.
+    ///
+    /// Trims the tail to [`Self::TELEMETRY_QUEUE_CAP`] after every insert —
+    /// see its doc comment for why. Oldest-first by `id` (ULIDs sort
+    /// lexically by mint time), and folded into the same statement as the
+    /// trim decision so a burst of concurrent inserts can't race a separate
+    /// read-then-delete into over- or under-trimming.
+    pub async fn insert_telemetry_event(
+        &self,
+        id: &str,
+        created_at: &str,
+        name: &str,
+        props_json: &str,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO telemetry_events (id, created_at, name, props_json)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(id)
+        .bind(created_at)
+        .bind(name)
+        .bind(props_json)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM telemetry_events WHERE id NOT IN \
+             (SELECT id FROM telemetry_events ORDER BY id DESC LIMIT ?1)",
+        )
+        .bind(Self::TELEMETRY_QUEUE_CAP)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The largest `telemetry_events.id`, or `None` when the queue is empty —
+    /// the snapshot upper bound for a sync window (`until`), same role as
+    /// [`Self::max_event_id`].
+    pub async fn telemetry_max_event_id(&self) -> Result<Option<String>, Error> {
+        let row = sqlx::query("SELECT MAX(id) AS m FROM telemetry_events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<Option<String>, _>("m"))
+    }
+
+    /// Load telemetry events in the id window `(cursor, until]`, ordered by id —
+    /// the un-synced telemetry backlog for a flush. `cursor = None` means "from
+    /// the beginning". Mirrors [`Self::events_between`]'s id-cursor idiom.
+    pub async fn telemetry_events_since(
+        &self,
+        cursor: Option<&str>,
+        until: &str,
+        limit: i64,
+    ) -> Result<Vec<TelemetryEventRow>, Error> {
+        let rows = match cursor {
+            Some(c) => {
+                sqlx::query(
+                    "SELECT id, created_at, name, props_json FROM telemetry_events \
+                     WHERE id > ?1 AND id <= ?2 ORDER BY id ASC LIMIT ?3",
+                )
+                .bind(c)
+                .bind(until)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, created_at, name, props_json FROM telemetry_events \
+                     WHERE id <= ?1 ORDER BY id ASC LIMIT ?2",
+                )
+                .bind(until)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows.iter().map(row_to_telemetry_event).collect())
+    }
+
+    /// Delete telemetry events with id ≤ `id` — retention/pruning for rows
+    /// already acked by the cloud. Returns the number of rows removed.
+    pub async fn delete_telemetry_events_through(&self, id: &str) -> Result<u64, Error> {
+        let res = sqlx::query("DELETE FROM telemetry_events WHERE id <= ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 /// Tighten `path` (and its SQLite `-wal`/`-shm` sidecars) to owner-only `0600`
@@ -2324,6 +2438,20 @@ pub struct ZavetSpecCapture {
     pub body_md: Option<String>,
     /// Git blob sha of the file at the capturing commit.
     pub content_hash: Option<String>,
+}
+
+/// One stored telemetry event, as read from `telemetry_events`. Mirrors the
+/// columns 1:1 (see migration `0006_telemetry.sql`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryEventRow {
+    /// ULID, monotonic — also the sync-window cursor value.
+    pub id: String,
+    /// RFC 3339 timestamp string, stored verbatim.
+    pub created_at: String,
+    /// Wire event name, e.g. `cli_command_executed`.
+    pub name: String,
+    /// Serialized `TelemetryEventWire` JSON.
+    pub props_json: String,
 }
 
 /// A stored decision row plus its guard globs.
@@ -2634,6 +2762,15 @@ fn row_to_token_row(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRow, Error> {
         est_cost_usd: row.get::<Option<f64>, _>("est_cost"),
         at: row.get("at"),
     })
+}
+
+fn row_to_telemetry_event(row: &sqlx::sqlite::SqliteRow) -> TelemetryEventRow {
+    TelemetryEventRow {
+        id: row.get("id"),
+        created_at: row.get("created_at"),
+        name: row.get("name"),
+        props_json: row.get("props_json"),
+    }
 }
 
 fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
@@ -3131,6 +3268,54 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("")
+        );
+    }
+
+    #[tokio::test]
+    async fn nuke_clears_the_telemetry_queue_and_its_cursor_and_health() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_telemetry_event("01A", "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+            .await
+            .unwrap();
+        store
+            .meta_set(crate::telemetry::META_TELEMETRY_CURSOR, "01A")
+            .await
+            .unwrap();
+        store
+            .meta_set(
+                crate::telemetry::META_TELEMETRY_HEALTH,
+                r#"{"consecutiveFailures":3}"#,
+            )
+            .await
+            .unwrap();
+
+        store.nuke().await.unwrap();
+
+        assert_eq!(store.telemetry_max_event_id().await.unwrap(), None);
+        assert_eq!(
+            store
+                .telemetry_events_since(None, "01ZZZZZZZZZZZZZZZZZZZZZZZZ", 100)
+                .await
+                .unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            store
+                .meta_get(crate::telemetry::META_TELEMETRY_CURSOR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "a stale cursor over an emptied queue would skip every re-queued event"
+        );
+        assert_eq!(
+            store
+                .meta_get(crate::telemetry::META_TELEMETRY_HEALTH)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(""),
         );
     }
 
@@ -4149,5 +4334,136 @@ mod tests {
         assert_eq!(totals.cache_read, 0);
         assert_eq!(totals.cache_create, 0);
         assert_eq!(totals.est_cost_usd, 0.0);
+    }
+
+    // ---- telemetry (WP1) ----
+
+    #[tokio::test]
+    async fn telemetry_events_since_empty_queue_is_empty() {
+        let store = Store::open_in_memory().await.unwrap();
+        assert_eq!(store.telemetry_max_event_id().await.unwrap(), None);
+        let rows = store
+            .telemetry_events_since(None, "01ZZZZZZZZZZZZZZZZZZZZZZZZ", 100)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn telemetry_insert_and_read_back_round_trips() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_telemetry_event("01A", "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+            .await
+            .unwrap();
+        store
+            .insert_telemetry_event(
+                "01B",
+                "2026-01-01T00:00:01Z",
+                "cli_command_executed",
+                r#"{"command":"status"}"#,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.telemetry_max_event_id().await.unwrap(),
+            Some("01B".to_string())
+        );
+
+        let rows = store
+            .telemetry_events_since(None, "01B", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "01A");
+        assert_eq!(rows[0].name, "cli_daemon_started");
+        assert_eq!(rows[1].id, "01B");
+        assert_eq!(rows[1].props_json, r#"{"command":"status"}"#);
+    }
+
+    #[tokio::test]
+    async fn telemetry_events_since_respects_cursor_and_until_window() {
+        let store = Store::open_in_memory().await.unwrap();
+        for id in ["01A", "01B", "01C", "01D"] {
+            store
+                .insert_telemetry_event(id, "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+                .await
+                .unwrap();
+        }
+        // (01A, 01C] -> 01B, 01C.
+        let rows = store
+            .telemetry_events_since(Some("01A"), "01C", 100)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["01B", "01C"]);
+    }
+
+    #[tokio::test]
+    async fn telemetry_events_since_respects_limit() {
+        let store = Store::open_in_memory().await.unwrap();
+        for id in ["01A", "01B", "01C"] {
+            store
+                .insert_telemetry_event(id, "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+                .await
+                .unwrap();
+        }
+        let rows = store.telemetry_events_since(None, "01C", 2).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["01A", "01B"]);
+    }
+
+    #[tokio::test]
+    async fn delete_telemetry_events_through_prunes_only_up_to_id() {
+        let store = Store::open_in_memory().await.unwrap();
+        for id in ["01A", "01B", "01C"] {
+            store
+                .insert_telemetry_event(id, "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+                .await
+                .unwrap();
+        }
+        let deleted = store.delete_telemetry_events_through("01B").await.unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = store
+            .telemetry_events_since(None, "01C", 100)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = remaining.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["01C"]);
+    }
+
+    /// A no-cloud-linked install (or one whose flush is stuck) never runs
+    /// `delete_telemetry_events_through` — nothing else prunes this table —
+    /// so `insert_telemetry_event` itself must cap it, oldest-first.
+    #[tokio::test]
+    async fn insert_telemetry_event_caps_the_queue_and_evicts_the_oldest() {
+        let store = Store::open_in_memory().await.unwrap();
+        let cap = Store::TELEMETRY_QUEUE_CAP;
+        let total = cap + 5;
+        for i in 0..total {
+            let id = format!("{i:010}"); // zero-padded so lexical order == insertion order
+            store
+                .insert_telemetry_event(&id, "2026-01-01T00:00:00Z", "cli_daemon_started", "{}")
+                .await
+                .unwrap();
+        }
+
+        let until = store.telemetry_max_event_id().await.unwrap().unwrap();
+        let rows = store
+            .telemetry_events_since(None, &until, total + 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            cap as usize,
+            "the queue must never exceed the cap"
+        );
+        // The oldest 5 ids (0000000000..0000000004) were evicted; the newest
+        // `cap` rows survive.
+        let oldest_surviving: i64 = rows[0].id.parse().unwrap();
+        assert_eq!(oldest_surviving, total - cap);
+        let newest_surviving: i64 = rows[rows.len() - 1].id.parse().unwrap();
+        assert_eq!(newest_surviving, total - 1);
     }
 }

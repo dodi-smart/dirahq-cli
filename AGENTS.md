@@ -56,6 +56,12 @@ agent context at session start. Keep it short and non-negotiable.
 - Nothing enters `repo_dirs` unless the directory demonstrably belongs to the
   repo it is filed under, and `register_repo_dir` stays I/O-free.
   See DIRASH-0027.
+- Telemetry ships only the closed `TelemetryEvent` enum — never argv, paths,
+  repo names, git identity, or error text. Plaintext repo refs are hashed
+  daemon-side with the per-install salt; the analytics id is never derived
+  from the device key; the flush gate is consent, never `cloud_link`.
+  Changing what ships changes `TELEMETRY_DISCLOSURE` and `docs/TELEMETRY.md`
+  in the same commit. See DIRASH-0033.
 
 ### Recorded decisions (read the file before changing guarded code; ask /zavet:why)
 
@@ -91,6 +97,8 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0030 — Full-content knowledge sync is opted into by its own prompt, never implied by linking (active)
 - DIRASH-0031 — One backoff ladder lives in dira_core; callers own their attempt budget (active)
 - DIRASH-0032 — A record's first-sight triple is repaired as a unit, from recorded facts (active)
+- DIRASH-0033 — Telemetry is opt-out, anonymous by construction, and rides its own unsigned channel (active)
+- DIRASH-0034 — Repo-visibility probing sends the plaintext ref only to the forge's own public API, anonymously (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 
@@ -102,6 +110,7 @@ agent context at session start. Keep it short and non-negotiable.
 - harness-sources — Harness sources and hook ingestion (session, high)
 - knowledge-sync — Knowledge sync — the consent-gated second channel (session, medium)
 - onboarding — Onboarding — dira onboard and the installer handoff (session, high)
+- telemetry — Telemetry — anonymous product analytics (session, high)
 
 Capture bar: record non-obvious choices a future reader could not reconstruct — micro-decisions as commit trailers (Why:/Rejected:/Constraint:/Refs:), structural ones via /zavet:decide.
 Spec maintenance (do this as part of normal work, no command needed): when implementing or changing a feature, update its covering spec in .zavet/specs/ — or create one from .zavet/.spec-template.md (origin: session) for substantial new features — reference the decisions involved, and add a `Spec: <slug>` trailer to the commit.

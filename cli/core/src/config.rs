@@ -145,6 +145,31 @@ impl Default for UpdateKnobs {
     }
 }
 
+/// Anonymous usage-telemetry knob (`[telemetry]` in `config.toml`).
+///
+/// Governs the local `telemetry_events` queue and its sync to the cloud ingest
+/// endpoint (see `dira_core::telemetry`): `false` stops new events from being
+/// queued and stops the daemon from flushing whatever is already queued. It
+/// does not touch attestation sync (D-0001) or the knowledge channel
+/// (`SyncKnobs::knowledge`) — those have their own, separately-gated consent.
+/// Env override: `DIRA_TELEMETRY__ENABLED=true|false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryKnobs {
+    /// Whether anonymous usage telemetry may be collected and synced at all.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for TelemetryKnobs {
+    fn default() -> Self {
+        // Not `#[derive(Default)]`, for the same reason as `UpdateKnobs`: that
+        // would give `enabled: false` (bool's zero value), contradicting the
+        // field's own serde default — telemetry is on out of the box, same as
+        // every pre-WP1 config that lacks a `[telemetry]` table entirely.
+        Self { enabled: true }
+    }
+}
+
 /// Daemon + CLI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -265,6 +290,9 @@ pub struct Config {
     /// Passive-update-check knobs (`[update]` table; see [`UpdateKnobs`]).
     #[serde(default)]
     pub update: UpdateKnobs,
+    /// Anonymous usage-telemetry knob (`[telemetry]` table; see [`TelemetryKnobs`]).
+    #[serde(default)]
+    pub telemetry: TelemetryKnobs,
 }
 
 /// Where the control socket lives by default.
@@ -387,6 +415,7 @@ impl Default for Config {
             modules: Modules::default(),
             sync: SyncKnobs::default(),
             update: UpdateKnobs::default(),
+            telemetry: TelemetryKnobs::default(),
         }
     }
 }
@@ -1038,6 +1067,44 @@ mod tests {
                 .extract()
                 .unwrap();
             assert!(!c.update.check);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn telemetry_enabled_defaults_to_true() {
+        // Absent [telemetry] table (every pre-WP1 config) must resolve to
+        // telemetry-on, matching TelemetryKnobs::default().
+        assert!(Config::default().telemetry.enabled);
+        let c: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("idle_seconds = 120"))
+            .extract()
+            .unwrap();
+        assert!(c.telemetry.enabled);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn telemetry_enabled_layers_from_toml_and_env() {
+        let c: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[telemetry]\nenabled = false"))
+            .extract()
+            .unwrap();
+        assert!(!c.telemetry.enabled);
+
+        // Env wins over toml, via the same DIRA_ prefix + `__`->`.` mapping
+        // Config::load installs (DIRA_TELEMETRY__ENABLED -> telemetry.enabled).
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DIRA_TELEMETRY__ENABLED", "false");
+            let c: Config = Figment::from(Serialized::defaults(Config::default()))
+                .merge(Toml::string("[telemetry]\nenabled = true"))
+                .merge(
+                    Env::prefixed("DIRA_")
+                        .map(|k| k.as_str().to_lowercase().replace("__", ".").into()),
+                )
+                .extract()
+                .unwrap();
+            assert!(!c.telemetry.enabled);
             Ok(())
         });
     }

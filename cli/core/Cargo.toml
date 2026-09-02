@@ -32,6 +32,9 @@ keyring.workspace = true
 # `keyring` installs the platform store; entries are built against whatever store
 # is registered, which is `keyring-core`'s job (see `identity::keychain_entry`).
 keyring-core.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 # `figment::Jail` (env-isolated config tests) is gated behind its `test` feature.

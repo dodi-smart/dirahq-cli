@@ -52,6 +52,32 @@ pub struct AppState {
     pub sync: SyncHandle,
     /// Handle to the knowledge sync task (M2; consent-gated, own cursors).
     pub knowledge_sync: crate::knowledge_sync::KnowledgeSyncHandle,
+    /// Handle to the telemetry sync task (WP2; consent-gated, unsigned
+    /// batches). See [`crate::telemetry_sync::TelemetrySyncHandle`] for why
+    /// this holds its receiver internally rather than threading it out of
+    /// [`crate::build_state`] alongside `sync`/`knowledge_sync`'s.
+    pub telemetry_sync: crate::telemetry_sync::TelemetrySyncHandle,
+    /// This daemon's telemetry identity (install id + salt), minted at most
+    /// once per daemon lifetime. See [`AppState::telemetry_identity`].
+    ///
+    /// `Arc`-wrapped (unlike `device_key`'s `RwLock`, which is genuinely
+    /// mutable — see [`AppState::invalidate_device_key`]) so every clone of
+    /// this `AppState` shares the SAME cell: a `OnceCell` living directly on
+    /// the struct would give each clone its own, independent "first call"
+    /// and defeat the whole point of capping minting at one attempt.
+    pub telemetry_identity:
+        Arc<tokio::sync::OnceCell<dira_core::telemetry::identity::TelemetryIdentity>>,
+    /// Cache + in-flight bookkeeping for [`crate::repo_visibility`]'s
+    /// GitHub/GitLab visibility probe (WP3), keyed by the salted `repo_hash`
+    /// so it carries the same privacy property as the telemetry pipeline
+    /// itself. Lives on `AppState` (rather than a lazy static) so tests can
+    /// construct an isolated daemon and inspect/seed it directly.
+    pub visibility_cache: Arc<crate::repo_visibility::VisibilityCache>,
+    /// Base URL for [`crate::repo_visibility`]'s GitHub probe. Not a config
+    /// knob — every production daemon gets [`crate::repo_visibility::GITHUB_API_BASE`]
+    /// from `build_state` — this exists purely so a test can point `ingest`'s
+    /// whole visibility pipeline at a mock instead of the real network.
+    pub github_api_base: Arc<str>,
     /// This device's signing key, used to sign attestation batches. Loaded
     /// **lazily** off the startup critical path: the key is only needed for
     /// sync/signing, never to answer a control request, and loading it can block
@@ -165,6 +191,34 @@ impl AppState {
                 None
             }
         }
+    }
+
+    /// This daemon's telemetry identity, minted at most once per daemon
+    /// lifetime and shared by every caller thereafter.
+    ///
+    /// Replaces three independent `identity::load_or_mint` call sites in
+    /// `telemetry_sync.rs` (`ingest`, `install_id`, `flush_telemetry`), each
+    /// of which used to hit the store on every single event/flush — and,
+    /// because none of them serialized against each other, could race: two
+    /// concurrent first callers on a fresh store could each observe "nothing
+    /// minted yet" and persist a *different* salt, the later write winning
+    /// silently while the earlier caller's already-returned identity kept
+    /// disagreeing with what actually ended up on disk (see
+    /// [`dira_core::telemetry::identity::load_or_mint`]'s own doc). Routing
+    /// every caller through [`tokio::sync::OnceCell::get_or_try_init`] makes
+    /// the mint happen exactly once; every other concurrent caller waits on
+    /// that one attempt instead of racing it.
+    ///
+    /// Returns an owned clone rather than a borrow tied to the cell, so
+    /// callers don't hold anything across their own store/HTTP awaits — same
+    /// reasoning as [`Self::device_key`].
+    pub async fn telemetry_identity(
+        &self,
+    ) -> Result<dira_core::telemetry::identity::TelemetryIdentity, dira_core::Error> {
+        self.telemetry_identity
+            .get_or_try_init(|| dira_core::telemetry::identity::load_or_mint(&self.store))
+            .await
+            .cloned()
     }
 
     /// Discard the cached device key so the NEXT [`AppState::device_key`] call
@@ -883,6 +937,42 @@ mod tests {
             .await
             .expect("reloads after invalidation");
         assert_eq!(reloaded.public_base64(), second.public_base64());
+    }
+
+    /// The TOCTOU this `OnceCell` exists to close: without it, two concurrent
+    /// FIRST callers on a fresh store could each observe "nothing minted
+    /// yet" and persist a different salt, the later write winning silently
+    /// while the earlier caller's already-returned identity disagreed with
+    /// what ended up on disk. `get_or_try_init` makes exactly one of these
+    /// two calls actually mint; the other only ever observes that result.
+    #[tokio::test]
+    async fn telemetry_identity_mints_at_most_once_under_concurrent_callers() {
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        let config = dira_core::Config::default();
+        let (state, ..) = crate::build_state(store, config).await.unwrap();
+        // Both handles share the same `Arc<OnceCell<_>>` (see the field's own
+        // doc) — cloning `AppState` must never give a caller its own cell.
+        let state2 = state.clone();
+
+        let (a, b) = tokio::join!(state.telemetry_identity(), state2.telemetry_identity());
+        let a = a.expect("mint succeeds");
+        let b = b.expect("mint succeeds");
+        assert_eq!(
+            a.install_id, b.install_id,
+            "both concurrent callers must observe the identical minted id"
+        );
+        assert_eq!(a.salt, b.salt, "and the identical minted salt");
+
+        // And what's actually on disk is exactly what both callers saw —
+        // neither call's return value is stale relative to the persisted
+        // meta row.
+        let persisted_id = state
+            .store
+            .meta_get(dira_core::telemetry::identity::META_TELEMETRY_INSTALL_ID)
+            .await
+            .unwrap()
+            .expect("minted id was persisted");
+        assert_eq!(persisted_id, a.install_id);
     }
 
     const IDLE: Duration = Duration::minutes(5);

@@ -82,6 +82,13 @@ pub(crate) struct Options {
     pub harness: Vec<String>,
     /// The tier from `--knowledge`. `None` means ask.
     pub knowledge: Option<KnowledgeSyncMode>,
+    /// The choice from an explicit `--telemetry <on|off>`. `None` means ask.
+    ///
+    /// Parsed from argv by [`parse_telemetry`], called from the `Onboard`
+    /// arm of `main.rs`'s `run()` — the clap definition and the
+    /// `Options { .. }` construction both live there, alongside the
+    /// equivalent `--knowledge`/`parse_knowledge` wiring.
+    pub telemetry: Option<bool>,
 }
 
 impl Options {
@@ -98,6 +105,13 @@ impl Options {
     pub fn resolve_defaults(&mut self) {
         if self.yes && self.knowledge.is_none() {
             self.knowledge = Some(KnowledgeSyncMode::Full);
+        }
+        // Same fold, for the same reason: without it, `--print --yes` could
+        // only say "leave telemetry on (after asking)" for a run that will
+        // never ask. `true` is telemetry's own default answer, mirroring
+        // `full` above.
+        if self.yes && self.telemetry.is_none() {
+            self.telemetry = Some(true);
         }
     }
 }
@@ -168,6 +182,42 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
             crate::config_cmd::set_quiet(config, "sync.knowledge", raw)
         }),
     ));
+    // After knowledge, not before: the two consent prompts read as a pair in
+    // the transcript, and `telemetry.enabled` is (like `sync.knowledge`)
+    // config the daemon reads at startup — the same restart-ordering
+    // reasoning applies.
+    //
+    // The consent source follows the same DIRASH-0030-flavored fold every
+    // other onboarding choice does: an explicit `--telemetry <on|off>` and a
+    // `--yes`-resolved default both arrive here as `Some(_)` (see
+    // `Options::resolve_defaults`) and are indistinguishable from each other
+    // by the time this step runs — both are "a non-interactive flag decided
+    // this", which is exactly what `ConsentSource::YesFlag` means. Only a
+    // genuinely unset `opts.telemetry` means the interactive prompt ran.
+    let telemetry_source = if opts.telemetry.is_some() {
+        dira_core::telemetry::event::ConsentSource::YesFlag
+    } else {
+        dira_core::telemetry::event::ConsentSource::Prompt
+    };
+    results.push((
+        "telemetry".into(),
+        steps::telemetry(
+            &state,
+            &opts,
+            ui.as_mut(),
+            &|enabled: bool| {
+                crate::config_cmd::set_quiet(
+                    config,
+                    "telemetry.enabled",
+                    if enabled { "on" } else { "off" },
+                )
+            },
+            |enabled: bool| async move {
+                crate::telemetry::record_consent(config, enabled, telemetry_source).await;
+            },
+        )
+        .await,
+    ));
 
     print_summary(&results);
     print_open_items(&state, &results);
@@ -229,6 +279,13 @@ fn print_plan(state: &detect::State, opts: &Options) {
         None => "full (after asking)",
     };
     println!("  · set knowledge sync to {tier}");
+
+    match opts.telemetry {
+        Some(true) => println!("  · leave anonymous telemetry on"),
+        Some(false) => println!("  · turn anonymous telemetry off"),
+        None => println!("  · leave anonymous telemetry on (after asking)"),
+    }
+
     println!("\nNothing was changed.");
 }
 
@@ -328,6 +385,19 @@ pub(crate) fn parse_knowledge(raw: &str) -> Result<KnowledgeSyncMode> {
     }
 }
 
+/// Parse `--telemetry`. Mirrors [`parse_knowledge`]'s shape; `main.rs`'s own
+/// inline `match` used to duplicate this exact logic before the flag was
+/// threaded through to [`Options::telemetry`].
+pub(crate) fn parse_telemetry(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(anyhow::anyhow!(
+            "--telemetry must be one of: on, off (got `{other}`)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +411,14 @@ mod tests {
         );
         assert_eq!(parse_knowledge(" full ").unwrap(), KnowledgeSyncMode::Full);
         assert!(parse_knowledge("everything").is_err());
+    }
+
+    #[test]
+    fn telemetry_parses_on_and_off_and_rejects_others() {
+        assert!(parse_telemetry("on").unwrap());
+        assert!(!parse_telemetry("off").unwrap());
+        assert!(!parse_telemetry(" OFF ").unwrap());
+        assert!(parse_telemetry("maybe").is_err());
     }
 
     /// The four outcomes must be visually distinct without colour, because
@@ -394,5 +472,40 @@ mod tests {
         let mut opts = Options::default();
         opts.resolve_defaults();
         assert_eq!(opts.knowledge, None);
+    }
+
+    /// `--yes` must resolve telemetry to `Some(true)` up front too, so
+    /// `--print --yes` can state the concrete answer instead of "(after
+    /// asking)" for a run that will never ask.
+    #[test]
+    fn yes_resolves_telemetry_to_on_up_front() {
+        let mut opts = Options {
+            yes: true,
+            ..Options::default()
+        };
+        assert_eq!(opts.telemetry, None, "unset before resolution");
+        opts.resolve_defaults();
+        assert_eq!(opts.telemetry, Some(true));
+    }
+
+    /// An explicit `--telemetry off` survives `--yes`: the more specific flag
+    /// wins, exactly like `--knowledge` does.
+    #[test]
+    fn an_explicit_telemetry_choice_is_not_overridden_by_yes() {
+        let mut opts = Options {
+            yes: true,
+            telemetry: Some(false),
+            ..Options::default()
+        };
+        opts.resolve_defaults();
+        assert_eq!(opts.telemetry, Some(false));
+    }
+
+    /// Without `--yes` telemetry stays unset, so the step asks.
+    #[test]
+    fn without_yes_telemetry_is_left_to_the_prompt() {
+        let mut opts = Options::default();
+        opts.resolve_defaults();
+        assert_eq!(opts.telemetry, None);
     }
 }

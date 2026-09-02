@@ -6,6 +6,7 @@
 //! - [`store`]: the append-only SQLite store.
 //! - [`project`]: working-dir → canonical repo + identity resolution.
 //! - [`config`]: layered configuration.
+//! - [`telemetry`]: anonymous usage-telemetry foundation (identity, event model, wire types).
 
 pub mod accounting;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod report;
 pub mod signing;
 pub mod store;
 pub mod sync;
+pub mod telemetry;
 pub mod tokens;
 pub mod zavet;
 

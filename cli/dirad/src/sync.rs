@@ -32,10 +32,10 @@ use tokio::time::{sleep, sleep_until, Instant};
 /// exported here for the daemon's existing references.
 pub use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR, META_TOKEN_CURSOR};
 
-/// Debounce window: coalesce a burst of triggers into one flush.
-const DEBOUNCE: StdDuration = StdDuration::from_secs(3);
-/// Backstop cadence: flush even with no triggers (and retry after failures).
-const BACKSTOP: StdDuration = StdDuration::from_secs(90);
+// Debounce and backstop cadences live on `Config` (`sync_debounce_secs` /
+// `sync_backstop_secs`, defaults 3s / 90s) so short-lived runtimes — a cloud
+// agent VM that can be reclaimed the moment a session goes quiet — can flush
+// more eagerly than a resident daemon needs to. Read once at task start below.
 /// The device→cloud backoff ladder: 2s seed, doubling, capped at 300s. Shared
 /// with the knowledge sync task, which rides the same ladder.
 ///
@@ -103,8 +103,10 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
     // instant the daemon starts (e.g. the writer's hot path nudging on the very
     // first captured event) would sit unserviced until the backstop, instead of
     // landing within the usual 3s debounce.
+    let debounce = state.config.sync_debounce();
+    let backstop = state.config.sync_backstop();
     let mut backstop_at =
-        Instant::now() + crate::jitter::jittered(BACKSTOP, crate::jitter::DEFAULT_FRAC);
+        Instant::now() + crate::jitter::jittered(backstop, crate::jitter::DEFAULT_FRAC);
 
     let mut backoff = StdDuration::ZERO;
     // Consecutive failed flush attempts since the last success, surfaced on the
@@ -120,12 +122,12 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
                 }
                 // Debounce: let a burst of triggers settle into one flush. Deliberately
                 // NOT jittered — it's a coalescer, not an independent periodic timer.
-                sleep(DEBOUNCE).await;
+                sleep(debounce).await;
                 // Drain any triggers that arrived during the debounce.
                 while rx.try_recv().is_ok() {}
             }
             _ = sleep_until(backstop_at) => {
-                backstop_at = Instant::now() + crate::jitter::jittered(BACKSTOP, crate::jitter::DEFAULT_FRAC);
+                backstop_at = Instant::now() + crate::jitter::jittered(backstop, crate::jitter::DEFAULT_FRAC);
             }
         }
 
@@ -818,7 +820,7 @@ async fn flush(
             .map_err(|e| SyncError::Fatal(format!("load session history: {e}")))?,
         _ => Vec::new(),
     };
-    let chunks = dira_core::sync::build_chunked_batches(
+    let mut chunks = dira_core::sync::build_chunked_batches(
         &events,
         &token_rows,
         &artifact_rows,
@@ -830,6 +832,21 @@ async fn flush(
         &seed,
         &history,
     );
+
+    // Stamp the cloud runtime (contract 1.4) onto every rollup leaving this
+    // process. It is a property of the running environment — not of the stored
+    // events — so it is applied here rather than inside the pure batch builder,
+    // and it is safe after assembly because batch ids derive from events/
+    // artifacts/intervals only, never from the session rollups. Local daemons
+    // detect nothing and the fields stay off the wire, byte-identical to 1.3.
+    if let Some(rt) = dira_core::runtime::detect() {
+        for chunk in &mut chunks {
+            for s in &mut chunk.batch.sessions {
+                s.runtime = Some(rt.id.clone());
+                s.runtime_session_ref = rt.session_ref.clone();
+            }
+        }
+    }
 
     // 4. POST each chunk in order; advance the event cursor to that chunk's high-water
     //    only on its 2xx ack, so an interrupt mid-drain resumes from the last acked
@@ -1430,8 +1447,8 @@ mod tests {
 
     /// Regression test for the startup-flush-stall fix: a trigger that fires
     /// the instant the daemon starts (the writer's hot path, on the very
-    /// first captured event) must be serviced within the ordinary DEBOUNCE
-    /// window, not delayed until the ~81-99s jittered BACKSTOP. Drives the
+    /// first captured event) must be serviced within the ordinary debounce
+    /// window, not delayed until the ~81-99s jittered backstop. Drives the
     /// actual `run` loop (not just `flush`), so the fix is proved end to end.
     ///
     /// Before the fix, `run` blocked on a pre-loop `sleep_until(backstop_at)`
@@ -1492,7 +1509,7 @@ mod tests {
         // append at daemon start.
         trigger.try_send(()).expect("trigger channel has room");
 
-        // DEBOUNCE is 3s; give it a generous 15s real-time deadline (CI
+        // The default debounce is 3s; give it a generous 15s real-time deadline (CI
         // scheduling slack) — still over 5x tighter than the OLD bug's
         // ~81-99s stall, so this deadline elapsing is conclusive either way.
         let deadline = StdDuration::from_secs(15);
@@ -2603,6 +2620,108 @@ mod tests {
             serde_json::json!("feat/long"),
             "the registry's last-resolved branch must carry through onto the partial"
         );
+    }
+
+    /// Contract 1.4: inside a detected cloud runtime every shipped rollup —
+    /// partial or terminal — carries `runtime`/`runtimeSessionRef`; outside
+    /// one, neither key reaches the wire (byte-identical to 1.3 payloads).
+    #[tokio::test]
+    async fn rollups_carry_the_cloud_runtime_only_inside_one() {
+        // Pin BOTH detection inputs for the duration of the test — the suite
+        // itself may run inside a real cloud session (CLAUDE_CODE_REMOTE set),
+        // which is exactly what the first half must not detect. Originals are
+        // restored on drop, even on panic.
+        struct RestoreEnv(Vec<(&'static str, Option<String>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let pinned = [
+            dira_core::runtime::ENV_RUNTIME,
+            dira_core::runtime::ENV_CLAUDE_CODE_REMOTE,
+            dira_core::runtime::ENV_CLAUDE_CODE_REMOTE_SESSION_ID,
+        ];
+        let _restore = RestoreEnv(pinned.iter().map(|k| (*k, std::env::var(k).ok())).collect());
+        for k in pinned {
+            std::env::remove_var(k);
+        }
+
+        let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        dira_core::identity::set_device_id(&store, "01TESTDEVICE")
+            .await
+            .unwrap();
+        // An ended session in the window so the flush ships a terminal rollup.
+        let start = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        store
+            .append(&human_event(
+                "r1",
+                "s-run",
+                start,
+                dira_core::model::EventKind::SessionStart,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&human_event(
+                "r2",
+                "s-run",
+                start + time::Duration::seconds(30),
+                dira_core::model::EventKind::PreTool,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&human_event(
+                "r3",
+                "s-run",
+                start + time::Duration::seconds(60),
+                dira_core::model::EventKind::SessionEnd,
+            ))
+            .await
+            .unwrap();
+        let config = dira_core::Config {
+            cloud_url: Some(cloud.base_url().to_string()),
+            ..Default::default()
+        };
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
+        let key = DeviceKey::generate();
+
+        // Outside a cloud runtime: the keys must not exist on the wire at all.
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+        flush(&state, &key, &state.http).await.expect("flush ok");
+        let body: serde_json::Value =
+            serde_json::from_str(&cloud.requests("/api/v1/ingest")[0]).unwrap();
+        let s = &body["payload"]["sessions"].as_array().unwrap()[0];
+        assert!(
+            s.get("runtime").is_none() && s.get("runtimeSessionRef").is_none(),
+            "a local daemon must ship rollups byte-identical to pre-1.4"
+        );
+
+        // Inside one (explicit DIRA_RUNTIME marker): every rollup is stamped.
+        std::env::set_var(dira_core::runtime::ENV_RUNTIME, "cursor-cloud");
+        // Rewind the cursor so the same window re-ships ("" sorts before any
+        // event ULID, and the window read is `id > cursor`).
+        state.store.meta_set(META_SYNC_CURSOR, "").await.unwrap();
+        cloud.push("/api/v1/ingest", MockResp::ok(OK_INGEST));
+        flush(&state, &key, &state.http).await.expect("flush ok");
+        let body: serde_json::Value =
+            serde_json::from_str(&cloud.requests("/api/v1/ingest")[1]).unwrap();
+        let s = &body["payload"]["sessions"].as_array().unwrap()[0];
+        assert_eq!(
+            s["runtime"],
+            serde_json::json!("cursor-cloud"),
+            "a detected runtime must be stamped onto shipped rollups"
+        );
+        // DIRA_RUNTIME alone carries no session ref, so the key stays absent.
+        assert!(s.get("runtimeSessionRef").is_none());
     }
 
     /// WP-B9: `record_health` on a success clears `last_error_kind`, stamps

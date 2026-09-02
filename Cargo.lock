@@ -1045,6 +1045,7 @@ dependencies = [
  "keyring",
  "keyring-core",
  "proptest",
+ "reqwest",
  "serde",
  "serde_jcs",
  "serde_json",

@@ -170,7 +170,9 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
     // link fail deterministically, since that timeout used to bound the
     // whole transfer rather than just a stall (see `retry::Policy::download`'s
     // doc for that fix).
-    let http = reqwest::Client::builder()
+    // Via `httpclient::builder()`: GitHub is MITM'd by the same proxy as the
+    // cloud in remote runtimes, so `dira update` honors DIRA_EXTRA_CA_CERTS too.
+    let http = dira_core::httpclient::builder()
         .connect_timeout(retry::CONNECT_TIMEOUT)
         .read_timeout(retry::READ_TIMEOUT)
         .build()

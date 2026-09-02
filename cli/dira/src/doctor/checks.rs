@@ -22,7 +22,12 @@ pub(crate) struct HarnessWiring {
     pub expected: usize,
     pub missing: Vec<String>,
     /// Every dira-looking command string in the file, including ones pointing
-    /// at a different binary.
+    /// at a different binary — but NOT a portable wrapper. Filled by
+    /// `init::dira_hook_commands`, which matches the literal substring
+    /// `" hook "`; a portable command like `sh .dira/hook.sh claude` has no
+    /// space before `hook.sh` and never matches, so a project entry that is
+    /// purely the portable wrapper reads as `commands: vec![]` here, not as a
+    /// command that then gets filtered out as portable.
     pub commands: Vec<String>,
 }
 
@@ -483,6 +488,88 @@ pub(crate) fn hooks_exe_path(wiring: &[HarnessWiring], current_exe: Option<&str>
     }
 }
 
+/// For a harness wired at both project and global scope, does the project
+/// entry double-deliver, or does it yield?
+///
+/// `dira cloud init` writes project-scope entries as a portable wrapper
+/// (`.dira/hook.sh`) that exports `DIRA_HOOK_VIA=portable` before forwarding;
+/// `dira hook` reads that marker and, when the *same event* for the *same
+/// harness* is also wired at user scope with a resolvable executable, exits 0
+/// without forwarding a second time. So a wrapper entry overlapping global
+/// scope is not double delivery — it is exactly the design working. A
+/// machine-specific project entry (an absolute path, or one `dira init`
+/// wrote directly rather than the wrapper) has no such yield check, and the
+/// same event really does fire from both scopes.
+///
+/// Never a failure: the worst case here is one hook running twice, not lost
+/// capture. A harness wired at only one scope has nothing to overlap, so it
+/// is absent from the verdict rather than counted as "fine" — per
+/// DIRASH-0022, absent evidence is a skip.
+///
+/// Judges the same `Vec<HarnessWiring>` facts `hooks.config`/`hooks.exe_path`
+/// read off disk; a scope counts as wired for a harness when that scope's
+/// file wires at least one of its events (`HarnessWiring::wired() > 0`).
+pub(crate) fn scope_overlap(wiring: &[HarnessWiring]) -> Check {
+    const ID: &str = "hooks.scope_overlap";
+
+    let mut harnesses: Vec<&'static str> = wiring.iter().map(|w| w.harness).collect();
+    harnesses.sort_unstable();
+    harnesses.dedup();
+
+    let mut duplicating: Option<(&HarnessWiring, Vec<&str>)> = None;
+    let mut yielding: Vec<&'static str> = Vec::new();
+
+    for harness in harnesses {
+        let project = wiring
+            .iter()
+            .find(|w| w.harness == harness && w.scope == "project" && w.wired() > 0);
+        let global_wired = wiring
+            .iter()
+            .any(|w| w.harness == harness && w.scope == "global" && w.wired() > 0);
+        let Some(project) = project else { continue };
+        if !global_wired {
+            continue;
+        }
+        let non_portable: Vec<&str> = project
+            .commands
+            .iter()
+            .filter(|c| !crate::init::command_is_portable_wrapper(c, harness))
+            .map(|s| s.as_str())
+            .collect();
+        if non_portable.is_empty() {
+            yielding.push(harness);
+        } else if duplicating.is_none() {
+            duplicating = Some((project, non_portable));
+        }
+    }
+
+    if let Some((w, cmds)) = duplicating {
+        return Check::warn(
+            ID,
+            format!(
+                "{} is wired at both project and global scope with a machine-specific \
+                 command ({}) — the event runs twice on this machine",
+                w.label(),
+                cmds.join(", ")
+            ),
+        )
+        .remedy("dira cloud init  — rewrites the project entry as the portable wrapper, which yields to global-scope wiring")
+        .detail(json!({ "harness": w.harness, "path": w.path, "commands": cmds }));
+    }
+    if !yielding.is_empty() {
+        return Check::ok(
+            ID,
+            format!(
+                "{} wired at both scopes via the portable wrapper — it yields to \
+                 global-scope wiring, so the event runs once",
+                yielding.join(", ")
+            ),
+        )
+        .detail(json!({ "harnesses": yielding }));
+    }
+    Check::skip(ID, "no harness is wired at both project and global scope")
+}
+
 /// Did a hook recently fail to reach the daemon?
 ///
 /// A failure. The breadcrumb's own wording is "captured activity is being lost
@@ -727,6 +814,198 @@ pub(crate) fn update_failures(f: &super::UpdateFacts) -> Check {
     Check::ok(ID, "no recent update failures").detail(detail)
 }
 
+// ---- cloud runtime -------------------------------------------------------
+
+/// Facts for the three `cloud.*` checks, gathered in `doctor::gather` (the
+/// reachability GET and the env/tree reads live there; the judges stay pure).
+pub(crate) struct CloudFacts {
+    pub runtime: Option<dira_core::runtime::CloudRuntime>,
+    /// `DIRA_RUNNER_TOKEN` present and non-blank (its value is never read
+    /// into the facts — a diagnostic must not carry a credential).
+    pub runner_token_set: bool,
+    /// `DIRA_EXTRA_CA_CERTS` value, and whether the file it names exists.
+    pub extra_ca: Option<(String, bool)>,
+    /// `DIRA_IDENTITY_EMAIL` present and non-blank.
+    pub identity_email_env: bool,
+    /// The committed teleport artifacts in the current directory, `None`
+    /// when the repo has no `.dira/` at all (most repos — not a finding).
+    pub bootstrap: Option<BootstrapFacts>,
+    /// One GET against `{cloud_url}/api/v1/meta`: `Ok(status)` = the wire
+    /// works; `Err(msg)` = transport failure. `None` = no cloud_url.
+    pub meta_probe: Option<Result<u16, String>>,
+}
+
+/// What `.dira/` holds, as read off disk.
+pub(crate) struct BootstrapFacts {
+    pub hook_sh: bool,
+    pub bootstrap_sh: bool,
+    /// The `version="${DIRA_VERSION:-X.Y.Z}"` pin in bootstrap.sh, if parseable.
+    pub pinned_version: Option<String>,
+}
+
+/// Read the teleport artifacts under `root/.dira`, `None` when absent.
+pub(crate) fn read_bootstrap_artifacts(root: &Path) -> Option<BootstrapFacts> {
+    let dir = root.join(".dira");
+    if !dir.is_dir() {
+        return None;
+    }
+    let bootstrap = std::fs::read_to_string(dir.join("bootstrap.sh")).ok();
+    Some(BootstrapFacts {
+        hook_sh: dir.join("hook.sh").is_file(),
+        bootstrap_sh: bootstrap.is_some(),
+        pinned_version: bootstrap.as_deref().and_then(parse_pinned_version),
+    })
+}
+
+/// Pull `X.Y.Z` out of the generated `version="${DIRA_VERSION:-X.Y.Z}"` line.
+fn parse_pinned_version(bootstrap: &str) -> Option<String> {
+    let marker = "${DIRA_VERSION:-";
+    let start = bootstrap.find(marker)? + marker.len();
+    let rest = &bootstrap[start..];
+    let end = rest.find('}')?;
+    let v = rest[..end].trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Which cloud runtime this process is in, and whether the provisioning env
+/// a capture-and-sync session needs is present.
+///
+/// The `DIRA_EXTRA_CA_CERTS` readability arm runs before the runtime gate: a
+/// bundle file that has gone missing or unreadable is a real misconfiguration
+/// on ANY machine, not just a cloud one — the variable was set by something,
+/// and every device→cloud client silently drops it (DIRASH-0033's
+/// never-brick posture). Reporting that only inside a detected runtime would
+/// hide it on the machine where the operator actually set it by hand.
+pub(crate) fn cloud_runtime(c: &CloudFacts) -> Check {
+    const ID: &str = "cloud.runtime";
+    if let Some((path, false)) = &c.extra_ca {
+        return Check::warn(
+            ID,
+            format!("DIRA_EXTRA_CA_CERTS names a file that cannot be opened ({path})"),
+        )
+        .remedy("point DIRA_EXTRA_CA_CERTS at a readable PEM bundle, or unset it")
+        .detail(json!({ "extra_ca": path }));
+    }
+    let Some(rt) = &c.runtime else {
+        // Symmetric with `cloud_bootstrap`: on a plain machine there is
+        // nothing to report, and per DIRASH-0022 absent evidence is a skip,
+        // never an `Ok` verdict about a state that was never evaluated.
+        return Check::skip(
+            ID,
+            "not a cloud runtime (no runtime marker in the environment)",
+        )
+        .detail(json!({ "runtime": null }));
+    };
+    let detail = json!({
+        "runtime": rt.id,
+        "session_ref": rt.session_ref,
+        "runner_token_set": c.runner_token_set,
+        "identity_email_set": c.identity_email_env,
+        "extra_ca": c.extra_ca.as_ref().map(|(p, _)| p.clone()),
+    });
+    if !c.runner_token_set {
+        // Without a token the VM captures locally and syncs nothing — real
+        // work, but it dies with the VM. Worth a nudge, not a failure.
+        return Check::warn(
+            ID,
+            format!("cloud runtime '{}', but DIRA_RUNNER_TOKEN is not set — capture stays local to this ephemeral VM", rt.id),
+        )
+        .remedy("set DIRA_RUNNER_TOKEN in the environment settings (see docs/cloud-runtimes.md)")
+        .detail(detail);
+    }
+    Check::ok(
+        ID,
+        format!("cloud runtime '{}', provisioning env present", rt.id),
+    )
+    .detail(detail)
+}
+
+/// Does the wire to the cloud work — DNS, egress policy, proxy, and TLS?
+///
+/// Any HTTP status is a pass: even a 404 proves the transport; what the
+/// status *means* is `sync.health`'s business. A transport error is judged
+/// by its text, because the two remedies are disjoint: a certificate error
+/// wants `DIRA_EXTRA_CA_CERTS`, everything else wants the network allowlist.
+///
+/// Never `Fail`, and never runs unprompted (DIRASH-0022's probe-policy
+/// exemption from D-0006, recorded in `.zavet/specs/doctor.md`): `gather`
+/// only performs the GET inside a detected cloud runtime, or when this id is
+/// named explicitly via `--check`. A bare `dira doctor` on an offline machine
+/// must never fail because it could not reach a network it was never told to
+/// probe.
+pub(crate) fn cloud_reachability(c: &CloudFacts, cloud_url: Option<&str>) -> Check {
+    const ID: &str = "cloud.reachability";
+    let Some(url) = cloud_url else {
+        return Check::skip(ID, "no cloud_url configured");
+    };
+    let Some(probe) = c.meta_probe.as_ref() else {
+        return Check::skip(
+            ID,
+            "not probed outside a cloud runtime; run `dira doctor --check cloud.reachability`",
+        );
+    };
+    match probe {
+        Ok(status) => Check::ok(ID, format!("{url} answered (HTTP {status})")).detail(json!({
+            "url": url, "status": status,
+        })),
+        Err(msg) => {
+            let tls = msg.to_lowercase();
+            let tls = tls.contains("certificate") || tls.contains("tls") || tls.contains("ssl");
+            let check = Check::warn(ID, format!("cannot reach {url}: {msg}"))
+                .detail(json!({ "url": url, "error": msg, "tls_suspected": tls }));
+            if tls {
+                check.remedy(
+                    "the egress proxy re-terminates TLS — set DIRA_EXTRA_CA_CERTS to the \
+                     proxy's CA bundle: check whether $SSL_CERT_FILE or $NODE_EXTRA_CA_CERTS \
+                     already names it, or run this repo's .dira/bootstrap.sh if it has one; \
+                     otherwise the system bundle (in a cloud VM, usually \
+                     /etc/ssl/certs/ca-certificates.crt) is the fallback. See DIRASH-0033",
+                )
+            } else {
+                check.remedy(
+                    "allow the cloud host in this environment's network settings (Custom \
+                     network access), or check cloud_url — see docs/cloud-runtimes.md",
+                )
+            }
+        }
+    }
+}
+
+/// Are the committed teleport artifacts in this repo whole and current?
+pub(crate) fn cloud_bootstrap(c: &CloudFacts) -> Check {
+    const ID: &str = "cloud.bootstrap";
+    let Some(b) = &c.bootstrap else {
+        return Check::skip(
+            ID,
+            "this repo has no .dira/ teleport artifacts (fine unless you expected them)",
+        );
+    };
+    let detail = json!({
+        "hook_sh": b.hook_sh,
+        "bootstrap_sh": b.bootstrap_sh,
+        "pinned_version": b.pinned_version,
+        "current_version": env!("CARGO_PKG_VERSION"),
+    });
+    if !b.hook_sh || !b.bootstrap_sh {
+        return Check::warn(ID, ".dira/ exists but is missing generated scripts")
+            .remedy("dira cloud init — regenerates hook.sh + bootstrap.sh")
+            .detail(detail);
+    }
+    match b.pinned_version.as_deref() {
+        None => Check::warn(ID, ".dira/bootstrap.sh has no parseable version pin")
+            .remedy("dira cloud init — regenerates the script with a pinned release")
+            .detail(detail),
+        Some(v) => {
+            let mut summary = format!("teleport artifacts present (pinned v{v}");
+            if v != env!("CARGO_PKG_VERSION") {
+                summary.push_str(&format!("; this binary is v{}", env!("CARGO_PKG_VERSION")));
+            }
+            summary.push(')');
+            Check::ok(ID, summary).detail(detail)
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -755,6 +1034,19 @@ pub(crate) mod tests {
             cwd: Some("/work/api".into()),
             project: Ok("github.com/acme/api".into()),
             update: super::super::UpdateFacts::default(),
+            cloud: cloud_facts_plain(),
+        }
+    }
+
+    /// A machine that is not a cloud runtime and has no teleport artifacts.
+    pub(crate) fn cloud_facts_plain() -> CloudFacts {
+        CloudFacts {
+            runtime: None,
+            runner_token_set: false,
+            extra_ca: None,
+            identity_email_env: false,
+            bootstrap: None,
+            meta_probe: None,
         }
     }
 
@@ -1045,6 +1337,86 @@ pub(crate) mod tests {
         );
     }
 
+    fn scoped_wiring(harness: &'static str, scope: &'static str, cmd: &str) -> HarnessWiring {
+        HarnessWiring {
+            harness,
+            scope,
+            path: format!("{scope}/.{harness}/settings.json"),
+            expected: 1,
+            missing: Vec::new(),
+            commands: vec![cmd.to_string()],
+        }
+    }
+
+    // --- hooks.scope_overlap ---------------------------------------------
+
+    #[test]
+    fn scope_overlap_skips_when_only_one_scope_is_wired() {
+        let project = scoped_wiring("claude", "project", "/bin/dira hook claude");
+        assert_eq!(
+            scope_overlap(std::slice::from_ref(&project)).level,
+            Level::Skip
+        );
+
+        let global = scoped_wiring("claude", "global", "/bin/dira hook claude");
+        assert_eq!(
+            scope_overlap(std::slice::from_ref(&global)).level,
+            Level::Skip
+        );
+    }
+
+    /// The design's own point: a portable-wrapper project entry has a yield
+    /// check built in (`DIRA_HOOK_VIA=portable`), so overlapping global-scope
+    /// wiring is not double delivery.
+    #[test]
+    fn scope_overlap_is_ok_when_the_project_entry_is_the_portable_wrapper() {
+        let project = scoped_wiring("claude", "project", "sh .dira/hook.sh claude");
+        let global = scoped_wiring("claude", "global", "/home/u/.local/bin/dira hook claude");
+        let c = scope_overlap(&[project, global]);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.summary.contains("claude"), "{}", c.summary);
+    }
+
+    /// Same verdict, but with a fixture that matches the real data flow
+    /// instead of `scoped_wiring`'s fabricated `commands` entry: a project
+    /// entry that is purely the portable wrapper never puts anything in
+    /// `HarnessWiring.commands` at all (`init::dira_hook_commands` filters on
+    /// the literal substring `" hook "`, which `sh .dira/hook.sh claude`
+    /// never contains — see the `commands` field doc). `missing` shorter than
+    /// `expected` is what makes `wired() > 0` true here, the same way a real
+    /// partially-wired portable entry would.
+    #[test]
+    fn scope_overlap_is_ok_when_the_project_entry_has_no_recorded_commands() {
+        let project = HarnessWiring {
+            harness: "claude",
+            scope: "project",
+            path: ".claude/settings.json".to_string(),
+            expected: 2,
+            missing: vec!["Notification".to_string()],
+            commands: vec![],
+        };
+        let global = scoped_wiring("claude", "global", "/home/u/.local/bin/dira hook claude");
+        let c = scope_overlap(&[project, global]);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.summary.contains("claude"), "{}", c.summary);
+    }
+
+    /// A machine-specific project entry has no yield check, so the same event
+    /// really does fire from both scopes — worth a warning, never a failure.
+    #[test]
+    fn scope_overlap_warns_on_a_machine_specific_project_entry() {
+        let project = scoped_wiring("claude", "project", "/home/u/.local/bin/dira hook claude");
+        let global = scoped_wiring("claude", "global", "/home/u/.local/bin/dira hook claude");
+        let c = scope_overlap(&[project, global]);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.remedy.expect("advice").contains("dira cloud init"));
+    }
+
+    #[test]
+    fn scope_overlap_skips_with_no_wiring_at_all() {
+        assert_eq!(scope_overlap(&[]).level, Level::Skip);
+    }
+
     /// The harness runs hook commands through a shell, so `$HOME/...` is a
     /// working config. Reporting it as a missing binary is a false alarm on a
     /// healthy machine — worse than saying nothing.
@@ -1269,5 +1641,165 @@ pub(crate) mod tests {
             update_shadowed(&f, Some("/anywhere/at/all/dira")).level,
             Level::Skip
         );
+    }
+
+    // --- cloud.* -------------------------------------------------------------
+
+    fn in_claude_web() -> CloudFacts {
+        CloudFacts {
+            runtime: Some(dira_core::runtime::CloudRuntime {
+                id: "claude-web".into(),
+                session_ref: Some("cse_01A".into()),
+            }),
+            runner_token_set: true,
+            extra_ca: Some(("/etc/ssl/certs/ca-certificates.crt".into(), true)),
+            identity_email_env: true,
+            bootstrap: None,
+            meta_probe: None,
+        }
+    }
+
+    /// Every `cloud.*` id is absent evidence on a plain machine, not a
+    /// verdict: `cloud_runtime` was symmetric with `cloud_bootstrap` even
+    /// before this test existed for it, and DIRASH-0022 says absent evidence
+    /// is `Skip`, never `Ok`.
+    #[test]
+    fn a_plain_machine_skips_every_cloud_check() {
+        let c = cloud_facts_plain();
+        assert_eq!(cloud_runtime(&c).level, Level::Skip);
+        // No cloud_url: absent evidence is a skip (DIRASH-0022).
+        assert_eq!(cloud_reachability(&c, None).level, Level::Skip);
+        assert_eq!(cloud_bootstrap(&c).level, Level::Skip);
+    }
+
+    /// `cloud.reachability` never fires the GET on its own — `gather` only
+    /// probes inside a detected runtime or when named via `--check`. A
+    /// configured `cloud_url` with no probe result must still skip, not
+    /// silently read as "unreachable".
+    #[test]
+    fn cloud_reachability_skips_when_not_probed_even_with_a_url_configured() {
+        let mut c = cloud_facts_plain();
+        c.meta_probe = None;
+        let check = cloud_reachability(&c, Some("https://app.dirahq.sh"));
+        assert_eq!(check.level, Level::Skip);
+        assert!(
+            check.summary.contains("--check cloud.reachability"),
+            "{}",
+            check.summary
+        );
+    }
+
+    /// DIRASH-0033: a bundle the caller can no longer open is a real
+    /// misconfiguration on ANY machine, not just inside a cloud runtime —
+    /// this arm must fire even on a plain one.
+    #[test]
+    fn a_missing_extra_ca_file_warns_on_a_plain_machine_too() {
+        let mut c = cloud_facts_plain();
+        c.extra_ca = Some(("/nope.pem".into(), false));
+        let check = cloud_runtime(&c);
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.summary.contains("/nope.pem"), "{}", check.summary);
+    }
+
+    #[test]
+    fn a_provisioned_cloud_vm_is_ok_and_named() {
+        let c = cloud_runtime(&in_claude_web());
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.summary.contains("claude-web"), "{}", c.summary);
+    }
+
+    /// A cloud VM without a runner token captures into a store that dies with
+    /// the VM — worth a nudge with the fix, never a failure.
+    #[test]
+    fn a_cloud_vm_without_a_runner_token_warns_with_the_remedy() {
+        let mut f = in_claude_web();
+        f.runner_token_set = false;
+        let c = cloud_runtime(&f);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.summary.contains("DIRA_RUNNER_TOKEN"), "{}", c.summary);
+        assert!(c.remedy.is_some());
+    }
+
+    #[test]
+    fn a_missing_extra_ca_file_warns_before_anything_tries_to_use_it() {
+        let mut f = in_claude_web();
+        f.extra_ca = Some(("/nope.pem".into(), false));
+        let c = cloud_runtime(&f);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.summary.contains("/nope.pem"), "{}", c.summary);
+    }
+
+    /// Any HTTP status proves the wire; the two transport-failure remedies are
+    /// disjoint and must each name their own fix. Per DIRASH-0022's
+    /// probe-policy exemption, a transport error is `Warn`, never `Fail` —
+    /// an unreachable cloud is not broken local capture.
+    #[test]
+    fn reachability_judges_transport_not_status_and_never_fails() {
+        let url = Some("https://app.dirahq.sh");
+        let mut f = in_claude_web();
+
+        f.meta_probe = Some(Ok(404));
+        assert_eq!(cloud_reachability(&f, url).level, Level::Ok);
+
+        f.meta_probe = Some(Err(
+            "error sending request: invalid peer certificate: UnknownIssuer".into(),
+        ));
+        let c = cloud_reachability(&f, url);
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.remedy
+                .as_deref()
+                .unwrap_or_default()
+                .contains("DIRA_EXTRA_CA_CERTS"),
+            "a TLS failure must point at the extra-CA opt-in: {:?}",
+            c.remedy
+        );
+
+        f.meta_probe = Some(Err("error sending request: dns error".into()));
+        let c = cloud_reachability(&f, url);
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.remedy.as_deref().unwrap_or_default().contains("network"),
+            "a non-TLS failure must point at the egress policy: {:?}",
+            c.remedy
+        );
+    }
+
+    #[test]
+    fn bootstrap_artifacts_judge_completeness_and_read_the_pin() {
+        let mut f = in_claude_web();
+        // Partial artifacts: a repo where someone deleted hook.sh.
+        f.bootstrap = Some(BootstrapFacts {
+            hook_sh: false,
+            bootstrap_sh: true,
+            pinned_version: Some("0.5.0".into()),
+        });
+        let c = cloud_bootstrap(&f);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c
+            .remedy
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cloud init"));
+
+        // Whole artifacts: ok, naming the pin even when it trails this binary.
+        f.bootstrap = Some(BootstrapFacts {
+            hook_sh: true,
+            bootstrap_sh: true,
+            pinned_version: Some("0.5.0".into()),
+        });
+        let c = cloud_bootstrap(&f);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.summary.contains("0.5.0"), "{}", c.summary);
+    }
+
+    /// The pin parser reads exactly what the generator writes — the same
+    /// template, so the two cannot drift without this failing.
+    #[test]
+    fn the_pin_parser_reads_the_generated_template() {
+        let generated =
+            include_str!("../../templates/dira-bootstrap.sh").replace("{{VERSION}}", "1.2.3");
+        assert_eq!(parse_pinned_version(&generated).as_deref(), Some("1.2.3"));
+        assert_eq!(parse_pinned_version("nothing here"), None);
     }
 }

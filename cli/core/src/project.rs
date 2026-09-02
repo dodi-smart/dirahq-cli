@@ -112,6 +112,13 @@ pub fn explain_project(cwd: &Path) -> Result<String, ProjectMiss> {
     canonicalize_remote(&url).ok_or(ProjectMiss::UnparseableRemote { remote, url })
 }
 
+/// Env var overriding the attribution email (`identity_email`) that is
+/// otherwise read from `git config user.email`. For runtimes whose git
+/// identity is injected by the platform rather than the person the work
+/// belongs to — a cloud agent VM configures git as the acting bot — the
+/// operator states the attribution out-of-band instead. Blank reads as unset.
+pub const ENV_IDENTITY_EMAIL: &str = "DIRA_IDENTITY_EMAIL";
+
 /// Resolve a directory to its project + identity. Never errors — an unresolvable
 /// directory simply yields `None` fields.
 pub fn resolve(cwd: &Path) -> Resolved {
@@ -120,9 +127,28 @@ pub fn resolve(cwd: &Path) -> Resolved {
 
     Resolved {
         project: explain_project(cwd).ok(),
-        identity_email: git(root, &["config", "user.email"]),
+        identity_email: env_identity_email().or_else(|| git(root, &["config", "user.email"])),
         identity_name: git(root, &["config", "user.name"]),
     }
+}
+
+/// The [`ENV_IDENTITY_EMAIL`] override, if set, non-blank, and a plausible
+/// email (at most 254 chars — RFC 5321's overall address ceiling — and
+/// containing an `@`). An operator's typo (a stray path, an empty-but-set
+/// value some templating left behind, a whole file pasted in by mistake)
+/// must not attribute every captured event to garbage instead of falling
+/// through to the git identity that's still available — same never-brick
+/// posture as `identity::env_key` and `httpclient`'s extra-CA opt-in.
+fn env_identity_email() -> Option<String> {
+    let raw = crate::env::non_blank(ENV_IDENTITY_EMAIL)?;
+    if raw.len() <= 254 && raw.contains('@') {
+        return Some(raw);
+    }
+    tracing::warn!(
+        "{ENV_IDENTITY_EMAIL} is set but not a plausible email address (over 254 chars, or \
+         missing '@'); falling back to git config user.email"
+    );
+    None
 }
 
 /// The repo toplevel for `cwd`, if inside a git work tree.
@@ -852,7 +878,7 @@ pub fn canonicalize_remote(url: &str) -> Option<String> {
 mod tests {
     use super::{
         canonicalize_remote, explain_project, first_commit_date, knowledge_activity,
-        log_commit_refs, paths_touched_since_days, resolve, ProjectMiss,
+        log_commit_refs, paths_touched_since_days, resolve, ProjectMiss, ENV_IDENTITY_EMAIL,
     };
 
     #[test]
@@ -1116,6 +1142,74 @@ mod tests {
             &[("upstream", "git@github.com:acme/api.git")],
         );
         assert_eq!(resolve(&root).project, explain_project(&root).ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `DIRA_IDENTITY_EMAIL` must win over the repo's `git config user.email`,
+    /// and a blank OR implausible value must read as unset (falling through
+    /// to git config, with a warning for the implausible case — never
+    /// silently attributing to garbage). The env var is process-global; no
+    /// other test in this module touches it or asserts `identity_email`, and
+    /// the drop guard clears it even on panic, so this needs no lock.
+    #[test]
+    fn env_identity_email_overrides_git_config() {
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_IDENTITY_EMAIL);
+            }
+        }
+        let _clear = ClearEnv;
+
+        let root = init_plain_repo("env-identity", "2026-05-01T10:00:00+00:00");
+
+        // The repo config (t@example.com, per init_plain_repo) loses to the env.
+        std::env::set_var(ENV_IDENTITY_EMAIL, "runner@dirahq.sh");
+        assert_eq!(
+            resolve(&root).identity_email.as_deref(),
+            Some("runner@dirahq.sh"),
+            "env override must win over git config"
+        );
+
+        // Blank means "not configured": fall through to git config.
+        std::env::set_var(ENV_IDENTITY_EMAIL, "   ");
+        assert_eq!(
+            resolve(&root).identity_email.as_deref(),
+            Some("t@example.com"),
+            "blank env value must fall through to git config"
+        );
+
+        // Missing '@': not a plausible email — fall through, don't attribute
+        // to garbage.
+        std::env::set_var(ENV_IDENTITY_EMAIL, "not-an-email");
+        assert_eq!(
+            resolve(&root).identity_email.as_deref(),
+            Some("t@example.com"),
+            "a value without '@' must fall through to git config"
+        );
+
+        // Over the 254-char ceiling: also falls through, even though it does
+        // contain an '@'.
+        let too_long = format!("{}@example.com", "a".repeat(250));
+        assert!(too_long.len() > 254);
+        std::env::set_var(ENV_IDENTITY_EMAIL, &too_long);
+        assert_eq!(
+            resolve(&root).identity_email.as_deref(),
+            Some("t@example.com"),
+            "an over-length value must fall through to git config"
+        );
+
+        // Exactly at the 254-char ceiling: still accepted.
+        let local = "a".repeat(254 - "@example.com".len());
+        let at_ceiling = format!("{local}@example.com");
+        assert_eq!(at_ceiling.len(), 254);
+        std::env::set_var(ENV_IDENTITY_EMAIL, &at_ceiling);
+        assert_eq!(
+            resolve(&root).identity_email.as_deref(),
+            Some(at_ceiling.as_str()),
+            "a value at exactly the 254-char ceiling must still be accepted"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

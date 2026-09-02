@@ -29,6 +29,9 @@ getrandom.workspace = true
 serde_jcs.workspace = true
 base64.workspace = true
 keyring.workspace = true
+# `httpclient::builder()` — the one place device→cloud reqwest clients are
+# constructed, so the extra-CA opt-in (DIRA_EXTRA_CA_CERTS) applies everywhere.
+reqwest.workspace = true
 # `keyring` installs the platform store; entries are built against whatever store
 # is registered, which is `keyring-core`'s job (see `identity::keychain_entry`).
 keyring-core.workspace = true

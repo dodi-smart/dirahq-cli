@@ -9,12 +9,15 @@
 
 pub mod accounting;
 pub mod config;
+pub mod env;
+pub mod httpclient;
 pub mod identity;
 pub mod model;
 pub mod pricing;
 pub mod project;
 pub mod protocol;
 pub mod report;
+pub mod runtime;
 pub mod signing;
 pub mod store;
 pub mod sync;

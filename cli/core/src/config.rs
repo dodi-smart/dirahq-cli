@@ -216,6 +216,17 @@ pub struct Config {
     /// `SessionEnd`. The cloud MUST UPSERT session rows by `session_id` (latest
     /// wins) for this to be safe — see `sync::build_batch_with_partials`.
     pub partial_rollup_after_secs: u64,
+    /// Debounce window (seconds) the sync task uses to coalesce a burst of
+    /// triggers into one flush. [`Config::sync_debounce`] clamps it. The
+    /// default suits a resident daemon; it is a knob at all so short-lived
+    /// runtimes can trade POST volume for latency.
+    pub sync_debounce_secs: u64,
+    /// Backstop cadence (seconds): the sync task flushes at least this often
+    /// even with no triggers (the trigger channel is lossy by design).
+    /// [`Config::sync_backstop`] clamps it. Ephemeral cloud runtimes set this
+    /// low (e.g. `DIRA_SYNC_BACKSTOP_SECS=15`) so an abruptly reclaimed VM
+    /// loses at most that much un-synced tail.
+    pub sync_backstop_secs: u64,
     /// Compute report day boundaries (`Today` / `Week`) in the *system local*
     /// timezone instead of UTC.
     ///
@@ -380,6 +391,8 @@ impl Default for Config {
             heartbeat_idle_secs: 90,
             presence_ttl_secs: 75,
             partial_rollup_after_secs: 3600,
+            sync_debounce_secs: 3,
+            sync_backstop_secs: 90,
             report_local_day: true,
             deep_idle_after_secs: 900,
             presence_ttl_deep_idle_secs: 600,
@@ -474,6 +487,24 @@ impl Config {
         let idle = time::Duration::seconds(self.agent_idle_seconds as i64);
         let max_span = time::Duration::seconds(self.agent_max_span_seconds as i64).max(idle);
         crate::accounting::AgentPolicy { idle, max_span }
+    }
+
+    /// The sync trigger debounce, clamped to `[1, 60]` seconds. A zero would
+    /// turn the coalescer into a no-op busy path and anything past a minute
+    /// stops being a coalescer at all; both are misconfigurations this clamp
+    /// absorbs rather than rejects — same pattern as [`Config::coalesce`].
+    pub fn sync_debounce(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.sync_debounce_secs.clamp(1, 60))
+    }
+
+    /// The sync backstop cadence, floored at 5 seconds and never below the
+    /// effective debounce. The floor keeps a zealous knob (or a typo'd `0`)
+    /// from turning the safety-net timer into a tight POST loop; the
+    /// debounce bound keeps the backstop meaningful as the *slower* of the
+    /// two wake sources.
+    pub fn sync_backstop(&self) -> std::time::Duration {
+        let floor = self.sync_debounce().as_secs().max(5);
+        std::time::Duration::from_secs(self.sync_backstop_secs.max(floor))
     }
 
     /// The effective coalescing window, clamped to strictly less than the idle
@@ -785,6 +816,86 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(c.coalesce(), time::Duration::ZERO);
+    }
+
+    #[test]
+    fn sync_cadence_defaults_match_the_historical_constants() {
+        // 3s debounce / 90s backstop were compile-time constants in the sync
+        // task before they became knobs; the defaults must not drift.
+        let c = Config::default();
+        assert_eq!(c.sync_debounce(), std::time::Duration::from_secs(3));
+        assert_eq!(c.sync_backstop(), std::time::Duration::from_secs(90));
+    }
+
+    #[test]
+    fn sync_cadence_clamps_absorb_misconfiguration() {
+        // Zeroes: debounce floors at 1s, backstop at 5s — never a busy loop.
+        let c = Config {
+            sync_debounce_secs: 0,
+            sync_backstop_secs: 0,
+            ..Config::default()
+        };
+        assert_eq!(c.sync_debounce(), std::time::Duration::from_secs(1));
+        assert_eq!(c.sync_backstop(), std::time::Duration::from_secs(5));
+
+        // An oversized debounce caps at 60s, and the backstop can never be
+        // the *faster* of the two wake sources.
+        let c = Config {
+            sync_debounce_secs: 900,
+            sync_backstop_secs: 10,
+            ..Config::default()
+        };
+        assert_eq!(c.sync_debounce(), std::time::Duration::from_secs(60));
+        assert_eq!(c.sync_backstop(), std::time::Duration::from_secs(60));
+    }
+
+    /// `DIRA_SYNC_BACKSTOP_SECS` is the knob the module docs name verbatim
+    /// (`Config::sync_backstop_secs`'s doc comment: "ephemeral cloud runtimes
+    /// set this low, e.g. DIRA_SYNC_BACKSTOP_SECS=15"). Pin that it actually
+    /// reaches `sync_backstop()` through the same `Env::prefixed("DIRA_")`
+    /// layering `Config::load` installs, same pattern as the
+    /// `DIRA_MODULES__ZAVET` / `DIRA_SYNC__KNOWLEDGE` tests above.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn env_sync_backstop_secs_reaches_sync_backstop() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DIRA_SYNC_BACKSTOP_SECS", "15");
+            let c: Config = Figment::from(Serialized::defaults(Config::default()))
+                .merge(
+                    Env::prefixed("DIRA_")
+                        .map(|k| k.as_str().to_lowercase().replace("__", ".").into()),
+                )
+                .extract()
+                .unwrap();
+            assert_eq!(c.sync_backstop_secs, 15);
+            assert_eq!(c.sync_backstop(), std::time::Duration::from_secs(15));
+            Ok(())
+        });
+    }
+
+    /// An unparsable `DIRA_SYNC_BACKSTOP_SECS` (a `u64` field) must fail
+    /// extraction with an error that NAMES the offending key — a bare
+    /// "invalid type" with nothing to grep for is useless to an operator
+    /// staring at a daemon that won't start.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn unparsable_sync_backstop_secs_errors_naming_the_key() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DIRA_SYNC_BACKSTOP_SECS", "not-a-number");
+            let err = Figment::from(Serialized::defaults(Config::default()))
+                .merge(
+                    Env::prefixed("DIRA_")
+                        .map(|k| k.as_str().to_lowercase().replace("__", ".").into()),
+                )
+                .extract::<Config>()
+                .expect_err("a non-numeric value must not silently coerce");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("sync_backstop_secs"),
+                "error must name the offending key: {msg}"
+            );
+            Ok(())
+        });
     }
 
     #[test]

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.3.0";
+pub const SCHEMA_VERSION: &str = "1.4.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -159,6 +159,19 @@ pub struct SessionRollup {
     /// Optional + omitted-when-absent so older payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The cloud runtime the session ran in (`claude-web`, `cursor-cloud`, …),
+    /// from `dira_core::runtime::detect`. Absent for local sessions, so the
+    /// dashboard can badge cloud-agent work without inferring it from device
+    /// labels. Still metadata-only: a runtime name, never content.
+    /// Optional + omitted-when-absent so older payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// The runtime's own session reference (e.g. Claude's remote session id),
+    /// letting the dashboard deep-link the harness-side transcript. Only ever
+    /// set alongside `runtime`.
+    /// Optional + omitted-when-absent so older payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_session_ref: Option<String>,
 }
 
 /// Token usage for a session/turn. Cost is always an estimate, separate from time.
@@ -1183,6 +1196,9 @@ mod tests {
                     branch: Some("b".into()),
                     note: None,
                     label: None,
+                    // Populated so the content-token walk covers the 1.4 fields.
+                    runtime: Some("claude-web".into()),
+                    runtime_session_ref: Some("cse".into()),
                 }],
                 token_usage: vec![TokenUsage {
                     id: "t".into(),
@@ -1443,6 +1459,44 @@ mod tests {
         assert!(!json.contains("sessionChangeId"));
         assert!(!json.contains("touchedPaths"));
         assert!(!json.contains("blobs"));
+    }
+
+    #[test]
+    fn session_runtime_roundtrips_camel_case_and_is_omitted_when_none() {
+        // The 1.4 runtime marker serializes under its camelCase wire names and
+        // round-trips; absent, neither key reaches the wire, so pre-1.4
+        // payloads (and any fixture omitting them) stay byte-identical.
+        let mut s = SessionRollup {
+            session_id: "s".into(),
+            harness: Harness::ClaudeCode,
+            kind: SessionKind::Agent,
+            repo_canonical: None,
+            identity_email: "e".into(),
+            started_at: "t".into(),
+            ended_at: None,
+            agent_wall_seconds: 1,
+            prompts: None,
+            branch: None,
+            note: None,
+            label: None,
+            runtime: Some("claude-web".into()),
+            runtime_session_ref: Some("cse_01".into()),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"runtime\":\"claude-web\""));
+        assert!(json.contains("\"runtimeSessionRef\":\"cse_01\""));
+        let back: SessionRollup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.runtime.as_deref(), Some("claude-web"));
+        assert_eq!(back.runtime_session_ref.as_deref(), Some("cse_01"));
+
+        s.runtime = None;
+        s.runtime_session_ref = None;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("runtime"));
+        // And a pre-1.4 payload (no runtime keys) still deserializes.
+        let old: SessionRollup = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.runtime, None);
+        assert_eq!(old.runtime_session_ref, None);
     }
 
     #[test]

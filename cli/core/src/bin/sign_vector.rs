@@ -76,6 +76,10 @@ pub fn build_vector() -> serde_json::Value {
                 "преглед на сесията 📝 — transcript decode had a stray \u{FFFD} byte".to_string(),
             ),
             label: Some("ревю".to_string()),
+            // Populated so the 1.4 runtime fields are exercised by the
+            // cross-language vector, not just tolerated.
+            runtime: Some("claude-web".to_string()),
+            runtime_session_ref: Some("cse_01RUNTIME00000000000000000".to_string()),
         }],
         token_usage: vec![],
         artifacts: vec![],

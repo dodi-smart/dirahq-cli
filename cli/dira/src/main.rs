@@ -2,6 +2,7 @@
 //! Unix domain socket; holds no state of its own.
 
 mod client;
+mod cloud_init;
 mod config_cmd;
 mod daemon;
 mod device;
@@ -9,6 +10,7 @@ mod doctor;
 mod duration;
 mod format;
 mod hook_health;
+mod hook_yield;
 mod init;
 mod onboard;
 mod render;
@@ -157,6 +159,7 @@ Piped output is plain (no color) and 80-column stable.",
 Examples:
   dira status               the summary block
   dira status --detailed    + parallel lanes, active sessions, today's rollup
+  dira status --json        the whole view as one JSON object, for scripts
   dira status | cat         plain, parseable output for scripts"
     )]
     Status {
@@ -164,6 +167,12 @@ Examples:
         /// and the count of token turns captured outside a repo.
         #[arg(long, alias = "full")]
         detailed: bool,
+        /// Emit the whole status view as JSON instead of the summary block —
+        /// today's rollup included, so it still reports sessions that have
+        /// already ended. This is the scriptable "what did dira capture"
+        /// surface, and what the cloud-capture smoke test asserts on.
+        #[arg(long)]
+        json: bool,
     },
     /// Live auto-refreshing dashboard of the "Right Now" view (q/Esc to quit).
     #[command(
@@ -243,8 +252,15 @@ Examples:
     /// List active + recent sessions.
     #[command(after_help = "\
 Examples:
-  dira sessions              handles, projects, human/agent time, state")]
-    Sessions,
+  dira sessions              handles, projects, human/agent time, state
+  dira sessions --json       the same rows as one JSON object, for scripts")]
+    Sessions {
+        /// Emit the session list as JSON instead of a table. Scriptable proof
+        /// of what was captured (`jq '.sessions | length'`), and what CI
+        /// asserts on.
+        #[arg(long)]
+        json: bool,
+    },
     /// Retroactive manual entry, e.g. `dira invoice 1h Meeting with Fol` (bare = minutes).
     #[command(
         alias = "invoice",
@@ -332,6 +348,25 @@ Examples:
         /// Print the resulting settings/snippet without writing.
         #[arg(long)]
         print: bool,
+    },
+    /// Cloud agent runtimes: generate repo-committed capture wiring.
+    #[command(
+        long_about = "\
+Tooling for cloud agent runtimes (Claude Code on the web, Cursor cloud
+agents), where sessions run in ephemeral VMs and the repository is the only
+delivery channel. `cloud init` writes portable, committable artifacts —
+`.dira/hook.sh`, `.dira/bootstrap.sh`, and project hook configs invoking
+them — so agent activity in those VMs is captured and attested like local
+work. See docs/cloud-runtimes.md.",
+        after_help = "\
+Examples:
+  dira cloud init                    wire claude + cursor for cloud runtimes
+  dira cloud init --harness claude   just Claude Code
+  dira cloud init --print            show everything, write nothing"
+    )]
+    Cloud {
+        #[command(subcommand)]
+        action: CloudAction,
     },
     /// Manage the resident daemon.
     #[command(
@@ -752,6 +787,32 @@ Examples:
 }
 
 #[derive(Subcommand)]
+enum CloudAction {
+    /// Generate portable, repo-committed hook wiring + bootstrap scripts.
+    #[command(after_help = "\
+Writes .dira/hook.sh (portable forwarder), .dira/bootstrap.sh (installs the
+pinned dira release in a cloud VM, starts the daemon, claims a runner-token
+device, forwards the SessionStart event), and merges portable commands into
+the project's .claude/settings.json / .cursor/hooks.json — replacing any
+machine-specific entries `dira init` left there. Commit the result.
+
+Idempotent: re-running only rewrites what drifted.")]
+    Init {
+        /// Cloud harnesses to wire (default: all). Repeatable or
+        /// comma-separated: claude, cursor.
+        #[arg(long, value_name = "HARNESS", value_delimiter = ',')]
+        harness: Vec<String>,
+        /// Print everything without writing any file.
+        #[arg(long)]
+        print: bool,
+        /// Skip fetching release digests; bootstrap.sh verifies against the
+        /// release's own .sha256 asset at install time instead.
+        #[arg(long)]
+        no_pin: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum DeviceAction {
     /// Claim a link code and bind this device to the cloud.
     #[command(
@@ -764,15 +825,24 @@ capture still runs locally; nothing syncs.",
         after_help = "\
 Examples:
   dira device link           prompts for the code
-  dira device link --code ABC123 --label \"work laptop\""
+  dira device link --code ABC123 --label \"work laptop\"
+  dira device link --runner-token TOKEN
+                             non-interactive claim for headless runtimes
+                             (also read from DIRA_RUNNER_TOKEN)"
     )]
     Link {
         /// The one-time code from the cloud Connections page (prompted if omitted).
         #[arg(long)]
         code: Option<String>,
-        /// A name for this device in the cloud UI (defaults to the hostname).
+        /// A name for this device in the cloud UI (defaults to the hostname;
+        /// runner claims default to cloud:<runtime>:<session>).
         #[arg(long)]
         label: Option<String>,
+        /// Claim non-interactively with a revocable runner token minted on the
+        /// cloud Connections page — for headless runtimes (cloud agent VMs,
+        /// CI). Never prompts.
+        #[arg(long, env = crate::device::ENV_RUNNER_TOKEN, hide_env_values = true)]
+        runner_token: Option<String>,
     },
     /// Show whether this device is linked, the cloud URL, and the sync backlog.
     #[command(after_help = "\
@@ -1027,6 +1097,15 @@ async fn main() -> Result<()> {
             // harnesses and report once; `dira init`'s own output is unchanged.
             return wired.map(|w| w.print());
         }
+        Command::Cloud { action } => {
+            return match action {
+                CloudAction::Init {
+                    harness,
+                    print,
+                    no_pin,
+                } => cloud_init::run(harness, *print, *no_pin).await,
+            };
+        }
         Command::Watch { interval } => {
             return tui::run(&config, std::time::Duration::from_millis(*interval)).await;
         }
@@ -1148,9 +1227,11 @@ async fn main() -> Result<()> {
         }
         Command::Device { action } => {
             return match action {
-                DeviceAction::Link { code, label } => {
-                    device::link(&config, code.clone(), label.clone()).await
-                }
+                DeviceAction::Link {
+                    code,
+                    label,
+                    runner_token,
+                } => device::link(&config, code.clone(), label.clone(), runner_token.clone()).await,
                 DeviceAction::Status => device::status(&config).await,
                 DeviceAction::RotateKey => device::rotate_key(&config).await,
                 DeviceAction::Unlink { yes } => device::unlink(&config, *yes).await,
@@ -1162,14 +1243,25 @@ async fn main() -> Result<()> {
 
     // `status` renders with a client-side flag (summary vs detailed), so it
     // sends + renders here instead of the generic print path below.
-    if let Command::Status { detailed } = &cli.command {
+    if let Command::Status { detailed, json } = &cli.command {
         // BEFORE the send, deliberately. The case this breadcrumb exists for is a
         // daemon that is running but refusing hooks — where `status` itself fails
         // with the same access-denied error, so anything printed after the send
         // never runs. Warning first means the one command a confused user reaches
         // for always says why capture is dead.
+        //
+        // The breadcrumb goes to stderr, so it does not disturb `--json`'s
+        // one-object-on-stdout contract (the same split `doctor --json` keeps).
         hook_health::maybe_warn();
         let resp = client::send(&config.socket_path, &Request::Status).await?;
+        if *json {
+            // stdout carries exactly one JSON object: no update notice, no
+            // render fallbacks. A consumer parses stdout unconditionally.
+            if !render::print_json(&resp) {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         match resp {
             Response::Status(s) => render::print_status(&s, *detailed),
             other => {
@@ -1200,17 +1292,18 @@ async fn main() -> Result<()> {
     // the `req` match below.
     let zavet_status_cwd_scoped = zavet_status_is_cwd_scoped(&cli.command);
     let cwd_for_adapter_status = cwd.clone();
-    // Presentation flags on the zavet list views. Read by reference for the
-    // same reason as above: the `req` match below consumes `cli.command`. Kept
-    // as two independent bindings — layout and output format are unrelated, and
-    // pairing them means a third subcommand wanting `--json` has to edit a
-    // match that also carries row widths.
-    let zavet_json = matches!(
+    // Which commands want their daemon response rendered as JSON rather than
+    // as a table. Read by reference for the same reason as above: the `req`
+    // match below consumes `cli.command`. Kept independent of `row_opts` —
+    // layout and output format are unrelated, and pairing them means a
+    // subcommand wanting `--json` has to edit a match that also carries row
+    // widths.
+    let json_output = matches!(
         &cli.command,
         Command::Zavet {
             action: ZavetAction::Decisions { json: true, .. }
                 | ZavetAction::Wiki { json: true, .. }
-        }
+        } | Command::Sessions { json: true }
     );
     let row_opts = match &cli.command {
         Command::Zavet {
@@ -1226,7 +1319,7 @@ async fn main() -> Result<()> {
     let req = match cli.command {
         // Returned above, in the client-side block.
         Command::Onboard { .. } => unreachable!("onboard is handled client-side"),
-        Command::Sessions => Request::Sessions,
+        Command::Sessions { .. } => Request::Sessions,
         Command::Start {
             project,
             label,
@@ -1331,6 +1424,7 @@ async fn main() -> Result<()> {
         // already handled above
         Command::Status { .. }
         | Command::Init { .. }
+        | Command::Cloud { .. }
         | Command::Watch { .. }
         | Command::Daemon { .. }
         | Command::Device { .. }
@@ -1350,7 +1444,7 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     }
-    let ok = if zavet_json {
+    let ok = if json_output {
         render::print_json(&resp)
     } else {
         render::print_with(&resp, row_opts)
@@ -1389,8 +1483,31 @@ const HOOK_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2)
 /// as it ever was.
 const HOOK_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Forward a JSON payload from stdin to the daemon, wrapped into a request by
-/// `wrap`.
+/// Read stdin and parse it as the hook payload — the part of
+/// [`forward_stdin`] that has to run *before* the portable-hook yield check,
+/// which needs to peek `hook_event_name` out of the payload before deciding
+/// whether to forward it at all.
+///
+/// `Err` already carries the fully-formed [`HookOutcome`] (breadcrumb and
+/// debug line applied via [`note_hook_failure`]), so a caller on the failure
+/// path never has to re-derive it.
+fn read_hook_payload(label: &str, probe: bool) -> Result<serde_json::Value, HookOutcome> {
+    let mut buf = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        return Err(note_hook_failure(
+            label,
+            probe,
+            &format!("could not read the hook payload: {e}"),
+        ));
+    }
+    serde_json::from_str(&buf)
+        .map_err(|e| note_hook_failure(label, probe, &format!("hook payload was not JSON: {e}")))
+}
+
+/// Wrap an already-parsed payload into a request and send it to the daemon —
+/// the part of [`forward_stdin`] shared with the portable-hook yield check,
+/// which reads and inspects the payload itself before deciding whether this
+/// half runs at all.
 ///
 /// Hook shims are fire-and-forget and must never break the agent loop: this still
 /// exits 0 on every path and writes nothing to stdout. What changed is that a
@@ -1402,26 +1519,13 @@ const HOOK_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// `DIRA_HOOK_DEBUG=1` additionally prints the failure to stderr, which harnesses
 /// capture into their own logs — the switch that turns a support conversation
 /// into one line.
-async fn forward_stdin(
+async fn deliver_hook_payload(
     config: &Config,
     label: &str,
     probe: bool,
+    payload: serde_json::Value,
     wrap: impl FnOnce(serde_json::Value) -> Request,
 ) -> HookOutcome {
-    let mut buf = String::new();
-    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-        return note_hook_failure(
-            label,
-            probe,
-            &format!("could not read the hook payload: {e}"),
-        );
-    }
-    let payload: serde_json::Value = match serde_json::from_str(&buf) {
-        Ok(v) => v,
-        Err(e) => {
-            return note_hook_failure(label, probe, &format!("hook payload was not JSON: {e}"))
-        }
-    };
     let req = wrap(payload);
     match tokio::time::timeout(
         HOOK_TOTAL_BUDGET,
@@ -1441,6 +1545,22 @@ async fn forward_stdin(
         Ok(Err(e)) => note_hook_failure(label, probe, &e.to_string()),
         Err(_) => note_hook_failure(label, probe, "timed out reaching dirad"),
     }
+}
+
+/// Forward a JSON payload from stdin to the daemon, wrapped into a request by
+/// `wrap`. `dira zavet emit` (the only other caller) has no yield check, so it
+/// still goes straight through both halves.
+async fn forward_stdin(
+    config: &Config,
+    label: &str,
+    probe: bool,
+    wrap: impl FnOnce(serde_json::Value) -> Request,
+) -> HookOutcome {
+    let payload = match read_hook_payload(label, probe) {
+        Ok(p) => p,
+        Err(outcome) => return outcome,
+    };
+    deliver_hook_payload(config, label, probe, payload, wrap).await
 }
 
 /// Whether this hook shim was spawned by `dira doctor --probe`.
@@ -1475,6 +1595,15 @@ enum HookOutcome {
     Delivered,
     /// A transport failure — the daemon was never reached.
     Failed,
+    /// Never forwarded: this was a portable-wrapper invocation and the same
+    /// event for the same harness is already live at user scope. Not a
+    /// failure — deliberately excluded from `hook_health`, which exists to
+    /// surface a *broken* delivery channel, and this one is working exactly
+    /// as designed. Unlike `hook_health`, `DIRA_HOOK_DEBUG` DOES print a line
+    /// for this outcome — a yield is silent by design, and the debug switch
+    /// is how someone confirms it actually happened rather than the event
+    /// having simply gone missing. See `hook_yield`.
+    Yielded,
 }
 
 /// Exit code a probe-mode hook uses to report a transport failure.
@@ -1493,12 +1622,44 @@ fn note_hook_failure(label: &str, probe: bool, reason: &str) -> HookOutcome {
     HookOutcome::Failed
 }
 
-/// Forward a harness hook payload from stdin to the daemon.
+/// Forward a harness hook payload from stdin to the daemon — unless this is a
+/// portable-wrapper invocation (`DIRA_HOOK_VIA=portable`) AND the same event
+/// for the same harness is both wired live at user scope AND wired, at
+/// project scope, through the portable wrapper itself. The marker alone is
+/// never enough: a stray `DIRA_HOOK_VIA=portable` inherited from a shell
+/// profile must not make a direct invocation yield just because a live
+/// user-scope entry happens to exist. When both hold, the user-scope wiring
+/// will deliver the event on its own and forwarding again would double-count
+/// it. See `hook_yield`.
+///
+/// The payload is read and parsed once, here, specifically so the event name
+/// can be peeked *before* deciding whether to forward at all — probe mode
+/// (`dira doctor --probe`) always drives the direct, non-portable form, so it
+/// never takes this branch and always sees a real forward.
 async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcome {
+    let payload = match read_hook_payload(harness, probe) {
+        Ok(p) => p,
+        Err(outcome) => return outcome,
+    };
+    if hook_yield::via_portable() && !probe {
+        let event = payload.get("hook_event_name").and_then(|v| v.as_str());
+        if let Some(event) = event {
+            let user_scope_live = hook_yield::user_scope_wires(harness, event);
+            let project_wraps_portable = hook_yield::project_scope_wires_portable(harness, event);
+            if hook_yield::should_yield(user_scope_live, project_wraps_portable) {
+                if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
+                    eprintln!("dira hook {harness}: yielded to user-scope wiring for {event}");
+                }
+                return HookOutcome::Yielded;
+            }
+        }
+    }
     let owned = harness.to_string();
-    forward_stdin(config, harness, probe, move |payload| Request::IngestHook {
-        harness: owned,
-        payload,
+    deliver_hook_payload(config, harness, probe, payload, move |payload| {
+        Request::IngestHook {
+            harness: owned,
+            payload,
+        }
     })
     .await
 }

@@ -216,7 +216,7 @@ pub(crate) async fn device(config: &Config, state: &mut State, ui: &mut dyn Ui) 
             "no code entered — run `dira device link` when you have one".into(),
         );
     }
-    match crate::device::link(config, Some(code), None).await {
+    match crate::device::link(config, Some(code), None, None).await {
         Ok(()) => {
             state.device_linked = true;
             StepOutcome::Done("device linked".into())

@@ -10,6 +10,11 @@
 //! 3. `POST /api/v1/devices/claim` with `{ code, ed25519Pubkey, label,
 //!    clientNonce }` and persist **only** the `deviceId` the cloud returns.
 //!
+//! Headless runtimes use `dira device link --runner-token` (or the
+//! `DIRA_RUNNER_TOKEN` env) instead of a one-time code: same endpoint, same
+//! invariants, but authorized by a revocable environment-scoped token, so a
+//! cloud agent VM can claim an ephemeral device with nobody at a keyboard.
+//!
 //! ## Cloud invariant: the server assigns the device id
 //!
 //! The device id is **server-assigned**. The client never chooses or pre-persists
@@ -46,6 +51,78 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
+/// Build the one-shot HTTP client these commands use. Goes through
+/// [`dira_core::httpclient`] so the `DIRA_EXTRA_CA_CERTS` opt-in (cloud
+/// runtimes behind a TLS-intercepting proxy) applies to claim/rotate too, not
+/// just the daemon's pooled client.
+///
+/// Bounded so a claim/rotate/probe can never hang the CLI indefinitely: a
+/// slow TCP handshake fails fast at `connect_timeout`, and a connected-but-
+/// silent cloud is capped by the overall `timeout` — both well past any real
+/// round trip, but short enough that an operator staring at a stuck `dira
+/// device link` gets an answer instead of a hang.
+fn http_client() -> Result<reqwest::Client> {
+    dira_core::httpclient::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("build HTTP client")
+}
+
+/// The environment fallback for `--runner-token` — clap's `env =` in
+/// `main.rs` and doctor's headless-provisioning check both name it from here.
+pub const ENV_RUNNER_TOKEN: &str = "DIRA_RUNNER_TOKEN";
+
+/// `meta` key holding the in-flight claim's `clientNonce`. Set BEFORE the
+/// claim POST while the device is still unlinked, and cleared only once a
+/// claim succeeds — same shape as `identity::META_PENDING_ROTATED_AT`, just
+/// scoped to `link` rather than `rotate_key`. Absent (or empty) ⇒ no claim
+/// attempt is in flight, so the next `link` mints a fresh nonce.
+const META_PENDING_CLAIM_NONCE: &str = "device_pending_claim_nonce";
+
+/// The `clientNonce` for this claim attempt: reuse whatever is pending from an
+/// interrupted previous attempt, or mint and persist a fresh one. Persisting
+/// BEFORE the caller's POST is what makes a crash or a lost response safe to
+/// retry — the next `link` call loads this SAME value rather than generating
+/// a new one, so the cloud's `(code, nonce)` idempotency key collapses the
+/// retry onto the same device row instead of minting a second one.
+async fn pending_claim_nonce(store: &Store) -> Result<String> {
+    if let Some(existing) = store
+        .meta_get(META_PENDING_CLAIM_NONCE)
+        .await?
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(existing);
+    }
+    let fresh = Ulid::generate().to_string();
+    store.meta_set(META_PENDING_CLAIM_NONCE, &fresh).await?;
+    Ok(fresh)
+}
+
+/// Best-effort clear-and-log for the pending claim nonce, called only AFTER
+/// `identity::set_device_id` has already returned `Ok` — the device is
+/// durably linked the instant that call succeeds, so a failure clearing the
+/// nonce afterward must NEVER be mistaken for the link itself failing: a
+/// headless caller would see a false "link failed" for an already-successful
+/// link, and a retry would just print "device already linked" and exit
+/// before ever reaching this write again (see `link`'s doc comment). A stale
+/// pending nonce left behind is harmless dead data — nothing reads it once
+/// the device is linked.
+///
+/// Takes the `meta_set` `Result` (rather than the `Store` + key) so the "log,
+/// don't propagate" policy is unit-testable in isolation, without a `Store`
+/// that can be made to fail `meta_set` on demand — `Store` (see
+/// `cli/core/src/store.rs`) has no such fault-injection seam.
+// Returns `()`, not a `Result` — that signature IS the guarantee that a
+// failed clear can never propagate back out of `link` as an error; there is
+// nothing left to assert with a unit test that the type checker doesn't
+// already prove.
+fn handle_nonce_clear_result(result: std::result::Result<(), dira_core::Error>) {
+    if let Err(e) = result {
+        eprintln!("warning: linked, but failed to clear the pending claim nonce: {e}");
+    }
+}
+
 /// Resolve the cloud base URL or fail with an actionable message.
 fn cloud_url(config: &Config) -> Result<String> {
     config.cloud_url.clone().ok_or_else(|| {
@@ -56,8 +133,22 @@ fn cloud_url(config: &Config) -> Result<String> {
     })
 }
 
-/// `dira device link`: claim a link code and bind this device.
-pub async fn link(config: &Config, code: Option<String>, label: Option<String>) -> Result<()> {
+/// `dira device link`: claim a link code (or a runner token) and bind this
+/// device.
+///
+/// The runner-token path is the non-interactive variant for headless runtimes
+/// (cloud agent VMs, CI): instead of a one-time code a human reads off the
+/// Connections page, it presents a revocable, environment-scoped token minted
+/// there, and the cloud mints an ephemeral device for it. Every other
+/// invariant is identical — the cloud still assigns the device id, nothing is
+/// persisted until it does, and a retry with the same `clientNonce` is
+/// idempotent. No TTY is touched anywhere on that path.
+pub async fn link(
+    config: &Config,
+    code: Option<String>,
+    label: Option<String>,
+    runner_token: Option<String>,
+) -> Result<()> {
     let base = cloud_url(config)?;
     let store = Store::open(&config.db_path)
         .await
@@ -74,27 +165,41 @@ pub async fn link(config: &Config, code: Option<String>, label: Option<String>) 
         .await
         .context("load or create device key")?;
 
-    let code = match code {
-        Some(c) => c,
-        None => prompt("Enter link code: ")?,
-    };
-    let code = code.trim().to_string();
-    if code.is_empty() {
-        return Err(anyhow!("a link code is required"));
+    // A client nonce for idempotency ONLY — not an identity. The cloud uses it
+    // to collapse a retried claim onto the same device row; it never becomes
+    // the device id (the cloud assigns that). Persisted in `meta` BEFORE the
+    // POST — same crash-safety pattern as rotation's
+    // `identity::META_PENDING_ROTATED_AT`: a crash or a failed/lost-response
+    // claim leaves it on disk, so the NEXT `dira device link` reuses this SAME
+    // nonce instead of minting a fresh one, which is what lets the cloud
+    // collapse the retry onto the same row rather than a second device.
+    // Cleared only once a claim actually succeeds.
+    let client_nonce = pending_claim_nonce(&store).await?;
+
+    let auth = match runner_token {
+        Some(token) => {
+            // Both can reach here at once (main.rs no longer refuses the
+            // combination — see the doc comment on the precedence test
+            // below); the runner token wins silently in the return value,
+            // but a caller who passed a `--code` that then did nothing
+            // deserves to know why.
+            if code.is_some() {
+                eprintln!("ignoring --code: {ENV_RUNNER_TOKEN} is set");
+            }
+            ClaimAuth::RunnerToken(token)
+        }
+        None => ClaimAuth::Code(match code {
+            Some(c) => c,
+            None => prompt("Enter link code: ")?,
+        }),
     }
-
-    let label = label.or_else(default_label);
-
-    // A client nonce for idempotency ONLY — not an identity. The cloud uses it to
-    // collapse a retried claim onto the same device row; it never becomes the
-    // device id (the cloud assigns that). We do NOT persist anything yet: the
-    // device stays unlinked until the cloud hands back an authoritative id.
-    let client_nonce = Ulid::generate().to_string();
+    .validated()?;
+    let label = label.or_else(|| auth.default_label());
+    let body = claim_request_body(&auth, &key.public_base64(), label.as_deref(), &client_nonce);
 
     let url = format!("{}/api/v1/devices/claim", base.trim_end_matches('/'));
-    let body = claim_request_body(&code, &key.public_base64(), label.as_deref(), &client_nonce);
 
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let resp = client
         .post(&url)
         .json(&body)
@@ -105,8 +210,10 @@ pub async fn link(config: &Config, code: Option<String>, label: Option<String>) 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        // Nothing was persisted, so a failed claim leaves us cleanly unlinked —
-        // re-running with the same nonce is idempotent on the cloud side.
+        // The device id itself stays unpersisted, so a failed claim leaves us
+        // cleanly unlinked — but the nonce we just sent stays in `meta` so the
+        // next `dira device link` retries with the SAME `clientNonce`, which is
+        // what makes that retry idempotent on the cloud side.
         return Err(anyhow!("link failed ({status}): {}", message_of(&text)));
     }
 
@@ -116,30 +223,109 @@ pub async fn link(config: &Config, code: Option<String>, label: Option<String>) 
     let returned = device_id_from_response(&text)
         .ok_or_else(|| anyhow!("link succeeded but the cloud returned no deviceId"))?;
     identity::set_device_id(&store, &returned).await?;
+    // The claim resolved — clear the pending nonce so a FUTURE re-link (after
+    // an operator clears `device_id`) starts a fresh attempt with a fresh one.
+    // Best-effort — see `handle_nonce_clear_result`'s doc comment for why a
+    // failed clear must never surface as "link failed".
+    handle_nonce_clear_result(store.meta_set(META_PENDING_CLAIM_NONCE, "").await);
 
     println!("linked as {returned}");
     println!("sync will start on the next event or backstop (no daemon restart needed)");
     Ok(())
 }
 
+/// How a claim authorizes itself — the ONE thing the two `dira device link`
+/// paths differ in. A one-time human-read `code`, or a revocable,
+/// environment-scoped `runnerToken` so a headless VM can claim with nobody at
+/// a keyboard. The endpoint contract lives in `.zavet/specs/cloud-runtime.md`;
+/// the cloud repo implements it.
+enum ClaimAuth {
+    Code(String),
+    RunnerToken(String),
+}
+
+impl ClaimAuth {
+    /// Trim the credential; an empty one fails with the variant's actionable
+    /// message before any network or prompt is touched.
+    fn validated(self) -> Result<Self> {
+        match self {
+            ClaimAuth::Code(c) => match c.trim() {
+                "" => Err(anyhow!("a link code is required")),
+                c => Ok(ClaimAuth::Code(c.to_string())),
+            },
+            ClaimAuth::RunnerToken(t) => match t.trim() {
+                "" => Err(anyhow!(
+                    "a runner token is required (pass --runner-token or set {ENV_RUNNER_TOKEN})"
+                )),
+                t => Ok(ClaimAuth::RunnerToken(t.to_string())),
+            },
+        }
+    }
+
+    /// The single claim-body key this variant contributes, and its value.
+    fn wire_entry(&self) -> (&'static str, &str) {
+        match self {
+            ClaimAuth::Code(c) => ("code", c),
+            ClaimAuth::RunnerToken(t) => ("runnerToken", t),
+        }
+    }
+
+    /// The fallback label when the user passed none: runner claims name the
+    /// ambient cloud runtime (ephemeral VMs must stay tellable-apart), code
+    /// claims get the plain hostname a laptop wants.
+    fn default_label(&self) -> Option<String> {
+        match self {
+            ClaimAuth::Code(_) => default_label(),
+            ClaimAuth::RunnerToken(_) => default_runner_label(),
+        }
+    }
+}
+
 /// Build the `POST /api/v1/devices/claim` request body.
 ///
 /// Pure + deterministic given its inputs, so the wire shape is unit-testable
-/// without a network or store. Carries the link `code`, our `ed25519Pubkey`, an
-/// optional `label`, and a `clientNonce` for idempotency — but **never** a
-/// client-chosen `deviceId`: the cloud assigns the identity (see the module docs).
+/// without a network or store. Carries the [`ClaimAuth`] credential under its
+/// variant's key, our `ed25519Pubkey`, an optional `label`, and a
+/// `clientNonce` for idempotency — but **never** a client-chosen `deviceId`:
+/// the cloud assigns the identity (see the module docs).
 fn claim_request_body(
-    code: &str,
+    auth: &ClaimAuth,
     pubkey_b64: &str,
     label: Option<&str>,
     client_nonce: &str,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "code": code,
+    let mut body = serde_json::json!({
         "ed25519Pubkey": pubkey_b64,
         "label": label,
         "clientNonce": client_nonce,
-    })
+    });
+    let (key, value) = auth.wire_entry();
+    body[key] = serde_json::Value::String(value.to_string());
+    body
+}
+
+/// Default label for a runner-claimed device, from the ambient runtime.
+fn default_runner_label() -> Option<String> {
+    runner_label(dira_core::runtime::detect(), default_label())
+}
+
+/// Pure core of [`default_runner_label`]: `cloud:<runtime>:<session-or-host>`
+/// when a cloud runtime is detected (so a dashboard full of ephemeral VM
+/// devices stays tellable-apart), else the plain hostname a laptop gets.
+fn runner_label(
+    rt: Option<dira_core::runtime::CloudRuntime>,
+    hostname: Option<String>,
+) -> Option<String> {
+    match rt {
+        Some(rt) => {
+            let suffix = rt
+                .session_ref
+                .or(hostname)
+                .unwrap_or_else(|| "unknown".to_string());
+            Some(format!("cloud:{}:{}", rt.id, suffix))
+        }
+        None => hostname,
+    }
 }
 
 /// Extract the cloud-assigned `deviceId` from a successful claim response body.
@@ -296,7 +482,7 @@ pub async fn rotate_key(config: &Config) -> Result<()> {
         }
     };
 
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     resume_rotation(
         &client,
         &base,
@@ -805,26 +991,70 @@ mod tests {
     use dira_core::signing::verify_payload;
 
     #[test]
-    fn claim_body_carries_no_client_chosen_device_id() {
-        // The claim request must NOT smuggle a client-chosen device id under any
-        // name. Identity is server-assigned; we only send a clearly-named nonce.
-        let body = claim_request_body("CODE-123", "PUBKEYb64", Some("laptop"), "01NONCE");
-        assert_eq!(body["code"], "CODE-123");
-        assert_eq!(body["ed25519Pubkey"], "PUBKEYb64");
-        assert_eq!(body["label"], "laptop");
-        assert_eq!(body["clientNonce"], "01NONCE");
-        // No `deviceId` field at all — the cloud owns the id.
-        assert!(
-            body.get("deviceId").is_none(),
-            "claim body must not contain a client-chosen deviceId"
-        );
+    fn claim_body_carries_the_auth_key_and_no_client_chosen_device_id() {
+        // Same shape and same red lines for both auth variants: the credential
+        // under its clearly-named key (and ONLY that key), never a
+        // client-chosen deviceId — identity is server-assigned; the nonce is
+        // idempotency only.
+        for (auth, key, value, absent) in [
+            (
+                ClaimAuth::Code("CODE-123".into()),
+                "code",
+                "CODE-123",
+                "runnerToken",
+            ),
+            (
+                ClaimAuth::RunnerToken("tok_ENV1".into()),
+                "runnerToken",
+                "tok_ENV1",
+                "code",
+            ),
+        ] {
+            let body = claim_request_body(&auth, "PUBKEYb64", Some("laptop"), "01NONCE");
+            assert_eq!(body[key], value);
+            assert_eq!(body["ed25519Pubkey"], "PUBKEYb64");
+            assert_eq!(body["label"], "laptop");
+            assert_eq!(body["clientNonce"], "01NONCE");
+            assert!(
+                body.get("deviceId").is_none(),
+                "claim body must not contain a client-chosen deviceId"
+            );
+            assert!(
+                body.get(absent).is_none(),
+                "each variant carries only its own credential key"
+            );
+        }
     }
 
     #[test]
     fn claim_body_omits_label_as_null_when_absent() {
-        let body = claim_request_body("CODE", "PK", None, "01NONCE");
+        let body = claim_request_body(&ClaimAuth::Code("CODE".into()), "PK", None, "01NONCE");
         assert!(body["label"].is_null());
         assert!(body.get("deviceId").is_none());
+    }
+
+    #[test]
+    fn runner_label_names_the_runtime_and_falls_back_sanely() {
+        use dira_core::runtime::CloudRuntime;
+        let rt = |id: &str, sref: Option<&str>| CloudRuntime {
+            id: id.into(),
+            session_ref: sref.map(Into::into),
+        };
+        // Session ref beats hostname: it's what tells ephemeral VMs apart.
+        assert_eq!(
+            runner_label(Some(rt("claude-web", Some("cse_01A"))), Some("vm".into())).as_deref(),
+            Some("cloud:claude-web:cse_01A")
+        );
+        // No session ref: the hostname still scopes the label.
+        assert_eq!(
+            runner_label(Some(rt("cursor-cloud", None)), Some("vm-7".into())).as_deref(),
+            Some("cloud:cursor-cloud:vm-7")
+        );
+        // No runtime detected (a laptop provisioning a runner key): plain host.
+        assert_eq!(
+            runner_label(None, Some("laptop".into())).as_deref(),
+            Some("laptop")
+        );
     }
 
     #[test]
@@ -987,6 +1217,166 @@ mod tests {
         let queued = cloud_status_line(Some(&old), Some(&new), 5);
         assert!(queued.contains("5 event(s) queued"), "{queued}");
         assert!(!queued.contains("resync"), "{queued}");
+    }
+
+    /// The full runner-token link path, end to end against a mock cloud: no
+    /// TTY is touched, the claim body carries the token (never a code), and
+    /// the server-assigned device id — and nothing else — is persisted.
+    #[tokio::test]
+    async fn runner_token_link_claims_without_a_tty() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+
+        let cloud = MockCloud::start(&["/api/v1/devices/claim"]).await;
+        cloud.push(
+            "/api/v1/devices/claim",
+            MockResp::ok(r#"{"deviceId":"01RUNNERDEV"}"#),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dira_core::Config {
+            db_path: dir.path().join("dira.db"),
+            cloud_url: Some(cloud.base_url().to_string()),
+            ..dira_core::Config::default()
+        };
+
+        link(&config, None, None, Some("tok_123".into()))
+            .await
+            .expect("runner claim must succeed non-interactively");
+
+        let reqs = cloud.requests("/api/v1/devices/claim");
+        assert_eq!(reqs.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+        assert_eq!(body["runnerToken"], "tok_123");
+        assert!(body.get("code").is_none(), "no link code on the wire");
+        assert!(body.get("deviceId").is_none(), "id stays server-assigned");
+
+        let store = Store::open(&config.db_path).await.unwrap();
+        assert_eq!(
+            identity::device_id(&store).await.unwrap().as_deref(),
+            Some("01RUNNERDEV")
+        );
+    }
+
+    /// A blank runner token errors out before any network or prompt — the
+    /// headless path must never fall back to interactivity.
+    #[tokio::test]
+    async fn blank_runner_token_errors_instead_of_prompting() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dira_core::Config {
+            db_path: dir.path().join("dira.db"),
+            cloud_url: Some("http://127.0.0.1:9".to_string()),
+            ..dira_core::Config::default()
+        };
+        let err = link(&config, None, None, Some("   ".into()))
+            .await
+            .expect_err("blank token must fail fast");
+        assert!(err.to_string().contains("runner token"), "{err}");
+    }
+
+    /// WP-D item 2: the claim nonce is persisted in `meta` BEFORE the POST
+    /// while the device is unlinked — same crash-safety shape as rotation's
+    /// `META_PENDING_ROTATED_AT`. A failed claim must not mint a fresh nonce
+    /// on the next attempt: the retry has to send the SAME `clientNonce`, or
+    /// the cloud's `(code, nonce)` idempotency key can't collapse it onto the
+    /// same device row. Cleared only once a claim actually succeeds.
+    #[tokio::test]
+    async fn a_retried_claim_reuses_the_same_client_nonce_and_clears_it_on_success() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+
+        let cloud = MockCloud::start(&["/api/v1/devices/claim"]).await;
+        cloud.push(
+            "/api/v1/devices/claim",
+            MockResp::status(500, "upstream timeout"),
+        );
+        cloud.push(
+            "/api/v1/devices/claim",
+            MockResp::ok(r#"{"deviceId":"01RETRYDEV"}"#),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dira_core::Config {
+            db_path: dir.path().join("dira.db"),
+            cloud_url: Some(cloud.base_url().to_string()),
+            ..dira_core::Config::default()
+        };
+
+        link(&config, Some("CODE-1".into()), None, None)
+            .await
+            .expect_err("first attempt must fail on the mock's 500");
+        link(&config, Some("CODE-1".into()), None, None)
+            .await
+            .expect("second attempt must succeed and reuse the pending nonce");
+
+        let reqs = cloud.requests("/api/v1/devices/claim");
+        assert_eq!(reqs.len(), 2, "both attempts must have reached the cloud");
+        let first: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&reqs[1]).unwrap();
+        assert_eq!(
+            first["clientNonce"], second["clientNonce"],
+            "a retried claim must send the SAME clientNonce as the failed attempt"
+        );
+
+        let store = Store::open(&config.db_path).await.unwrap();
+        assert_eq!(
+            identity::device_id(&store).await.unwrap().as_deref(),
+            Some("01RETRYDEV")
+        );
+        assert_eq!(
+            store
+                .meta_get(META_PENDING_CLAIM_NONCE)
+                .await
+                .unwrap()
+                .unwrap_or_default(),
+            "",
+            "the pending nonce must be cleared once the claim succeeds"
+        );
+    }
+
+    /// Item 4 (WP-D; the CLI-layer half of this, dropping `main.rs`'s
+    /// `conflicts_with = "runner_token"` on `--code`, is WP-B's edit): once
+    /// both flags can reach `link` at once, it must still resolve
+    /// unambiguously rather than error — the runner token wins and the code
+    /// is silently ignored, mirroring the `match runner_token { Some(_) =>
+    /// .., None => .. }` precedence already in `link`.
+    #[tokio::test]
+    async fn link_prefers_the_runner_token_over_a_code_when_both_are_given() {
+        let _keychain_lock = keychain_lock().await;
+        use_mock_keychain();
+
+        let cloud = MockCloud::start(&["/api/v1/devices/claim"]).await;
+        cloud.push(
+            "/api/v1/devices/claim",
+            MockResp::ok(r#"{"deviceId":"01BOTHDEV"}"#),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dira_core::Config {
+            db_path: dir.path().join("dira.db"),
+            cloud_url: Some(cloud.base_url().to_string()),
+            ..dira_core::Config::default()
+        };
+
+        link(
+            &config,
+            Some("CODE-IGNORED".into()),
+            None,
+            Some("tok_wins".into()),
+        )
+        .await
+        .expect("a code and a runner token together must not error — the token wins");
+
+        let reqs = cloud.requests("/api/v1/devices/claim");
+        assert_eq!(reqs.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+        assert_eq!(body["runnerToken"], "tok_wins");
+        assert!(
+            body.get("code").is_none(),
+            "the code must be ignored on the wire, not sent alongside the token"
+        );
     }
 
     /// A fresh old/pending keypair + an in-memory store with nothing pending

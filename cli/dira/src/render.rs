@@ -136,6 +136,16 @@ pub fn print(resp: &Response) -> bool {
 ///
 /// An error response still renders as an error, so a failure is never a
 /// silently empty document.
+///
+/// A `Response::Error` is the one case that does NOT reuse `emit`'s "print
+/// the value whole" fallback: `--json` still means "one JSON document on
+/// stdout, always", including on failure, so a script piping this output
+/// never has to special-case a human `error: …` line landing on stderr
+/// instead — it emits `{"status":"error","message":…}` on stdout, same
+/// channel as every success. `main.rs` already exits 1 on this `false`.
+/// (A daemon-down error that never reached a `Response` at all — the socket
+/// connect itself failing — is a separate, earlier failure path and still
+/// goes to stderr; see `docs/cloud-runtimes.md`'s `--json` note.)
 pub fn print_json(resp: &Response) -> bool {
     fn emit<T: serde::Serialize>(v: &T) -> bool {
         match serde_json::to_string_pretty(v) {
@@ -150,7 +160,10 @@ pub fn print_json(resp: &Response) -> bool {
         }
     }
     match resp {
-        Response::Error { .. } => print(resp),
+        Response::Error { message } => {
+            emit(&error_json(message));
+            false
+        }
         Response::ZavetDecisions(v) => emit(v),
         Response::ZavetSync(v) => emit(v),
         Response::ZavetWiki(v) => emit(v),
@@ -159,6 +172,12 @@ pub fn print_json(resp: &Response) -> bool {
         Response::ZavetSpec(v) => emit(v),
         other => emit(other),
     }
+}
+
+/// The JSON document [`print_json`] emits for a `Response::Error`. Pure, so
+/// the envelope's shape is unit-testable without capturing stdout.
+fn error_json(message: &str) -> serde_json::Value {
+    serde_json::json!({"status": "error", "message": message})
 }
 
 /// [`print`], with per-row options the zavet list views honour. Every other
@@ -2238,6 +2257,28 @@ fn print_report(r: &Report, layout: &Layout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--json` must still answer on the same channel (stdout) and with the
+    /// same shape (one JSON document) when the response IS an error — a
+    /// script piping `dira status --json` must never have to special-case a
+    /// human `error: …` line landing on stderr instead.
+    #[test]
+    fn error_json_carries_the_status_and_message_fields() {
+        let doc = error_json("daemon unreachable");
+        assert_eq!(doc["status"], "error");
+        assert_eq!(doc["message"], "daemon unreachable");
+    }
+
+    /// `print_json` on an error response still returns `false` — `main.rs`
+    /// relies on that to exit 1 — even though the document now lands on
+    /// stdout instead of stderr.
+    #[test]
+    fn print_json_of_an_error_response_returns_false() {
+        let resp = Response::Error {
+            message: "boom".to_string(),
+        };
+        assert!(!print_json(&resp));
+    }
 
     fn uncaptured_row(reason: &str) -> ZavetUncapturedView {
         ZavetUncapturedView {

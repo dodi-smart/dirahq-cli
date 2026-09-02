@@ -49,18 +49,33 @@ contract: contract-schema vector
 # NOT a contract artifact and deliberately NOT part of `just ci`: it needs the
 # network, and the table is an estimate for local display only. The cloud keeps
 # its own copy, is authoritative, and re-prices historical rows — the two are
-# allowed to drift between refreshes. Runs monthly in CI; run it by hand after a
-# model launch or a price change.
+# allowed to drift between refreshes. Runs weekly in CI (a monthly cadence once
+# left claude-fable-5-1 estimated at the sonnet fallback price for weeks after its
+# 2026-09-01 launch); run it by hand too after a model launch or a price change.
 #
-# Writes via a temp file so a failed fetch or a rejected payload can never
-# truncate the vendored table.
+# Build before the fetch: this used to pipe curl straight into `cargo run`,
+# which meant curl's connection sat idle for the ~2 minutes cargo spent
+# compiling before it read a byte — the pipe buffer filled, curl blocked, and
+# models.dev dropped the connection (the 2026-09-02 CI outage, run 33498614567).
+# Building the binary first guarantees nothing is ever waiting in a pipe.
+#
+# curl's --speed-limit/--speed-time turns a stalled transfer into a retried
+# error instead of a multi-minute hang, and --retry covers ordinary transient
+# failures. Still writes via a temp file and only `mv`s once `pricing_sync`
+# exits 0, so a failed fetch or a rejected payload can never truncate the
+# vendored table. The trailing path argument hands the binary the existing
+# table so a refresh only ever appends, never drops a retired model id.
 pricing-sync:
     #!/usr/bin/env bash
     set -euo pipefail
-    tmp="$(mktemp)"
-    trap 'rm -f "$tmp"' EXIT
-    curl -fsSL https://models.dev/api.json \
-      | cargo run -q -p dira-core --bin pricing_sync > "$tmp"
+    cargo build -q -p dira-core --bin pricing_sync
+    raw="$(mktemp)"; tmp="$(mktemp)"
+    trap 'rm -f "$raw" "$tmp"' EXIT
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+         --connect-timeout 20 --max-time 300 --speed-limit 1024 --speed-time 60 \
+         -o "$raw" https://models.dev/api.json
+    cargo run -q -p dira-core --bin pricing_sync -- cli/core/pricing/models.json \
+         < "$raw" > "$tmp"
     mv "$tmp" cli/core/pricing/models.json
     echo "wrote cli/core/pricing/models.json"
 

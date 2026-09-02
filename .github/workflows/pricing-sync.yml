@@ -1,26 +1,30 @@
 name: Pricing Sync
 
 # Refresh the bundled model-price table (cli/core/pricing/models.json) from
-# models.dev and open a PR when prices changed. Runs monthly; run it by hand
+# models.dev and open a PR when prices changed. Runs weekly; run it by hand
 # (workflow_dispatch) after a model launch or a price change.
 #
 # The commit is `fix(cli)`, which releases a patch — the table is compiled into
 # the binaries, so a refresh only reaches users when they update. That release
 # is the point of the job.
 #
-# This mirrors the cloud's own monthly pricing-sync. The two tables are
-# deliberately allowed to drift: the cloud is authoritative for cost and
-# re-prices historical rows, while this copy exists so `dira status` /
-# `dira report` have a number to show offline. `est_cost_usd` on the wire is
-# contract-documented as a label, never a billing base, so a stale table here
-# never moves an invoice.
+# Weekly, not the cloud's own monthly cadence: claude-fable-5-1 launched
+# 2026-09-01, and a monthly job would leave it estimated at the sonnet fallback
+# ($3/$15) against a real $10/$50 for up to a month. Weekly also caps a
+# transient models.dev outage at a week of staleness instead of a month. The
+# two tables are still deliberately allowed to drift regardless of cadence: the
+# cloud is authoritative for cost and re-prices historical rows, while this
+# copy exists so `dira status` / `dira report` have a number to show offline.
+# `est_cost_usd` on the wire is contract-documented as a label, never a billing
+# base, so a stale table here never moves an invoice.
 #
-# models.dev being down just fails the run (no PR); retry manually or wait for
-# next month — pricing freshness is never critical.
+# The fetch step below retries through transient failures and stalls on its
+# own; models.dev being down for longer than that retry budget still fails the
+# run with no PR, but the next scheduled run is a week away, not a month.
 
 on:
   schedule:
-    - cron: "0 6 1 * *" # monthly, 1st at 06:00 UTC
+    - cron: "0 6 * * 1" # weekly, Mondays at 06:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -49,20 +53,56 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: refresh the table from models.dev
         shell: bash
-        # Mirrors `just pricing-sync`. Writes via a temp file so a failed fetch
-        # or a rejected payload can never truncate the vendored table.
+        # Mirrors `just pricing-sync`.
+        #
+        # Build before anything touches a pipe. This is the actual fix for the
+        # 2026-09-02 outage (run 33498614567: `curl: (18) Transferred a partial
+        # file`, then an EOF parse error on the truncated JSON). The old step
+        # piped curl straight into `cargo run`, which spent ~2 minutes compiling
+        # before reading a single byte — the pipe buffer filled, curl blocked,
+        # and models.dev dropped the idle connection. The job's reported 2m13s
+        # runtime was entirely build time, and the sync binary's own truncation
+        # guard caught the bad payload, so the failure was silent: no bad table,
+        # but also no PR and no signal. Building the binary first means nothing
+        # is ever sitting in a pipe while cargo compiles.
+        #
+        # --speed-limit 1024 --speed-time 60 turns a stalled transfer (under
+        # 1KB/s for 60s) into a retried error instead of a multi-minute hang —
+        # exactly the failure mode above, now caught even if something else
+        # downstream of curl gets slow again.
+        #
+        # Still writes via a temp file and only `mv`s once `pricing_sync` exits
+        # 0, so a rejected payload can never truncate the vendored table — that
+        # guarantee is unchanged, just split across the raw fetch and the
+        # tool's output instead of living in a single piped command.
+        #
+        # The trailing `cli/core/pricing/models.json` argument hands the sync
+        # binary the current table so a refresh only ever appends: it can no
+        # longer drop a model id that models.dev has stopped publishing. The
+        # append-only behavior lives in the binary; this step just wires the
+        # argument through.
         run: |
           set -euo pipefail
-          tmp="$(mktemp)"
-          trap 'rm -f "$tmp"' EXIT
-          curl -fsSL https://models.dev/api.json \
-            | cargo run -q -p dira-core --bin pricing_sync > "$tmp"
+          cargo build -q -p dira-core --bin pricing_sync
+          raw="$(mktemp)"; tmp="$(mktemp)"
+          trap 'rm -f "$raw" "$tmp"' EXIT
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+               --connect-timeout 20 --max-time 300 --speed-limit 1024 --speed-time 60 \
+               -o "$raw" https://models.dev/api.json
+          cargo run -q -p dira-core --bin pricing_sync -- cli/core/pricing/models.json \
+               < "$raw" > "$tmp"
           mv "$tmp" cli/core/pricing/models.json
       - name: validate the refreshed table
         # The pricing tests assert the table parses, covers every harness
         # family, and still splits generations correctly — so a bad refresh
         # fails here rather than shipping.
-        run: cargo test -p dira-core --lib pricing tokens
+        #
+        # The `--` is load-bearing: `cargo test` takes a single filter, so the
+        # bare `… --lib pricing tokens` this used to run died on "unexpected
+        # argument 'tokens'" before a test could execute. Nothing noticed,
+        # because the fetch above had never once succeeded far enough to reach
+        # this step. Past `--`, libtest takes both filters.
+        run: cargo test -p dira-core --lib -- pricing tokens
       - name: open PR
         uses: peter-evans/create-pull-request@v8
         with:

@@ -91,13 +91,16 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0030 — Full-content knowledge sync is opted into by its own prompt, never implied by linking (active)
 - DIRASH-0031 — One backoff ladder lives in dira_core; callers own their attempt budget (active)
 - DIRASH-0032 — A record's first-sight triple is repaired as a unit, from recorded facts (active)
+- DIRASH-0033 — Extra CA roots are an explicit, additive opt-in — the bundled store is never swapped (active)
 - DIRASH-0035 — A newer schema is refused loudly, never run against (active)
 - DIRASH-0036 — A pricing refresh appends and never drops a vendored id (active)
+- DIRASH-0037 — The portable hook yields to live user-scope wiring — no cache, no time window (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 
 - attestation-sync — Attestation sync and session rollups (session, high)
 - capture-pipeline — Zavet capture pipeline (session, high)
+- cloud-runtime — Cloud agent runtimes (teleport) (session, high)
 - daemon-lifecycle — Daemon startup and ingress lifecycle (session, high)
 - distribution-and-update — Distribution and self-update (session, high)
 - doctor — Diagnostics — dira doctor and the capture probe (session, high)

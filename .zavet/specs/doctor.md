@@ -1,16 +1,16 @@
 ---
 title: Diagnostics — dira doctor and the capture probe
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-08-14
+date: 2026-09-02
 paths:
   - cli/dira/src/doctor/**
   - cli/dirad/src/probe.rs
   - cli/dira/src/hook_health.rs
   - cli/dira/src/init.rs
-decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029]
+decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029, DIRASH-0033]
 ---
 
 ## Overview
@@ -27,11 +27,20 @@ was listening, commit capture worked, and cloud sync was green. The one
 broken link was the hook shim's connect to the control channel, and nothing
 exercised it.
 
-The command has two halves. Sixteen **static checks** read the daemon, the
+The command has two halves. Twenty-one **static checks** read the daemon, the
 store, the harness configs, the cloud state and whether self-update is landing.
 One opt-in **capture probe** (`--probe`) injects a synthetic hook through the
 command string the harness config actually invokes and verifies a row lands.
 It is the only check that would have caught the incident above.
+
+Three of the static checks are `cloud.*`: whether this process is inside a
+detected cloud runtime and has the env a capture-and-sync session needs
+(`cloud.runtime`), whether the wire to the configured cloud actually works
+(`cloud.reachability`), and whether this repo's committed `.dira/` teleport
+artifacts are whole and current (`cloud.bootstrap`). A fourth,
+`hooks.scope_overlap`, judges the same harness-wiring facts `hooks.config`/
+`hooks.exe_path` read to say whether a harness wired at both project and
+global scope double-delivers or yields (see Behavior below).
 
 ## Behavior
 
@@ -62,6 +71,40 @@ It is the only check that would have caught the incident above.
   unquoted form can contain spaces. Binary identity is `hooks.exe_path`'s
   question, and it expands `$HOME`/`~` before testing existence, reporting
   anything else as unverifiable rather than as a false alarm.
+- `hooks.scope_overlap` judges the same `Vec<HarnessWiring>` facts `hooks.config`/
+  `hooks.exe_path` read. A scope counts as wired for a harness when that scope's
+  file wires at least one of its events. When a harness is wired at both project
+  and global scope, the project entry is either the repo-committed portable
+  wrapper (`.dira/hook.sh`, which yields to matching user-scope wiring at
+  runtime via its own `DIRA_HOOK_VIA=portable` marker) or a machine-specific
+  path with no such yield check. The former is `ok` — the design working as
+  intended, one delivery. The latter is `warn` — the event genuinely fires
+  twice — never `fail`, because double delivery is not lost capture. A harness
+  wired at only one scope has nothing to overlap: `skip`, not a fabricated
+  `ok` about a comparison that never happened.
+- **Probe policy: `cloud.reachability` never fires its network GET on a bare
+  `dira doctor`.** This is an explicit, recorded exemption from D-0006's "no
+  network I/O on a default path" for the one check that needs one. The GET
+  runs only when `args.wants("cloud.reachability")` is ALSO true (i.e.
+  `--check` is empty, or names `cloud.reachability`) AND either (a)
+  `dira_core::runtime::detect()` finds a cloud runtime, or (b) the caller
+  names `cloud.reachability` explicitly via `--check`. The `wants` gate is
+  what keeps `--check <other-id>` from performing a GET even while running
+  *inside* a detected cloud runtime — naming one specific check must not
+  pull in the runtime-triggered default set. Otherwise the check is `skip`,
+  with a summary naming the opt-in (`--check cloud.reachability`). When it
+  does run: `connect_timeout(1500ms)`, request `timeout(2s)`, and the verdict
+  is `ok` on any HTTP status (even a 404 proves the transport) or `warn` on a
+  transport error — never `fail`; an unreachable cloud is not broken local
+  capture, and a machine with no configured `cloud_url` at all skips for that
+  reason instead.
+- `cloud.runtime` is symmetric with `cloud.bootstrap`: on a plain, non-cloud
+  machine it is `skip`, not `ok` — there is no cloud-runtime state to have
+  evaluated. Its `DIRA_EXTRA_CA_CERTS`-readability arm runs *before* the
+  runtime gate, so a bundle file that is missing or unreadable is reported on
+  every machine, not only inside a detected runtime — the variable was set by
+  something, and every device→cloud client silently drops an unreadable bundle
+  (DIRASH-0033).
 - Three `update.*` checks answer whether self-update is actually taking effect,
   which the passive notice cannot: that only escalates on failures the counter
   saw. `update.rollback` reports a leftover `.dira*.old.restore.<pid>` sidecar,
@@ -150,6 +193,14 @@ changing what a level means for an existing id, does.
   overwrite the evidence it exists to report on.
 - **No `update.*` check ever returns `fail`.** A stale binary is not broken
   capture, and exit `2` is an installer-facing contract meaning it is.
+- **`cloud.reachability` never performs its GET outside a detected cloud
+  runtime or an explicit `--check cloud.reachability`, and never returns
+  `fail`.** The D-0006 exemption is scoped to that one probe, not a general
+  license for `dira doctor` to touch the network.
+- **No `cloud.*` or `hooks.scope_overlap` check ever returns `fail`.** Missing
+  cloud provisioning, an unreachable cloud, stale `.dira/` artifacts, and a
+  double-firing hook are all real findings, but none of them is lost local
+  capture — the one thing exit `2` is reserved for.
 - **The harness hook contract is otherwise unchanged**: a hook still always
   exits 0 and never writes stdout. Probe mode is the sole exception, and only a
   process `dira doctor` spawned itself can be in it.

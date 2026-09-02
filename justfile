@@ -89,11 +89,15 @@ install: release link daemon-restart
     @echo "Installed. `dira` + `dirad` are live from {{bin_dir}} (latest build)."
 
 # Symlink dira + dirad into {{bin_dir}} (idempotent; safe to re-run).
+#
+# The symlinking itself lives in dev-install.sh rather than inline here. It is
+# install-path logic — D-0004's dev-install detection reads the PATH entry with
+# `symlink_metadata` and goes blind the moment these become copies — so it
+# belongs in a shellcheck'd script beside install.sh, under that decision's
+# guard, instead of in a recipe the guard could only reach by claiming the
+# whole justfile and every unrelated recipe in it.
 link:
-    mkdir -p "{{bin_dir}}"
-    ln -sf "{{justfile_directory()}}/target/release/dira" "{{bin_dir}}/dira"
-    ln -sf "{{justfile_directory()}}/target/release/dirad" "{{bin_dir}}/dirad"
-    @echo "Linked dira + dirad -> {{bin_dir}}"
+    sh dev-install.sh "{{justfile_directory()}}" "{{bin_dir}}"
 
 # Restart the resident daemon from the freshly built binary.
 #

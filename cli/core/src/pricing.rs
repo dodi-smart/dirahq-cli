@@ -288,17 +288,36 @@ mod tests {
         }
     }
 
+    /// Pinning literal ids here used to be brittle — a monthly re-sync could drop
+    /// one and the test would rot silently until something noticed prices were
+    /// missing. The sync is now append-only (it never drops a vendored id), so
+    /// pinning is safe, and doing so buys something a looser family/substring
+    /// check does not: a whole provider vanishing from the catalog fails here,
+    /// not just a stale id. One id per supported harness family, plus the full
+    /// Anthropic generation lineup dira actually observes today.
     #[test]
     fn the_bundled_table_parses_and_covers_every_harness_family() {
         let t = table();
         assert!(t.len() > 50, "table looks truncated: {} entries", t.len());
         for id in [
+            // Anthropic (Claude Code): every generation in active use.
+            "claude-opus-5",
             "claude-opus-4-8",
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "claude-fable-5",
+            "claude-fable-5-1",
+            // One id per remaining supported harness family.
+            "gpt-5.3-codex",          // openai/Codex
+            "gemini-3.1-pro-preview", // google/Gemini CLI
+            "grok-4.5",               // xai
         ] {
-            assert!(resolve(id).is_some(), "{id} must resolve");
+            // Presence in the table, not `resolve().is_some()`: the cascade's
+            // prefix step would answer for a missing id out of a shorter
+            // sibling and hide the gap. That is exactly how `claude-fable-5-1`
+            // read as priced while it was absent — it matched `claude-fable-5`
+            // and inherited a cache-read rate four times its own.
+            assert!(t.contains_key(id), "{id} must be a table entry");
         }
     }
 

@@ -6,7 +6,7 @@ guards:
   - cli/dira/src/update/replace.rs
   - install.sh
   - install.ps1
-  - justfile
+  - dev-install.sh
 origin: recorded
 verified: true
 ---
@@ -20,8 +20,8 @@ only. Never a build-tree binary.
 
 ## Why
 
-`just install` symlinks `target/release/{dira,dirad}` into `~/.local/bin`, so
-a contributor's PATH entry points into their build tree. Silently replacing
+`just install` symlinks `target/release/{dira,dirad}` into `~/.local/bin` (via
+`dev-install.sh`), so a contributor's PATH entry points into their build tree. Silently replacing
 that symlink with a released binary destroys their dev loop in a way that is
 confusing to diagnose: `cargo build` keeps succeeding, the binary on PATH
 just stops changing. Overwriting a file *inside* `target/` is worse. The
@@ -47,5 +47,11 @@ sees it.
   never treat `current_exe()` as authoritative for this check.
 - Any new install-like path must reuse `discover_install` rather than
   re-deriving the rule.
+- The dev install must stay a **symlink**. `dev-install.sh` exists so that
+  rule sits in one guarded, shellcheck'd file: copying the binaries onto PATH
+  instead would leave a dev install indistinguishable from a managed one and
+  silently defeat every refusal above. This guard used to name the whole
+  `justfile`, which fired on unrelated recipes and taught readers to skim past
+  it.
 - Error text must name `just install` as the way to update a dev build, and
   give the exact commands to switch to released binaries.

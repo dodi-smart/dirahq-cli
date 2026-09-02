@@ -386,6 +386,12 @@ not-json
     /// `claude-fable-5` used to match nothing and fall through to the sonnet-shaped
     /// fallback, which under-estimated it by ~3×. It is a real family with its own
     /// price, and it must not be reported as unpriced.
+    ///
+    /// `claude-fable-5-1` must be pinned separately, not folded into the
+    /// `claude-fable-5` case above: its `cache_read` is 0.25, a quarter of
+    /// `claude-fable-5`'s 1.0, while every other rate matches. If the two ever
+    /// collapsed onto one table key, cache reads on the newer model would be
+    /// priced 4x too high.
     #[test]
     fn fable_is_priced_and_recognised() {
         let p = pricing_for("claude-fable-5");
@@ -394,6 +400,13 @@ not-json
             (10.0, 50.0, 1.0, 12.5)
         );
         assert_eq!(pricing_family("claude-fable-5"), Some("claude-fable-5"));
+
+        let p1 = pricing_for("claude-fable-5-1");
+        assert_eq!(
+            (p1.input, p1.output, p1.cache_read, p1.cache_write),
+            (10.0, 50.0, 0.25, 12.5)
+        );
+        assert_eq!(pricing_family("claude-fable-5-1"), Some("claude-fable-5-1"));
     }
 
     #[test]
@@ -407,6 +420,7 @@ not-json
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "claude-fable-5",
+            "claude-fable-5-1",
             "grok",
         ] {
             assert!(pricing_family(m).is_some(), "{m}");

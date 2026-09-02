@@ -1,0 +1,83 @@
+name: Cloud capture
+
+# Does a real agent session, wired only through committed config, actually
+# reach dira? Every other test covers a half of that: the unit tests pin what
+# `dira cloud init` writes, `cloud_init_e2e` pins the files on disk, and
+# `doctor --probe` drives dira's own synthetic hook. This job runs Claude Code
+# headless in a simulated cloud runtime and asserts on dira's captured output,
+# so a regression in the hook wiring, the bootstrap, or the writer's
+# enrichment is caught here rather than in someone's cloud session.
+#
+# Costs real tokens on every run, so it is scoped to changes that can plausibly
+# break the cloud path, plus manual dispatch. The run is bounded by
+# --max-budget-usd inside the script.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [develop, main]
+    paths:
+      - "cli/dira/src/cloud_init.rs"
+      - "cli/dira/templates/**"
+      - "cli/dira/src/init.rs"
+      - "cli/dira/src/hook_yield.rs"
+      - "cli/dira/src/device.rs"
+      - "cli/core/src/runtime.rs"
+      - "cli/core/src/httpclient.rs"
+      - ".github/scripts/cloud-capture-smoke.sh"
+      - ".github/workflows/cloud-capture.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cloud-capture:
+    name: Real agent session is captured
+    # GitHub-hosted, never self-hosted: this builds and runs contributor code
+    # straight off a `pull_request` trigger, the same reasoning the `rust` job
+    # in ci.yml spells out at length.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    env:
+      RUST_BACKTRACE: "1"
+      # Absent on fork PRs — GitHub does not expose secrets there. The script
+      # treats that as a documented SKIP, not a failure, so a fork PR stays
+      # green instead of red for a reason its author cannot fix.
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build dira + dirad
+        run: cargo build -p dira -p dirad
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The published CLI is `@anthropic-ai/claude-code` — note that the bare
+      # `claude` name on npm is an unrelated package, not this one. Pinned
+      # rather than `latest` so a CLI release can't silently change the
+      # behavior this smoke test asserts on; bump the fallback here (checked
+      # with `npm view @anthropic-ai/claude-code version`) when it drifts too
+      # far behind, or set the repository variable CLAUDE_CODE_CLI_VERSION to
+      # override without a code change.
+      - name: Install the Claude Code CLI
+        run: npm install -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_CLI_VERSION || '2.1.258' }}"
+
+      - name: A real agent session is captured by dira
+        run: sh .github/scripts/cloud-capture-smoke.sh
+

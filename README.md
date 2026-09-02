@@ -124,6 +124,16 @@ stdin→socket shim (`dira hook <harness>`); OpenCode has no command hooks, so i
 daemon's loopback `/hooks/opencode` route instead. Each harness's own hook vocabulary is
 normalized into Dira's shared event set in `cli/sources`.
 
+### Cloud agent runtimes
+
+Agents that run in the cloud — Claude Code on the web, Cursor cloud agents — get captured
+too: `dira cloud init` generates portable, repo-committed wiring (`.dira/hook.sh`,
+`.dira/bootstrap.sh`, project hook configs) that installs dira inside each session VM,
+captures its hook events, and syncs attestations from there. The generated bootstrap ships
+with a sha256 digest pinned at commit time (`--no-pin` to opt out), so a session VM verifies
+its own download without a second network round trip. See
+[docs/cloud-runtimes.md](docs/cloud-runtimes.md).
+
 ## Cloud sync (optional)
 
 The CLI/daemon point at the hosted cloud (`https://app.dirahq.sh`) out of the box, but

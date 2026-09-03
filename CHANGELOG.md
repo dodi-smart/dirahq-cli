@@ -1,3 +1,29 @@
+## [0.6.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.5.1...v0.6.0) (2026-09-03)
+
+### ✨ Features
+
+* **cli:** teleport dira into cloud agent runtimes ([4929e22](https://github.com/dodi-smart/dirahq-cli/commit/4929e221aac13a1d1fad4cd23c8923611b257b12))
+* **contract:** carry the session runtime on the wire (schema 1.4) ([6d32ebb](https://github.com/dodi-smart/dirahq-cli/commit/6d32ebb398e163a69f0297331ad1e915b9676b92))
+* **daemon:** extra CA roots, sync cadence knobs, identity override, and the flush-time runtime stamp ([1f25bc0](https://github.com/dodi-smart/dirahq-cli/commit/1f25bc01c6d6b91c20252e560f86b9fda69d459f))
+
+### 🐛 Bug Fixes
+
+* **cli:** keep vendored model prices when models.dev stops publishing an id ([09cab09](https://github.com/dodi-smart/dirahq-cli/commit/09cab0980fd8298b2417afc6efc90a317ee21813))
+* **cli:** refresh model pricing from models.dev ([be52623](https://github.com/dodi-smart/dirahq-cli/commit/be52623634f3d47e9e65d44d3aeeda48cb4ee53b))
+* **cli:** refuse a newer database schema with an actionable error, not a bare version number ([e315d3c](https://github.com/dodi-smart/dirahq-cli/commit/e315d3cef936298a458c4f82f1dce819dc3d1739))
+
+### 📚 Documentation
+
+* **repo:** cloud runtimes guide, living spec, and decision records ([92a85cf](https://github.com/dodi-smart/dirahq-cli/commit/92a85cf81fc6987284c7396fa82c86b5753a8dde))
+
+### ♻️ Code Refactoring
+
+* **repo:** move the dev-install symlinking into its own guarded script ([7007a5b](https://github.com/dodi-smart/dirahq-cli/commit/7007a5b83cc602c5bcbf3920d7f9b0d35bfa0210))
+
+### 👷 Continuous Integration
+
+* **repo:** prove a real agent session reaches dira in a simulated cloud runtime ([4cd676c](https://github.com/dodi-smart/dirahq-cli/commit/4cd676cc8e6cd78478537efb75da01e09d0eb7e9))
+
 ## [0.5.1](https://github.com/dodi-smart/dirahq-cli/compare/v0.5.0...v0.5.1) (2026-08-14)
 
 ### 🐛 Bug Fixes

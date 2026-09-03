@@ -30,12 +30,12 @@ every such row is counted and warned about.
 `capture_tokens` used to be handed the project of the single event that
 triggered it and stamped that onto every turn in the pass. One `Stop` whose cwd
 failed to resolve therefore marked every turn since the last watermark
-repo-less — potentially hundreds of turns — while the `Stop`s either side
+repo-less, potentially hundreds of turns, while the `Stop`s either side
 resolved the same repo perfectly well.
 
 The cloud's D-0026 makes that expensive rather than cosmetic: repo-less token
 usage is neither counted nor shown, so an unattributed turn is not merely
-unattributed, it is **invisible**. It is also unrecoverable in place — rows are
+unattributed, it is **invisible**. It is also unrecoverable in place. Rows are
 written `ON CONFLICT(id) DO NOTHING` and the byte watermark advances
 immediately after, so no later, better-attributed pass can repair them.
 
@@ -54,25 +54,26 @@ mis-attribution. So attribution is favoured.
 This also depends on the `ProjectCache` never caching a failure permanently. A
 sticky negative verdict poisons every later event *and* every later turn for
 that cwd until the daemon restarts, which would reduce per-turn resolution to
-theatre. Successes are cached for the writer's lifetime — a repo's origin does
-not move under a running daemon — while failures expire and are retried.
+theatre. Successes are cached for the writer's lifetime, because a repo's
+origin does not move under a running daemon, while failures expire and are
+retried.
 
 Per-turn resolution is free in the steady state precisely because of that cache:
 a pass over hundreds of turns sharing one cwd performs a single git shell-out.
 
 ## Rejected
 
-- **Carry forward the last known-good project only** — cheaper, but silently
+- **Carry forward the last known-good project only**: cheaper, but silently
   wrong for any session that changes repo mid-flight, which is a real case.
-- **Persist `cwd` on `token_usage` / the wire** — a filesystem path is content,
+- **Persist `cwd` on `token_usage` / the wire**: a filesystem path is content,
   it is not needed after resolution, and D-0001 keeps the attestation wire
   content-free.
-- **Repair existing NULL rows with an `UPDATE`** — token rows ride their own
+- **Repair existing NULL rows with an `UPDATE`**: token rows ride their own
   rowid cursor (D-0018) and an `UPDATE` does not move a rowid, so a repaired row
   below the cursor would never re-send and the device and cloud would then
   disagree. That is worse than a known, bounded gap. The source `cwd` is gone in
   any case: the watermark passed those lines and it was never stored.
-- **Decode grok's cwd from its session path** — grok encodes cwd in
+- **Decode grok's cwd from its session path**: grok encodes cwd in
   `~/.grok/sessions/<encoded-cwd>/`, but the encoding is unverified. Guessing it
   would produce confidently wrong attribution, which is worse than the honest
   fallback. Grok keeps `cwd: None` and rides the chain.
@@ -81,9 +82,10 @@ a pass over hundreds of turns sharing one cwd performs a single git shell-out.
 
 - Never attribute a batch of turns from a single event's project. If you add a
   harness, give its turns their own `cwd` or accept the fallback chain.
-- Never write `project = NULL` where a fallback rung is available, and never
-  drop the unattributed counter — an invisible turn must stay visible to the
-  operator even when it cannot be attributed. Visibility is the **aggregate**:
+- Never write `project = NULL` when the chain still offers a fallback, and
+  never drop the unattributed counter. An invisible turn must stay visible to
+  the operator even when it cannot be attributed. Visibility is the
+  **aggregate**:
   `ProgressTracker` plus `dira status --detailed`. It is deliberately NOT a
   per-occurrence `warn` or a line on the default `dira status`: repo-less turns
   are routine (any harness run outside a repo), so both put a permanent

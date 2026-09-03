@@ -336,6 +336,20 @@
             "null"
           ]
         },
+        "runtime": {
+          "description": "The cloud runtime the session ran in (`claude-web`, `cursor-cloud`, …),\nfrom `dira_core::runtime::detect`. Absent for local sessions, so the\ndashboard can badge cloud-agent work without inferring it from device\nlabels. Still metadata-only: a runtime name, never content.\nOptional + omitted-when-absent so older payloads stay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtimeSessionRef": {
+          "description": "The runtime's own session reference (e.g. Claude's remote session id),\nletting the dashboard deep-link the harness-side transcript. Only ever\nset alongside `runtime`.\nOptional + omitted-when-absent so older payloads stay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "sessionId": {
           "description": "Harness session id, or daemon-issued ULID for manual sessions.",
           "type": "string"

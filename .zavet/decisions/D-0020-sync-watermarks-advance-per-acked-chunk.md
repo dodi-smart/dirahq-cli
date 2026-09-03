@@ -17,7 +17,7 @@ verified: true
 ## Decision
 
 `META_TOKEN_CURSOR` and `META_ARTIFACTS_CURSOR` advance on **each chunk's own
-2xx**, to the high rowid that chunk carried — not on the final chunk's ack.
+2xx**, to the high rowid that chunk carried, not on the final chunk's ack.
 A flush that dies part-way keeps everything the cloud already accepted.
 
 Within one flush, consecutive ingest POSTs are spaced once a drain is long
@@ -32,7 +32,7 @@ the flush gate, a count in the log line.
 
 D-0018 gave tokens their own cursor and their own 1000-row chunking, which made
 a drain's chunk count independent of the event backlog. The cloud's ingest
-budget (30/min, fixed window) had been sized on the opposite assumption — its
+budget (30/min, fixed window) had been sized on the opposite assumption. Its
 own comment says "a drain must NEVER be throttled mid-flight, so the budget
 covers a full large drain". Nothing re-derived that sizing when the coupling
 was cut.
@@ -45,7 +45,7 @@ cycle with the cursor blank throughout, and the wasted retries burned the same
 budget ordinary event sync needed.
 
 An all-or-nothing watermark makes progress depend on an unbounded number of
-*consecutive* successes. That is not a rate-limit bug — a network blip or a
+*consecutive* successes. That is not a rate-limit bug. A network blip or a
 daemon restart mid-drain costs the whole backlog just as completely. Per-chunk
 advance makes progress monotonic, so a drain converges over as many windows as
 it needs.
@@ -56,12 +56,12 @@ would leave the restart hazard intact, which is why both ship together.
 
 ## Rejected
 
-- **Raise the cloud's ingest budget** — moves the cliff to the next backlog size
+- **Raise the cloud's ingest budget**: moves the cliff to the next backlog size
   and leaves every non-429 interruption just as expensive.
-- **Pace only, keep the `is_last` watermark** — a drain still loses everything to
+- **Pace only, keep the `is_last` watermark**: a drain still loses everything to
   one blip, and the pacing constant becomes load-bearing for correctness rather
   than for politeness.
-- **A dedicated token flush loop** — rejected in D-0018 for the same reasons, and
+- **A dedicated token flush loop**: rejected in D-0018 for the same reasons, and
   per-chunk advance removes the motivation for it.
 
 ## Agent directives
@@ -69,7 +69,7 @@ would leave the restart hazard intact, which is why both ship together.
 - Advance a stream's watermark on the chunk that carried the rows, in that
   chunk's own 2xx branch. Never gate a watermark on `is_last`.
 - A chunk's watermark is the high rowid **it** carried, never the flush-wide
-  snapshot bound — writing the snapshot bound from a non-final chunk claims rows
+  snapshot bound. Writing the snapshot bound from a non-final chunk claims rows
   that never left the machine.
 - Partial rollups stay on `is_last`: they are a live-registry snapshot, not a
   cursor over stored rows.
@@ -84,7 +84,7 @@ rowid (fails on the old `is_last` code, which left it blank); the follow-up
 flush must send one chunk, not the whole backlog; and the pacing policy tests
 pin that a single-chunk flush is never delayed while a long drain is.
 
-Not verified in the field yet — the stranded backlog on the reporting machine
+Not verified in the field yet. The stranded backlog on the reporting machine
 is the test case, and it has not been re-run against this change.
 
 ## Open questions

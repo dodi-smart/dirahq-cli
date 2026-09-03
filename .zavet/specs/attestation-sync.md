@@ -19,7 +19,7 @@ decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025]
 
 How the daemon turns locally-stored events into signed attestation batches:
 the cursor-windowed flush, deterministic chunking, and the two kinds of
-`SessionRollup` — terminal (ended) and partial (still-live) — including how
+`SessionRollup`, terminal (ended) and partial (still-live), including how
 rollups keep their `prompts`/`branch`/wall-clock when a session outlives a
 single flush window (issue #40).
 
@@ -29,7 +29,7 @@ single flush window (issue #40).
   chunks only at > idle breaks (never inside a billable interval), POSTs each
   chunk, and advances the cursor per 2xx ack. The final chunk carries the
   partial rollups; its ack marks partials sent. Row cursors do NOT ride that
-  flag — each chunk advances the artifact and token watermarks it carried, on
+  flag. Each chunk advances the artifact and token watermarks it carried, on
   its own 2xx (D-0020).
 - Token rows ride `META_TOKEN_CURSOR`, a `token_usage.rowid` watermark, on
   exactly the artifact cursor's discipline. They are NOT selected by the
@@ -38,13 +38,13 @@ single flush window (issue #40).
   load-bearing (D-0018): a turn is discovered by the `Stop` that *follows* it,
   so its transcript timestamp always sorts below the window's own first event,
   and the old `at`-window selection therefore skipped ~97% of captured compute
-  permanently — nothing recorded that a row had never been sent, so no later
+  permanently. Nothing recorded that a row had never been sent, so no later
   flush reconsidered it. `nuke` and a full `dira device resync` both blank the
   cursor; for `nuke` that is required, not tidy, because emptying the table
   lets SQLite re-issue rowid 1 beneath a surviving watermark.
 - Upstream of that cursor, `capture_tokens` reads each transcript from a
   per-file byte watermark (`token_offset:<session>[:<sidecar stem>]`) paired
-  with a prologue fingerprint (`token_fp:` — FNV-1a over the first ≤4 KiB).
+  with a prologue fingerprint (`token_fp:`, FNV-1a over the first ≤4 KiB).
   The offset says WHERE to resume; the fingerprint says WHICH file it refers
   to, because a length comparison alone cannot see a transcript replaced by a
   different file of equal-or-greater length. An ABSENT fingerprint means an
@@ -56,29 +56,28 @@ single flush window (issue #40).
   and that session re-read the same bad tail forever; and once a lossy decode
   is in play, an index into the decoded string is no longer a file offset
   (U+FFFD is 3 bytes per 1–3 replaced). Watermark read/write failures log at
-  `warn` — a watermark that silently stops advancing is what made a 97%
+  `warn`. A watermark that silently stops advancing is what made a 97%
   compute loss invisible for weeks.
 - Artifacts and token rows are spread across those chunks, at most
-  `CHUNK_ARTIFACTS` / `CHUNK_TOKENS` each,
-  with extra artifact-/token-only chunks appended when the backlog outlasts the
-  event chunks. Spreading rather than capping the store read is what keeps
-  those cursors honest — each chunk advances its stream's watermark only to the
-  high rowid IT carried, so the cursor can never move past a row that was not
-  sent, and a drain that dies part-way keeps everything the cloud accepted.
-  Gating those cursors on the final chunk instead made progress depend on an
-  unbounded run of consecutive successes: 48,601 token rows is 49 chunks
-  against the cloud's 30/min ingest budget, so the drain was throttled at
-  chunk 31, recorded nothing, and restarted at row 1 forever (issue #88,
-  D-0020). A long drain now paces its POSTs to stay inside that budget.
-  Artifacts are the fat rows
-  (`touched_paths`, `blobs`); unbounded, a `dira device resync` built one
-  body out of the whole backlog and was rejected `413` (issue #71). The
-  ceiling is the platform's request-body limit, not a cloud policy, so
-  construction is the only place it can be respected.
+  `CHUNK_ARTIFACTS` / `CHUNK_TOKENS` each, with extra artifact-/token-only
+  chunks appended when the backlog outlasts the event chunks. Spreading
+  rather than capping the store read is what keeps those cursors honest.
+  Each chunk advances its stream's watermark only to the high rowid IT
+  carried, so the cursor can never move past a row that was not sent, and a
+  drain that dies part-way keeps everything the cloud accepted. Gating those
+  cursors on the final chunk instead made progress depend on an unbounded
+  run of consecutive successes: 48,601 token rows is 49 chunks against the
+  cloud's 30/min ingest budget, so the drain was throttled at chunk 31,
+  recorded nothing, and restarted at row 1 forever (issue #88, D-0020). A
+  long drain now paces its POSTs to stay inside that budget. Artifacts are
+  the fat rows (`touched_paths`, `blobs`); unbounded, a `dira device resync`
+  built one body out of the whole backlog and was rejected `413` (issue
+  #71). The ceiling is the platform's request-body limit, not a cloud
+  policy, so construction is the only place it can be respected.
 - A session whose entire life is lifecycle events is not a session. The live
-  registry marks `had_signal` on the first human signal OR agent activity —
-  deliberately the union, so an agent-only run is real on its first tool
-  call — and `SessionRegistry::active` reports only sessions that are
+  registry marks `had_signal` on the first human signal OR agent activity.
+  That is deliberately the union, so an agent-only run is real on its first
+  tool call. `SessionRegistry::active` reports only sessions that are
   `!ended`, have shown a signal, and are not stale. Staleness matters
   because `ended` is not a latch and a crashed harness never sends
   `SessionEnd`: without the bound such a session is broadcast as live
@@ -87,7 +86,7 @@ single flush window (issue #40).
 - Terminal rollups are emitted by the chunk whose slice contains the
   session's `SessionEnd`/`ManualStop`, but are aggregated over the session's
   FULL retained event history (`Store::events_for_sessions`, bounded by the
-  window's `until` id), not just the tail window — prompts, branch,
+  window's `until` id), not just the tail window. Prompts, branch,
   `started_at`, and clamped `agent_wall_seconds` cover the whole
   session. Best-effort: compaction prunes events that are both synced and
   past retention, so a session outliving retention rolls up from what
@@ -99,25 +98,26 @@ single flush window (issue #40).
   makes the latest end win.
 - Partial rollups describe still-live sessions from the daemon's in-memory
   registry: rolling clamped `active_seconds`, a live `prompts` counter,
-  and the last-resolved branch (last-wins — the honest answer for a live
+  and the last-resolved branch (last-wins is the honest answer for a live
   session, deliberately unlike the terminal rollup's start-branch policy,
-  whose write supersedes the partial anyway). The registry is a pure fold
-  over events, so daemon-restart hydration replays it back for free.
+  whose write supersedes the partial anyway). The registry is a pure
+  reduction over events, so daemon-restart hydration replays it back for
+  free.
 
 ## Interfaces & data
 
 - `dira_core::sync::build_chunked_batches(events, tokens, artifacts,
-  partials, device_id, idle, now, seed, history)` — `history` feeds ONLY
+  partials, device_id, idle, now, seed, history)`. `history` feeds ONLY
   `build_sessions`; intervals and `batch_id_for_chunk` remain pure functions
   of the window, so batch ids are byte-identical with or without history.
-- `Store::events_for_sessions(session_ids, until)` — per-id queries riding
+- `Store::events_for_sessions(session_ids, until)`. Per-id queries ride
   `idx_events_session_at`; no cross-session ordering guarantee.
 - History merging dedups by event id (ULID, the events PK) against the chunk
-  slice, which also folds in same-window events sitting in other chunks.
+  slice, which also includes same-window events sitting in other chunks.
 - The flush's summary log reads the cloud's ack through
   `dira_core::sync::parse_ingest_response`, the same parser the epoch/watermark
-  handshake uses — response-only and unsigned, so its fields never touch the
-  signing vector. Its `accepted`/`duplicates` are `Option`, and an absent
+  handshake uses. It is response-only and unsigned, so its fields never touch
+  the signing vector. Its `accepted`/`duplicates` are `Option`, and an absent
   count renders `-`. The contract's `IngestAck` is NOT used here: every field
   is `#[serde(default)]`, so it cannot tell "absent" from "zero" and turned
   the live cloud's counter-free 202 into `accepted=0 duplicates=0` on every
@@ -128,9 +128,9 @@ single flush window (issue #40).
   2xx report it via `dira_core::sync::warn_unreadable_body` and continue on
   defaults; callers parsing an *error* body fall back quietly, since a proxy's
   HTML 502 is not contract drift. Before #104 all of these were
-  `unwrap_or_default()`, so an unreadable ack dropped `dataEpoch` — a cloud that
-  had reset its durable log was indistinguishable from one that never mentioned
-  an epoch, and the re-send never fired.
+  `unwrap_or_default()`, so an unreadable ack dropped `dataEpoch`. A cloud
+  that had reset its durable log was indistinguishable from one that never
+  mentioned an epoch, and the re-send never fired.
 
 ## Invariants
 
@@ -139,11 +139,11 @@ single flush window (issue #40).
   unresolved `Stop` would otherwise mark every turn since the last watermark
   repo-less, and repo-less compute is invisible rather than merely unlabelled.
 - A row is written with no project only when the turn's cwd, the triggering
-  event, and the session's sticky project are all unavailable — and every such
+  event, and the session's sticky project are all unavailable. Every such
   row is counted and warned, never silently dropped.
 - `TokenTurn.cwd` is capture-time provenance only. It never reaches the
   `token_usage` table, the contract, or the wire.
-- Nothing content-bearing crosses the wire — rollups are metadata only
+- Nothing content-bearing crosses the wire. Rollups are metadata only
   (D-0001); the flush path performs no foreground network I/O outside the
   sync task (D-0006).
 - Cloud merge semantics the rollups rely on: partial UPSERTs are
@@ -152,7 +152,7 @@ single flush window (issue #40).
   monotonic (≥ the last partial's rolling counters).
 - A retried chunk after compaction may carry slightly different rollup
   content under the same `batch_id`; the cloud's batch-id dedup keeps the
-  first accepted version — every version is a superset of the old
+  first accepted version. Every version is a superset of the old
   tail-only rollup.
 - Exactly one chunk per flush carries `is_last`, and it is the final one.
   Both the artifact cursor and the partial-sent watermark hang off it, so a

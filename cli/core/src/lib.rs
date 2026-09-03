@@ -9,12 +9,15 @@
 
 pub mod accounting;
 pub mod config;
+pub mod env;
+pub mod httpclient;
 pub mod identity;
 pub mod model;
 pub mod pricing;
 pub mod project;
 pub mod protocol;
 pub mod report;
+pub mod runtime;
 pub mod signing;
 pub mod store;
 pub mod sync;
@@ -36,6 +39,13 @@ pub enum Error {
     Sqlx(Box<sqlx::Error>),
     #[error("migration error: {0}")]
     Migrate(Box<sqlx::migrate::MigrateError>),
+    #[error(
+        "{db} was last written by a newer dira/dirad (it records schema migration {version}, \
+         which this binary does not know). Refusing to run against a newer schema. \
+         Update this binary (`dira update`), or restore the version that wrote the database \
+         (`dira update --version <that version>`)."
+    )]
+    SchemaNewer { version: i64, db: String },
     #[error("time formatting error: {0}")]
     Time(String),
     #[error("time parse error: {0}")]

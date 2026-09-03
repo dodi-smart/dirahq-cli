@@ -298,7 +298,10 @@ fn archive_extension(target: &str) -> &'static str {
     }
 }
 
-fn asset_names(version: &str, target: &str) -> (String, String) {
+/// `pub(crate)`: `dira cloud init` (WP-G, digest pinning) reuses this to name
+/// the two musl `.sha256` assets it fetches at generation time, without
+/// duplicating the naming rule.
+pub(crate) fn asset_names(version: &str, target: &str) -> (String, String) {
     (
         format!("dira-{version}-{target}.{}", archive_extension(target)),
         format!("dira-{version}-{target}.sha256"),

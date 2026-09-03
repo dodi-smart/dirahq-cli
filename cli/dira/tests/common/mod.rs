@@ -17,6 +17,7 @@
 //!    still overlap.
 
 #![allow(dead_code)] // each test binary uses a different subset
+#![allow(unused_imports)] // ditto — a binary that doesn't use MockGitHub doesn't need axum
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -93,5 +94,134 @@ pub fn isolate_user_dirs(cmd: &mut Command, home: &Path) {
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_DATA_HOME", home.join("data"))
         .env("DIRA_SOCKET_PATH", home.join("isolated-never-created.sock"))
-        .env("DIRA_DB_PATH", home.join("isolated.db"));
+        .env("DIRA_DB_PATH", home.join("isolated.db"))
+        // A developer with a relocated Claude Code config (`CLAUDE_CONFIG_DIR`
+        // set in their own shell) must not have it leak into a subprocess that
+        // is supposed to see only the isolated `home` above — `hook_yield`
+        // and `init::harness_config_paths` both honour this var to find
+        // Claude's user-scope settings.json.
+        .env_remove("CLAUDE_CONFIG_DIR");
+}
+
+// ---------------------------------------------------------------------------
+// mock GitHub: one route for `/repos/{repo}/releases/latest`, one generic
+// filename-keyed asset route standing in for `DIRA_DOWNLOAD_URL`'s base.
+//
+// Started life in `update_e2e.rs` (`dira update`'s own e2e suite); moved here
+// so `cloud_init_e2e.rs` can reuse `download_base()` for the release-digest
+// fetch (WP-G) without a second copy of the same mock server drifting from
+// this one.
+// ---------------------------------------------------------------------------
+
+use axum::extract::Path as AxPath;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Router;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+#[derive(Clone, Default)]
+struct MockState {
+    latest_body: Arc<Mutex<String>>,
+    assets: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    /// When set, answer 401 to any request carrying an `Authorization` header
+    /// while still serving anonymous ones — GitHub's behaviour for a stale or
+    /// expired token.
+    reject_authorized: Arc<Mutex<bool>>,
+}
+
+pub struct MockGitHub {
+    base_url: String,
+    state: MockState,
+}
+
+impl MockGitHub {
+    pub async fn start() -> Self {
+        let state = MockState::default();
+
+        let latest_state = state.clone();
+        let assets_state = state.clone();
+        let router = Router::new()
+            .route(
+                "/repos/{repo}/releases/latest",
+                get(
+                    move |AxPath(_repo): AxPath<String>, headers: axum::http::HeaderMap| {
+                        // Stands in for a stale/expired credential: GitHub 401s
+                        // an request carrying a bad bearer while serving the
+                        // very same endpoint anonymously. See
+                        // `reject_authorized_requests`.
+                        let reject = *latest_state.reject_authorized.lock().unwrap();
+                        let authorized = headers.contains_key(axum::http::header::AUTHORIZATION);
+                        let body = latest_state.latest_body.lock().unwrap().clone();
+                        async move {
+                            if reject && authorized {
+                                return StatusCode::UNAUTHORIZED.into_response();
+                            }
+                            ([("content-type", "application/json")], body).into_response()
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/assets/{filename}",
+                get(move |AxPath(filename): AxPath<String>| {
+                    let assets_state = assets_state.clone();
+                    async move {
+                        let assets = assets_state.assets.lock().unwrap();
+                        match assets.get(&filename) {
+                            Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock GitHub server");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        Self {
+            base_url: format!("http://{addr}"),
+            state,
+        }
+    }
+
+    pub fn download_base(&self) -> String {
+        format!("{}/assets", self.base_url)
+    }
+
+    /// The mock server's own root — what `DIRA_API_URL` should point at for
+    /// a test that exercises `/repos/{repo}/releases/latest` (i.e. anything
+    /// that resolves "latest" rather than pinning `--version`).
+    pub fn api_base(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn set_latest_tag(&self, tag: &str) {
+        let body = serde_json::json!({
+            "tag_name": tag,
+            "prerelease": false,
+            "draft": false,
+            "assets": []
+        });
+        *self.state.latest_body.lock().unwrap() = body.to_string();
+    }
+
+    /// Make every authenticated request 401 while anonymous ones keep working.
+    pub fn reject_authorized_requests(&self) {
+        *self.state.reject_authorized.lock().unwrap() = true;
+    }
+
+    pub fn put_asset(&self, name: &str, bytes: Vec<u8>) {
+        self.state
+            .assets
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), bytes);
+    }
 }

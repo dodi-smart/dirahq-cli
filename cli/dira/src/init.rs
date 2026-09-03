@@ -24,7 +24,7 @@
 use anyhow::{bail, Context, Result};
 use dira_core::{Config, Store};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What a single harness's wiring actually did.
 ///
@@ -126,7 +126,7 @@ pub enum OnUnparseable {
 }
 
 /// Claude Code events we hook and whether they need a tool matcher.
-const CLAUDE_EVENTS: &[(&str, bool)] = &[
+pub(crate) const CLAUDE_EVENTS: &[(&str, bool)] = &[
     ("SessionStart", false),
     ("SessionEnd", false),
     ("UserPromptSubmit", false),
@@ -151,7 +151,7 @@ const GEMINI_EVENTS: &[(&str, bool)] = &[
 ];
 
 /// Cursor hook event names (camelCase). Mapped in `dira_sources::cursor`.
-const CURSOR_EVENTS: &[&str] = &[
+pub(crate) const CURSOR_EVENTS: &[&str] = &[
     "sessionStart",
     "sessionEnd",
     "beforeSubmitPrompt",
@@ -224,20 +224,37 @@ pub async fn wire(
 pub fn run(global: bool, print_only: bool, on_unparseable: OnUnparseable) -> Result<Wired> {
     let (command, legacy_command) = hook_commands("claude");
     let path = if global {
-        dira_core::config::home_dir()
-            .context("resolve home directory")?
-            .join(".claude/settings.json")
+        claude_user_settings_path()?
     } else {
         PathBuf::from(".claude/settings.json")
     };
-    apply_json_settings(
+    let mut note = None;
+    let wired = apply_json_settings(
         path,
         print_only,
         on_unparseable,
         "Claude Code",
         &command,
-        |s| inject_nested_hooks(s, &command, &legacy_command, CLAUDE_EVENTS, "*"),
-    )
+        |s| {
+            let added = inject_nested_hooks(
+                s,
+                CLAUDE_EVENTS,
+                "*",
+                &HookWrite {
+                    command_for: &|_| command.clone(),
+                    legacy_command: Some(&legacy_command),
+                    replace_dira: None,
+                    harness: "claude",
+                    timeout_for: None,
+                },
+            );
+            if added == 0 {
+                note = portable_wrapper_note(s, "claude");
+            }
+            added
+        },
+    )?;
+    Ok(Wired { note, ..wired })
 }
 
 /// `dira init gemini` — wire Gemini CLI command hooks into `~/.gemini/settings.json`
@@ -258,7 +275,20 @@ pub fn run_gemini(global: bool, print_only: bool, on_unparseable: OnUnparseable)
         on_unparseable,
         "Gemini CLI",
         &command,
-        |s| inject_nested_hooks(s, &command, &legacy_command, GEMINI_EVENTS, ".*"),
+        |s| {
+            inject_nested_hooks(
+                s,
+                GEMINI_EVENTS,
+                ".*",
+                &HookWrite {
+                    command_for: &|_| command.clone(),
+                    legacy_command: Some(&legacy_command),
+                    replace_dira: None,
+                    harness: "gemini",
+                    timeout_for: None,
+                },
+            )
+        },
     )
 }
 
@@ -273,9 +303,25 @@ pub fn run_cursor(global: bool, print_only: bool, on_unparseable: OnUnparseable)
     } else {
         PathBuf::from(".cursor/hooks.json")
     };
-    apply_json_settings(path, print_only, on_unparseable, "Cursor", &command, |s| {
-        inject_cursor_hooks(s, &command, &legacy_command)
-    })
+    let mut note = None;
+    let wired = apply_json_settings(path, print_only, on_unparseable, "Cursor", &command, |s| {
+        let added = inject_flat_hooks(
+            s,
+            CURSOR_EVENTS,
+            &HookWrite {
+                command_for: &|_| command.clone(),
+                legacy_command: Some(&legacy_command),
+                replace_dira: None,
+                harness: "cursor",
+                timeout_for: None,
+            },
+        );
+        if added == 0 {
+            note = portable_wrapper_note(s, "cursor");
+        }
+        added
+    })?;
+    Ok(Wired { note, ..wired })
 }
 
 /// `dira init grok` — wire Grok Build hooks into `~/.grok/hooks/dira.json`.
@@ -304,7 +350,20 @@ pub fn run_grok(global: bool, print_only: bool, on_unparseable: OnUnparseable) -
         on_unparseable,
         "Grok Build",
         &command,
-        |s| inject_nested_hooks(s, &command, &legacy_command, GROK_EVENTS, "*"),
+        |s| {
+            inject_nested_hooks(
+                s,
+                GROK_EVENTS,
+                "*",
+                &HookWrite {
+                    command_for: &|_| command.clone(),
+                    legacy_command: Some(&legacy_command),
+                    replace_dira: None,
+                    harness: "grok",
+                    timeout_for: None,
+                },
+            )
+        },
     )?;
     Ok(Wired { note, ..wired })
 }
@@ -366,12 +425,12 @@ fn hook_commands(harness: &str) -> (String, String) {
     (command, legacy_command)
 }
 
-/// Does this hook group already invoke our command, in either form?
+/// Does this hook group already carry a command the predicate accepts?
 ///
 /// The single source of truth for "is dira wired here", shared by `dira init`'s
 /// idempotency check and `dira doctor`'s reader — they cannot disagree about
 /// what a wired entry looks like if they ask the same function.
-fn group_has_command(group: &Value, command: &str, legacy_command: &str) -> bool {
+fn group_has_matching(group: &Value, current: impl Fn(&str) -> bool) -> bool {
     group
         .get("hooks")
         .and_then(|h| h.as_array())
@@ -379,7 +438,7 @@ fn group_has_command(group: &Value, command: &str, legacy_command: &str) -> bool
             hs.iter().any(|h| {
                 matches!(
                     h.get("command").and_then(|c| c.as_str()),
-                    Some(c) if c == command || c == legacy_command
+                    Some(c) if current(c)
                 )
             })
         })
@@ -404,7 +463,38 @@ fn group_has_command(group: &Value, command: &str, legacy_command: &str) -> bool
 pub(crate) fn command_invokes_hook(command: &str, harness: &str) -> bool {
     let command = command.trim();
     let suffix = format!(" hook {harness}");
-    command.ends_with(&suffix) && command.len() > suffix.len()
+    if command.ends_with(&suffix) && command.len() > suffix.len() {
+        return true;
+    }
+    // The repo-committed portable wrappers `dira cloud init` writes are
+    // dira-wired too — the reader must recognise them or `doctor` reports a
+    // teleport-ready repo as unwired.
+    command_is_portable_wrapper(command, harness)
+}
+
+/// Is `command` one of the repo-committed portable wrappers `dira cloud init`
+/// writes (`sh …/.dira/hook.sh <harness>`, or `bootstrap.sh` which ends by
+/// forwarding through it)? Anchored the same way as the direct form in
+/// [`command_invokes_hook`]: suffix match, non-empty prefix, so a bare
+/// `hook.sh claude` or a `--flag`-suffixed command doesn't count. The names
+/// come from the writer's consts, so writer and reader cannot drift.
+///
+/// Split out from [`command_invokes_hook`] because two callers need the
+/// distinction, not just the union: `dira init` in merge mode treats a
+/// portable entry as already wired (never duplicates it with an absolute
+/// path), and the portable hook itself yields to user-scope wiring only when
+/// that wiring is *not* another portable wrapper.
+pub(crate) fn command_is_portable_wrapper(command: &str, harness: &str) -> bool {
+    let command = command.trim();
+    [
+        crate::cloud_init::HOOK_SCRIPT,
+        crate::cloud_init::BOOTSTRAP_SCRIPT,
+    ]
+    .iter()
+    .any(|script| {
+        let suffix = format!("{script} {harness}");
+        command.ends_with(&suffix) && command.len() > suffix.len()
+    })
 }
 
 /// Is `event` wired to a dira hook for `harness` in this settings tree?
@@ -417,7 +507,10 @@ pub(crate) fn command_invokes_hook(command: &str, harness: &str) -> bool {
 /// Deliberately tolerant: a missing `hooks` object or a non-array
 /// `hooks.<Event>` reads as "not wired", never as an error. A diagnostic that
 /// refuses to run on a hand-edited config is a diagnostic nobody can use.
-fn event_is_wired(settings: &Value, event: &str, harness: &str) -> bool {
+///
+/// Shared with the portable hook's yield check (`hook_yield`), which asks the
+/// same question of the user-scope file before forwarding an event.
+pub(crate) fn event_is_wired(settings: &Value, event: &str, harness: &str) -> bool {
     let invokes = |v: &Value| {
         v.get("command")
             .and_then(|c| c.as_str())
@@ -433,6 +526,41 @@ fn event_is_wired(settings: &Value, event: &str, harness: &str) -> bool {
                     || e.get("hooks")
                         .and_then(|h| h.as_array())
                         .is_some_and(|inner| inner.iter().any(invokes))
+            })
+        })
+}
+
+/// Is `event` wired for `harness` in this settings tree specifically through
+/// a repo-committed portable wrapper — [`command_is_portable_wrapper`], not
+/// [`command_invokes_hook`]'s broader "some dira hook, direct or portable"
+/// question [`event_is_wired`] answers?
+///
+/// Shared tree-walk with [`event_is_wired`], narrower predicate. This is the
+/// other half of the portable hook's yield condition (DIRASH-0037): the
+/// marker (`DIRA_HOOK_VIA=portable`) alone is not proof that a real portable
+/// invocation is under way, so `hook_yield` also asks whether the
+/// **project**-scope config for this harness genuinely wires this event
+/// through the wrapper before it will let a live user-scope entry take over.
+pub(crate) fn event_wired_by_portable_wrapper(
+    settings: &Value,
+    event: &str,
+    harness: &str,
+) -> bool {
+    let wraps = |v: &Value| {
+        v.get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| command_is_portable_wrapper(c, harness))
+    };
+    settings
+        .get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|a| a.as_array())
+        .is_some_and(|entries| {
+            entries.iter().any(|e| {
+                wraps(e)
+                    || e.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .is_some_and(|inner| inner.iter().any(wraps))
             })
         })
 }
@@ -480,6 +608,48 @@ pub(crate) fn dira_hook_commands(settings: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// When a merge-mode write (`dira init`) added nothing because every event
+/// was already carried by a `dira cloud init` portable wrapper, the note
+/// `run`/`run_cursor` attach to the result explaining why — a bare "wired 0
+/// events" reads as broken, not as "already covered by the committed
+/// wrapper". `None` when nothing wired via the wrapper (the ordinary
+/// already-wired-by-`dira init`-itself case, which needs no extra words).
+pub(crate) fn portable_wrapper_note(settings: &Value, harness: &str) -> Option<String> {
+    contains_portable_wrapper_command(settings, harness).then(|| {
+        "note: hooks are already wired via the portable `dira cloud init` wrapper \
+         (.dira/hook.sh / .dira/bootstrap.sh) — leaving it as-is."
+            .to_string()
+    })
+}
+
+/// Does `settings` carry any command, in either shape, that
+/// [`command_is_portable_wrapper`] recognises for `harness`?
+///
+/// Deliberately NOT [`dira_hook_commands`]: that helper filters on the
+/// literal substring `" hook "`, which the direct `dira hook <harness>` form
+/// contains and the portable `sh …/.dira/hook.sh <harness>` form does not (no
+/// space precedes `hook.sh`). Reusing it here would silently never match a
+/// wrapper. Walks the same two shapes [`event_is_wired`] does.
+fn contains_portable_wrapper_command(settings: &Value, harness: &str) -> bool {
+    let Some(events) = settings.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    let matches = |v: &Value| {
+        v.get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| command_is_portable_wrapper(c, harness))
+    };
+    events.values().filter_map(|e| e.as_array()).any(|entries| {
+        entries.iter().any(|entry| {
+            matches(entry)
+                || entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|inner| inner.iter().any(matches))
+        })
+    })
 }
 
 /// Split the executable back out of a configured hook command string — the
@@ -551,16 +721,50 @@ pub(crate) fn harness_config_paths() -> Vec<HarnessConfig> {
         }
     }
     if let Ok(home) = &home {
+        let claude_config_dir = dira_core::env::non_blank(ENV_CLAUDE_CONFIG_DIR);
         for (harness, rel, events, _) in HARNESS_CONFIGS {
+            // Claude Code's user scope moves with CLAUDE_CONFIG_DIR; the
+            // reader must look where Claude Code reads, or a relocated user
+            // sees a stale `~/.claude/settings.json` reported as live wiring.
+            let path = if *harness == "claude" {
+                claude_user_settings_path_from(claude_config_dir.as_deref(), home)
+            } else {
+                home.join(rel)
+            };
             out.push(HarnessConfig {
                 harness,
                 scope: "global",
-                path: home.join(rel),
+                path,
                 events: events(),
             });
         }
     }
     out
+}
+
+/// Env var Claude Code honours to relocate its user config directory
+/// (`~/.claude` by default); the user-scope `settings.json` lives inside it.
+pub(crate) const ENV_CLAUDE_CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
+
+/// The user-scope Claude Code settings file — the one `dira init --global`
+/// writes and the portable hook's yield check reads. Honours
+/// [`ENV_CLAUDE_CONFIG_DIR`] so writer and reader both follow Claude Code
+/// when it has been relocated, and fall back to `~/.claude/settings.json`.
+pub(crate) fn claude_user_settings_path() -> Result<PathBuf> {
+    let home = dira_core::config::home_dir().context("resolve home directory")?;
+    Ok(claude_user_settings_path_from(
+        dira_core::env::non_blank(ENV_CLAUDE_CONFIG_DIR).as_deref(),
+        &home,
+    ))
+}
+
+/// Pure core of [`claude_user_settings_path`], so the precedence is testable
+/// without touching process-global env.
+fn claude_user_settings_path_from(config_dir: Option<&str>, home: &Path) -> PathBuf {
+    match config_dir {
+        Some(dir) => PathBuf::from(dir).join("settings.json"),
+        None => home.join(".claude/settings.json"),
+    }
 }
 
 /// Load a JSON settings file (or start empty), let `inject` merge our hooks in,
@@ -570,7 +774,7 @@ pub(crate) fn harness_config_paths() -> Vec<HarnessConfig> {
 /// `inject` returns how many events it newly added, which is what lets a
 /// caller distinguish "wired it" from "was already wired" without re-reading
 /// the file.
-fn apply_json_settings(
+pub(crate) fn apply_json_settings(
     path: PathBuf,
     print_only: bool,
     on_unparseable: OnUnparseable,
@@ -681,13 +885,14 @@ pub fn run_codex(_print_only: bool) -> Result<Wired> {
     })
 }
 
-/// Whether `path` already holds exactly `plugin` — a missing or unreadable
+/// Whether `path` already holds exactly `content` — a missing or unreadable
 /// file, or content that differs at all, is "not current" and must be
 /// (re)written. Pulled out of [`run_opencode`] so the no-op decision is
 /// testable against a real temp file without resolving `home_dir()` or a
-/// daemon bearer token, neither of which this check needs.
-fn opencode_plugin_is_current(path: &std::path::Path, plugin: &str) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|existing| existing == plugin)
+/// daemon bearer token, neither of which this check needs. Also the no-op
+/// check for `dira cloud init`'s committed scripts (`cloud_init::write_script`).
+pub(crate) fn content_is_current(path: &std::path::Path, content: &str) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|existing| existing == content)
 }
 
 /// `dira init opencode` — write the forwarder plugin to
@@ -725,7 +930,7 @@ pub async fn run_opencode(config: &Config, print_only: bool) -> Result<Wired> {
     // including onboarding's second, nothing-should-change pass — rewrote
     // the file and reported it as newly wired. Read the existing file
     // first; identical content is a real no-op.
-    let events_added = if opencode_plugin_is_current(&path, &plugin) {
+    let events_added = if content_is_current(&path, &plugin) {
         0
     } else {
         std::fs::write(&path, &plugin)?;
@@ -765,20 +970,75 @@ async fn resolve_bearer(config: &Config) -> Result<String> {
         )
 }
 
+/// The `timeout_for` field of [`HookWrite`], named so clippy's
+/// `type_complexity` lint doesn't fire on it inline.
+pub(crate) type TimeoutFor<'a> = dyn Fn(&str) -> Option<u64> + 'a;
+
+/// How a hook writer decides what to inject and what already counts as its
+/// own. One policy struct instead of parallel writer stacks: `dira init` and
+/// `dira cloud init` differ only in these four choices, and a single writer
+/// keeps them both in agreement with the one reader ([`command_invokes_hook`]).
+pub(crate) struct HookWrite<'a> {
+    /// The command to inject for a given event — constant for `dira init`,
+    /// per-event for `dira cloud init` (whose SessionStart runs the bootstrap
+    /// while every other event goes through the wrapper).
+    pub command_for: &'a dyn Fn(&str) -> String,
+    /// A second, legacy spelling that also counts as current — the
+    /// pre-upgrade unquoted form `dira init` may have written (see
+    /// [`hook_commands`]). Never re-added, never stripped.
+    pub legacy_command: Option<&'a str>,
+    /// When set, strip any OTHER dira-invoking entry for this harness before
+    /// adding (the `cloud init` replace semantics: an absolute-path
+    /// `dira init` leftover must not coexist with the portable form).
+    /// `None` = merge-only, `dira init`'s posture.
+    pub replace_dira: Option<&'a str>,
+    /// The harness this write is for — needed only to check an existing
+    /// command against [`command_is_portable_wrapper`] in [`is_current`].
+    ///
+    /// [`is_current`]: HookWrite::is_current
+    pub harness: &'a str,
+    /// Per-event `"timeout"` (seconds) to embed beside `"command"`, or `None`
+    /// to omit the field entirely — every `dira init` caller passes `None`,
+    /// so its entries stay byte-identical. `dira cloud init`'s SessionStart/
+    /// sessionStart bootstrap entry is the only thing that sets this: the
+    /// provisioning step (download + daemon start) needs headroom past a
+    /// harness's default hook timeout.
+    pub timeout_for: Option<&'a TimeoutFor<'a>>,
+}
+
+impl HookWrite<'_> {
+    /// Is an existing command string the entry this writer would inject?
+    ///
+    /// In merge mode (`replace_dira: None`, `dira init`'s posture) a
+    /// repo-committed portable wrapper for this harness also counts as
+    /// current: `dira init` must not lay a machine-specific entry beside a
+    /// `dira cloud init` wrapper that already delivers the same event. Replace
+    /// mode (`cloud init`) does not take this shortcut — it keeps exact
+    /// matching so a stale wrapper spelling (an old script name, say) is still
+    /// recognised as stale and replaced rather than mistaken for current.
+    fn is_current(&self, existing: &str, desired: &str) -> bool {
+        existing == desired
+            || self.legacy_command == Some(existing)
+            || (self.replace_dira.is_none() && command_is_portable_wrapper(existing, self.harness))
+    }
+
+    /// Should an existing command be stripped before adding `desired`?
+    fn is_stale(&self, existing: &str, desired: &str) -> bool {
+        self.replace_dira.is_some_and(|harness| {
+            command_invokes_hook(existing, harness) && !self.is_current(existing, desired)
+        })
+    }
+}
+
 /// Ensure each event has our command hook under a Claude/Gemini-shaped `hooks`
-/// object, without clobbering existing hooks. `matcher` is the catch-all value for
-/// tool events (`*` for Claude, `.*` for Gemini's regex matcher).
-///
-/// `legacy_command` is the always-unquoted form of `command` a pre-upgrade
-/// `dira init` may have already written (see [`hook_commands`]) — the
-/// "already installed" check matches either form so re-running `init` after
-/// an upgrade doesn't duplicate the entry.
-fn inject_nested_hooks(
+/// object, without clobbering non-dira hooks. `matcher` is the catch-all value
+/// for tool events (`*` for Claude, `.*` for Gemini's regex matcher).
+/// Returns how many events changed (an add or, in replace mode, a strip).
+pub(crate) fn inject_nested_hooks(
     settings: &mut Value,
-    command: &str,
-    legacy_command: &str,
     events: &[(&str, bool)],
     matcher: &str,
+    write: &HookWrite,
 ) -> usize {
     let hooks = settings
         .as_object_mut()
@@ -787,8 +1047,9 @@ fn inject_nested_hooks(
         .or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().expect("hooks is an object");
 
-    let mut added = 0;
+    let mut changed = 0;
     for (event, needs_matcher) in events {
+        let desired = (write.command_for)(event);
         let arr = hooks
             .entry((*event).to_string())
             .or_insert_with(|| json!([]));
@@ -797,38 +1058,62 @@ fn inject_nested_hooks(
             None => continue,
         };
 
+        let mut event_changed = false;
+        if write.replace_dira.is_some() {
+            // Strip stale dira entries from each group, then drop groups that
+            // end up empty — non-dira hooks are never touched.
+            for group in arr.iter_mut() {
+                if let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    let before = inner.len();
+                    inner.retain(|e| {
+                        !e.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|c| write.is_stale(c, &desired))
+                    });
+                    event_changed |= inner.len() != before;
+                }
+            }
+            let before = arr.len();
+            arr.retain(|group| {
+                group
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_none_or(|inner| !inner.is_empty())
+            });
+            event_changed |= arr.len() != before;
+        }
+
         let already = arr
             .iter()
-            .any(|group| group_has_command(group, command, legacy_command));
-        if already {
-            continue;
+            .any(|group| group_has_matching(group, |c| write.is_current(c, &desired)));
+        if !already {
+            let mut hook_entry = json!({ "type": "command", "command": desired });
+            if let Some(seconds) = write.timeout_for.and_then(|f| f(event)) {
+                hook_entry["timeout"] = json!(seconds);
+            }
+            let mut group = json!({ "hooks": [ hook_entry ] });
+            if *needs_matcher {
+                group["matcher"] = json!(matcher);
+            }
+            arr.push(group);
+            event_changed = true;
         }
-
-        let mut group = json!({ "hooks": [ { "type": "command", "command": command } ] });
-        if *needs_matcher {
-            group["matcher"] = json!(matcher);
-        }
-        arr.push(group);
-        added += 1;
+        changed += usize::from(event_changed);
     }
-    added
+    changed
 }
 
-/// Ensure each Cursor event has our `{ command }` entry under `hooks`, without
-/// clobbering existing ones. Cursor's `hooks.json` is a flat `{ version, hooks }`.
-///
-/// `legacy_command` is the always-unquoted form of `command` a pre-upgrade
-/// `dira init` may have already written (see [`hook_commands`]) — matched
-/// alongside `command` so re-running `init` after an upgrade doesn't
-/// duplicate the entry.
-fn inject_cursor_hooks(settings: &mut Value, command: &str, legacy_command: &str) -> usize {
+/// Cursor's flat-shape twin of [`inject_nested_hooks`]: each event holds
+/// `{ command }` entries directly under a `{ version, hooks }` object.
+pub(crate) fn inject_flat_hooks(settings: &mut Value, events: &[&str], write: &HookWrite) -> usize {
     let obj = settings.as_object_mut().expect("settings is an object");
     obj.entry("version".to_string()).or_insert_with(|| json!(1));
     let hooks = obj.entry("hooks".to_string()).or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().expect("hooks is an object");
 
-    let mut added = 0;
-    for event in CURSOR_EVENTS {
+    let mut changed = 0;
+    for event in events {
+        let desired = (write.command_for)(event);
         let arr = hooks
             .entry((*event).to_string())
             .or_insert_with(|| json!([]));
@@ -836,19 +1121,78 @@ fn inject_cursor_hooks(settings: &mut Value, command: &str, legacy_command: &str
             Some(a) => a,
             None => continue,
         };
+
+        let before = arr.len();
+        arr.retain(|e| {
+            !e.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| write.is_stale(c, &desired))
+        });
+        let mut event_changed = arr.len() != before;
+
         let already = arr.iter().any(|e| {
             matches!(
                 e.get("command").and_then(|c| c.as_str()),
-                Some(c) if c == command || c == legacy_command
+                Some(c) if write.is_current(c, &desired)
             )
         });
-        if already {
-            continue;
+        if !already {
+            let mut entry = json!({ "command": desired });
+            if let Some(seconds) = write.timeout_for.and_then(|f| f(event)) {
+                entry["timeout"] = json!(seconds);
+            }
+            arr.push(entry);
+            event_changed = true;
         }
-        arr.push(json!({ "command": command }));
-        added += 1;
+        changed += usize::from(event_changed);
     }
-    added
+    changed
+}
+
+/// Test-only shims mirroring the constant-command [`HookWrite`] every
+/// `dira init` caller builds, so the injection tests keep their one-line shape.
+#[cfg(test)]
+fn inject_constant_nested(
+    settings: &mut Value,
+    command: &str,
+    legacy: &str,
+    events: &[(&str, bool)],
+    matcher: &str,
+) -> usize {
+    let command_for = |_: &str| command.to_string();
+    inject_nested_hooks(
+        settings,
+        events,
+        matcher,
+        &HookWrite {
+            command_for: &command_for,
+            legacy_command: Some(legacy),
+            replace_dira: None,
+            // "claude" regardless of `events`' actual harness (gemini/grok
+            // tables also go through this shim): `harness` only feeds the
+            // portable-wrapper shortcut in `is_current`, and none of these
+            // fixtures contain a `.dira/hook.sh`/`bootstrap.sh` command for
+            // it to (mis)match — see `HookWrite::is_current`.
+            harness: "claude",
+            timeout_for: None,
+        },
+    )
+}
+
+#[cfg(test)]
+fn inject_constant_flat(settings: &mut Value, command: &str, legacy: &str) -> usize {
+    let command_for = |_: &str| command.to_string();
+    inject_flat_hooks(
+        settings,
+        CURSOR_EVENTS,
+        &HookWrite {
+            command_for: &command_for,
+            legacy_command: Some(legacy),
+            replace_dira: None,
+            harness: "cursor",
+            timeout_for: None,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -864,12 +1208,12 @@ mod reader_tests {
     #[test]
     fn the_reader_recognises_everything_the_writer_injects() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, CMD, LEGACY, CLAUDE_EVENTS, "*");
+        inject_constant_nested(&mut s, CMD, LEGACY, CLAUDE_EVENTS, "*");
         assert!(missing_hooks(&s, &claude_events(), "claude").is_empty());
 
         let cursor_cmd = "\"/Users/John Doe/.local/bin/dira\" hook cursor";
         let mut c = json!({});
-        inject_cursor_hooks(&mut c, cursor_cmd, cursor_cmd);
+        inject_constant_flat(&mut c, cursor_cmd, cursor_cmd);
         assert!(missing_hooks(&c, CURSOR_EVENTS, "cursor").is_empty());
     }
 
@@ -888,7 +1232,7 @@ mod reader_tests {
             "dira hook claude",
         ] {
             let mut s = json!({});
-            inject_nested_hooks(&mut s, cmd, cmd, CLAUDE_EVENTS, "*");
+            inject_constant_nested(&mut s, cmd, cmd, CLAUDE_EVENTS, "*");
             assert!(
                 missing_hooks(&s, &claude_events(), "claude").is_empty(),
                 "{cmd} should read as wired"
@@ -900,7 +1244,7 @@ mod reader_tests {
     #[test]
     fn a_hook_for_another_harness_is_not_this_harness_wiring() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, "/bin/dira hook gemini", "x", CLAUDE_EVENTS, "*");
+        inject_constant_nested(&mut s, "/bin/dira hook gemini", "x", CLAUDE_EVENTS, "*");
         assert_eq!(
             missing_hooks(&s, &claude_events(), "claude").len(),
             CLAUDE_EVENTS.len()
@@ -912,6 +1256,183 @@ mod reader_tests {
             "claude"
         ));
         assert!(!command_invokes_hook("/bin/dira status", "claude"));
+    }
+
+    /// The repo-committed portable wrappers (`dira cloud init`) must read as
+    /// wired too — and with the same anchoring: suffix only, non-empty
+    /// prefix, right harness.
+    #[test]
+    fn portable_wrapper_commands_read_as_wired() {
+        for cmd in [
+            "sh \"$CLAUDE_PROJECT_DIR\"/.dira/hook.sh claude",
+            "sh \"$CLAUDE_PROJECT_DIR\"/.dira/bootstrap.sh claude",
+            "sh .dira/hook.sh claude",
+        ] {
+            assert!(command_invokes_hook(cmd, "claude"), "{cmd}");
+        }
+        assert!(command_invokes_hook("sh .dira/hook.sh cursor", "cursor"));
+        // Wrong harness, bare invocation, or trailing flags stay unwired.
+        assert!(!command_invokes_hook("sh .dira/hook.sh cursor", "claude"));
+        assert!(!command_invokes_hook("hook.sh claude", "claude"));
+        assert!(!command_invokes_hook(
+            "sh .dira/hook.sh claude --x",
+            "claude"
+        ));
+    }
+
+    /// The wrapper predicate is the strict subset of "invokes dira": the
+    /// direct `dira hook <harness>` form is wired but is not a wrapper, so a
+    /// caller that needs the distinction (merge-mode `dira init`, the yield
+    /// check) gets it.
+    #[test]
+    fn portable_wrapper_predicate_excludes_the_direct_form() {
+        assert!(command_is_portable_wrapper(
+            "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "claude"
+        ));
+        assert!(command_is_portable_wrapper(
+            "sh .dira/bootstrap.sh cursor",
+            "cursor"
+        ));
+        assert!(!command_is_portable_wrapper(
+            "/bin/dira hook claude",
+            "claude"
+        ));
+        assert!(!command_is_portable_wrapper("dira hook claude", "claude"));
+        assert!(!command_is_portable_wrapper("hook.sh claude", "claude"));
+        assert!(!command_is_portable_wrapper(
+            "sh .dira/hook.sh claude",
+            "cursor"
+        ));
+    }
+
+    /// `dira init` in merge mode over a `cloud init`'d project settings file
+    /// must add nothing: every event already reads as current because it is
+    /// carried by the portable wrapper, not because it matches the direct
+    /// `dira hook claude` form.
+    #[test]
+    fn merge_mode_treats_a_portable_wrapper_as_already_wired() {
+        let mut s = json!({});
+        for (event, _) in CLAUDE_EVENTS {
+            let script = if *event == "SessionStart" {
+                "bootstrap.sh"
+            } else {
+                "hook.sh"
+            };
+            s["hooks"][event] = json!([
+                { "hooks": [ { "type": "command",
+                    "command": format!("sh \"${{CLAUDE_PROJECT_DIR:-.}}\"/.dira/{script} claude") } ] }
+            ]);
+        }
+        let command = "/Users/me/.local/bin/dira hook claude".to_string();
+        let write = HookWrite {
+            command_for: &|_| command.clone(),
+            legacy_command: None,
+            replace_dira: None,
+            harness: "claude",
+            timeout_for: None,
+        };
+        let changed = inject_nested_hooks(&mut s, CLAUDE_EVENTS, "*", &write);
+        assert_eq!(changed, 0, "a portable wrapper must count as already wired");
+        assert!(
+            portable_wrapper_note(&s, "claude").is_some(),
+            "the caller needs to know it was the wrapper, not a direct match"
+        );
+    }
+
+    /// Replace mode (`cloud init`'s posture) does NOT take the merge-mode
+    /// shortcut: a stale wrapper spelling (an old script name) must still be
+    /// recognised as stale and replaced, not mistaken for current.
+    #[test]
+    fn replace_mode_does_not_treat_an_arbitrary_wrapper_spelling_as_current() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command",
+                        "command": "sh .dira/hook.sh claude" } ] }
+                ]
+            }
+        });
+        let desired = "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude".to_string();
+        let write = HookWrite {
+            command_for: &|_| desired.clone(),
+            legacy_command: None,
+            replace_dira: Some("claude"),
+            harness: "claude",
+            timeout_for: None,
+        };
+        let changed = inject_nested_hooks(&mut s, CLAUDE_EVENTS, "*", &write);
+        assert!(
+            changed > 0,
+            "the differing wrapper spelling must be replaced"
+        );
+        let stop = s["hooks"]["Stop"].as_array().unwrap();
+        let commands: Vec<&str> = stop
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .filter_map(|e| e["command"].as_str())
+            .collect();
+        assert_eq!(commands, vec![desired.as_str()]);
+    }
+
+    /// No portable wrapper anywhere in the settings ⇒ no note, even when
+    /// nothing was added (the ordinary already-wired-by-`dira-init`-itself
+    /// case, which needs no extra words).
+    #[test]
+    fn portable_wrapper_note_is_none_without_a_wrapper() {
+        let s = json!({
+            "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "dira hook claude" } ] } ] }
+        });
+        assert!(portable_wrapper_note(&s, "claude").is_none());
+    }
+
+    /// `HookWrite::timeout_for` embeds a `"timeout"` field beside `"command"`
+    /// only for the events it names — SessionStart/sessionStart, in
+    /// `cloud init`'s real use — and never for ordinary `dira init` writes
+    /// (`timeout_for: None`, pinned by every other test in this file).
+    #[test]
+    fn timeout_for_embeds_the_field_only_for_named_events() {
+        let mut s = json!({});
+        let write = HookWrite {
+            command_for: &|_| "dira hook claude".to_string(),
+            legacy_command: None,
+            replace_dira: None,
+            harness: "claude",
+            timeout_for: Some(&|event: &str| (event == "SessionStart").then_some(300)),
+        };
+        inject_nested_hooks(&mut s, CLAUDE_EVENTS, "*", &write);
+        assert_eq!(
+            s["hooks"]["SessionStart"][0]["hooks"][0]["timeout"].as_u64(),
+            Some(300)
+        );
+        assert!(s["hooks"]["Stop"][0]["hooks"][0].get("timeout").is_none());
+
+        let mut c = json!({});
+        let cursor_write = HookWrite {
+            command_for: &|_| "dira hook cursor".to_string(),
+            legacy_command: None,
+            replace_dira: None,
+            harness: "cursor",
+            timeout_for: Some(&|event: &str| (event == "sessionStart").then_some(300)),
+        };
+        inject_flat_hooks(&mut c, CURSOR_EVENTS, &cursor_write);
+        assert_eq!(c["hooks"]["sessionStart"][0]["timeout"].as_u64(), Some(300));
+        assert!(c["hooks"]["stop"][0].get("timeout").is_none());
+    }
+
+    /// Writer and reader both follow Claude Code's relocated user config:
+    /// `CLAUDE_CONFIG_DIR` wins, else `~/.claude/settings.json`.
+    #[test]
+    fn claude_user_settings_path_honours_config_dir() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            claude_user_settings_path_from(None, home),
+            PathBuf::from("/home/u/.claude/settings.json")
+        );
+        assert_eq!(
+            claude_user_settings_path_from(Some("/opt/cc"), home),
+            PathBuf::from("/opt/cc/settings.json")
+        );
     }
 
     /// Project scope before global, per harness — Claude Code's own precedence,
@@ -943,14 +1464,14 @@ mod reader_tests {
     #[test]
     fn legacy_unquoted_entries_are_recognised() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, LEGACY, LEGACY, CLAUDE_EVENTS, "*");
+        inject_constant_nested(&mut s, LEGACY, LEGACY, CLAUDE_EVENTS, "*");
         assert!(missing_hooks(&s, &claude_events(), "claude").is_empty());
     }
 
     #[test]
     fn a_partially_wired_config_names_only_the_missing_events() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, CMD, LEGACY, &CLAUDE_EVENTS[..2], "*");
+        inject_constant_nested(&mut s, CMD, LEGACY, &CLAUDE_EVENTS[..2], "*");
         let missing = missing_hooks(&s, &claude_events(), "claude");
         assert_eq!(missing.len(), CLAUDE_EVENTS.len() - 2);
         assert!(!missing.contains(&"SessionStart".to_string()));
@@ -978,7 +1499,7 @@ mod reader_tests {
     #[test]
     fn hook_commands_surface_a_stale_binary_and_both_config_shapes() {
         let mut nested = json!({});
-        inject_nested_hooks(
+        inject_constant_nested(
             &mut nested,
             "/old/path/dira hook claude",
             "x",
@@ -992,7 +1513,7 @@ mod reader_tests {
 
         let cursor_cmd = "\"/Users/John Doe/.local/bin/dira\" hook cursor";
         let mut cursor = json!({});
-        inject_cursor_hooks(&mut cursor, cursor_cmd, cursor_cmd);
+        inject_constant_flat(&mut cursor, cursor_cmd, cursor_cmd);
         assert_eq!(dira_hook_commands(&cursor), vec![cursor_cmd]);
 
         // A non-dira hook someone else installed is not ours to report on.
@@ -1046,7 +1567,7 @@ mod tests {
     #[test]
     fn injects_into_empty_settings() {
         let mut s = json!({});
-        inject_nested_hooks(
+        inject_constant_nested(
             &mut s,
             "dira hook claude",
             "dira hook claude",
@@ -1060,14 +1581,14 @@ mod tests {
     #[test]
     fn is_idempotent() {
         let mut s = json!({});
-        inject_nested_hooks(
+        inject_constant_nested(
             &mut s,
             "dira hook claude",
             "dira hook claude",
             CLAUDE_EVENTS,
             "*",
         );
-        inject_nested_hooks(
+        inject_constant_nested(
             &mut s,
             "dira hook claude",
             "dira hook claude",
@@ -1091,7 +1612,7 @@ mod tests {
             }
         });
         // The new quoted form differs from what's on disk...
-        inject_nested_hooks(
+        inject_constant_nested(
             &mut s,
             "\"/Users/John Doe/bin/dira\" hook claude",
             "/Users/John Doe/bin/dira hook claude",
@@ -1108,7 +1629,7 @@ mod tests {
             "model": "claude-opus-4-8",
             "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "other" } ] } ] }
         });
-        inject_nested_hooks(
+        inject_constant_nested(
             &mut s,
             "dira hook claude",
             "dira hook claude",
@@ -1123,7 +1644,7 @@ mod tests {
     #[test]
     fn gemini_injects_lifecycle_and_regex_matcher() {
         let mut s = json!({});
-        inject_nested_hooks(
+        inject_constant_nested(
             &mut s,
             "dira hook gemini",
             "dira hook gemini",
@@ -1138,7 +1659,7 @@ mod tests {
     #[test]
     fn cursor_injects_flat_command_entries() {
         let mut s = json!({});
-        inject_cursor_hooks(&mut s, "dira hook cursor", "dira hook cursor");
+        inject_constant_flat(&mut s, "dira hook cursor", "dira hook cursor");
         assert_eq!(s["version"].as_i64(), Some(1));
         assert_eq!(
             s["hooks"]["beforeSubmitPrompt"][0]["command"].as_str(),
@@ -1150,8 +1671,8 @@ mod tests {
     #[test]
     fn cursor_is_idempotent_and_preserves_keys() {
         let mut s = json!({ "version": 1, "hooks": { "stop": [ { "command": "other" } ] } });
-        inject_cursor_hooks(&mut s, "dira hook cursor", "dira hook cursor");
-        inject_cursor_hooks(&mut s, "dira hook cursor", "dira hook cursor");
+        inject_constant_flat(&mut s, "dira hook cursor", "dira hook cursor");
+        inject_constant_flat(&mut s, "dira hook cursor", "dira hook cursor");
         // pre-existing + ours, ours added once.
         assert_eq!(s["hooks"]["stop"].as_array().unwrap().len(), 2);
     }
@@ -1164,7 +1685,7 @@ mod tests {
             "version": 1,
             "hooks": { "stop": [ { "command": "/Users/John Doe/bin/dira hook cursor" } ] }
         });
-        inject_cursor_hooks(
+        inject_constant_flat(
             &mut s,
             "\"/Users/John Doe/bin/dira\" hook cursor",
             "/Users/John Doe/bin/dira hook cursor",
@@ -1187,7 +1708,7 @@ mod tests {
     #[test]
     fn grok_injects_events_without_matcher() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
+        inject_constant_nested(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
         assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert!(s["hooks"]["PreToolUse"][0].get("matcher").is_none());
     }
@@ -1195,8 +1716,8 @@ mod tests {
     #[test]
     fn grok_inject_is_idempotent() {
         let mut s = json!({});
-        inject_nested_hooks(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
-        inject_nested_hooks(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
+        inject_constant_nested(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
+        inject_constant_nested(&mut s, "dira hook grok", "dira hook grok", GROK_EVENTS, "*");
         assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }
@@ -1222,7 +1743,7 @@ mod apply_tests {
     fn wire(path: PathBuf, on_unparseable: OnUnparseable) -> Result<Wired> {
         let (command, legacy) = ("dira hook claude", "dira hook claude");
         apply_json_settings(path, false, on_unparseable, "Claude Code", command, |s| {
-            inject_nested_hooks(s, command, legacy, CLAUDE_EVENTS, "*")
+            inject_constant_nested(s, command, legacy, CLAUDE_EVENTS, "*")
         })
     }
 
@@ -1324,30 +1845,30 @@ mod apply_tests {
     /// A missing file is never "current" — the first run of `dira init
     /// opencode` must write, not silently no-op.
     #[test]
-    fn opencode_plugin_is_current_is_false_for_a_missing_file() {
+    fn content_is_current_is_false_for_a_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dira.js");
-        assert!(!opencode_plugin_is_current(&path, "// plugin body"));
+        assert!(!content_is_current(&path, "// plugin body"));
     }
 
     /// The re-run case this fix exists for: identical content on disk is a
     /// real no-op, so `run_opencode`'s `events_added` can be `0` and
     /// `already_wired()` can finally be true for OpenCode.
     #[test]
-    fn opencode_plugin_is_current_matches_identical_content() {
+    fn content_is_current_matches_identical_content() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dira.js");
         std::fs::write(&path, "// plugin body").unwrap();
-        assert!(opencode_plugin_is_current(&path, "// plugin body"));
+        assert!(content_is_current(&path, "// plugin body"));
     }
 
     /// Any drift at all — a bearer rotation, a port change, an upgrade that
     /// changes the generated plugin — must still trigger a real rewrite.
     #[test]
-    fn opencode_plugin_is_current_is_false_when_content_differs() {
+    fn content_is_current_is_false_when_content_differs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dira.js");
         std::fs::write(&path, "// old plugin body").unwrap();
-        assert!(!opencode_plugin_is_current(&path, "// new plugin body"));
+        assert!(!content_is_current(&path, "// new plugin body"));
     }
 }

@@ -131,6 +131,7 @@ pub(crate) const CHECK_IDS: &[&str] = &[
     "store.wal_size",
     "hooks.config",
     "hooks.exe_path",
+    "hooks.scope_overlap",
     "hook.breadcrumb",
     "project.resolves",
     "sync.health",
@@ -138,6 +139,9 @@ pub(crate) const CHECK_IDS: &[&str] = &[
     "update.rollback",
     "update.shadowed",
     "update.failures",
+    "cloud.runtime",
+    "cloud.reachability",
+    "cloud.bootstrap",
     // Opt-in: only ever emitted with `--probe`, because it spawns a child
     // process and writes+deletes a row. Keeping the default side-effect-free
     // is what makes `dira doctor` safe to run from install.sh and CI.
@@ -156,6 +160,12 @@ pub(crate) struct Args {
 impl Args {
     fn wants(&self, id: &str) -> bool {
         self.only.is_empty() || self.only.iter().any(|s| s == id)
+    }
+    /// Was `id` named explicitly (as opposed to running because `only` is
+    /// empty)? Unlike [`Args::wants`], a bare `dira doctor` never counts —
+    /// this is the probe-policy gate, not the render filter.
+    fn names(&self, id: &str) -> bool {
+        self.only.iter().any(|s| s == id)
     }
 }
 
@@ -193,6 +203,9 @@ pub(crate) struct Facts {
     pub doctor_elevated: bool,
     /// What the update-check cache knows, and where an update would land.
     pub update: UpdateFacts,
+    /// Cloud-runtime facts: detected runtime, provisioning env, committed
+    /// teleport artifacts, and one reachability GET against the cloud.
+    pub cloud: checks::CloudFacts,
 }
 
 /// Everything the three `update.*` checks judge, gathered up front like the rest.
@@ -233,7 +246,7 @@ pub(crate) async fn run(config: &Config, args: Args) -> i32 {
         return 2;
     }
 
-    let facts = gather(config).await;
+    let facts = gather(config, &args).await;
     let mut results = run_checks(&facts, &args);
     // Last, and only on request: it is the one check with side effects, and by
     // now every cheaper explanation for a broken capture path has been ruled
@@ -254,7 +267,7 @@ pub(crate) async fn run(config: &Config, args: Args) -> i32 {
     code
 }
 
-async fn gather(config: &Config) -> Facts {
+async fn gather(config: &Config, args: &Args) -> Facts {
     let daemon = crate::daemon::probe(config).await;
     let supervision = crate::daemon::detect_supervision(config).await;
 
@@ -313,9 +326,50 @@ async fn gather(config: &Config) -> Facts {
         })
         .collect();
 
+    // Cloud-runtime facts. The reachability GET is the one network touch in
+    // `gather` — read-only and bounded, but it must not fire on an ordinary
+    // offline machine (D-0006's "no blocking network call on a default path"
+    // extends here: see DIRASH-0022's probe-policy exemption in
+    // `.zavet/specs/doctor.md`). It runs only when a cloud runtime is
+    // actually detected, or the caller named `cloud.reachability` explicitly
+    // via `--check` — never on a bare `dira doctor` on a plain machine.
+    // `args.wants` gates it too, not just `runtime`/`names`: a
+    // `--check <other-id>` naming some other check must perform no GET even
+    // while running *inside* a detected cloud runtime — the caller asked for
+    // one specific check, not the runtime-triggered default set.
+    let runtime = dira_core::runtime::detect();
+    let should_probe_cloud =
+        args.wants("cloud.reachability") && (runtime.is_some() || args.names("cloud.reachability"));
+    let meta_probe = match (config.cloud_url.as_deref(), should_probe_cloud) {
+        (Some(base), true) => Some(probe_cloud_meta(base).await),
+        _ => None,
+    };
+    let bootstrap_root = match &cwd {
+        Some(dir) => dira_core::project::toplevel(dir).unwrap_or_else(|| dir.clone()),
+        None => std::path::PathBuf::from("."),
+    };
+    let cloud = checks::CloudFacts {
+        runtime,
+        runner_token_set: dira_core::env::non_blank(crate::device::ENV_RUNNER_TOKEN).is_some(),
+        // A file's existence is not enough: a bundle the daemon's own token
+        // cannot read is functionally the same as a missing one, and
+        // `File::open` is the same test `httpclient::builder` performs when it
+        // actually loads the bundle — `metadata` alone can lie on a file that
+        // exists but is unreadable (e.g. a root-owned mount).
+        extra_ca: dira_core::env::non_blank(dira_core::httpclient::ENV_EXTRA_CA_CERTS).map(|p| {
+            let readable = std::fs::File::open(&p).is_ok();
+            (p, readable)
+        }),
+        identity_email_env: dira_core::env::non_blank(dira_core::project::ENV_IDENTITY_EMAIL)
+            .is_some(),
+        bootstrap: checks::read_bootstrap_artifacts(&bootstrap_root),
+        meta_probe,
+    };
+
     Facts {
         cwd: cwd.map(|d| d.display().to_string()),
         project,
+        cloud,
         update: UpdateFacts {
             cache: crate::update::notice::cache_facts(),
             install_dir,
@@ -335,6 +389,44 @@ async fn gather(config: &Config) -> Facts {
         doctor_elevated: dira_ipc::elevation::is_elevated(),
         store_write,
         device,
+    }
+}
+
+/// One bounded, read-only GET against `{base}/api/v1/meta` — the same
+/// anonymous handshake the daemon makes. `Ok(status)` means the wire worked
+/// (any HTTP status: even a 404 proves DNS, the proxy, and TLS are fine);
+/// `Err` carries the transport error, which is what `cloud.reachability`
+/// judges (never past `Warn` — see DIRASH-0022's probe-policy exemption).
+/// Built via `httpclient::builder()` so `DIRA_EXTRA_CA_CERTS` is exercised
+/// exactly as sync would exercise it. Tight timeouts — 1.5s to connect, 2s for
+/// the whole request — because this only ever runs when something already
+/// gates it (a detected cloud runtime, or an explicit `--check
+/// cloud.reachability`), so a slow, doomed connection should fail fast rather
+/// than hold up the rest of the report.
+async fn probe_cloud_meta(base: &str) -> Result<u16, String> {
+    let url = format!("{}/api/v1/meta", base.trim_end_matches('/'));
+    let client = dira_core::httpclient::builder()
+        .connect_timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .map_err(|e| format!("build client: {e}"))?;
+    match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(resp) => Ok(resp.status().as_u16()),
+        Err(e) => {
+            // The full chain, not just the top error: reqwest's outer error is
+            // often "error sending request" with the TLS cause underneath.
+            let mut msg = e.to_string();
+            let mut src = std::error::Error::source(&e);
+            while let Some(cause) = src {
+                msg = format!("{msg}: {cause}");
+                src = cause.source();
+            }
+            Err(msg)
+        }
     }
 }
 
@@ -380,6 +472,7 @@ pub(crate) fn run_checks(f: &Facts, args: &Args) -> Vec<Check> {
 
     push(checks::hooks_config(&f.hooks));
     push(checks::hooks_exe_path(&f.hooks, f.current_exe.as_deref()));
+    push(checks::scope_overlap(&f.hooks));
     push(checks::breadcrumb(f.breadcrumb.as_ref()));
     push(checks::project_resolves(f));
 
@@ -395,6 +488,10 @@ pub(crate) fn run_checks(f: &Facts, args: &Args) -> Vec<Check> {
     push(checks::update_rollback(&f.update));
     push(checks::update_shadowed(&f.update, f.current_exe.as_deref()));
     push(checks::update_failures(&f.update));
+
+    push(checks::cloud_runtime(&f.cloud));
+    push(checks::cloud_reachability(&f.cloud, f.cloud_url.as_deref()));
+    push(checks::cloud_bootstrap(&f.cloud));
 
     out
 }

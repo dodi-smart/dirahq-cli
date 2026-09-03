@@ -28,7 +28,7 @@ made safe by four things, in this order:
    other id under the reserved prefix is refused at ingress, so a stale replay,
    a hand-crafted payload, or a `doctor` that died between arm and verify can
    never create a probe row.
-3. **Every read in `Store` filters the prefix in SQL** — `events_since`,
+3. **Every read in `Store` filters the prefix in SQL**: `events_since`,
    `events_between`, `events_for_sessions`, `human_signal_seed`,
    `count_events_after`, and `compact`'s snapshot. `SessionRegistry::observe`
    refuses it too. `max_event_id` is deliberately left unfiltered.
@@ -41,17 +41,18 @@ hook child.** `dira doctor` does, under the user's own token.
 ## Why
 
 **Why the daemon spawns nothing.** The probe exists to detect a daemon whose
-control channel refuses ordinary processes — on Windows, one started from an
-Administrator terminal, whose named pipe carries that token's DACL and a High
-integrity label. A child the *daemon* forked would inherit the elevated token
-and open that pipe happily. The probe would pass on exactly the machine the bug
-is on, which is worse than having no probe: it would certify the broken state.
-The spawning process must be the one whose access is in question.
+control channel refuses ordinary processes. On Windows, that means one
+started from an Administrator terminal, whose named pipe carries that token's
+DACL and a High integrity label. A child the *daemon* forked would inherit the
+elevated token and open that pipe happily. The probe would pass on exactly the
+machine the bug is on, which is worse than having no probe: it would certify
+the broken state. The spawning process must be the one whose access is in
+question.
 
 **Why a daemon-minted id rather than a CLI-chosen one.** The reserved prefix
 alone makes probe rows invisible, but it does not stop a probe being *aimed*.
 If the CLI passed the id, anything that could send an `IngestHook` could write
-under the prefix — and then arrange for real events to be filtered out of
+under the prefix, and then arrange for real events to be filtered out of
 billing by naming a session `dira-probe-…`. Minting server-side plus a TTL'd
 admit turns "probe rows are ignored" into "probe rows can only exist because
 this daemon asked for one, seconds ago".
@@ -62,7 +63,7 @@ inspecting one file instead of auditing `sync.rs` (138 KB) forever.
 `count_events_after` already has two callers and is the obvious thing a future
 feature reaches for; a call-site rule must be re-learned by everyone, a
 store-level one is handed to them. The cost is one bound `NOT LIKE` on windowed
-queries that already scan — `append`, the actual hot path, is untouched.
+queries that already scan. `append`, the actual hot path, is untouched.
 
 **Why `max_event_id` is exempt.** It is only the snapshot upper bound for a sync
 window. Filtering it would hold the cursor below a probe id that is about to be
@@ -77,8 +78,8 @@ the live `SessionRegistry`, and `build_session_views` renders from it. Neither
 touches SQL, so the store filters cannot reach either.
 
 **Why an unconditional reap.** Deleting only on success leaves a row behind
-precisely when something went wrong — the case where the user is least likely
-to notice and most likely to be reading their numbers closely.
+precisely when something went wrong. That is the case where the user is least
+likely to notice and most likely to be reading their numbers closely.
 
 **Why the writer gets a probe short path** rather than a payload engineered to
 survive coalescing and degenerate-session pruning: those behaviours are correct,
@@ -94,7 +95,7 @@ will ever match.
 
 - **A daemon-side lost-hook counter on `DaemonInfo`.** The daemon cannot count
   hooks that never arrived. In the motivating incident it saw zero Claude events
-  and looked perfectly healthy — that is the entire problem.
+  and looked perfectly healthy. That is the entire problem.
 - **Letting the daemon fork the hook child.** Simpler, and wrong: see above.
 - **A CLI-chosen probe id.** Removes the arm round-trip, and hands anyone who
   can reach the socket a way to write rows that billing ignores.
@@ -109,8 +110,8 @@ will ever match.
 ## Agent directives
 
 - Never add a `Store` read of `events` without the `session_id NOT LIKE` guard,
-  unless it is deliberately probe-facing — and say so in its doc comment, as
-  `max_event_id` and `session_event_count` do.
+  unless it is deliberately probe-facing. If it is, say so in its doc comment,
+  as `max_event_id` and `session_event_count` do.
 - Never let the daemon spawn the hook child, on any platform, for any reason.
 - Never accept a probe session id chosen by the caller. Minting stays in
   `probe::arm`, and `probe::admit` stays the only way a probe row is created.
@@ -123,7 +124,7 @@ will ever match.
   success calling `record_success()` would clear a genuine failure counter the
   user still needs to see.
 - Changing the payload in `probe_hook_payload` means re-checking that it still
-  normalizes to a human signal — otherwise the probe reports "the daemon never
+  normalizes to a human signal. Otherwise the probe reports "the daemon never
   stored the event" on every healthy machine.
 
 ## Verification
@@ -151,6 +152,6 @@ missing-binary, acked-then-dropped and transport-refused paths each producing a
 distinct verdict; and the version-skew backstop degrading to a skip against the
 installed 0.3.0 daemon.
 
-**Not verified on Windows** — the elevated-pipe refusal the probe exists to
-catch cannot be reproduced on any runner we build on, and the probe has not been
-run on a real Windows host.
+**Not verified on Windows.** The elevated-pipe refusal the probe exists to
+catch cannot be reproduced on any runner we build on, and the probe has not
+been run on a real Windows host.

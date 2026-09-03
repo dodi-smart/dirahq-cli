@@ -14,17 +14,17 @@ confidence: high
 ## Decision
 
 `dira_ipc::Listener::bind` creates the windows named pipe with an explicit
-security descriptor — `D:P(A;;GA;;;SY)(A;;GA;;;<user SID>)S:(ML;;NW;;;ME)` — and
+security descriptor, `D:P(A;;GA;;;SY)(A;;GA;;;<user SID>)S:(ML;;NW;;;ME)`, and
 passes that same descriptor to **every** per-accept instance, not just the first.
 
 If the descriptor cannot be applied the bind degrades through DACL-only to
-unprotected and reports which rung it landed on via `DaemonInfo`; it never fails
-the bind. `dirad` warns when it is running elevated and keeps serving. `dira`
-maps `ERROR_ACCESS_DENIED` to its own actionable message instead of "daemon not
-running".
+unprotected and reports which level it landed on via `DaemonInfo`; it never
+fails the bind. `dirad` warns when it is running elevated and keeps serving.
+`dira` maps `ERROR_ACCESS_DENIED` to its own actionable message instead of
+"daemon not running".
 
-`verified: false` until the manual runbook below is executed on a real machine —
-the elevated↔non-elevated path cannot be exercised by any automated test we can
+`verified: false` until the manual runbook below is executed on a real machine.
+The elevated↔non-elevated path cannot be exercised by any automated test we can
 run.
 
 ## Why
@@ -40,7 +40,7 @@ For an *elevated* token that default grants `BUILTIN\Administrators` rather than
 the interactive user, and the object additionally carries a High mandatory
 integrity label. A medium-integrity `dira hook claude` is then refused twice
 over. On one user's machine that produced 303 stored events, **all** of them
-`harness='manual'`, and zero agent events ever — while `dira daemon status`
+`harness='manual'`, and zero agent events ever. Meanwhile `dira daemon status`
 reported a healthy daemon, the loopback ingress was listening, commit capture
 worked, and cloud sync stayed green. The denial was reproduced outside our CLI
 with a raw `NamedPipeClientStream`, so it is the pipe object, not our client.
@@ -48,8 +48,8 @@ with a raw `NamedPipeClientStream`, so it is the pipe object, not our client.
 The user SID is the load-bearing detail: a UAC-split account's filtered (Medium)
 and elevated (High) tokens **share** it, so a single ACE spans the elevation
 boundary while still excluding every other local user. That is the windows
-equivalent of unix `0600` — where all of a user's processes reach the socket
-regardless of privilege — not a widening of it.
+equivalent of unix `0600`, where all of a user's processes reach the socket
+regardless of privilege, not a widening of it.
 
 `GENERIC_ALL` is required rather than a tighter mask: the generic mapping folds
 `FILE_CREATE_PIPE_INSTANCE` into `FILE_GENERIC_WRITE`, and the daemon's own
@@ -66,9 +66,9 @@ that will not start.
 
 - **A loopback-HTTP fallback for the hook path.** The bearer-authenticated
   `127.0.0.1:8722` ingress exists, was listening throughout the incident, and the
-  non-elevated user can read the bearer from the store — so it *would* have
-  worked. Rejected anyway: it makes the capture path depend on a surface D-0009
-  deliberately made optional and survivable, and widens the
+  non-elevated user can read the bearer from the store. So it *would* have
+  worked. Rejected anyway: it makes the capture path depend on the ingress
+  port D-0009 deliberately made optional and survivable, and widens the
   reachable-from-a-browser footprint, to work around a bug a correct ACL fixes
   outright.
 - **Refusing to start when elevated.** Breaks a configuration this change makes
@@ -81,19 +81,19 @@ that will not start.
 - **An Everyone / Authenticated-Users ACE.** A real regression versus even the
   accidental status quo.
 - **A daemon-side lost-hook counter.** The daemon cannot count hooks that never
-  arrived — which is precisely why this went unnoticed. The breadcrumb has to be
+  arrived. That is precisely why this went unnoticed. The breadcrumb has to be
   written client-side, by the shim that failed.
 
 ## Agent directives
 
-- Never create a windows control-pipe instance without the explicit descriptor —
+- Never create a windows control-pipe instance without the explicit descriptor:
   not in `bind`, and **not in the accept loop**. A default-DACL instance #2
   reintroduces the bug for every connection after the first, and the failure is
   invisible in any test that opens only one connection.
 - Never widen the pipe DACL beyond the creating token's user SID plus `SY`, and
   never label it below `ME`.
 - Never make a descriptor failure fatal to the control-socket bind (D-0009), and
-  never let it be silent — surface the rung on `DaemonInfo`.
+  never let it be silent. Report the level on `DaemonInfo`.
 - Never map `ERROR_ACCESS_DENIED` to "the daemon is not running", and never
   advise a bare `dira daemon start` in response to it: following that advice
   spawns a daemon that dies on `first_pipe_instance` after clobbering the live
@@ -115,9 +115,9 @@ Needs two differently-elevated tokens on one machine; GitHub runners provide one
    change, `access denied`.
 3. Normal PowerShell: pipe a `SessionStart` payload into `dira hook claude`; exit
    0, and `dira status` shows the event with no hook-health warning.
-4. **Negative control:** force the DACL-only rung and repeat step 2. It must
+4. **Negative control:** force the DACL-only level and repeat step 2. It must
    *fail*, proving the integrity label is load-bearing. If it succeeds, the SACL
-   is unnecessary — amend this record and drop it rather than keeping it on
+   is unnecessary. Amend this record and drop it rather than keeping it on
    faith.
 5. **Second local user account:** user B must not reach user A's daemon. This is
    what proves the gate was not widened.

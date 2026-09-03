@@ -26,10 +26,14 @@ jobs:
         with:
           configFile: commitlint.config.mjs
 
-  # Lint install.sh: POSIX-only shellcheck plus canonical shfmt formatting.
+  # Lint the shell that puts a binary on someone's PATH: POSIX-only shellcheck
+  # plus canonical shfmt formatting. Both scripts here are install-path logic
+  # guarded by D-0004 — install.sh places a released binary, dev-install.sh
+  # symlinks a build-tree one — which is why they are held to a standard the
+  # rest of the repo's shell is not.
   # Lightweight — stays on GitHub-hosted runners, same as commit-lint.
   shell-lint:
-    name: Shell Lint (install.sh)
+    name: Shell Lint (install scripts)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: github.event.pull_request.draft == false
@@ -39,10 +43,10 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: shfmt
-      - name: shellcheck -s sh install.sh
-        run: shellcheck -s sh install.sh
-      - name: shfmt -d -s -ln posix -i 2 install.sh
-        run: shfmt -d -s -ln posix -i 2 install.sh
+      - name: shellcheck -s sh install.sh dev-install.sh
+        run: shellcheck -s sh install.sh dev-install.sh
+      - name: shfmt -d -s -ln posix -i 2 install.sh dev-install.sh
+        run: shfmt -d -s -ln posix -i 2 install.sh dev-install.sh
 
   # Lint install.ps1: PSScriptAnalyzer at Warning severity, install.sh's Windows sibling.
   # Lightweight — stays on GitHub-hosted runners, same as shell-lint above. `shell: pwsh`

@@ -102,8 +102,10 @@ pub async fn build_state(
     // instead of a fresh TCP/TLS handshake per tick. No default timeout — callers
     // set a per-request timeout sized to that call. A build failure here now fails
     // daemon startup outright rather than silently disabling whichever task used
-    // to build its own client.
-    let http = reqwest::Client::builder()
+    // to build its own client. Built via `httpclient::builder()` so the
+    // DIRA_EXTRA_CA_CERTS opt-in (proxied cloud runtimes) applies to every
+    // device→cloud call this client serves.
+    let http = dira_core::httpclient::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(120))
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()

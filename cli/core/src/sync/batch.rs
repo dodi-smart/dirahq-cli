@@ -248,6 +248,10 @@ fn assemble_batch(
             branch: p.branch.clone(),
             note: p.note.clone(),
             label: p.label.clone(),
+            // Stamped by the daemon at flush time (a property of the running
+            // environment, not of the stored events) — see dirad's sync loop.
+            runtime: None,
+            runtime_session_ref: None,
         });
     }
 
@@ -802,6 +806,10 @@ fn build_sessions(
                 branch,
                 note: a.note,
                 label: a.label,
+                // Stamped by the daemon at flush time (a property of the running
+                // environment, not of the stored events) — see dirad's sync loop.
+                runtime: None,
+                runtime_session_ref: None,
             }
         })
         .collect()

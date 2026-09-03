@@ -16,9 +16,10 @@ decisions: [D-0008, D-0009, D-0010, D-0016, D-0019]
 
 ## Overview
 
-How `dirad` comes up: which surfaces it binds, in what order, what happens when
-one of them cannot bind, and how it refuses to run twice. The ordering is not
-incidental — it decides whether a failing daemon can still be diagnosed.
+How `dirad` comes up: which entry points it binds, in what order, what
+happens when one of them cannot bind, and how it refuses to run twice. The
+ordering is not incidental. It decides whether a failing daemon can still be
+diagnosed.
 
 The control channel is platform-split behind `dira-ipc`: a Unix domain socket
 on unix, a named pipe on windows (D-0010). Everything below about socket
@@ -32,32 +33,32 @@ user-only DACL plus a medium integrity label (D-0016). The channel carries
 `Nuke`/`Shutdown`/`IngestHook` with no auth of its own, so that gate is the
 whole of its access control. Windows previously passed a NULL descriptor and
 inherited the creating token's default, which for an elevated daemon excluded
-the interactive user entirely — a silent, total capture outage.
+the interactive user entirely. That was a silent, total capture outage.
 
 ## Behavior
 
 - Startup reports the store it opened. `DaemonInfo` carries `db_path` plus a
   `storage_warning` when `project_dirs()` did not resolve and the store fell
-  through to `$TMPDIR` — a whole capture history somewhere the OS may clear on
-  reboot. `dira` compares the reported path against its OWN resolution
-  (`store_divergence_line`) because the elevated / service-account case is
-  invisible to either process alone: `project_dirs()` succeeds on both sides and
-  simply lands in two profiles. Neither condition is fatal — the log sink
-  resolves through the same `project_dirs()` and windows nulls stdio, so a bail
-  is invisible exactly where it would fire, and an exiting daemon respawn-loops
-  (D-0009). Both fields are `#[serde(default)]` for skew.
+  through to `$TMPDIR`. That is a whole capture history somewhere the OS may
+  clear on reboot. `dira` compares the reported path against its OWN
+  resolution (`store_divergence_line`) because the elevated / service-account
+  case is invisible to either process alone: `project_dirs()` succeeds on
+  both sides and simply lands in two profiles. Neither condition is fatal.
+  The log sink resolves through the same `project_dirs()` and windows nulls
+  stdio, so a bail is invisible exactly where it would fire, and an exiting
+  daemon respawn-loops (D-0009). Both fields are `#[serde(default)]` for skew.
 - `run()` loads config, then binds the control channel **before opening the
   store**, then opens the store, builds state, and binds the loopback HTTP hook
   ingress. Both binds precede hydration, so `Ping`/`Status` answer immediately
   and a status during warm-up reports `hydrating: true`.
 - Control-channel-before-store is load-bearing (D-0019). `Store::open` runs
-  `sqlx::migrate!` and can both fail and block, and it used to run *before* the
-  single-instance guard — so a duplicate daemon opened and migrated the
+  `sqlx::migrate!` and can both fail and block, and it used to run *before*
+  the single-instance guard. So a duplicate daemon opened and migrated the
   database, and contended for it, before the guard could refuse. That is the
   window in which two processes genuinely hold one database. Binding first
   makes the refusal the earliest, cheapest and only side-effect-free thing a
-  duplicate hits, and satisfies D-0009's directive that any startup surface
-  which can fail must bind after the control socket.
+  duplicate hits, and satisfies D-0009's directive that any startup step
+  that can fail must bind after the control socket.
 - Nothing accepts on the listener until `serve_control`; that gap already
   existed (the HTTP bind and the hydrate spawn sit inside it) and is only
   extended by the store open.
@@ -82,14 +83,14 @@ the interactive user entirely — a silent, total capture outage.
   cannot be determined, restart errors with manual instructions instead of
   starting a second daemon beside it.
 - **No replacement daemon is started until the previous PROCESS is confirmed
-  exited** (D-0019), on every windows restart path — bare and scheduled-task
+  exited** (D-0019), on every windows restart path, bare and scheduled-task
   alike. The sequence is `Shutdown` → wait for process exit → `taskkill /F` →
   wait again → only then start. Failure to confirm exit is a hard error naming
   the surviving pid and the manual command, never a silent extra daemon.
 - Exit is decided by the process probe (`tasklist`), never by whether the
   control channel answers. `serve_control` is a detached accept loop nothing
   cancels and the shutdown notify fires only after the response is written, so
-  the pipe answers `Ping` for the whole of teardown — "stopped answering" and
+  the pipe answers `Ping` for the whole of teardown. "Stopped answering" and
   "exited" are different questions, and the grace budget (15 s) must exceed the
   worst-case teardown (3 s offline beat + 5 s WAL checkpoint) or an orderly
   shutdown gets force-killed mid-checkpoint.
@@ -108,18 +109,18 @@ the interactive user entirely — a silent, total capture outage.
   integration tests in `cli/dirad/tests/startup_binding.rs` drive the real
   code paths rather than a copy. Callers hold the `SocketLock` as long as the
   listener serves; `run()` keeps it as a local until shutdown.
-- `Listener::security_degradation() -> Option<String>` reports which rung of
-  the descriptor ladder the windows bind landed on (labeled → DACL-only →
-  default); always `None` on unix. `run()` folds it together with the
+- `Listener::security_degradation() -> Option<String>` reports which level of
+  the descriptor fallback the windows bind landed on (labeled → DACL-only →
+  default); always `None` on unix. `run()` combines it with the
   elevation advisory into
   `Response::DaemonInfo.control_channel_warning: Option<String>`. `DEGRADED`
-  stays reserved for "captures nothing" — an elevated but reachable daemon is
+  stays reserved for "captures nothing". An elevated but reachable daemon is
   an advisory `note:`, not a degradation.
 - `Response::DaemonInfo.http_ingress_error: Option<String>` carries the
   degradation to clients. It is `#[serde(default)]`, so a newer `dira` reading
   an older daemon's reply during a partial update sees `None` instead of a
   parse error. This is local IPC (`cli/core/src/protocol.rs`), not the cloud
-  contract — it needs no schema regeneration.
+  contract. It needs no schema regeneration.
 
 ## Invariants
 
@@ -128,15 +129,15 @@ the interactive user entirely — a silent, total capture outage.
   A rewind that under-reports what it moved is the same class of defect as one
   that moves the wrong thing.
 - `ResyncQueued` reports the event backlog and the token backlog as separate
-  numbers. They are never folded together — one counter spanning two streams is
-  worse than the under-count it would replace.
+  numbers. They are never combined into one counter. A single counter
+  spanning two streams is worse than the under-count it would replace.
 - A failed backlog count is logged, never collapsed to a bare `0`: silently
   reporting "nothing pending" right after a user asked for a rewind is
   indistinguishable from success.
 - The control socket binds first and an ingress failure never costs it
-  (D-0009). It is the surface every client and supervision probe depends on.
+  (D-0009). Every client and supervision probe depends on it.
 - The control socket path is never unlinked without first proving nothing
-  answers on it, and never outside the `<sock>.lock` flock (D-0009) — the
+  answers on it, and never outside the `<sock>.lock` flock (D-0009). The
   probe detects a live daemon, the lock serializes the reclaim, and unlinking
   a live path orphans the owner silently.
 - The socket path itself is a fixed per-user location, never `$TMPDIR`
@@ -144,7 +145,7 @@ the interactive user entirely — a silent, total capture outage.
 - A daemon that cannot do its job never reports as plainly healthy.
 - The control channel is permission-gated on every platform, and the gate is
   explicit, never inherited from a process token (D-0016).
-- A descriptor failure degrades and is surfaced; it never fails the bind, and
+- A descriptor failure degrades and is reported; it never fails the bind, and
   it is never silent.
 
 ## Open Questions
@@ -155,4 +156,4 @@ the interactive user entirely — a silent, total capture outage.
   other exit path and was left alone here.
 - The ingress retry runs forever. A daemon whose configured port is
   permanently owned by something else stays degraded indefinitely, visible
-  only via `dira daemon status` — there is no escalation beyond the log line.
+  only via `dira daemon status`. There is no escalation beyond the log line.

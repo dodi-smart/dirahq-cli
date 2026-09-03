@@ -24,8 +24,8 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 - Supported sources: claude (default), codex, gemini, cursor, opencode
   (HTTP plugin), grok (grok-build), generic (harness-neutral JSON). `Manual`
   is a pseudo-harness for `dira start`, outside the sources crate.
-- Alias spelling lives ONLY in `canonical_harness_id()` — `dira init` and hook
-  dispatch both resolve through it so accepted spellings can never drift.
+- Alias spelling lives ONLY in `canonical_harness_id()`. `dira init` and hook
+  dispatch both resolve through it, so accepted spellings can never drift.
 - A source returns `None` for unknown events or malformed payloads; the daemon
   acks silently so a harness never retries. This is also the cross-harness
   defense: grok-build can replay Claude/Cursor hook configs (compat layer),
@@ -43,7 +43,7 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
   which reads `_x.ai/session/update` envelopes and extracts `usage` only from
   `turn_completed` records, keyed by the update's `_meta.eventId` (falling
   back to `prompt_id` + envelope timestamp). The offset/dedup machinery is
-  shared with Claude's transcript capture — only the per-line parser differs.
+  shared with Claude's transcript capture. Only the per-line parser differs.
   `signals.json` was investigated as an alternative (diffing its counters)
   and dropped: it carries no token counters at all, so `updates.jsonl` is the
   only source of per-turn usage.
@@ -59,10 +59,10 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 - `source` / `reason` are Claude Code's `SessionStart.source` (`startup`,
   `resume`, `clear`, `compact`, `fork`) and `SessionEnd.reason` (`clear`,
   `resume`, `logout`, `prompt_input_exit`, `bypass_permissions_disabled`,
-  `other`). Every other source sets both `None`. Nothing accounts on them —
-  they ride the writer's ingest debug line. They exist because dropping them
+  `other`). Every other source sets both `None`. Nothing accounts on them.
+  They ride the writer's ingest debug line. They exist because dropping them
   made a launcher spawn and a real session indistinguishable at the ingress,
-  which is what kept issue #74 invisible; the fix for that issue gates on
+  which is what kept issue #74 invisible. The fix for that issue gates on
   observed activity instead, so it stays harness-independent.
 - Adding a harness touches: contract `Harness` enum (+ `just contract`),
   the source module + `lib.rs` registry/aliases, `init.rs` writer,
@@ -70,19 +70,19 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 
 ## Invariants
 
-- Metadata that crosses the wire is routinely non-ASCII — notes, branch names,
-  labels, and U+FFFD from a lossy transcript decode — so the cross-language
+- Metadata that crosses the wire is routinely non-ASCII: notes, branch names,
+  labels, and U+FFFD from a lossy transcript decode. So the cross-language
   signing vector carries Cyrillic, a non-BMP emoji (a surrogate pair on the JS
   side) and U+FFFD. A JCS disagreement on string escaping rejects the whole
   batch, not one field, so this is pinned by a fixture rather than asserted in
   a comment.
 - Only metadata crosses ingestion; hook payload content fields are ignored.
-- Every unknown event/payload is a silent ack — never an error to the
+- Every unknown event/payload is a silent ack: never an error to the
   harness, never a retry loop.
 - `dira hook <id>` always exits 0 and writes nothing to stdout. That is the
   *harness* contract, and it is unchanged. A **transport** failure (the daemon
   could not be reached, or refused the connection) additionally leaves a durable
-  local breadcrumb that `dira status` surfaces — "never tell the harness" had
+  local breadcrumb that `dira status` shows. "Never tell the harness" had
   been implemented as "never tell anyone", so a dead capture channel was
   indistinguishable from a healthy one for days. A **semantic** non-result
   (unknown harness, unaccounted event kind) stays silent everywhere. See D-0016.

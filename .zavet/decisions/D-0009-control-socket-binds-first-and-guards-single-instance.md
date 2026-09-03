@@ -27,23 +27,23 @@ The reorder alone would have been worse than the bug. The old code unlinked
 the socket path unconditionally, and the TCP bind was the *accidental* mutual
 exclusion that stopped a second daemon from ever reaching that unlink. Binding
 the UDS first without a real guard means a duplicate steals the path from a
-healthy daemon, whose listener then survives on an unlinked inode — alive,
+healthy daemon, whose listener then survives on an unlinked inode: alive,
 holding the DB, reachable by nobody, and silent about it. The explicit guard
 is the prerequisite that makes the ordering safe, not a nicety alongside it.
 
 `connect` is the liveness probe rather than a protocol `Ping`: a stale file
 gives `ECONNREFUSED`, and dirad has no control client of its own.
 
-Degraded-with-retry (not exit) is what actually ends the respawn loop — there
+Degraded-with-retry (not exit) is what actually ends the respawn loop. There
 is nothing left for a supervisor to restart, and the daemon reclaims the port
 by itself when the squatter goes away.
 
 ## Rejected
 
-- **Reorder only** — silently breaks a healthy daemon. See above.
-- **Exit with a nicer message** — still a `KeepAlive` loop, and still leaves
+- **Reorder only**. Silently breaks a healthy daemon. See above.
+- **Exit with a nicer message**. Still a `KeepAlive` loop, and still leaves
   every client unable to tell a port conflict from a dead daemon.
-- **A pidfile lock** — a second source of truth that goes stale on SIGKILL;
+- **A pidfile lock**. A second source of truth that goes stale on SIGKILL;
   the socket already answers the exact question being asked.
 
 ## Amendment: the reclaim is serialized by an flock (2026-07-22)
@@ -51,7 +51,7 @@ by itself when the squatter goes away.
 The probe→unlink→bind sequence is not atomic on its own. Two daemons racing
 onto a *stale* socket file can both observe "nothing answers" before either
 unlinks; the loser's unlink then steals the path from the winner's freshly
-bound listener — the same orphaned-listener failure through a second door.
+bound listener. The same orphaned-listener failure through a second door.
 The original incident was masked from this race because launchd serializes
 its own spawns, but a manual start racing a `KeepAlive` respawn is enough.
 
@@ -62,7 +62,7 @@ exits with the same "already running" message.
 
 This does not reopen the rejected pidfile-lock option: a pidfile goes stale
 on SIGKILL because its *content* is the source of truth, while an `flock` is
-kernel-held and released on any exit, SIGKILL included — it cannot go stale.
+kernel-held and released on any exit, SIGKILL included. It cannot go stale.
 The `connect` probe stays, both because a pre-lock daemon holds the socket
 without holding any lock, and because the socket still answers the "is it
 alive" question the lock cannot.
@@ -72,12 +72,12 @@ alive" question the lock cannot.
 - Never bind the ingress port before the control socket, and never make an
   ingress bind failure fatal.
 - Never unlink the control socket path without first proving nothing answers
-  on it, and never probe/unlink/bind outside the `<sock>.lock` flock — the
+  on it, and never probe/unlink/bind outside the `<sock>.lock` flock: the
   probe detects a live daemon, the lock makes the reclaim race-free.
 - Never release `SocketLock` while the daemon still serves the socket, and
   never turn the flock into a pidfile (its content must stay meaningless).
-- Any new startup surface that can fail must either bind after the control
+- Any new startup step that can fail must either bind after the control
   socket or be survivable; the control socket must stay the first thing up
   and the last thing lost.
-- When adding a degradation, surface it on `DaemonInfo` — a daemon that
+- When adding a degradation, expose it on `DaemonInfo`. A daemon that
   cannot do its job must never report as plainly healthy.

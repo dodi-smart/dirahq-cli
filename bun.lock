@@ -13,7 +13,7 @@
         "@semantic-release/git": "11.0.1",
         "@semantic-release/github": "12.0.9",
         "@semantic-release/release-notes-generator": "14.1.1",
-        "conventional-changelog-conventionalcommits": "9.3.1",
+        "conventional-changelog-conventionalcommits": "10.4.0",
         "semantic-release": "25.0.9",
         "semantic-release-scope-filter": "1.0.0",
       },
@@ -230,7 +230,7 @@
 
     "conventional-changelog-angular": ["conventional-changelog-angular@8.3.1", "", { "dependencies": { "compare-func": "^2.0.0" } }, "sha512-6gfI3otXK5Ph5DfCOI1dblr+kN3FAm5a97hYoQkqNZxOaYa5WKfXH+AnpsmS+iUH2mgVC2Cg2Qw9m5OKcmNrIg=="],
 
-    "conventional-changelog-conventionalcommits": ["conventional-changelog-conventionalcommits@9.3.1", "", { "dependencies": { "compare-func": "^2.0.0" } }, "sha512-dTYtpIacRpcZgrvBYvBfArMmK2xvIpv2TaxM0/ZI5CBtNUzvF2x0t15HsbRABWprS6UPmvj+PzHVjSx4qAVKyw=="],
+    "conventional-changelog-conventionalcommits": ["conventional-changelog-conventionalcommits@10.4.0", "", { "dependencies": { "@conventional-changelog/template": "^1.4.0" } }, "sha512-Rriac6ZrAlVm6cy9Bz4NSp+WMHpwNXoPIYex+HjCgduAVUSbnew29DQjQw0C4g9u3HtSYzGiGY+pdBXAZo+4aA=="],
 
     "conventional-changelog-writer": ["conventional-changelog-writer@8.4.0", "", { "dependencies": { "@simple-libs/stream-utils": "^1.2.0", "conventional-commits-filter": "^5.0.0", "handlebars": "^4.7.7", "meow": "^13.0.0", "semver": "^7.5.2" }, "bin": { "conventional-changelog-writer": "dist/cli/index.js" } }, "sha512-HHBFkk1EECxxmCi4CTu091iuDpQv5/OavuCUAuZmrkWpmYfyD816nom1CvtfXJ/uYfAAjavgHvXHX291tSLK8g=="],
 
@@ -1001,6 +1001,10 @@
     "wrap-ansi/ansi-styles": ["ansi-styles@6.2.3", "", {}, "sha512-4Dj6M28JB+oAH8kFkTLUo+a2jwOFkuqb3yucU0CANcRRUbxS0cP0nZYCGjcc3BNXwRIsUVmDGgzawme7zvJHvg=="],
 
     "wrap-ansi/string-width": ["string-width@7.2.0", "", { "dependencies": { "emoji-regex": "^10.3.0", "get-east-asian-width": "^1.0.0", "strip-ansi": "^7.1.0" } }, "sha512-tsaTIkKW9b4N+AEj+SVA+WhJzV7/zMhcSu78mLKWSk7cXMOSHsBKFWUs0fWwq8QyK3MgJBQRX6Gbi4kYbdvGkQ=="],
+
+    "@commitlint/config-conventional/conventional-changelog-conventionalcommits/@conventional-changelog/template": ["@conventional-changelog/template@1.2.1", "", {}, "sha512-TzlTVpKPjaqW6qOYjQcYUDuGsLCNsvFHVBXkYGTAnf5V37jCWrE5haKNXzz0WZUtVHjrpV76L1buANjwXMfT8w=="],
+
+    "@commitlint/parse/conventional-changelog-angular/@conventional-changelog/template": ["@conventional-changelog/template@1.2.1", "", {}, "sha512-TzlTVpKPjaqW6qOYjQcYUDuGsLCNsvFHVBXkYGTAnf5V37jCWrE5haKNXzz0WZUtVHjrpV76L1buANjwXMfT8w=="],
 
     "@commitlint/parse/conventional-commits-parser/@simple-libs/stream-utils": ["@simple-libs/stream-utils@2.0.0", "", {}, "sha512-fCTuZK4QBa+39Oz9l4OGfJfz+GpwCp3AqO7Zch3to99xHPgstVsRFpeQ8LNd2o1Gv8raL2mCFwiaHh7bFSp5DQ=="],
 

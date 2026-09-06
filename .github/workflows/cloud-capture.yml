@@ -66,7 +66,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
 
       # The published CLI is `@anthropic-ai/claude-code` — note that the bare
       # `claude` name on npm is an unrelated package, not this one. Pinned

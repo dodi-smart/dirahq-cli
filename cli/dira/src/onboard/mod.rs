@@ -78,6 +78,9 @@ pub(crate) struct Options {
     pub print: bool,
     pub no_service: bool,
     pub no_zavet: bool,
+    /// Don't commit cloud-agent capture wiring (`.dira/`, project hook
+    /// configs) into this repo.
+    pub no_cloud: bool,
     /// Wire exactly these, bypassing detection.
     pub harness: Vec<String>,
     /// The tier from `--knowledge`. `None` means ask.
@@ -158,6 +161,10 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
             ui.as_mut(),
         ),
     ));
+    results.push((
+        "cloud:repo".into(),
+        steps::cloud_repo(&steps::SystemApplier, &state, &opts, ui.as_mut()).await,
+    ));
     // Knowledge last of the mutating steps: it writes config the daemon reads
     // at startup, and step 3 may have just restarted the daemon. Ordering it
     // after means the value is on disk before the *next* start; the summary
@@ -222,6 +229,32 @@ fn print_plan(state: &detect::State, opts: &Options) {
             ),
             (Some(r), false) => println!("  · scaffold .zavet/ in {}", r.display()),
         }
+    }
+
+    match steps::cloud_plan(state, opts) {
+        steps::CloudPlan::Skip(reason) => println!("  · skip cloud wiring ({reason})"),
+        steps::CloudPlan::Current { root, ver } => println!(
+            "  · leave {}'s cloud wiring alone (current, pinned v{ver})",
+            root.display()
+        ),
+        steps::CloudPlan::NewerPin { root, pin } => println!(
+            "  · leave {}'s cloud wiring alone (pins v{pin}, newer than this dira)",
+            root.display()
+        ),
+        steps::CloudPlan::Wire { root, harnesses } => println!(
+            "  · wire {} for cloud agents (.dira/ + {})",
+            root.display(),
+            harnesses.join(", ")
+        ),
+        steps::CloudPlan::Refresh {
+            root,
+            harnesses: _,
+            delta,
+        } => println!(
+            "  · refresh cloud wiring in {} ({})",
+            root.display(),
+            delta.join("; ")
+        ),
     }
 
     let tier = match opts.knowledge {
@@ -291,6 +324,22 @@ fn print_open_items(state: &detect::State, results: &[(String, StepOutcome)]) {
         open.push(
             "git hooks are staged but not active: dira never sets core.hooksPath. \
              Run `git config core.hooksPath .zavet/githooks` yourself if you want them"
+                .into(),
+        );
+    }
+
+    if results
+        .iter()
+        .any(|(n, o)| n == "cloud:repo" && matches!(o, StepOutcome::Done(_)))
+    {
+        open.push(
+            "commit the cloud wiring (.dira/, .claude/settings.json, .cursor/hooks.json) so \
+             cloud agents pick it up"
+                .into(),
+        );
+        open.push(
+            "per cloud environment (not per repo): set DIRA_RUNNER_TOKEN and allow the cloud \
+             host — `dira cloud init --print` shows the snippets; see docs/cloud-runtimes.md"
                 .into(),
         );
     }
@@ -394,5 +443,96 @@ mod tests {
         let mut opts = Options::default();
         opts.resolve_defaults();
         assert_eq!(opts.knowledge, None);
+    }
+
+    fn base_cloud_state() -> detect::State {
+        detect::State {
+            harnesses: Vec::new(),
+            supervision: crate::daemon::Supervision::NotRunning,
+            repo_root: None,
+            has_zavet_dir: false,
+            claude_present: false,
+            zavet_installed: false,
+            device_linked: false,
+            knowledge: KnowledgeSyncMode::Off,
+            cloud: None,
+        }
+    }
+
+    /// `print_plan`'s cloud line and `cloud_repo`'s outcome must never
+    /// disagree about what a run would do — both are read off
+    /// `steps::cloud_plan` rather than re-deriving the decision, so this pins
+    /// that a skip reason from the plan is exactly the reason the step
+    /// reports. The applier panics on any call, proving the step never
+    /// reaches it for a skip.
+    #[tokio::test]
+    async fn cloud_plan_and_cloud_repo_agree_on_skips() {
+        use super::prompt::test_ui::ScriptedUi;
+
+        struct Boom;
+        impl steps::CloudApplier for Boom {
+            fn apply<'a>(
+                &'a self,
+                _root: &'a std::path::Path,
+                _req: &'a crate::cloud_init::ApplyRequest<'a>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<crate::cloud_init::Applied>>
+                        + 'a,
+                >,
+            > {
+                panic!("a skip must never reach the applier")
+            }
+        }
+
+        // --no-cloud.
+        let opts = Options {
+            no_cloud: true,
+            ..Options::default()
+        };
+        let state = base_cloud_state();
+        assert_eq!(
+            steps::cloud_plan(&state, &opts),
+            steps::CloudPlan::Skip("--no-cloud".into())
+        );
+        let mut ui = ScriptedUi::new();
+        assert_eq!(
+            steps::cloud_repo(&Boom, &state, &opts, &mut ui).await,
+            StepOutcome::Skipped("--no-cloud".into())
+        );
+
+        // Not inside a git repository.
+        let opts = Options::default();
+        let state = base_cloud_state();
+        let plan_reason = match steps::cloud_plan(&state, &opts) {
+            steps::CloudPlan::Skip(r) => r,
+            other => panic!("expected Skip, got {other:?}"),
+        };
+        assert!(plan_reason.contains("not inside a git repository"));
+        let mut ui = ScriptedUi::new();
+        match steps::cloud_repo(&Boom, &state, &opts, &mut ui).await {
+            StepOutcome::Skipped(r) => assert_eq!(r, plan_reason),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+
+        // --harness names no cloud-capable harness.
+        let opts = Options {
+            harness: vec!["codex".into()],
+            ..Options::default()
+        };
+        let state = detect::State {
+            repo_root: Some(std::path::PathBuf::from("/tmp/dira-cloud-plan-test")),
+            ..base_cloud_state()
+        };
+        let plan_reason = match steps::cloud_plan(&state, &opts) {
+            steps::CloudPlan::Skip(r) => r,
+            other => panic!("expected Skip, got {other:?}"),
+        };
+        assert!(plan_reason.contains("no cloud-capable harness"));
+        let mut ui = ScriptedUi::new();
+        match steps::cloud_repo(&Boom, &state, &opts, &mut ui).await {
+            StepOutcome::Skipped(r) => assert_eq!(r, plan_reason),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
     }
 }

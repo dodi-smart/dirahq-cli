@@ -37,6 +37,7 @@ use crate::init::{
 };
 use crate::update;
 use anyhow::{bail, Context, Result};
+use dira_core::Config;
 use std::path::{Path, PathBuf};
 
 /// `"timeout"` (seconds) embedded beside the SessionStart/sessionStart
@@ -78,102 +79,537 @@ fn render_bootstrap(version: &str, sha256_x86_64: &str, sha256_aarch64: &str) ->
         .replace("{{SHA256_AARCH64}}", sha256_aarch64)
 }
 
+/// Resolve `--harness` values to the [`CLOUD_WIRABLE`] ids they name, in
+/// order and deduplicated. Empty means all of them.
+pub(crate) fn select_harnesses(harnesses: &[String]) -> Result<Vec<&'static str>> {
+    if harnesses.is_empty() {
+        return Ok(CLOUD_WIRABLE.to_vec());
+    }
+    let mut out = Vec::new();
+    for h in harnesses {
+        let id = dira_sources::canonical_harness_id(h)
+            .and_then(|id| CLOUD_WIRABLE.iter().copied().find(|w| *w == id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown or unsupported cloud harness '{h}' (expected: {})",
+                    CLOUD_WIRABLE.join(", ")
+                )
+            })?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// The corrupt-config policy a given harness selection implies. Bare `cloud
+/// init` (or `--harness a,b`) touches several files the user never
+/// individually named — same reasoning as `dira onboard` — so a malformed
+/// one is refused, not silently discarded. Naming exactly one harness is the
+/// same consent `dira init <harness>` already has for that one file.
+fn on_unparseable_for(selected: &[&str]) -> OnUnparseable {
+    if selected.len() == 1 {
+        OnUnparseable::Overwrite
+    } else {
+        OnUnparseable::Refuse
+    }
+}
+
 /// `dira cloud init` entrypoint. `harnesses` empty means all of
 /// [`CLOUD_WIRABLE`]; `print_only` renders everything to stdout and writes
 /// nothing (the `--print` contract `dira init` has); `no_pin` skips the
 /// release-digest fetch and writes an unpinned `bootstrap.sh` (verified at
 /// install time against the release's own `.sha256` asset instead).
+///
+/// A thin narrating wrapper: the write path is [`apply`], shared with
+/// `dira onboard`'s cloud step and `dira cloud refresh`; the read path is
+/// [`status`], shared with `dira doctor`. Only `--print` is rendered here.
 pub async fn run(harnesses: &[String], print_only: bool, no_pin: bool) -> Result<()> {
-    let selected: Vec<&str> = if harnesses.is_empty() {
-        CLOUD_WIRABLE.to_vec()
-    } else {
-        let mut out = Vec::new();
-        for h in harnesses {
-            let id = dira_sources::canonical_harness_id(h)
-                .filter(|id| CLOUD_WIRABLE.contains(id))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "unknown or unsupported cloud harness '{h}' (expected: {})",
-                        CLOUD_WIRABLE.join(", ")
-                    )
-                })?;
-            if !out.contains(&id) {
-                out.push(id);
-            }
-        }
-        out
-    };
-
-    // Bare `cloud init` (or `--harness a,b`) touches several files the user
-    // never individually named — same reasoning as `dira onboard` — so a
-    // malformed one is refused, not silently discarded. Naming exactly one
-    // harness is the same consent `dira init <harness>` already has for that
-    // one file.
-    let on_unparseable = if selected.len() == 1 {
-        OnUnparseable::Overwrite
-    } else {
-        OnUnparseable::Refuse
-    };
+    let selected = select_harnesses(harnesses)?;
+    let on_unparseable = on_unparseable_for(&selected);
 
     let cwd = std::env::current_dir().context("resolve the current directory")?;
     let root = resolve_root(&cwd, print_only)?;
-
     let version = env!("CARGO_PKG_VERSION");
-    let bootstrap_path = root.join(".dira/bootstrap.sh");
-    let gh_ctx = update::resolve::GhContext::from_env();
-    let (sha256_x86_64, sha256_aarch64) =
-        resolve_digests(&bootstrap_path, version, no_pin, &gh_ctx).await;
-    let bootstrap = render_bootstrap(version, &sha256_x86_64, &sha256_aarch64);
-
-    if !print_only {
-        warn_dev_build_or_prerelease(version);
-        if cfg!(windows) {
-            eprintln!(
-                "warning: .dira/hook.sh and .dira/bootstrap.sh are POSIX shell scripts committed \
-                 to the repo; the hook command wired for them (`sh .dira/...`) needs Git Bash's \
-                 `sh` on PATH to run on this Windows machine."
-            );
-        }
-    }
 
     if print_only {
+        let bootstrap_path = root.join(".dira").join(BOOTSTRAP_SCRIPT);
+        let gh_ctx = update::resolve::GhContext::from_env();
+        let (sha256_x86_64, sha256_aarch64, warning) =
+            resolve_digests(&bootstrap_path, version, no_pin, &gh_ctx).await;
+        if let Some(w) = warning {
+            eprintln!("warning: {w}");
+        }
+        let bootstrap = render_bootstrap(version, &sha256_x86_64, &sha256_aarch64);
         println!("# ---- .dira/hook.sh ----");
         println!("{HOOK_SH_TEMPLATE}");
         println!("# ---- .dira/bootstrap.sh ----");
         println!("{bootstrap}");
-    } else {
-        write_script(&root.join(".dira/hook.sh"), HOOK_SH_TEMPLATE)?;
-        write_script(&bootstrap_path, &bootstrap)?;
-        write_plain(&root.join(".dira/.gitattributes"), GITATTRIBUTES_CONTENT)?;
-        println!("wrote .dira/hook.sh + .dira/bootstrap.sh (pinned to v{version})");
+        for id in &selected {
+            match *id {
+                "claude" => wire_claude(&root, true, on_unparseable)?,
+                "cursor" => wire_cursor(&root, true, on_unparseable)?,
+                other => bail!("unknown cloud harness '{other}'"),
+            };
+        }
+        print_snippets(version, &selected);
+        return Ok(());
     }
 
-    for id in &selected {
-        let wired = match *id {
-            "claude" => wire_claude(&root, print_only, on_unparseable)?,
-            "cursor" => wire_cursor(&root, print_only, on_unparseable)?,
-            other => bail!("unknown cloud harness '{other}'"),
-        };
+    let applied = apply(
+        &root,
+        &ApplyRequest {
+            harnesses: &selected,
+            no_pin,
+            on_unparseable,
+        },
+    )
+    .await?;
+    for w in &applied.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!(
+        "wrote .dira/hook.sh + .dira/bootstrap.sh (pinned to v{})",
+        applied.pinned_version
+    );
+    for wired in &applied.wired {
         wired.print();
     }
-
-    if !print_only {
-        let mut committed_paths = vec![
-            ".dira/hook.sh",
-            ".dira/bootstrap.sh",
-            ".dira/.gitattributes",
-        ];
-        if selected.contains(&"claude") {
-            committed_paths.push(".claude/settings.json");
-        }
-        if selected.contains(&"cursor") {
-            committed_paths.push(".cursor/hooks.json");
-        }
-        warn_if_gitignored(&root, &committed_paths);
-    }
-
     print_snippets(version, &selected);
     Ok(())
+}
+
+/// `dira cloud refresh` entrypoint (DIRASH-0038). `after_update` is set only
+/// by `dira update`'s post-swap step: it quiets the routine "nothing to do"
+/// paths (never-wired, already up to date) that would otherwise print on
+/// every single update, and it adds the "other repos still pin an older
+/// dira" advisory read from the local event log.
+///
+/// Never resolves a cwd outside the repo the command is actually run from —
+/// [`stale_known_repos`] only *reads* other repos' state, never touches
+/// them. Under `--after-update` this never fails the exit code: a refresh
+/// glued to every `dira update` must never turn an update's own success
+/// into a failure over something as recoverable as "run `dira cloud
+/// refresh` by hand later". Run directly (no `--after-update`), a real
+/// error still propagates normally.
+pub async fn run_refresh(config: &Config, after_update: bool) -> Result<()> {
+    let running = env!("CARGO_PKG_VERSION");
+    let cwd = std::env::current_dir().context("resolve the current directory")?;
+    let not_wired_line = |where_: &Path| {
+        format!(
+            "nothing to refresh: {} has no .dira/ cloud wiring (dira onboard or dira cloud init writes it)",
+            where_.display()
+        )
+    };
+
+    let Some(root) = dira_core::project::toplevel(&cwd) else {
+        if !after_update {
+            println!("{}", not_wired_line(&cwd));
+        }
+        return Ok(());
+    };
+
+    let outcome = match refresh(&root, running).await {
+        Ok(o) => o,
+        Err(e) => {
+            if after_update {
+                eprintln!(
+                    "warning: could not refresh cloud wiring in {}: {e:#}",
+                    root.display()
+                );
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
+
+    match outcome {
+        RefreshOutcome::NotWired => {
+            if !after_update {
+                println!("{}", not_wired_line(&root));
+            }
+        }
+        RefreshOutcome::UpToDate { pin } => {
+            if !after_update {
+                println!(".dira/ already pins v{pin}");
+            }
+        }
+        RefreshOutcome::PinnedNewer { pin } => {
+            println!(".dira/ pins v{pin}, newer than this dira — left alone");
+        }
+        RefreshOutcome::Refreshed { delta, applied, .. } => {
+            for w in &applied.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!(
+                "refreshed cloud wiring in {}: {} — review and commit",
+                root.display(),
+                delta.join(", ")
+            );
+        }
+    }
+
+    if after_update {
+        let stale = stale_known_repos(&config.db_path, running, Some(root.as_path())).await;
+        if !stale.is_empty() {
+            println!(
+                "{} other repo(s) still pin an older dira — run `dira cloud refresh` in each:",
+                stale.len()
+            );
+            for (path, pin) in &stale {
+                println!("  {} (v{pin})", path.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The applier — everything `cloud init` writes, as a value
+// ---------------------------------------------------------------------------
+
+/// What one [`apply`] should do. `harnesses` are [`CLOUD_WIRABLE`] ids (see
+/// [`select_harnesses`]); `no_pin` skips the digest fetch; `on_unparseable`
+/// is the corrupt-config policy for the harness configs it merges into.
+pub(crate) struct ApplyRequest<'a> {
+    pub harnesses: &'a [&'a str],
+    pub no_pin: bool,
+    pub on_unparseable: OnUnparseable,
+}
+
+/// What one [`apply`] did. Every flag is "actually wrote", so a caller can
+/// tell a fixpoint re-run (`!changed()`) from a real change and report only
+/// the delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Applied {
+    pub wrote_hook_sh: bool,
+    pub wrote_bootstrap: bool,
+    pub wrote_gitattributes: bool,
+    /// The version now pinned in `.dira/bootstrap.sh`.
+    pub pinned_version: String,
+    /// Whether that pin carries release digests (false: unpinned form).
+    pub digests_pinned: bool,
+    /// One per requested harness, in request order.
+    pub wired: Vec<Wired>,
+    /// Best-effort advisories (dev build, prerelease, gitignored paths, the
+    /// Windows `sh` note). Never a failure; the caller decides how to show
+    /// them.
+    pub warnings: Vec<String>,
+}
+
+impl Applied {
+    /// Whether anything on disk changed.
+    pub fn changed(&self) -> bool {
+        self.wrote_hook_sh
+            || self.wrote_bootstrap
+            || self.wrote_gitattributes
+            || self.wired.iter().any(|w| w.events_added > 0)
+    }
+}
+
+/// Write the cloud artifacts under `root` (a git toplevel — callers resolve
+/// it; see [`resolve_root`]). Idempotent: identical content is never
+/// rewritten, hook entries are merged with replace semantics, and the report
+/// says exactly what changed. Network: the digest fetch only, unless
+/// `no_pin`.
+pub(crate) async fn apply(root: &Path, req: &ApplyRequest<'_>) -> Result<Applied> {
+    let version = env!("CARGO_PKG_VERSION");
+    let dir = root.join(".dira");
+    let bootstrap_path = dir.join(BOOTSTRAP_SCRIPT);
+    let gh_ctx = update::resolve::GhContext::from_env();
+    let mut warnings = Vec::new();
+
+    let (sha256_x86_64, sha256_aarch64, warning) =
+        resolve_digests(&bootstrap_path, version, req.no_pin, &gh_ctx).await;
+    warnings.extend(warning);
+    let digests_pinned = !sha256_x86_64.is_empty() && !sha256_aarch64.is_empty();
+    let bootstrap = render_bootstrap(version, &sha256_x86_64, &sha256_aarch64);
+
+    warnings.extend(dev_build_or_prerelease_warnings(version));
+    if cfg!(windows) {
+        warnings.push(
+            ".dira/hook.sh and .dira/bootstrap.sh are POSIX shell scripts committed to the \
+             repo; the hook command wired for them (`sh .dira/...`) needs Git Bash's `sh` on \
+             PATH to run on this Windows machine."
+                .into(),
+        );
+    }
+
+    let wrote_hook_sh = write_script(&dir.join(HOOK_SCRIPT), HOOK_SH_TEMPLATE)?;
+    let wrote_bootstrap = write_script(&bootstrap_path, &bootstrap)?;
+    let wrote_gitattributes = write_plain(&dir.join(".gitattributes"), GITATTRIBUTES_CONTENT)?;
+
+    let mut wired = Vec::with_capacity(req.harnesses.len());
+    for id in req.harnesses {
+        wired.push(match *id {
+            "claude" => wire_claude(root, false, req.on_unparseable)?,
+            "cursor" => wire_cursor(root, false, req.on_unparseable)?,
+            other => bail!("unknown cloud harness '{other}'"),
+        });
+    }
+
+    let mut committed_paths = vec![
+        ".dira/hook.sh",
+        ".dira/bootstrap.sh",
+        ".dira/.gitattributes",
+    ];
+    for h in harness_configs(req.harnesses) {
+        committed_paths.push(h.1);
+    }
+    warnings.extend(gitignored_warnings(root, &committed_paths));
+
+    Ok(Applied {
+        wrote_hook_sh,
+        wrote_bootstrap,
+        wrote_gitattributes,
+        pinned_version: version.to_string(),
+        digests_pinned,
+        wired,
+        warnings,
+    })
+}
+
+/// The project-scope config each cloud harness is wired through, as
+/// `(harness id, repo-relative path)`. Reader and writer share this row so
+/// `status` looks exactly where `apply` writes.
+fn harness_configs(harnesses: &[&str]) -> Vec<(&'static str, &'static str)> {
+    harnesses
+        .iter()
+        .filter_map(|id| match *id {
+            "claude" => Some(("claude", ".claude/settings.json")),
+            "cursor" => Some(("cursor", ".cursor/hooks.json")),
+            _ => None,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The reader — what a repo's cloud wiring looks like, without touching it
+// ---------------------------------------------------------------------------
+
+/// One generated file's relation to what this binary would write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactState {
+    Missing,
+    /// Byte-identical to this binary's template.
+    Current,
+    /// Present but different (hand-edited, or an older template).
+    Stale,
+}
+
+/// `.dira/bootstrap.sh`'s state. The pin is kept as the raw string it was
+/// written with; [`RepoCloudStatus::pin_relation`] does the semver reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootstrapState {
+    Missing,
+    /// Present, but the `${DIRA_VERSION:-X}` pin could not be read.
+    Unparseable,
+    Pinned(String),
+}
+
+/// How the committed pin compares to the version asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinRelation {
+    Missing,
+    Unparseable,
+    /// The pin is older than this binary — the one case a refresh moves it.
+    Older,
+    Same,
+    /// The pin is newer than this binary. Never ours to lower.
+    Newer,
+}
+
+/// One cloud harness's project-scope wiring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HarnessCloudWiring {
+    pub id: &'static str,
+    /// Repo-relative config path (`.claude/settings.json`).
+    pub path: PathBuf,
+    pub config_present: bool,
+    /// `false` only when the file exists and is not JSON.
+    pub parseable: bool,
+    /// How many events [`apply`] would add or replace. `0` is the fixpoint —
+    /// this is the writer's own injection run against a copy, so the reader
+    /// cannot drift from what the writer considers current.
+    pub events_missing: usize,
+}
+
+impl HarnessCloudWiring {
+    /// Nothing for [`apply`] to do here.
+    pub fn current(&self) -> bool {
+        self.config_present && self.parseable && self.events_missing == 0
+    }
+}
+
+/// Everything [`status`] learned. Pure data; the judgments are methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoCloudStatus {
+    /// `.dira/` exists at all — the "was this repo ever wired" signal
+    /// `dira doctor` skips on.
+    pub dir_present: bool,
+    pub hook_sh: ArtifactState,
+    pub bootstrap: BootstrapState,
+    pub gitattributes: ArtifactState,
+    /// One per requested harness, in request order.
+    pub harnesses: Vec<HarnessCloudWiring>,
+}
+
+impl RepoCloudStatus {
+    /// The committed pin against `running` (a `CARGO_PKG_VERSION`).
+    pub fn pin_relation(&self, running: &str) -> PinRelation {
+        let pinned = match &self.bootstrap {
+            BootstrapState::Missing => return PinRelation::Missing,
+            BootstrapState::Unparseable => return PinRelation::Unparseable,
+            BootstrapState::Pinned(v) => v,
+        };
+        match (
+            semver::Version::parse(pinned),
+            semver::Version::parse(running),
+        ) {
+            (Ok(p), Ok(r)) => match p.cmp(&r) {
+                std::cmp::Ordering::Less => PinRelation::Older,
+                std::cmp::Ordering::Equal => PinRelation::Same,
+                std::cmp::Ordering::Greater => PinRelation::Newer,
+            },
+            _ if pinned == running => PinRelation::Same,
+            _ => PinRelation::Unparseable,
+        }
+    }
+
+    /// Whether the repo already holds everything this binary would write,
+    /// or something newer: nothing to do. A pin newer than `running` counts
+    /// as current — the rule is that a pin only ever moves forward, so an
+    /// older `dira` has nothing to contribute.
+    pub fn is_current(&self, running: &str) -> bool {
+        self.hook_sh == ArtifactState::Current
+            && self.gitattributes == ArtifactState::Current
+            && matches!(
+                self.pin_relation(running),
+                PinRelation::Same | PinRelation::Newer
+            )
+            && self.harnesses.iter().all(HarnessCloudWiring::current)
+    }
+
+    /// Nothing has ever been written: no `.dira/`, no portable hook entries.
+    pub fn is_fresh(&self) -> bool {
+        !self.dir_present
+            && self
+                .harnesses
+                .iter()
+                .all(|h| !h.config_present || h.events_missing > 0)
+    }
+
+    /// One line per thing [`apply`] would change at `running`, in write
+    /// order. Empty exactly when [`is_current`](Self::is_current).
+    pub fn describe_delta(&self, running: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        match self.hook_sh {
+            ArtifactState::Missing => out.push(".dira/hook.sh missing".into()),
+            ArtifactState::Stale => {
+                out.push(".dira/hook.sh differs from this dira's template".into())
+            }
+            ArtifactState::Current => {}
+        }
+        match self.pin_relation(running) {
+            PinRelation::Missing => {
+                out.push(format!(".dira/bootstrap.sh missing (would pin v{running})"))
+            }
+            PinRelation::Unparseable => out.push(format!(
+                ".dira/bootstrap.sh has no readable pin (would pin v{running})"
+            )),
+            PinRelation::Older => {
+                if let BootstrapState::Pinned(v) = &self.bootstrap {
+                    out.push(format!("bootstrap pin v{v} → v{running}"));
+                }
+            }
+            PinRelation::Same | PinRelation::Newer => {}
+        }
+        match self.gitattributes {
+            ArtifactState::Missing => out.push(".dira/.gitattributes missing".into()),
+            ArtifactState::Stale => out.push(".dira/.gitattributes differs".into()),
+            ArtifactState::Current => {}
+        }
+        for h in &self.harnesses {
+            let path = h.path.display();
+            if !h.config_present {
+                out.push(format!("{path}: {} event(s) to wire", h.events_missing));
+            } else if !h.parseable {
+                out.push(format!("{path}: not valid JSON"));
+            } else if h.events_missing > 0 {
+                out.push(format!("{path}: {} event(s) missing", h.events_missing));
+            }
+        }
+        out
+    }
+}
+
+/// Read what `root`'s cloud wiring looks like for `harnesses` (see
+/// [`CLOUD_WIRABLE`]). **Read-only by construction**: no writes, no
+/// spawns, no network — it never fetches digests, so a same-version pin
+/// counts as current whether or not it carries them ([`apply`]'s content
+/// diff still corrects that when it runs). Safe for `dira onboard`'s
+/// detection pass (DIRASH-0029) and `dira doctor`'s gather (DIRASH-0022).
+pub(crate) fn status(root: &Path, harnesses: &[&str]) -> RepoCloudStatus {
+    let dir = root.join(".dira");
+    let bootstrap = match std::fs::read_to_string(dir.join(BOOTSTRAP_SCRIPT)) {
+        Err(_) => BootstrapState::Missing,
+        Ok(text) => match parse_quoted_field(&text, "${DIRA_VERSION:-", '}') {
+            Some(v) if !v.is_empty() => BootstrapState::Pinned(v),
+            _ => BootstrapState::Unparseable,
+        },
+    };
+    let wiring = harness_configs(harnesses)
+        .into_iter()
+        .map(|(id, rel)| {
+            let path = PathBuf::from(rel);
+            let (config_present, parseable, mut settings) =
+                match std::fs::read_to_string(root.join(rel)) {
+                    Err(_) => (false, true, serde_json::json!({})),
+                    Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(v) => (true, true, v),
+                        Err(_) => (true, false, serde_json::json!({})),
+                    },
+                };
+            // The writer's own injection against a scratch copy: the count
+            // it reports is exactly what `apply` would change.
+            let events_missing = match id {
+                "claude" => inject_nested_hooks(
+                    &mut settings,
+                    CLAUDE_EVENTS,
+                    "*",
+                    &portable_write(&claude_command, "claude", &claude_timeout),
+                ),
+                _ => inject_flat_hooks(
+                    &mut settings,
+                    CURSOR_EVENTS,
+                    &portable_write(&cursor_command, "cursor", &cursor_timeout),
+                ),
+            };
+            HarnessCloudWiring {
+                id,
+                path,
+                config_present,
+                parseable,
+                events_missing,
+            }
+        })
+        .collect();
+    RepoCloudStatus {
+        dir_present: dir.is_dir(),
+        hook_sh: artifact_state(&dir.join(HOOK_SCRIPT), HOOK_SH_TEMPLATE),
+        bootstrap,
+        gitattributes: artifact_state(&dir.join(".gitattributes"), GITATTRIBUTES_CONTENT),
+        harnesses: wiring,
+    }
+}
+
+fn artifact_state(path: &Path, expected: &str) -> ArtifactState {
+    match std::fs::read_to_string(path) {
+        Err(_) => ArtifactState::Missing,
+        Ok(existing) if existing == expected => ArtifactState::Current,
+        Ok(_) => ArtifactState::Stale,
+    }
 }
 
 /// Where `cloud init` writes: the repo root, resolved via
@@ -198,11 +634,12 @@ fn resolve_root(cwd: &Path, print_only: bool) -> Result<PathBuf> {
     })
 }
 
-/// Warn (never fail) when this `dira` looks like a development build, or the
-/// version it is about to pin is itself a prerelease — both are things
-/// `cloud init` can generate without noticing, and both are surprising to
-/// discover only once a cloud VM fails to provision.
-fn warn_dev_build_or_prerelease(version: &str) {
+/// Advisories (never failures) when this `dira` looks like a development
+/// build, or the version it is about to pin is itself a prerelease — both are
+/// things `cloud init` can generate without noticing, and both are surprising
+/// to discover only once a cloud VM fails to provision.
+fn dev_build_or_prerelease_warnings(version: &str) -> Vec<String> {
+    let mut out = Vec::new();
     // Reuses D-0004's own dev-install predicate (`update::replace::discover_install`,
     // the same guard `dira update`/`daemon.rs` refuse a dev install with) rather
     // than a second detector that could drift from it. `Err` (e.g. `dira` isn't
@@ -211,32 +648,34 @@ fn warn_dev_build_or_prerelease(version: &str) {
         update::replace::discover_install(None),
         Ok(update::replace::Guard::DevBuild { .. } | update::replace::Guard::DevSymlink { .. })
     ) {
-        eprintln!(
-            "warning: this `dira` looks like a development build, not an installed release — \
+        out.push(format!(
+            "this `dira` looks like a development build, not an installed release — \
              the v{version} it is about to pin into .dira/bootstrap.sh may not exist as a \
              published release. Run `dira cloud init` from an installed `dira` (`dira update`) \
              once that version ships, or pass --no-pin for an unpinned bootstrap in the meantime."
-        );
+        ));
     }
     if is_prerelease(version) {
-        eprintln!(
-            "warning: v{version} is a prerelease — cloud VMs provisioned from this pin will \
+        out.push(format!(
+            "v{version} is a prerelease — cloud VMs provisioned from this pin will \
              install a prerelease build of dira. Re-run `dira cloud init` from a stable release \
              if that isn't intended."
-        );
+        ));
     }
+    out
 }
 
 fn is_prerelease(version: &str) -> bool {
     semver::Version::parse(version).is_ok_and(|v| !v.pre.is_empty())
 }
 
-/// Warn (never fail) about any of `rels` (repo-relative) that `git
-/// check-ignore` matches under `root` — a committed artifact excluded by the
-/// repo's own `.gitignore` silently never reaches a cloud VM, which is a
+/// Advisories (never failures) about any of `rels` (repo-relative) that
+/// `git check-ignore` matches under `root` — a committed artifact excluded by
+/// the repo's own `.gitignore` silently never reaches a cloud VM, which is a
 /// confusing way to discover `cloud init` "didn't work". Best-effort: a
 /// missing `git`, or any other spawn failure, makes no claim.
-fn warn_if_gitignored(root: &Path, rels: &[&str]) {
+fn gitignored_warnings(root: &Path, rels: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
     for rel in rels {
         let ignored = std::process::Command::new("git")
             .arg("-C")
@@ -244,17 +683,19 @@ fn warn_if_gitignored(root: &Path, rels: &[&str]) {
             .arg("check-ignore")
             .arg("--quiet")
             .arg(rel)
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         if ignored {
-            eprintln!(
-                "warning: {rel} is excluded by this repo's .gitignore — as written it will never \
+            out.push(format!(
+                "{rel} is excluded by this repo's .gitignore — as written it will never \
                  be committed. Add a negation rule (e.g. `!{rel}`, or `!.dira/`) to .gitignore, or \
                  remove the matching rule, then `git add {rel}`."
-            );
+            ));
         }
     }
+    out
 }
 
 /// Resolve the two musl release digests to embed, or the unpinned fallback.
@@ -270,42 +711,43 @@ async fn resolve_digests(
     version: &str,
     no_pin: bool,
     ctx: &update::resolve::GhContext,
-) -> (String, String) {
+) -> (String, String, Option<String>) {
     if no_pin {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), None);
     }
     match fetch_release_digests(version, ctx).await {
-        Ok(pair) => pair,
+        Ok((x86_64, aarch64)) => (x86_64, aarch64, None),
         Err(e) => {
             let kept =
                 existing_pin(bootstrap_path).and_then(|(pinned_version, x86_64, aarch64)| {
                     (pinned_version == version && !x86_64.is_empty() && !aarch64.is_empty())
                         .then_some((x86_64, aarch64))
                 });
-            if kept.is_some() {
-                eprintln!(
-                    "warning: could not refresh release digests for v{version} ({e:#}) — keeping \
+            let warning = if kept.is_some() {
+                format!(
+                    "could not refresh release digests for v{version} ({e:#}) — keeping \
                      the existing pin in .dira/bootstrap.sh unchanged."
-                );
+                )
             } else {
-                eprintln!(
-                    "warning: could not fetch release digests for v{version} ({e:#}) — writing an \
+                format!(
+                    "could not fetch release digests for v{version} ({e:#}) — writing an \
                      unpinned .dira/bootstrap.sh (it verifies against the release's own .sha256 \
                      asset at install time instead). Re-run `dira cloud init` once the release is \
                      reachable, or pass --no-pin to silence this."
-                );
-            }
-            kept.unwrap_or_default()
+                )
+            };
+            let (x86_64, aarch64) = kept.unwrap_or_default();
+            (x86_64, aarch64, Some(warning))
         }
     }
 }
 
 /// Parse the `version`/`expected_x86_64`/`expected_aarch64` lines out of a
 /// previously generated `bootstrap.sh` on disk, `None` if it doesn't exist or
-/// doesn't parse. A small local mirror of `doctor::checks::parse_pinned_version`
-/// (same find-a-marker-then-a-terminator approach) rather than a cross-package
-/// reuse — that helper lives in a different WP's file.
-fn existing_pin(path: &Path) -> Option<(String, String, String)> {
+/// doesn't parse. [`status`] and `dira doctor` read the version half through
+/// the same [`parse_quoted_field`] marker, so there is one spelling of the
+/// generated pin line in the codebase.
+pub(crate) fn existing_pin(path: &Path) -> Option<(String, String, String)> {
     let contents = std::fs::read_to_string(path).ok()?;
     let version = parse_quoted_field(&contents, "${DIRA_VERSION:-", '}')?;
     let x86_64 = parse_quoted_field(&contents, "expected_x86_64=\"", '"')?;
@@ -403,16 +845,15 @@ fn write_plain(path: &Path, content: &str) -> Result<bool> {
 }
 
 /// [`write_plain`] plus the exec bit on unix, for the two committed scripts.
-fn write_script(path: &Path, content: &str) -> Result<()> {
+/// Returns whether it wrote, like [`write_plain`].
+fn write_script(path: &Path, content: &str) -> Result<bool> {
     let wrote = write_plain(path, content)?;
     #[cfg(unix)]
     if wrote {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
     }
-    #[cfg(not(unix))]
-    let _ = wrote;
-    Ok(())
+    Ok(wrote)
 }
 
 /// The portable command for a Claude Code event. SessionStart runs the
@@ -568,6 +1009,168 @@ fn print_snippets(version: &str, selected: &[&str]) {
     println!(
         "\ncommit .dira/ and the hook configs; see docs/cloud-runtimes.md for the full guide."
     );
+}
+
+// ---------------------------------------------------------------------------
+// Refresh — `dira cloud refresh` / `dira update`'s post-swap step (DIRASH-0038)
+// ---------------------------------------------------------------------------
+
+/// What [`refresh`] found, and — if anything moved — what it did.
+#[derive(Debug)]
+pub(crate) enum RefreshOutcome {
+    /// `root` was never wired for cloud (`.dira/` does not exist). Refresh
+    /// never creates it — run `dira cloud init` / `dira onboard` for that.
+    NotWired,
+    /// The committed pin already matches `running`; nothing to do.
+    UpToDate { pin: String },
+    /// The committed pin is newer than `running` — never ours to lower.
+    PinnedNewer { pin: String },
+    /// The pin (and/or `hook.sh` / `.gitattributes` / harness wiring) moved
+    /// forward to `running`. `from`/`to` are read by tests pinning the
+    /// never-downgrades rule; `run_refresh` reports the same fact via
+    /// `delta`/`applied` instead.
+    Refreshed {
+        #[allow(dead_code)]
+        from: Option<String>,
+        #[allow(dead_code)]
+        to: String,
+        delta: Vec<String>,
+        applied: Applied,
+    },
+}
+
+/// Refresh `root`'s already-committed cloud wiring up to `running` (a
+/// `CARGO_PKG_VERSION`): `.dira/hook.sh`, `.dira/bootstrap.sh`'s pin, and any
+/// harness config already wired. Called by `dira cloud refresh`, and — via
+/// `dira update`'s post-swap step, from the freshly installed binary — after
+/// a successful `dira update` (DIRASH-0038).
+///
+/// **Never creates `.dira/`.** A repo that was never wired for cloud stays
+/// unwired here; that's `dira cloud init` / `dira onboard`'s job.
+/// **Never lowers a pin.** A pin newer than `running` (e.g. this machine's
+/// `dira` hasn't updated yet, but a teammate's has, and pushed a newer pin)
+/// is left exactly alone — see [`RepoCloudStatus::pin_relation`].
+/// **Only refreshes harnesses already wired.** A repo that only ever wired
+/// Claude stays Claude-only; if none of [`CLOUD_WIRABLE`]'s project configs
+/// are present, the harness-agnostic scripts (`hook.sh`, `bootstrap.sh`,
+/// `.gitattributes`) are still refreshed, with an empty harness set.
+///
+/// A thin wrapper over [`refresh_with`], which takes `no_pin` as a seam:
+/// this always passes `false` (a real refresh always tries to pin release
+/// digests), unit tests pass `true` to avoid the network fetch.
+pub(crate) async fn refresh(root: &Path, running: &str) -> Result<RefreshOutcome> {
+    refresh_with(root, running, false).await
+}
+
+async fn refresh_with(root: &Path, running: &str, no_pin: bool) -> Result<RefreshOutcome> {
+    let st = status(root, CLOUD_WIRABLE);
+    if !st.dir_present {
+        return Ok(RefreshOutcome::NotWired);
+    }
+    if st.pin_relation(running) == PinRelation::Newer {
+        let BootstrapState::Pinned(pin) = &st.bootstrap else {
+            unreachable!("PinRelation::Newer implies a parsed pin");
+        };
+        return Ok(RefreshOutcome::PinnedNewer { pin: pin.clone() });
+    }
+    if st.is_current(running) {
+        // The only way `is_current` is true without having just returned
+        // `PinnedNewer` above is `PinRelation::Same`, which — like `Newer`
+        // — only ever comes from a parsed pin.
+        let BootstrapState::Pinned(pin) = &st.bootstrap else {
+            unreachable!("is_current implies a parsed pin");
+        };
+        return Ok(RefreshOutcome::UpToDate { pin: pin.clone() });
+    }
+
+    let from = match &st.bootstrap {
+        BootstrapState::Pinned(v) => Some(v.clone()),
+        _ => None,
+    };
+    let delta = st.describe_delta(running);
+    let harnesses: Vec<&'static str> = st
+        .harnesses
+        .iter()
+        .filter(|h| h.config_present)
+        .map(|h| h.id)
+        .collect();
+
+    let applied = apply(
+        root,
+        &ApplyRequest {
+            harnesses: &harnesses,
+            no_pin,
+            on_unparseable: OnUnparseable::Refuse,
+        },
+    )
+    .await?;
+
+    Ok(RefreshOutcome::Refreshed {
+        from,
+        to: applied.pinned_version.clone(),
+        delta,
+        applied,
+    })
+}
+
+/// Other repos this machine has worked in (per the event log's `cwd`
+/// column) whose `.dira/` pin is behind `running`. Read-only by
+/// construction — no writes, and a missing or unopenable store answers
+/// empty rather than erroring, since this is advisory context for
+/// `dira cloud refresh --after-update`, never a reason to fail it.
+/// `exclude` (the repo just refreshed) is dropped so it never lists itself.
+pub(crate) async fn stale_known_repos(
+    db_path: &Path,
+    running: &str,
+    exclude: Option<&Path>,
+) -> Vec<(PathBuf, String)> {
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    let Ok(store) = dira_core::Store::open_readonly(db_path).await else {
+        return Vec::new();
+    };
+    let Ok(cwds) = store.distinct_event_cwds(200).await else {
+        return Vec::new();
+    };
+
+    // Compare canonical paths, report git's own. git resolves symlinks in
+    // the toplevel (`/private/tmp/…` on macOS for a `/tmp/…` cwd) while the
+    // caller's `exclude` is whatever `current_dir` handed it, so a raw
+    // compare listed the repo just refreshed as still stale. The canonical
+    // form is only for the compare: on Windows `canonicalize` yields a
+    // `\\?\C:\…` verbatim path nobody wants printed, and the git spelling
+    // is the one the user recognises.
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let exclude = exclude.map(canon);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for cwd in cwds {
+        let Some(root) = dira_core::project::toplevel(Path::new(&cwd)) else {
+            continue;
+        };
+        let key = canon(&root);
+        if exclude.as_deref() == Some(key.as_path()) {
+            continue;
+        }
+        if !seen.insert(key) {
+            continue;
+        }
+        let st = status(&root, CLOUD_WIRABLE);
+        if !st.dir_present {
+            continue;
+        }
+        match st.pin_relation(running) {
+            PinRelation::Older => {
+                if let BootstrapState::Pinned(v) = &st.bootstrap {
+                    out.push((root, v.clone()));
+                }
+            }
+            PinRelation::Unparseable => out.push((root, "?".to_string())),
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -792,7 +1395,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bootstrap_path = dir.path().join("bootstrap.sh");
         let ctx = ctx_at(UNREACHABLE);
-        let (x86_64, aarch64) = resolve_digests(&bootstrap_path, "9.9.9", true, &ctx).await;
+        let (x86_64, aarch64, _) = resolve_digests(&bootstrap_path, "9.9.9", true, &ctx).await;
         assert_eq!(x86_64, "");
         assert_eq!(aarch64, "");
     }
@@ -807,7 +1410,7 @@ mod tests {
         std::fs::write(&bootstrap_path, &existing).unwrap();
 
         let ctx = ctx_at(UNREACHABLE);
-        let (x86_64, aarch64) = resolve_digests(&bootstrap_path, "1.2.3", false, &ctx).await;
+        let (x86_64, aarch64, _) = resolve_digests(&bootstrap_path, "1.2.3", false, &ctx).await;
         assert_eq!(x86_64, "deadbeef");
         assert_eq!(aarch64, "cafef00d");
     }
@@ -823,7 +1426,7 @@ mod tests {
         std::fs::write(&bootstrap_path, &existing).unwrap();
 
         let ctx = ctx_at(UNREACHABLE);
-        let (x86_64, aarch64) = resolve_digests(&bootstrap_path, "2.0.0", false, &ctx).await;
+        let (x86_64, aarch64, _) = resolve_digests(&bootstrap_path, "2.0.0", false, &ctx).await;
         assert_eq!(x86_64, "");
         assert_eq!(aarch64, "");
     }
@@ -877,8 +1480,538 @@ mod tests {
         let ctx = ctx_at(&base);
         let dir = tempfile::tempdir().unwrap();
         let bootstrap_path = dir.path().join("bootstrap.sh"); // never written
-        let (x86_64, aarch64) = resolve_digests(&bootstrap_path, "9.9.9", false, &ctx).await;
+        let (x86_64, aarch64, _) = resolve_digests(&bootstrap_path, "9.9.9", false, &ctx).await;
         assert_eq!(x86_64, "");
         assert_eq!(aarch64, "");
+    }
+
+    // --- status / apply: the reader is the writer's own fixpoint test --------
+
+    const RUNNING: &str = env!("CARGO_PKG_VERSION");
+
+    fn all() -> &'static [&'static str] {
+        CLOUD_WIRABLE
+    }
+
+    async fn apply_unpinned(root: &Path) -> Applied {
+        apply(
+            root,
+            &ApplyRequest {
+                harnesses: all(),
+                no_pin: true,
+                on_unparseable: OnUnparseable::Refuse,
+            },
+        )
+        .await
+        .expect("apply")
+    }
+
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.push((p.clone(), std::fs::read(&p).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn status_on_an_empty_repo_reports_everything_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = status(dir.path(), all());
+        assert!(!st.dir_present);
+        assert_eq!(st.hook_sh, ArtifactState::Missing);
+        assert_eq!(st.bootstrap, BootstrapState::Missing);
+        assert_eq!(st.gitattributes, ArtifactState::Missing);
+        assert_eq!(st.pin_relation(RUNNING), PinRelation::Missing);
+        assert!(!st.is_current(RUNNING));
+        assert!(st.is_fresh());
+        assert_eq!(st.harnesses.len(), 2);
+        for h in &st.harnesses {
+            assert!(!h.config_present, "{}", h.id);
+            assert!(h.parseable);
+            assert!(h.events_missing > 0, "{}", h.id);
+            assert!(!h.current());
+        }
+        let delta = st.describe_delta(RUNNING);
+        assert!(
+            delta.iter().any(|l| l.contains("hook.sh missing")),
+            "{delta:?}"
+        );
+        assert!(
+            delta.iter().any(|l| l.contains(".claude/settings.json")),
+            "{delta:?}"
+        );
+        assert!(
+            delta.iter().any(|l| l.contains(".cursor/hooks.json")),
+            "{delta:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_after_apply_is_current_and_describes_no_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = apply_unpinned(dir.path()).await;
+        assert!(first.changed());
+        assert!(first.wrote_hook_sh && first.wrote_bootstrap && first.wrote_gitattributes);
+        assert!(!first.digests_pinned);
+        assert_eq!(first.pinned_version, RUNNING);
+        assert_eq!(first.wired.len(), 2);
+        assert!(first.wired.iter().all(|w| w.events_added > 0));
+
+        let st = status(dir.path(), all());
+        assert!(st.dir_present);
+        assert!(st.is_current(RUNNING), "{:?}", st.describe_delta(RUNNING));
+        assert!(!st.is_fresh());
+        assert_eq!(st.pin_relation(RUNNING), PinRelation::Same);
+        assert!(st.describe_delta(RUNNING).is_empty());
+
+        // And the applier agrees with the reader: a second run changes nothing.
+        let before = snapshot(dir.path());
+        let second = apply_unpinned(dir.path()).await;
+        assert!(!second.changed(), "{second:?}");
+        assert_eq!(before, snapshot(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn status_reports_an_older_pin_as_delta_and_a_newer_pin_as_not_ours_to_touch() {
+        let dir = tempfile::tempdir().unwrap();
+        apply_unpinned(dir.path()).await;
+        let bootstrap = dir.path().join(".dira").join(BOOTSTRAP_SCRIPT);
+
+        std::fs::write(&bootstrap, render_bootstrap("0.0.1", "", "")).unwrap();
+        let st = status(dir.path(), all());
+        assert_eq!(st.pin_relation(RUNNING), PinRelation::Older);
+        assert!(!st.is_current(RUNNING));
+        let delta = st.describe_delta(RUNNING);
+        assert_eq!(delta, vec![format!("bootstrap pin v0.0.1 → v{RUNNING}")]);
+
+        std::fs::write(&bootstrap, render_bootstrap("99.0.0", "", "")).unwrap();
+        let st = status(dir.path(), all());
+        assert_eq!(st.pin_relation(RUNNING), PinRelation::Newer);
+        assert!(st.is_current(RUNNING), "a newer pin is left alone");
+        assert!(st.describe_delta(RUNNING).is_empty());
+
+        std::fs::write(&bootstrap, "#!/bin/sh\necho no pin here\n").unwrap();
+        let st = status(dir.path(), all());
+        assert_eq!(st.bootstrap, BootstrapState::Unparseable);
+        assert_eq!(st.pin_relation(RUNNING), PinRelation::Unparseable);
+        assert!(!st.is_current(RUNNING));
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_hand_edited_hook_sh_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        apply_unpinned(dir.path()).await;
+        let hook = dir.path().join(".dira").join(HOOK_SCRIPT);
+        std::fs::write(&hook, format!("{HOOK_SH_TEMPLATE}# local tweak\n")).unwrap();
+        let st = status(dir.path(), all());
+        assert_eq!(st.hook_sh, ArtifactState::Stale);
+        assert!(!st.is_current(RUNNING));
+        assert!(st
+            .describe_delta(RUNNING)
+            .iter()
+            .any(|l| l.contains("hook.sh differs")));
+        // The applier repairs exactly that file and nothing else.
+        let again = apply_unpinned(dir.path()).await;
+        assert!(again.wrote_hook_sh);
+        assert!(!again.wrote_bootstrap && !again.wrote_gitattributes);
+        assert!(again.wired.iter().all(|w| w.events_added == 0));
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_partially_wired_harness_config() {
+        let dir = tempfile::tempdir().unwrap();
+        apply_unpinned(dir.path()).await;
+        // Drop one Claude event and corrupt the Cursor file.
+        let claude = dir.path().join(".claude/settings.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+        v["hooks"].as_object_mut().unwrap().remove("Stop");
+        std::fs::write(&claude, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        std::fs::write(dir.path().join(".cursor/hooks.json"), "{ not json").unwrap();
+
+        let st = status(dir.path(), all());
+        let claude = st.harnesses.iter().find(|h| h.id == "claude").unwrap();
+        assert!(claude.config_present && claude.parseable);
+        assert_eq!(claude.events_missing, 1);
+        assert!(!claude.current());
+        let cursor = st.harnesses.iter().find(|h| h.id == "cursor").unwrap();
+        assert!(cursor.config_present && !cursor.parseable);
+        assert!(!cursor.current());
+        let delta = st.describe_delta(RUNNING);
+        assert!(
+            delta
+                .iter()
+                .any(|l| l == ".claude/settings.json: 1 event(s) missing"),
+            "{delta:?}"
+        );
+        assert!(
+            delta
+                .iter()
+                .any(|l| l == ".cursor/hooks.json: not valid JSON"),
+            "{delta:?}"
+        );
+    }
+
+    #[test]
+    fn status_never_touches_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".dira")).unwrap();
+        std::fs::write(
+            dir.path().join(".dira").join(BOOTSTRAP_SCRIPT),
+            render_bootstrap("0.0.1", "", ""),
+        )
+        .unwrap();
+        let before = snapshot(dir.path());
+        let _ = status(dir.path(), all());
+        assert_eq!(before, snapshot(dir.path()));
+    }
+
+    #[test]
+    fn select_harnesses_accepts_aliases_and_rejects_non_cloud_ones() {
+        assert_eq!(select_harnesses(&[]).unwrap(), CLOUD_WIRABLE.to_vec());
+        assert_eq!(
+            select_harnesses(&["cursor".into(), "claude".into(), "cursor".into()]).unwrap(),
+            vec!["cursor", "claude"]
+        );
+        assert!(select_harnesses(&["codex".into()]).is_err());
+        assert!(select_harnesses(&["nope".into()]).is_err());
+    }
+
+    // --- refresh (DIRASH-0038) ------------------------------------------
+
+    #[tokio::test]
+    async fn refresh_never_creates_artifacts_and_never_downgrades() {
+        // An empty repo: NotWired, and refresh must not create .dira/.
+        let dir = tempfile::tempdir().unwrap();
+        let before = snapshot(dir.path());
+        let outcome = refresh(dir.path(), RUNNING).await.unwrap();
+        assert!(matches!(outcome, RefreshOutcome::NotWired));
+        assert_eq!(before, snapshot(dir.path()), "NotWired must not touch disk");
+
+        // Wire it (unpinned — no network), then push the pin ahead of `running`.
+        apply_unpinned(dir.path()).await;
+        let bootstrap = dir.path().join(".dira").join(BOOTSTRAP_SCRIPT);
+        std::fs::write(&bootstrap, render_bootstrap("99.0.0", "", "")).unwrap();
+        let before = snapshot(dir.path());
+        let outcome = refresh_with(dir.path(), RUNNING, true).await.unwrap();
+        match outcome {
+            RefreshOutcome::PinnedNewer { pin } => assert_eq!(pin, "99.0.0"),
+            other => panic!("expected PinnedNewer, got {other:?}"),
+        }
+        assert_eq!(
+            before,
+            snapshot(dir.path()),
+            "PinnedNewer must never lower the pin"
+        );
+
+        // Rewind the pin behind `running`: refresh must move it forward.
+        std::fs::write(&bootstrap, render_bootstrap("0.0.1", "", "")).unwrap();
+        let outcome = refresh_with(dir.path(), RUNNING, true).await.unwrap();
+        match outcome {
+            RefreshOutcome::Refreshed {
+                from,
+                to,
+                delta,
+                applied,
+            } => {
+                assert_eq!(from.as_deref(), Some("0.0.1"));
+                assert_eq!(to, RUNNING);
+                assert!(!delta.is_empty());
+                assert_eq!(applied.pinned_version, RUNNING);
+            }
+            other => panic!("expected Refreshed, got {other:?}"),
+        }
+        let st = status(dir.path(), CLOUD_WIRABLE);
+        assert_eq!(st.pin_relation(RUNNING), PinRelation::Same);
+
+        // Fixpoint: nothing left to refresh.
+        let outcome = refresh_with(dir.path(), RUNNING, true).await.unwrap();
+        match outcome {
+            RefreshOutcome::UpToDate { pin } => assert_eq!(pin, RUNNING),
+            other => panic!("expected UpToDate, got {other:?}"),
+        }
+    }
+
+    // --- regressions: pin ordering, partial wiring, corrupt configs, the listing
+
+    /// The develop channel ships `X.Y.Z-develop.N` builds. Semver orders a
+    /// prerelease below its release, so a repo pinned by a prerelease is
+    /// refreshed by the stable binary that follows it, and a stable pin is
+    /// never lowered by a prerelease binary of the same base version.
+    #[test]
+    fn prerelease_pins_order_below_their_release() {
+        let mut st = status(tempfile::tempdir().unwrap().path(), all());
+        st.bootstrap = BootstrapState::Pinned("0.6.0-develop.3".into());
+        assert_eq!(st.pin_relation("0.6.0"), PinRelation::Older);
+        assert_eq!(st.pin_relation("0.6.0-develop.4"), PinRelation::Older);
+        assert_eq!(st.pin_relation("0.6.0-develop.3"), PinRelation::Same);
+        st.bootstrap = BootstrapState::Pinned("0.6.0".into());
+        assert_eq!(st.pin_relation("0.6.0-develop.9"), PinRelation::Newer);
+        assert_eq!(st.pin_relation("0.7.0-develop.1"), PinRelation::Older);
+        st.bootstrap = BootstrapState::Pinned("not-a-version".into());
+        assert_eq!(st.pin_relation("0.6.0"), PinRelation::Unparseable);
+        assert_eq!(st.pin_relation("not-a-version"), PinRelation::Same);
+    }
+
+    #[test]
+    fn applied_changed_reflects_any_write_or_any_new_event() {
+        let quiet = Applied {
+            wrote_hook_sh: false,
+            wrote_bootstrap: false,
+            wrote_gitattributes: false,
+            pinned_version: RUNNING.into(),
+            digests_pinned: true,
+            wired: vec![Wired {
+                label: "Claude Code (cloud)",
+                kind: crate::init::Kind::Hooks,
+                path: Some(PathBuf::from(".claude/settings.json")),
+                command: String::new(),
+                events_added: 0,
+                note: None,
+            }],
+            warnings: Vec::new(),
+        };
+        assert!(!quiet.changed());
+        let mut one_file = quiet.clone();
+        one_file.wrote_gitattributes = true;
+        assert!(one_file.changed());
+        let mut one_event = quiet.clone();
+        one_event.wired[0].events_added = 1;
+        assert!(one_event.changed());
+    }
+
+    /// A repo that deliberately wires only Claude stays Claude-only across a
+    /// refresh: the harness set is what the repo already carries, never the
+    /// full `CLOUD_WIRABLE` list.
+    #[tokio::test]
+    async fn refresh_keeps_a_claude_only_repo_claude_only() {
+        let dir = tempfile::tempdir().unwrap();
+        apply(
+            dir.path(),
+            &ApplyRequest {
+                harnesses: &["claude"],
+                no_pin: true,
+                on_unparseable: OnUnparseable::Refuse,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join(".cursor/hooks.json").exists());
+        let bootstrap = dir.path().join(".dira").join(BOOTSTRAP_SCRIPT);
+        std::fs::write(&bootstrap, render_bootstrap("0.0.1", "", "")).unwrap();
+
+        let outcome = refresh_with(dir.path(), RUNNING, true).await.unwrap();
+        let RefreshOutcome::Refreshed { applied, .. } = outcome else {
+            panic!("expected Refreshed, got {outcome:?}");
+        };
+        assert_eq!(applied.wired.len(), 1);
+        assert_eq!(applied.wired[0].label, "Claude Code (cloud)");
+        assert!(
+            !dir.path().join(".cursor/hooks.json").exists(),
+            "a refresh must not add a harness the repo never opted into"
+        );
+    }
+
+    /// A refresh on a repo whose scripts drifted but whose configs are all
+    /// absent still rewrites the scripts, with an empty harness set.
+    #[tokio::test]
+    async fn refresh_with_no_harness_configs_still_repairs_the_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        apply_unpinned(dir.path()).await;
+        std::fs::remove_file(dir.path().join(".claude/settings.json")).unwrap();
+        std::fs::remove_file(dir.path().join(".cursor/hooks.json")).unwrap();
+        let hook = dir.path().join(".dira").join(HOOK_SCRIPT);
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let outcome = refresh_with(dir.path(), RUNNING, true).await.unwrap();
+        let RefreshOutcome::Refreshed { applied, .. } = outcome else {
+            panic!("expected Refreshed, got {outcome:?}");
+        };
+        assert!(applied.wrote_hook_sh);
+        assert!(applied.wired.is_empty());
+        assert!(!dir.path().join(".claude/settings.json").exists());
+        assert_eq!(status(dir.path(), all()).hook_sh, ArtifactState::Current);
+    }
+
+    /// Under `Refuse`, a corrupt harness config fails `apply` after the
+    /// scripts are written, and the next `status` reports exactly the
+    /// remaining delta — so a re-run after the user fixes the file finishes
+    /// the job rather than starting over.
+    #[tokio::test]
+    async fn a_corrupt_config_fails_apply_after_the_scripts_and_leaves_a_precise_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cursor")).unwrap();
+        std::fs::write(dir.path().join(".cursor/hooks.json"), "{ nope").unwrap();
+
+        let err = apply(
+            dir.path(),
+            &ApplyRequest {
+                harnesses: all(),
+                no_pin: true,
+                on_unparseable: OnUnparseable::Refuse,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("hooks.json"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".cursor/hooks.json")).unwrap(),
+            "{ nope",
+            "Refuse must leave the corrupt file untouched"
+        );
+
+        let st = status(dir.path(), all());
+        assert_eq!(st.hook_sh, ArtifactState::Current);
+        assert_eq!(st.pin_relation(RUNNING), PinRelation::Same);
+        let delta = st.describe_delta(RUNNING);
+        assert_eq!(
+            delta,
+            vec![".cursor/hooks.json: not valid JSON".to_string()]
+        );
+
+        // Fixed by hand: the re-run only wires cursor.
+        std::fs::write(dir.path().join(".cursor/hooks.json"), "{}").unwrap();
+        let again = apply_unpinned(dir.path()).await;
+        assert!(!again.wrote_hook_sh && !again.wrote_bootstrap && !again.wrote_gitattributes);
+        assert_eq!(again.wired[0].events_added, 0, "claude was already wired");
+        assert!(again.wired[1].events_added > 0, "cursor is wired now");
+    }
+
+    /// `Overwrite` (the single-`--harness` consent) replaces a corrupt file
+    /// instead of refusing.
+    #[tokio::test]
+    async fn a_corrupt_config_is_replaced_under_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/settings.json"), "{ nope").unwrap();
+        let applied = apply(
+            dir.path(),
+            &ApplyRequest {
+                harnesses: &["claude"],
+                no_pin: true,
+                on_unparseable: OnUnparseable::Overwrite,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(applied.wired[0].events_added > 0);
+        assert!(status(dir.path(), &["claude"]).harnesses[0].current());
+    }
+
+    async fn seed_event(store: &dira_core::Store, cwd: &Path, at: time::OffsetDateTime) {
+        store
+            .append(&dira_core::RawEvent {
+                id: ulid::Ulid::generate().to_string(),
+                at,
+                session_id: "s".into(),
+                harness: dira_contract::Harness::ClaudeCode,
+                kind: dira_core::EventKind::UserPrompt,
+                cwd: Some(cwd.display().to_string()),
+                project: None,
+                identity_email: None,
+                branch: None,
+                tool: None,
+                label: None,
+                activity: None,
+                note: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn git_init(dir: &Path) {
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init in {}", dir.display());
+    }
+
+    /// The listing is read-only and precise: one row per repo (two cwds in
+    /// the same work tree collapse), the repo just refreshed is excluded, a
+    /// current pin is not listed, a cwd outside any repo is ignored, and a
+    /// repo whose `.dira/` is gone is ignored. Nothing in any repo changes.
+    #[tokio::test]
+    async fn stale_known_repos_lists_each_older_repo_once_and_writes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let older = home.path().join("older");
+        let current = home.path().join("current");
+        let excluded = home.path().join("excluded");
+        let unwired = home.path().join("unwired");
+        let loose = home.path().join("loose"); // a cwd that is not a repo
+        for d in [&older, &current, &excluded, &unwired, &loose] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for d in [&older, &current, &excluded, &unwired] {
+            git_init(d);
+        }
+        for d in [&older, &current, &excluded] {
+            apply_unpinned(d).await;
+        }
+        for d in [&older, &excluded] {
+            std::fs::write(
+                d.join(".dira").join(BOOTSTRAP_SCRIPT),
+                render_bootstrap("0.0.1", "", ""),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(older.join("src/deep")).unwrap();
+
+        let db = home.path().join("dira.db");
+        let store = dira_core::Store::open(&db).await.unwrap();
+        let t0 = time::OffsetDateTime::now_utc();
+        seed_event(&store, &older, t0).await;
+        seed_event(
+            &store,
+            &older.join("src/deep"),
+            t0 + time::Duration::seconds(1),
+        )
+        .await;
+        seed_event(&store, &current, t0).await;
+        seed_event(&store, &excluded, t0).await;
+        seed_event(&store, &unwired, t0).await;
+        seed_event(&store, &loose, t0).await;
+        // `stale_known_repos` opens the store immutable, which never reads
+        // the WAL; checkpoint so the rows are in the main file.
+        store.wal_checkpoint_truncate().await.unwrap();
+        drop(store);
+
+        let before: Vec<_> = [&older, &current, &excluded, &unwired]
+            .iter()
+            .map(|d| snapshot(d))
+            .collect();
+        let listed = stale_known_repos(&db, RUNNING, Some(&excluded)).await;
+        let after: Vec<_> = [&older, &current, &excluded, &unwired]
+            .iter()
+            .map(|d| snapshot(d))
+            .collect();
+        assert_eq!(before, after, "the listing must not write anywhere");
+
+        let roots: Vec<PathBuf> = listed.iter().map(|(p, _)| p.clone()).collect();
+        let older_root = dira_core::project::toplevel(&older).unwrap();
+        assert_eq!(roots, vec![older_root], "{listed:?}");
+        assert_eq!(listed[0].1, "0.0.1");
+
+        // No store at all: silently nothing.
+        assert!(
+            stale_known_repos(&home.path().join("missing.db"), RUNNING, None)
+                .await
+                .is_empty()
+        );
     }
 }

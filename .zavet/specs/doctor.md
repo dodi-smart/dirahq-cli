@@ -1,16 +1,25 @@
 ---
 title: Diagnostics — dira doctor and the capture probe
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
-date: 2026-09-02
+date: 2026-09-09
 paths:
   - cli/dira/src/doctor/**
   - cli/dirad/src/probe.rs
   - cli/dira/src/hook_health.rs
   - cli/dira/src/init.rs
 decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029, DIRASH-0033]
+checks:
+  - a stale hook.sh warns and names dira onboard :: cargo test -p dira --bin dira -- doctor::checks::tests::a_stale_hook_sh_warns_with_onboard_as_the_remedy
+  - a present but unwired harness config warns :: cargo test -p dira --bin dira -- doctor::checks::tests::a_present_but_unwired_harness_config_warns
+  - an absent harness config is not a warning :: cargo test -p dira --bin dira -- doctor::checks::tests::an_absent_harness_config_is_not_a_warning
+  - an older pin is ok and names onboard :: cargo test -p dira --bin dira -- doctor::checks::tests::an_older_pin_is_ok_and_names_onboard
+  - a newer pin is ok and says so :: cargo test -p dira --bin dira -- doctor::checks::tests::a_newer_pin_is_ok_and_says_so
+  - bootstrap completeness and the pin are judged together :: cargo test -p dira --bin dira -- doctor::checks::tests::bootstrap_artifacts_judge_completeness_and_read_the_pin
+  - the generated template's pin reads back through the shared reader :: cargo test -p dira --bin dira -- doctor::checks::tests::the_pin_parser_reads_the_generated_template
+  - a plain machine still skips every cloud check :: cargo test -p dira --bin dira -- doctor::checks::tests::a_plain_machine_skips_every_cloud_check
 ---
 
 ## Overview
@@ -36,11 +45,20 @@ It is the only check that would have caught the incident above.
 Three of the static checks are `cloud.*`: whether this process is inside a
 detected cloud runtime and has the env a capture-and-sync session needs
 (`cloud.runtime`), whether the wire to the configured cloud actually works
-(`cloud.reachability`), and whether this repo's committed `.dira/` teleport
-artifacts are whole and current (`cloud.bootstrap`). A fourth,
-`hooks.scope_overlap`, judges the same harness-wiring facts `hooks.config`/
-`hooks.exe_path` read to say whether a harness wired at both project and
-global scope double-delivers or yields (see Behavior below).
+(`cloud.reachability`), and whether this repo's whole cloud wiring — the
+committed `.dira/` teleport artifacts, the version pin, and each requested
+harness's project-scope portable hook entries — is complete and current
+(`cloud.bootstrap`). `cloud.bootstrap` judges `cloud_init::status`'s own
+read-only snapshot rather than re-deriving any of it, so it cannot disagree
+with what `dira onboard` / `dira cloud init` consider done; every remedy it
+prints names `dira onboard` (with `dira cloud init` as the narrower
+alternative), and a stale version pin is folded into the `ok` summary as a
+note, never a `warn` — teammates on different `dira` versions committing the
+same repo must not all warn at each other over a pin that is merely older
+than the binary currently running `doctor`. A fourth, `hooks.scope_overlap`,
+judges the same harness-wiring facts `hooks.config`/`hooks.exe_path` read to
+say whether a harness wired at both project and global scope double-delivers
+or yields (see Behavior below).
 
 ## Behavior
 
@@ -105,6 +123,25 @@ global scope double-delivers or yields (see Behavior below).
   every machine, not only inside a detected runtime — the variable was set by
   something, and every device→cloud client silently drops an unreadable bundle
   (DIRASH-0033).
+- `cloud.bootstrap` skips exactly when `.dira/` is absent (`gather` filters
+  `cloud_init::status` on `dir_present`, keeping the existing skip wording).
+  Otherwise it judges, in order, never past `warn`: missing `hook.sh` or
+  `bootstrap.sh` warns ("missing generated scripts"); a hand-edited or
+  template-drifted `hook.sh` warns separately ("differs from this dira's
+  template"); an unparseable version pin warns; any requested harness whose
+  config file is *present* but not fully wired (unparseable JSON, or missing
+  portable hook entries) warns, naming the file and the event count — a
+  harness with no config file at all is not a warning, because a repo may
+  deliberately wire only one of `cloud_init::CLOUD_WIRABLE`. Every warning
+  remedy names `dira onboard` first, `dira cloud init` as the narrower
+  alternative. Once none of that applies it is `ok`, naming the pinned
+  version; when the pin is older than the running binary the summary still
+  says so and names `dira onboard` as what would refresh it (a note, not a
+  warning — see Overview); when the pin is newer it says so too and stops
+  there, since a pin only ever moves forward and an older `dira` has nothing
+  to contribute. A `.gitattributes` that is missing or stale is also folded
+  into the `ok` summary as a trailing note rather than a warning: it only
+  affects Windows checkouts.
 - Three `update.*` checks answer whether self-update is actually taking effect,
   which the passive notice cannot: that only escalates on failures the counter
   saw. `update.rollback` reports a leftover `.dira*.old.restore.<pid>` sidecar,

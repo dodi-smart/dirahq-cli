@@ -29,6 +29,7 @@ pub(crate) mod render;
 /// when doctor last ran on this machine.
 const META_LAST_RUN: &str = "doctor_last_run_at";
 
+use crate::cloud_init;
 use crate::update::replace::Guard;
 use dira_core::{Config, Store};
 use serde::Serialize;
@@ -362,7 +363,15 @@ async fn gather(config: &Config, args: &Args) -> Facts {
         }),
         identity_email_env: dira_core::env::non_blank(dira_core::project::ENV_IDENTITY_EMAIL)
             .is_some(),
-        bootstrap: checks::read_bootstrap_artifacts(&bootstrap_root),
+        // A repo with no `.dira/` at all still yields `None` here — filtered
+        // on `dir_present` rather than left as a status full of
+        // `Missing`/absent fields, so `cloud_bootstrap`'s existing skip
+        // wording ("this repo has no .dira/") still applies unchanged.
+        bootstrap: Some(cloud_init::status(
+            &bootstrap_root,
+            cloud_init::CLOUD_WIRABLE,
+        ))
+        .filter(|s| s.dir_present),
         meta_probe,
     };
 

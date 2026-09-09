@@ -8,6 +8,7 @@
 
 use super::{Check, Facts};
 use crate::client::Reach;
+use crate::cloud_init::{ArtifactState, BootstrapState, HarnessCloudWiring, PinRelation};
 use crate::daemon::{Info, Supervision};
 use crate::device::DeviceProbe;
 use crate::hook_health::Health;
@@ -827,44 +828,15 @@ pub(crate) struct CloudFacts {
     pub extra_ca: Option<(String, bool)>,
     /// `DIRA_IDENTITY_EMAIL` present and non-blank.
     pub identity_email_env: bool,
-    /// The committed teleport artifacts in the current directory, `None`
+    /// The repo's whole cloud wiring, as the shared reader sees it — `None`
     /// when the repo has no `.dira/` at all (most repos — not a finding).
-    pub bootstrap: Option<BootstrapFacts>,
+    /// `gather` filters `cloud_init::status`'s result on `dir_present` so a
+    /// repo with no `.dira/` yields `None` here rather than a status full of
+    /// `Missing`/absent fields.
+    pub bootstrap: Option<crate::cloud_init::RepoCloudStatus>,
     /// One GET against `{cloud_url}/api/v1/meta`: `Ok(status)` = the wire
     /// works; `Err(msg)` = transport failure. `None` = no cloud_url.
     pub meta_probe: Option<Result<u16, String>>,
-}
-
-/// What `.dira/` holds, as read off disk.
-pub(crate) struct BootstrapFacts {
-    pub hook_sh: bool,
-    pub bootstrap_sh: bool,
-    /// The `version="${DIRA_VERSION:-X.Y.Z}"` pin in bootstrap.sh, if parseable.
-    pub pinned_version: Option<String>,
-}
-
-/// Read the teleport artifacts under `root/.dira`, `None` when absent.
-pub(crate) fn read_bootstrap_artifacts(root: &Path) -> Option<BootstrapFacts> {
-    let dir = root.join(".dira");
-    if !dir.is_dir() {
-        return None;
-    }
-    let bootstrap = std::fs::read_to_string(dir.join("bootstrap.sh")).ok();
-    Some(BootstrapFacts {
-        hook_sh: dir.join("hook.sh").is_file(),
-        bootstrap_sh: bootstrap.is_some(),
-        pinned_version: bootstrap.as_deref().and_then(parse_pinned_version),
-    })
-}
-
-/// Pull `X.Y.Z` out of the generated `version="${DIRA_VERSION:-X.Y.Z}"` line.
-fn parse_pinned_version(bootstrap: &str) -> Option<String> {
-    let marker = "${DIRA_VERSION:-";
-    let start = bootstrap.find(marker)? + marker.len();
-    let rest = &bootstrap[start..];
-    let end = rest.find('}')?;
-    let v = rest[..end].trim();
-    (!v.is_empty()).then(|| v.to_string())
 }
 
 /// Which cloud runtime this process is in, and whether the provisioning env
@@ -971,39 +943,111 @@ pub(crate) fn cloud_reachability(c: &CloudFacts, cloud_url: Option<&str>) -> Che
     }
 }
 
-/// Are the committed teleport artifacts in this repo whole and current?
+/// Is this repo's whole cloud wiring — the generated scripts, the version
+/// pin, `.gitattributes`, and every requested harness's portable hook
+/// entries — present and current? Judged entirely from
+/// [`crate::cloud_init::status`]'s read-only snapshot: this check never
+/// touches disk itself, so it cannot disagree with what `dira onboard` /
+/// `dira cloud init` consider done.
+///
+/// A stale pin is a note folded into the `ok` summary, never a `warn`:
+/// teammates on different `dira` versions committing the same repo must not
+/// all warn at each other over a pin that is merely older than the binary
+/// currently running, not broken. Per DIRASH-0022, a warning here is never a
+/// `fail` — none of this is lost local capture.
 pub(crate) fn cloud_bootstrap(c: &CloudFacts) -> Check {
     const ID: &str = "cloud.bootstrap";
-    let Some(b) = &c.bootstrap else {
+    let Some(status) = &c.bootstrap else {
         return Check::skip(
             ID,
             "this repo has no .dira/ teleport artifacts (fine unless you expected them)",
         );
     };
+    let running = env!("CARGO_PKG_VERSION");
+    let pin_relation = status.pin_relation(running);
+
+    let artifact_str = |s: ArtifactState| match s {
+        ArtifactState::Missing => "missing",
+        ArtifactState::Current => "current",
+        ArtifactState::Stale => "stale",
+    };
+    let harness_detail = |h: &HarnessCloudWiring| {
+        json!({
+            "id": h.id,
+            "path": h.path.display().to_string(),
+            "present": h.config_present,
+            "parseable": h.parseable,
+            "events_missing": h.events_missing,
+        })
+    };
     let detail = json!({
-        "hook_sh": b.hook_sh,
-        "bootstrap_sh": b.bootstrap_sh,
-        "pinned_version": b.pinned_version,
-        "current_version": env!("CARGO_PKG_VERSION"),
+        "hook_sh": artifact_str(status.hook_sh),
+        "bootstrap_sh": !matches!(status.bootstrap, BootstrapState::Missing),
+        "pinned_version": match &status.bootstrap {
+            BootstrapState::Pinned(v) => Some(v.clone()),
+            BootstrapState::Missing | BootstrapState::Unparseable => None,
+        },
+        "pin_relation": format!("{pin_relation:?}"),
+        "current_version": running,
+        "gitattributes": artifact_str(status.gitattributes),
+        "harnesses": status.harnesses.iter().map(harness_detail).collect::<Vec<_>>(),
     });
-    if !b.hook_sh || !b.bootstrap_sh {
+
+    if status.hook_sh == ArtifactState::Missing || status.bootstrap == BootstrapState::Missing {
         return Check::warn(ID, ".dira/ exists but is missing generated scripts")
-            .remedy("dira cloud init — regenerates hook.sh + bootstrap.sh")
+            .remedy("dira onboard — rewrites the repo's cloud wiring (or dira cloud init)")
             .detail(detail);
     }
-    match b.pinned_version.as_deref() {
-        None => Check::warn(ID, ".dira/bootstrap.sh has no parseable version pin")
-            .remedy("dira cloud init — regenerates the script with a pinned release")
-            .detail(detail),
-        Some(v) => {
-            let mut summary = format!("teleport artifacts present (pinned v{v}");
-            if v != env!("CARGO_PKG_VERSION") {
-                summary.push_str(&format!("; this binary is v{}", env!("CARGO_PKG_VERSION")));
-            }
-            summary.push(')');
-            Check::ok(ID, summary).detail(detail)
+    if status.hook_sh == ArtifactState::Stale {
+        return Check::warn(ID, ".dira/hook.sh differs from this dira's template")
+            .remedy("dira onboard — refreshes .dira/hook.sh (or dira cloud init)")
+            .detail(detail);
+    }
+    if pin_relation == PinRelation::Unparseable {
+        return Check::warn(ID, ".dira/bootstrap.sh has no readable version pin")
+            .remedy("dira onboard — refreshes the repo's cloud wiring (or dira cloud init)")
+            .detail(detail);
+    }
+    // A harness whose config is absent entirely is not a warning: a repo may
+    // deliberately wire only one of the CLOUD_WIRABLE harnesses.
+    for h in &status.harnesses {
+        if h.config_present && !h.current() {
+            let path = h.path.display();
+            let summary = if !h.parseable {
+                format!("{path} is not valid JSON")
+            } else {
+                format!(
+                    "{path} is missing portable hook entries ({} event(s))",
+                    h.events_missing
+                )
+            };
+            return Check::warn(ID, summary)
+                .remedy("dira onboard — refreshes the repo's cloud wiring (or dira cloud init)")
+                .detail(detail);
         }
     }
+
+    let pin = match &status.bootstrap {
+        BootstrapState::Pinned(v) => v.clone(),
+        BootstrapState::Missing | BootstrapState::Unparseable => {
+            unreachable!("both arms handled above")
+        }
+    };
+    let mut summary = match pin_relation {
+        PinRelation::Older => format!(
+            "teleport artifacts present (pinned v{pin}; this dira is v{running} — dira onboard refreshes the pin)"
+        ),
+        PinRelation::Newer => {
+            format!("teleport artifacts present (pinned v{pin}, newer than this dira v{running})")
+        }
+        PinRelation::Same | PinRelation::Missing | PinRelation::Unparseable => {
+            format!("teleport artifacts present (pinned v{pin})")
+        }
+    };
+    if status.gitattributes != ArtifactState::Current {
+        summary.push_str("; .dira/.gitattributes missing");
+    }
+    Check::ok(ID, summary).detail(detail)
 }
 
 #[cfg(test)]
@@ -1050,7 +1094,7 @@ pub(crate) mod tests {
         }
     }
 
-    // --- project.resolves (#111) --------------------------------------------
+    // --- project.resolves (#111) -------------------------------------------
 
     fn facts_with_project(p: Result<String, dira_core::project::ProjectMiss>) -> Facts {
         Facts {
@@ -1645,6 +1689,35 @@ pub(crate) mod tests {
 
     // --- cloud.* -------------------------------------------------------------
 
+    /// A repo whose `.dira/` is fully current for `running` and whose two
+    /// `CLOUD_WIRABLE` harnesses are both wired with nothing missing —
+    /// the same fixpoint `cloud_init::status` would report against its own
+    /// writer.
+    pub(crate) fn wired_status(pin: &str) -> crate::cloud_init::RepoCloudStatus {
+        crate::cloud_init::RepoCloudStatus {
+            dir_present: true,
+            hook_sh: ArtifactState::Current,
+            bootstrap: BootstrapState::Pinned(pin.to_string()),
+            gitattributes: ArtifactState::Current,
+            harnesses: vec![
+                HarnessCloudWiring {
+                    id: "claude",
+                    path: std::path::PathBuf::from(".claude/settings.json"),
+                    config_present: true,
+                    parseable: true,
+                    events_missing: 0,
+                },
+                HarnessCloudWiring {
+                    id: "cursor",
+                    path: std::path::PathBuf::from(".cursor/hooks.json"),
+                    config_present: true,
+                    parseable: true,
+                    events_missing: 0,
+                },
+            ],
+        }
+    }
+
     fn in_claude_web() -> CloudFacts {
         CloudFacts {
             runtime: Some(dira_core::runtime::CloudRuntime {
@@ -1765,41 +1838,127 @@ pub(crate) mod tests {
         );
     }
 
+    /// A repo where someone deleted `hook.sh` (or `bootstrap.sh` never got
+    /// written) is incomplete, not merely stale — `dira onboard` is the
+    /// named remedy family throughout this file's checks.
     #[test]
     fn bootstrap_artifacts_judge_completeness_and_read_the_pin() {
+        let running = env!("CARGO_PKG_VERSION");
         let mut f = in_claude_web();
-        // Partial artifacts: a repo where someone deleted hook.sh.
-        f.bootstrap = Some(BootstrapFacts {
-            hook_sh: false,
-            bootstrap_sh: true,
-            pinned_version: Some("0.5.0".into()),
-        });
+
+        let mut incomplete = wired_status("0.5.0");
+        incomplete.hook_sh = ArtifactState::Missing;
+        f.bootstrap = Some(incomplete);
         let c = cloud_bootstrap(&f);
         assert_eq!(c.level, Level::Warn);
         assert!(c
             .remedy
             .as_deref()
             .unwrap_or_default()
-            .contains("cloud init"));
+            .contains("dira onboard"));
 
         // Whole artifacts: ok, naming the pin even when it trails this binary.
-        f.bootstrap = Some(BootstrapFacts {
-            hook_sh: true,
-            bootstrap_sh: true,
-            pinned_version: Some("0.5.0".into()),
-        });
+        f.bootstrap = Some(wired_status(running));
         let c = cloud_bootstrap(&f);
         assert_eq!(c.level, Level::Ok);
-        assert!(c.summary.contains("0.5.0"), "{}", c.summary);
+        assert!(c.summary.contains(running), "{}", c.summary);
     }
 
-    /// The pin parser reads exactly what the generator writes — the same
-    /// template, so the two cannot drift without this failing.
+    /// A hand-edited (or template-drifted) `hook.sh` warns with `dira onboard`
+    /// as the remedy — distinct wording from the missing-scripts case above,
+    /// same remedy family.
+    #[test]
+    fn a_stale_hook_sh_warns_with_onboard_as_the_remedy() {
+        let mut f = in_claude_web();
+        let mut status = wired_status(env!("CARGO_PKG_VERSION"));
+        status.hook_sh = ArtifactState::Stale;
+        f.bootstrap = Some(status);
+        let c = cloud_bootstrap(&f);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.summary.contains("hook.sh"), "{}", c.summary);
+        assert!(
+            c.remedy
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dira onboard"),
+            "{:?}",
+            c.remedy
+        );
+    }
+
+    /// A harness config that exists but is missing portable hook entries (or
+    /// is not valid JSON) is a real gap — `dira onboard` fixes it.
+    #[test]
+    fn a_present_but_unwired_harness_config_warns() {
+        let mut f = in_claude_web();
+        let mut status = wired_status(env!("CARGO_PKG_VERSION"));
+        status.harnesses[0].events_missing = 2;
+        f.bootstrap = Some(status);
+        let c = cloud_bootstrap(&f);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.summary.contains(".claude/settings.json"), "{}", c.summary);
+        assert!(c.summary.contains('2'), "{}", c.summary);
+        assert!(c
+            .remedy
+            .as_deref()
+            .unwrap_or_default()
+            .contains("dira onboard"));
+    }
+
+    /// A repo may deliberately wire only one of the `CLOUD_WIRABLE` harnesses
+    /// — an absent config for the other is not a finding.
+    #[test]
+    fn an_absent_harness_config_is_not_a_warning() {
+        let mut f = in_claude_web();
+        let mut status = wired_status(env!("CARGO_PKG_VERSION"));
+        status.harnesses[1].config_present = false;
+        status.harnesses[1].events_missing = 3;
+        f.bootstrap = Some(status);
+        let c = cloud_bootstrap(&f);
+        assert_eq!(c.level, Level::Ok, "{}", c.summary);
+    }
+
+    /// An older pin is a note in the `ok` summary, not a warning — it is
+    /// merely older than the binary running `doctor`, not broken, and
+    /// teammates on different `dira` versions must not all warn about it.
+    #[test]
+    fn an_older_pin_is_ok_and_names_onboard() {
+        let mut f = in_claude_web();
+        f.bootstrap = Some(wired_status("0.0.1"));
+        let c = cloud_bootstrap(&f);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.summary.contains("0.0.1"), "{}", c.summary);
+        assert!(
+            c.summary.contains(env!("CARGO_PKG_VERSION")),
+            "{}",
+            c.summary
+        );
+        assert!(c.summary.contains("dira onboard"), "{}", c.summary);
+    }
+
+    /// A pin newer than this binary is also `ok` — a pin only ever moves
+    /// forward, so an older `dira` has nothing to contribute.
+    #[test]
+    fn a_newer_pin_is_ok_and_says_so() {
+        let mut f = in_claude_web();
+        f.bootstrap = Some(wired_status("999.0.0"));
+        let c = cloud_bootstrap(&f);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.summary.contains("999.0.0"), "{}", c.summary);
+        assert!(c.summary.contains("newer"), "{}", c.summary);
+    }
+
+    /// `cloud_init::status` reads exactly what the generator writes — the
+    /// same template, so the two cannot drift without this failing.
     #[test]
     fn the_pin_parser_reads_the_generated_template() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".dira")).unwrap();
         let generated =
-            include_str!("../../templates/dira-bootstrap.sh").replace("{{VERSION}}", "1.2.3");
-        assert_eq!(parse_pinned_version(&generated).as_deref(), Some("1.2.3"));
-        assert_eq!(parse_pinned_version("nothing here"), None);
+            include_str!("../../templates/dira-bootstrap.sh").replace("{{VERSION}}", "9.9.9");
+        std::fs::write(dir.path().join(".dira/bootstrap.sh"), generated).unwrap();
+
+        let status = crate::cloud_init::status(dir.path(), &[]);
+        assert_eq!(status.bootstrap, BootstrapState::Pinned("9.9.9".into()));
     }
 }

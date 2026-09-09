@@ -1,10 +1,10 @@
 ---
 title: Cloud agent runtimes (teleport)
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-09-02
+date: 2026-09-09
 paths:
   - cli/dira/src/cloud_init.rs
   - cli/dira/templates/
@@ -12,8 +12,10 @@ paths:
   - cli/core/src/runtime.rs
   - cli/core/src/httpclient.rs
   - cli/dira/src/device.rs
-decisions: [D-0001, D-0009, D-0011, DIRASH-0033, DIRASH-0037]
+decisions: [D-0001, D-0009, D-0011, DIRASH-0029, DIRASH-0033, DIRASH-0037, DIRASH-0038]
 checks:
+  - status: freshness/pin/per-harness judgment matches what apply would do :: cargo test -p dira --bin dira -- cloud_init::tests::status_
+  - select_harnesses accepts aliases and rejects non-cloud-capable ones :: cargo test -p dira --bin dira -- cloud_init::tests::select_harnesses_accepts_aliases_and_rejects_non_cloud_ones
   - generated scripts substituted + POSIX + contracts :: cargo test -p dira --bin dira -- cloud_init::tests::generated_scripts_are_substituted_and_shell_sane
   - portable commands read as wired by the shared matcher :: cargo test -p dira --bin dira -- init::reader_tests::portable_wrapper_commands_read_as_wired
   - injection replaces absolute-path entries, converges :: cargo test -p dira --bin dira -- cloud_init::tests::nested_injection_replaces_absolute_path_entries_and_is_idempotent
@@ -52,6 +54,30 @@ live wiring instead (DIRASH-0037).
 
 ## Behavior
 
+- **Onboarding wires the repo by default.** `dira onboard`'s `cloud:repo` step
+  runs `dira cloud init`'s own writer against the current repo, on by
+  default, so a fresh machine setup doesn't separately require remembering
+  `dira cloud init`; `dira cloud init` remains the standalone/CI-scriptable
+  form (and the only one usable outside `dira onboard`'s waterfall), and
+  `--no-cloud` opts either one out. A re-run is delta-only: `cloud_init::
+  status` names exactly what changed (e.g. `bootstrap pin v0.5.0 → v0.6.0`)
+  and only the differing artifacts are rewritten; nothing changed reports
+  `AlreadyDone`. The bootstrap pin only ever moves forward — a teammate on an
+  older `dira` sees `AlreadyDone (… newer than this dira)` and never lowers
+  the committed pin. `status` never fetches digests (only `apply` does), so a
+  same-version but unpinned bootstrap counts as current until an `apply` run
+  actually pins it — a merely-missing pin at the same version is not treated
+  as drift. See `.zavet/specs/onboarding.md` for the step itself.
+- **`dira cloud refresh`** brings an existing `.dira/` wiring in the cwd repo
+  up to the running `dira`'s version — it never creates a wiring that isn't
+  there and never lowers the pin, the read-only-by-default posture `status`
+  gives it. After a successful `dira update` (binary swap + daemon restart),
+  the update spawns the freshly installed binary as `dira cloud refresh
+  --after-update`, which refreshes the cwd repo's pin through the *new*
+  binary and separately lists other repos the local store has seen events
+  from that still pin an older `dira` (read-only listing, no writes to those
+  other repos). `dira update --no-cloud` opts out of this post-update step.
+  See DIRASH-0038.
 - `dira cloud init` writes `.dira/hook.sh`, `.dira/bootstrap.sh` (version- and,
   unless `--no-pin`, digest-pinned from the generating binary), `.dira/
   .gitattributes` (`*.sh text eol=lf`, so a Windows checkout doesn't hand the
@@ -372,3 +398,7 @@ The CLI ships this claim variant dark until the cloud implements it:
   cargo test -p dirad --lib -- rollups_carry_the_cloud_runtime
 - bootstrap template is syntactically valid POSIX sh and shellcheck-clean ::
   sh -n cli/dira/templates/dira-bootstrap.sh && shellcheck -s sh cli/dira/templates/dira-bootstrap.sh
+- status's freshness/pin/per-harness judgment matches what apply would do ::
+  cargo test -p dira --bin dira -- cloud_init::tests::status_
+- select_harnesses accepts aliases and rejects non-cloud-capable ones ::
+  cargo test -p dira --bin dira -- cloud_init::tests::select_harnesses_accepts_aliases_and_rejects_non_cloud_ones

@@ -115,6 +115,12 @@ pub(crate) struct State {
     pub device_linked: bool,
     /// The currently resolved knowledge sync tier.
     pub knowledge: dira_core::config::KnowledgeSyncMode,
+    /// This repo's cloud-agent wiring (`.dira/`, portable hook configs), read
+    /// via `cloud_init::status` for every `CLOUD_WIRABLE` harness. `None`
+    /// outside a git work tree — mirrors `repo_root`, and read-only by
+    /// construction so computing it here cannot break `--print`'s
+    /// no-writes promise (DIRASH-0029 rule 3).
+    pub cloud: Option<crate::cloud_init::RepoCloudStatus>,
 }
 
 impl State {
@@ -223,6 +229,12 @@ pub(crate) fn repo(cwd: &Path) -> (Option<PathBuf>, bool) {
 /// The full detection pass.
 pub(crate) async fn run(config: &dira_core::Config, cwd: &Path) -> State {
     let (repo_root, has_zavet_dir) = repo(cwd);
+    // Read-only by construction (`cloud_init::status` never writes, spawns,
+    // or hits the network); computed only when there is a repo to read it
+    // for, same as `has_zavet_dir`.
+    let cloud = repo_root
+        .as_ref()
+        .map(|root| crate::cloud_init::status(root, crate::cloud_init::CLOUD_WIRABLE));
     let detected_harnesses = match dira_core::config::home_dir() {
         Ok(home) => harnesses(&home),
         // No resolvable `$HOME`: the old fallback probed `.` (cwd) instead,
@@ -245,6 +257,7 @@ pub(crate) async fn run(config: &dira_core::Config, cwd: &Path) -> State {
         zavet_installed: crate::zavet_install::plugin_root_offline().is_some(),
         device_linked: device_linked(config).await,
         knowledge: config.sync.knowledge,
+        cloud,
     }
 }
 
@@ -382,6 +395,7 @@ mod tests {
             zavet_installed: false,
             device_linked: false,
             knowledge: dira_core::config::KnowledgeSyncMode::Off,
+            cloud: None,
         };
 
         let ids: Vec<_> = state.wirable().iter().map(|h| h.probe.id).collect();
@@ -402,6 +416,7 @@ mod tests {
             zavet_installed: false,
             device_linked: false,
             knowledge: dira_core::config::KnowledgeSyncMode::Off,
+            cloud: None,
         };
         assert!(base.daemon_running());
         assert!(!base.supervised(), "a pidfile daemon dies with the session");

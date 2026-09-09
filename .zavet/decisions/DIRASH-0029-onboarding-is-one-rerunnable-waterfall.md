@@ -180,3 +180,89 @@ Two things came with it, both required rather than incidental:
   unnecessary. A supervisor still flaps against a socket it cannot take.
 - `install` is now `async`, and only stops a daemon nothing is supervising.
   Stopping a supervised one would just make its supervisor restart it mid-install.
+
+## Amendment: cloud wiring joins the waterfall (2026-09-09)
+
+`dira onboard` gains a `cloud:repo` step, on by default, sitting between
+`zavet:repo` and `knowledge`: it wires the current repo for cloud agents
+exactly like `dira cloud init` would.
+
+**Why on by default.** The repository is the only delivery channel a cloud
+agent's ephemeral VM reliably gets (see `.zavet/specs/cloud-runtime.md`'s
+"How it works"). A repo onboarded without it silently under-captures the
+moment work moves into a cloud session — the same failure class this decision
+already exists to prevent for a machine onboarded without `dira init`. Making
+it opt-out rather than opt-in is the only shape consistent with rule 1 above:
+skip, don't fail, but don't make the user discover the gap by absence.
+
+**Why both harnesses by default.** The repo is shared — whoever clones it
+next may run Claude Code or Cursor, and the person onboarding today usually
+doesn't know which. `dira cloud init`'s own default is "wire everything
+cloud-capable"; onboarding inherits that default rather than narrowing it,
+and `--harness` still narrows it to the cloud-capable harnesses named, same
+as it does for `dira cloud init` directly.
+
+**Why the pin only ever moves forward.** A committed `.dira/bootstrap.sh` pin
+is shared state: any teammate re-running onboarding, or `dira cloud refresh`,
+on any version of `dira` touches the same committed file. If the pin could
+move either direction, two teammates on different `dira` versions would fight
+over the committed version each time either one ran their tooling. Upward-only
+means the file converges to whoever has run the newest `dira`, and an older
+`dira` reports `AlreadyDone (… newer than this dira)` rather than quietly
+downgrading a teammate's pin.
+
+**Why the detection reader is the writer's own fixpoint test, not a marker
+file.** Rule 2 above already rules out a state file: nothing persisted can go
+stale independently of the machine. `cloud_init::status` holds to that by
+construction, not by a second hand-maintained probe — it runs the same
+hook-injection logic `apply` would run, against a scratch copy of each
+project config, and counts what would change. It compares each artifact to
+the running binary's own template and reads the bootstrap's embedded pin as a
+semver relation. There is no separate "have I onboarded cloud" bit anywhere;
+the reader cannot drift from the writer because it *is* the writer, aimed at
+a throwaway copy.
+
+**`dira update` now refreshes the cwd repo's pin.** After a successful update
+(binary swap + daemon restart), the freshly installed binary is spawned as
+`dira cloud refresh --after-update`, which refreshes the current repo's
+wiring to the new version and separately lists other repos the local store
+has seen events from that still pin an older `dira` — read-only for those,
+since refreshing a repo not on disk right now is not something `dira update`
+can safely do. This is decision DIRASH-0038; `--no-cloud` opts a given
+`dira update` invocation out of it.
+
+### Rejected
+
+- **A marker of the onboarded version.** The exact second source of truth
+  rule 2 forbids — it can drift from what is actually on disk (an artifact
+  hand-edited, or a `dira cloud init` run outside onboarding) without either
+  side noticing.
+- **Wiring only locally detected cloud-capable harnesses.** The repo is
+  shared; the machine running `dira onboard` today says nothing about who
+  clones it tomorrow. Detected-only wiring would silently under-capture for
+  every other contributor, the exact failure this amendment exists to close.
+- **Auto-committing the generated files.** Onboarding writes to the working
+  tree and says so; committing on the user's behalf reaches past what any
+  other step does and takes a decision (what goes in this commit, with what
+  message) that isn't onboarding's to make.
+- **Refreshing every store-known repo from `dira update`.** `dira update`
+  only touches the repo at `cwd`; a repo the store has seen events from may
+  not even be checked out on this machine right now, or may be checked out
+  somewhere the invoking user doesn't have write access. Listing them
+  read-only surfaces the drift without reaching into filesystem paths
+  `dira update` was never told about.
+
+### Agent directives
+
+- A new cloud artifact goes into `cloud_init::status` **and** `cloud_init::
+  apply` in the same change. `status` without a matching `apply` arm reports
+  drift that a re-run can never close; `apply` without a matching `status`
+  arm makes a re-run blind to what it just wrote.
+- Onboarding's `cloud:repo` step and `onboard::print_plan` share one
+  decision function. Do not fork a second copy of "what would this step do"
+  between the interactive path and `--print` — that is exactly the drift
+  rule 3 exists to prevent.
+- Never call `apply` from detection. `cloud_init::status` and anything
+  `onboard::detect` calls stay read-only and network-free; only a step's
+  execution (or `dira cloud init`/`dira cloud refresh` directly) may write or
+  fetch digests.

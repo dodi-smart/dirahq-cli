@@ -430,6 +430,289 @@ pub(crate) fn zavet_repo(
     StepOutcome::Done(msg)
 }
 
+// ---------------------------------------------------------------------------
+// Step — cloud:repo. Commit the portable cloud-agent wiring for this repo.
+// ---------------------------------------------------------------------------
+
+/// The `cloud:repo` decision, computed without touching disk or the network.
+///
+/// Shared by [`cloud_repo`] (which acts on it) and `mod::print_plan` (which
+/// only describes it), so the two can never disagree about what a run would
+/// do — the failure mode a hand-duplicated `if` chain in both places would
+/// otherwise invite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloudPlan {
+    /// Nothing to do, with the reason as it should be reported.
+    Skip(String),
+    /// Already wired at the version now running.
+    Current { root: PathBuf, ver: String },
+    /// Wired, but pinned to a version newer than this binary — never ours to
+    /// lower.
+    NewerPin { root: PathBuf, pin: String },
+    /// Nothing has ever been written here.
+    Wire {
+        root: PathBuf,
+        harnesses: Vec<&'static str>,
+    },
+    /// Something has been written before, but has drifted from what this
+    /// binary would produce.
+    Refresh {
+        root: PathBuf,
+        harnesses: Vec<&'static str>,
+        delta: Vec<String>,
+    },
+}
+
+/// Resolve `--harness` against [`crate::cloud_init::CLOUD_WIRABLE`], in
+/// `CLOUD_WIRABLE`'s own order (not the order the flags were typed in) so the
+/// report and the wire entries always read claude-then-cursor. Empty
+/// `--harness` means every cloud-wirable harness.
+fn select_cloud_harnesses(opts: &Options) -> Vec<&'static str> {
+    if opts.harness.is_empty() {
+        return crate::cloud_init::CLOUD_WIRABLE.to_vec();
+    }
+    let requested: std::collections::HashSet<&'static str> = opts
+        .harness
+        .iter()
+        .filter_map(|h| dira_sources::canonical_harness_id(h))
+        .collect();
+    crate::cloud_init::CLOUD_WIRABLE
+        .iter()
+        .copied()
+        .filter(|id| requested.contains(id))
+        .collect()
+}
+
+/// `state.cloud` was read for every `CLOUD_WIRABLE` harness (see
+/// `detect::run`); reuse it when the requested set is the same, so an
+/// unrestricted run costs one read instead of two. A narrower `--harness`
+/// selection re-reads for exactly the harnesses asked about.
+fn cloud_status_for(
+    state: &State,
+    root: &Path,
+    selected: &[&'static str],
+) -> crate::cloud_init::RepoCloudStatus {
+    if selected == crate::cloud_init::CLOUD_WIRABLE {
+        if let Some(s) = &state.cloud {
+            return s.clone();
+        }
+    }
+    crate::cloud_init::status(root, selected)
+}
+
+/// The pure decision behind `cloud:repo`, in the same order the step reads
+/// it in.
+pub(crate) fn cloud_plan(state: &State, opts: &Options) -> CloudPlan {
+    if opts.no_cloud {
+        return CloudPlan::Skip("--no-cloud".into());
+    }
+    let Some(root) = state.repo_root.clone() else {
+        return CloudPlan::Skip(
+            "not inside a git repository — run `dira onboard` from a repo to wire it for \
+             cloud agents"
+                .into(),
+        );
+    };
+    let selected = select_cloud_harnesses(opts);
+    if selected.is_empty() {
+        return CloudPlan::Skip("--harness names no cloud-capable harness (claude, cursor)".into());
+    }
+
+    let running = env!("CARGO_PKG_VERSION");
+    let status = cloud_status_for(state, &root, &selected);
+
+    if status.is_current(running) {
+        return if status.pin_relation(running) == crate::cloud_init::PinRelation::Newer {
+            let pin = match &status.bootstrap {
+                crate::cloud_init::BootstrapState::Pinned(v) => v.clone(),
+                _ => running.to_string(),
+            };
+            CloudPlan::NewerPin { root, pin }
+        } else {
+            CloudPlan::Current {
+                root,
+                ver: running.to_string(),
+            }
+        };
+    }
+
+    if status.is_fresh() {
+        CloudPlan::Wire {
+            root,
+            harnesses: selected,
+        }
+    } else {
+        let delta = status.describe_delta(running);
+        CloudPlan::Refresh {
+            root,
+            harnesses: selected,
+            delta,
+        }
+    }
+}
+
+/// The project-scope config path a cloud harness is wired through, for
+/// prompt wording only — `cloud_init`'s own `harness_configs` is private to
+/// that module.
+fn cloud_config_path(id: &str) -> &'static str {
+    match id {
+        "claude" => ".claude/settings.json",
+        "cursor" => ".cursor/hooks.json",
+        _ => "",
+    }
+}
+
+/// Seam over [`crate::cloud_init::apply`] so unit tests never write a real
+/// `.dira/` or `.claude/settings.json` / `.cursor/hooks.json`. Boxed-future
+/// rather than `async_trait` — the crate does not depend on it, and this is
+/// the only trait in the module that needs the shape.
+pub(crate) trait CloudApplier {
+    fn apply<'a>(
+        &'a self,
+        root: &'a Path,
+        req: &'a crate::cloud_init::ApplyRequest<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<crate::cloud_init::Applied>> + 'a>,
+    >;
+}
+
+/// The real applier: `dira onboard`'s own writes, shared with `dira cloud
+/// init` and `dira cloud refresh`.
+pub(crate) struct SystemApplier;
+
+impl CloudApplier for SystemApplier {
+    fn apply<'a>(
+        &'a self,
+        root: &'a Path,
+        req: &'a crate::cloud_init::ApplyRequest<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<crate::cloud_init::Applied>> + 'a>,
+    > {
+        Box::pin(crate::cloud_init::apply(root, req))
+    }
+}
+
+/// Run `apply`, report its warnings, and turn the result into a
+/// [`StepOutcome`]. `fresh`/`delta` decide the wording: a first wire names
+/// what got written, a refresh names the delta it was asked about before
+/// applying (not a second `describe_delta` call, which after a write would
+/// read empty and say nothing).
+async fn apply_cloud(
+    applier: &dyn CloudApplier,
+    root: &Path,
+    harnesses: &[&'static str],
+    ui: &mut dyn Ui,
+    fresh: bool,
+    delta: &[String],
+) -> StepOutcome {
+    let req = crate::cloud_init::ApplyRequest {
+        harnesses,
+        no_pin: false,
+        on_unparseable: OnUnparseable::Refuse,
+    };
+    let applied = match applier.apply(root, &req).await {
+        Ok(a) => a,
+        Err(e) => return StepOutcome::Failed(format!("cloud wiring: {e:#}")),
+    };
+    for w in &applied.warnings {
+        ui.say(&format!("warning: {w}"));
+    }
+    if !applied.changed() {
+        // Defensive: the plan said there was work, but the apply landed on a
+        // fixpoint anyway (a concurrent run finished it first, say).
+        return StepOutcome::AlreadyDone(format!(
+            "{} already wired for cloud agents (pinned v{})",
+            root.display(),
+            applied.pinned_version
+        ));
+    }
+
+    if fresh {
+        let mut parts = vec![format!(
+            ".dira/ (pinned v{}{})",
+            applied.pinned_version,
+            if applied.digests_pinned {
+                ""
+            } else {
+                ", unpinned digests"
+            }
+        )];
+        for (id, w) in harnesses.iter().zip(applied.wired.iter()) {
+            if w.events_added > 0 {
+                parts.push(format!("{id} {} event(s)", w.events_added));
+            }
+        }
+        StepOutcome::Done(format!(
+            "wired {} for cloud agents: {}",
+            root.display(),
+            parts.join(", ")
+        ))
+    } else {
+        StepOutcome::Done(format!(
+            "refreshed cloud wiring in {}: {}",
+            root.display(),
+            delta.join(", ")
+        ))
+    }
+}
+
+/// Step — commit this repo's portable cloud-agent wiring: `.dira/hook.sh` +
+/// `.dira/bootstrap.sh` (pinned to this binary's version) and hook entries in
+/// `.claude/settings.json` / `.cursor/hooks.json`, so Claude Code on the web
+/// and Cursor cloud agents capture the repo too, not just this machine.
+///
+/// On by default and delta-only: a re-run reports `AlreadyDone` once the
+/// pinned version and every requested harness's config match what this
+/// binary would write, and a stale repo is offered exactly the lines that
+/// changed, never a blind rewrite. See `cli/dira/src/cloud_init.rs`.
+pub(crate) async fn cloud_repo(
+    applier: &dyn CloudApplier,
+    state: &State,
+    opts: &Options,
+    ui: &mut dyn Ui,
+) -> StepOutcome {
+    match cloud_plan(state, opts) {
+        CloudPlan::Skip(reason) => StepOutcome::Skipped(reason),
+        CloudPlan::NewerPin { root, pin } => StepOutcome::AlreadyDone(format!(
+            "{} pins v{pin}, newer than this dira v{} — left alone",
+            root.display(),
+            env!("CARGO_PKG_VERSION")
+        )),
+        CloudPlan::Current { root, ver } => StepOutcome::AlreadyDone(format!(
+            "{} already wired for cloud agents (pinned v{ver})",
+            root.display()
+        )),
+        CloudPlan::Wire { root, harnesses } => {
+            let paths: Vec<&str> = harnesses.iter().map(|id| cloud_config_path(id)).collect();
+            let question = format!(
+                "Wire {} for cloud agents? Writes .dira/ and portable hook entries in {} \
+                 (commit them afterwards)",
+                root.display(),
+                paths.join(" + ")
+            );
+            if !ui.confirm(&question, true) {
+                return StepOutcome::Skipped("declined".into());
+            }
+            apply_cloud(applier, &root, &harnesses, ui, true, &[]).await
+        }
+        CloudPlan::Refresh {
+            root,
+            harnesses,
+            delta,
+        } => {
+            let question = format!(
+                "Refresh cloud wiring in {}? ({})",
+                root.display(),
+                delta.join("; ")
+            );
+            if !ui.confirm(&question, true) {
+                return StepOutcome::Skipped("declined".into());
+            }
+            apply_cloud(applier, &root, &harnesses, ui, false, &delta).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +734,7 @@ mod tests {
             zavet_installed: false,
             device_linked: false,
             knowledge: KnowledgeSyncMode::Off,
+            cloud: None,
         }
     }
 
@@ -810,6 +1094,461 @@ mod tests {
             ui.asked.len(),
             2,
             "must ask once per wirable harness, got: {:?}",
+            ui.asked
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // cloud:repo
+    // -----------------------------------------------------------------
+
+    use crate::cloud_init::{
+        Applied, ArtifactState, BootstrapState, HarnessCloudWiring, RepoCloudStatus,
+    };
+    use crate::init::{Kind, Wired};
+    use crate::onboard::prompt::Auto;
+    use std::cell::RefCell;
+
+    fn running() -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from("/tmp/dira-onboard-cloud-repo-test")
+    }
+
+    fn harness_wiring(id: &'static str, current: bool) -> HarnessCloudWiring {
+        HarnessCloudWiring {
+            id,
+            path: PathBuf::from(cloud_config_path(id)),
+            config_present: current,
+            parseable: true,
+            events_missing: if current { 0 } else { 8 },
+        }
+    }
+
+    /// Everything already matches what this binary would write.
+    fn current_status() -> RepoCloudStatus {
+        RepoCloudStatus {
+            dir_present: true,
+            hook_sh: ArtifactState::Current,
+            bootstrap: BootstrapState::Pinned(running().to_string()),
+            gitattributes: ArtifactState::Current,
+            harnesses: crate::cloud_init::CLOUD_WIRABLE
+                .iter()
+                .map(|id| harness_wiring(id, true))
+                .collect(),
+        }
+    }
+
+    /// Pinned to a version newer than this binary — never ours to lower.
+    fn newer_status() -> RepoCloudStatus {
+        RepoCloudStatus {
+            bootstrap: BootstrapState::Pinned("99.0.0".to_string()),
+            ..current_status()
+        }
+    }
+
+    /// Nothing has ever been written.
+    fn fresh_status() -> RepoCloudStatus {
+        RepoCloudStatus {
+            dir_present: false,
+            hook_sh: ArtifactState::Missing,
+            bootstrap: BootstrapState::Missing,
+            gitattributes: ArtifactState::Missing,
+            harnesses: crate::cloud_init::CLOUD_WIRABLE
+                .iter()
+                .map(|id| harness_wiring(id, false))
+                .collect(),
+        }
+    }
+
+    /// Written before, but the hook script and the pin have both drifted.
+    fn stale_status() -> RepoCloudStatus {
+        RepoCloudStatus {
+            dir_present: true,
+            hook_sh: ArtifactState::Stale,
+            bootstrap: BootstrapState::Pinned("0.1.0".to_string()),
+            gitattributes: ArtifactState::Current,
+            harnesses: crate::cloud_init::CLOUD_WIRABLE
+                .iter()
+                .map(|id| harness_wiring(id, true))
+                .collect(),
+        }
+    }
+
+    /// An applier that panics if called — proves a skip/already-done path
+    /// never reaches the writer.
+    struct Boom;
+    impl CloudApplier for Boom {
+        fn apply<'a>(
+            &'a self,
+            _root: &'a Path,
+            _req: &'a crate::cloud_init::ApplyRequest<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<crate::cloud_init::Applied>> + 'a>,
+        > {
+            panic!("must not apply")
+        }
+    }
+
+    /// Records the harness set it was asked to apply and returns a canned
+    /// `Applied`, so a test can assert both what was requested and what the
+    /// step reports without touching disk.
+    struct RecordingApplier {
+        applied: Applied,
+        requested: RefCell<Vec<String>>,
+    }
+
+    impl RecordingApplier {
+        fn new(applied: Applied) -> Self {
+            Self {
+                applied,
+                requested: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CloudApplier for RecordingApplier {
+        fn apply<'a>(
+            &'a self,
+            _root: &'a Path,
+            req: &'a crate::cloud_init::ApplyRequest<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<crate::cloud_init::Applied>> + 'a>,
+        > {
+            *self.requested.borrow_mut() = req.harnesses.iter().map(|s| s.to_string()).collect();
+            let applied = self.applied.clone();
+            Box::pin(async move { Ok(applied) })
+        }
+    }
+
+    fn fresh_applied() -> Applied {
+        Applied {
+            wrote_hook_sh: true,
+            wrote_bootstrap: true,
+            wrote_gitattributes: true,
+            pinned_version: running().to_string(),
+            digests_pinned: true,
+            wired: vec![
+                Wired {
+                    label: "Claude Code",
+                    kind: Kind::Hooks,
+                    path: Some(PathBuf::from(".claude/settings.json")),
+                    command: "dira hook claude".into(),
+                    events_added: 8,
+                    note: None,
+                },
+                Wired {
+                    label: "Cursor",
+                    kind: Kind::Hooks,
+                    path: Some(PathBuf::from(".cursor/hooks.json")),
+                    command: "dira hook cursor".into(),
+                    events_added: 7,
+                    note: None,
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_repo_outside_a_git_repository_is_skipped() {
+        let mut ui = ScriptedUi::new();
+        let outcome = cloud_repo(&Boom, &state(), &Options::default(), &mut ui).await;
+        assert!(
+            matches!(&outcome, StepOutcome::Skipped(m) if m.contains("not inside a git repository")),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_cloud_skips_the_step() {
+        let opts = Options {
+            no_cloud: true,
+            ..Options::default()
+        };
+        let st = State {
+            repo_root: Some(repo_root()),
+            cloud: Some(fresh_status()),
+            ..state()
+        };
+        let mut ui = ScriptedUi::new();
+        let outcome = cloud_repo(&Boom, &st, &opts, &mut ui).await;
+        assert_eq!(outcome, StepOutcome::Skipped("--no-cloud".into()));
+    }
+
+    #[tokio::test]
+    async fn already_current_is_already_done_and_never_applies() {
+        let st = State {
+            repo_root: Some(repo_root()),
+            cloud: Some(current_status()),
+            ..state()
+        };
+        let mut ui = ScriptedUi::new();
+        let outcome = cloud_repo(&Boom, &st, &Options::default(), &mut ui).await;
+        assert!(
+            matches!(&outcome, StepOutcome::AlreadyDone(m) if m.contains("already wired for cloud agents")),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newer_pin_is_already_done_and_says_so() {
+        let st = State {
+            repo_root: Some(repo_root()),
+            cloud: Some(newer_status()),
+            ..state()
+        };
+        let mut ui = ScriptedUi::new();
+        let outcome = cloud_repo(&Boom, &st, &Options::default(), &mut ui).await;
+        assert!(
+            matches!(&outcome, StepOutcome::AlreadyDone(m) if m.contains("newer")),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn declining_the_prompt_skips_without_applying() {
+        let st = State {
+            repo_root: Some(repo_root()),
+            cloud: Some(fresh_status()),
+            ..state()
+        };
+        let mut ui = ScriptedUi::new().with_confirms(&[false]);
+        let outcome = cloud_repo(&Boom, &st, &Options::default(), &mut ui).await;
+        assert_eq!(outcome, StepOutcome::Skipped("declined".into()));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_wire_names_dira_and_the_per_harness_event_counts() {
+        let st = State {
+            repo_root: Some(repo_root()),
+            cloud: Some(fresh_status()),
+            ..state()
+        };
+        let applier = RecordingApplier::new(fresh_applied());
+        let mut ui = ScriptedUi::new().with_confirms(&[true]);
+        let outcome = cloud_repo(&applier, &st, &Options::default(), &mut ui).await;
+        match &outcome {
+            StepOutcome::Done(m) => {
+                assert!(m.contains(".dira/"), "must name .dira/: {m}");
+                assert!(m.contains("claude 8 event(s)"), "got {m}");
+                assert!(m.contains("cursor 7 event(s)"), "got {m}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let expected: Vec<String> = crate::cloud_init::CLOUD_WIRABLE
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(*applier.requested.borrow(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_names_the_pre_apply_delta() {
+        let status = stale_status();
+        let expected_delta = status.describe_delta(running()).join(", ");
+        let st = State {
+            repo_root: Some(repo_root()),
+            cloud: Some(status),
+            ..state()
+        };
+        let applied = Applied {
+            wrote_hook_sh: true,
+            wrote_bootstrap: true,
+            wrote_gitattributes: false,
+            pinned_version: running().to_string(),
+            digests_pinned: true,
+            wired: vec![
+                Wired {
+                    label: "Claude Code",
+                    kind: Kind::Hooks,
+                    path: Some(PathBuf::from(".claude/settings.json")),
+                    command: "dira hook claude".into(),
+                    events_added: 0,
+                    note: None,
+                },
+                Wired {
+                    label: "Cursor",
+                    kind: Kind::Hooks,
+                    path: Some(PathBuf::from(".cursor/hooks.json")),
+                    command: "dira hook cursor".into(),
+                    events_added: 0,
+                    note: None,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let applier = RecordingApplier::new(applied);
+        let mut ui = ScriptedUi::new().with_confirms(&[true]);
+        let outcome = cloud_repo(&applier, &st, &Options::default(), &mut ui).await;
+        match &outcome {
+            StepOutcome::Done(m) => {
+                assert!(m.contains("refreshed cloud wiring"), "got {m}");
+                assert!(
+                    m.contains(&expected_delta),
+                    "got {m}, wanted {expected_delta}"
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_harness_with_no_cloud_capable_id_is_skipped() {
+        let st = State {
+            repo_root: Some(repo_root()),
+            ..state()
+        };
+        let opts = Options {
+            harness: vec!["codex".into()],
+            ..Options::default()
+        };
+        let mut ui = ScriptedUi::new();
+        let outcome = cloud_repo(&Boom, &st, &opts, &mut ui).await;
+        assert!(
+            matches!(&outcome, StepOutcome::Skipped(m) if m.contains("no cloud-capable harness")),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_only_harness_list_narrows_the_apply_request() {
+        // No `state.cloud` fixture: the selected set differs from
+        // `CLOUD_WIRABLE`, so the step re-reads via `cloud_init::status`
+        // against a repo root that does not exist on disk — a read-only,
+        // deterministic "nothing here yet" for a path that never resolves.
+        let st = State {
+            repo_root: Some(repo_root()),
+            ..state()
+        };
+        let opts = Options {
+            harness: vec!["cursor".into()],
+            ..Options::default()
+        };
+        let applied = Applied {
+            wrote_hook_sh: true,
+            wrote_bootstrap: true,
+            wrote_gitattributes: true,
+            pinned_version: running().to_string(),
+            digests_pinned: true,
+            wired: vec![Wired {
+                label: "Cursor",
+                kind: Kind::Hooks,
+                path: Some(PathBuf::from(".cursor/hooks.json")),
+                command: "dira hook cursor".into(),
+                events_added: 7,
+                note: None,
+            }],
+            warnings: Vec::new(),
+        };
+        let applier = RecordingApplier::new(applied);
+        let mut ui = ScriptedUi::new().with_confirms(&[true]);
+        let outcome = cloud_repo(&applier, &st, &opts, &mut ui).await;
+        assert!(matches!(outcome, StepOutcome::Done(_)), "got {outcome:?}");
+        assert_eq!(*applier.requested.borrow(), vec!["cursor".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_auto_ui_accepts_the_fresh_wire_prompt() {
+        let st = State {
+            repo_root: Some(repo_root()),
+            cloud: Some(fresh_status()),
+            ..state()
+        };
+        let applier = RecordingApplier::new(fresh_applied());
+        let mut ui = Auto;
+        let outcome = cloud_repo(&applier, &st, &Options::default(), &mut ui).await;
+        assert!(matches!(outcome, StepOutcome::Done(_)), "got {outcome:?}");
+    }
+
+    /// An applier error (a corrupt config under `Refuse`, say) is recorded
+    /// as `Failed` and never propagates: the run must go on to the knowledge
+    /// step, and the summary names what went wrong.
+    #[tokio::test]
+    async fn an_apply_error_is_a_failed_outcome_never_a_panic_or_abort() {
+        struct Broken;
+        impl CloudApplier for Broken {
+            fn apply<'a>(
+                &'a self,
+                _root: &'a Path,
+                _req: &'a crate::cloud_init::ApplyRequest<'a>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<crate::cloud_init::Applied>>
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Err(anyhow::anyhow!(
+                        ".cursor/hooks.json is not valid JSON — refusing to overwrite it"
+                    ))
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let st = State {
+            repo_root: Some(dir.path().to_path_buf()),
+            cloud: Some(crate::cloud_init::status(
+                dir.path(),
+                crate::cloud_init::CLOUD_WIRABLE,
+            )),
+            ..state()
+        };
+        let mut ui = ScriptedUi::new();
+        let outcome = cloud_repo(&Broken, &st, &Options::default(), &mut ui).await;
+        match outcome {
+            StepOutcome::Failed(m) => {
+                assert!(m.starts_with("cloud wiring:"), "{m}");
+                assert!(m.contains("hooks.json"), "{m}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The applier's advisories reach the user through the wizard's own
+    /// channel, not a stderr line lost between prompts.
+    #[tokio::test]
+    async fn applier_warnings_are_said_through_the_ui() {
+        struct Warns;
+        impl CloudApplier for Warns {
+            fn apply<'a>(
+                &'a self,
+                _root: &'a Path,
+                _req: &'a crate::cloud_init::ApplyRequest<'a>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<crate::cloud_init::Applied>>
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    let mut a = fresh_applied();
+                    a.warnings
+                        .push(".dira/hook.sh is excluded by this repo's .gitignore".into());
+                    Ok(a)
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let st = State {
+            repo_root: Some(dir.path().to_path_buf()),
+            cloud: Some(crate::cloud_init::status(
+                dir.path(),
+                crate::cloud_init::CLOUD_WIRABLE,
+            )),
+            ..state()
+        };
+        let mut ui = ScriptedUi::new();
+        let outcome = cloud_repo(&Warns, &st, &Options::default(), &mut ui).await;
+        assert!(matches!(outcome, StepOutcome::Done(_)), "{outcome:?}");
+        // `ScriptedUi` records `say` lines alongside the questions it was asked.
+        assert!(
+            ui.asked
+                .iter()
+                .any(|l| l.contains("warning:") && l.contains(".gitignore")),
+            "said: {:?}",
             ui.asked
         );
     }

@@ -324,6 +324,27 @@ impl Store {
         Ok(row.get::<i64, _>("n") as u64)
     }
 
+    /// Distinct non-empty `cwd` values across the event log, most recently
+    /// active first, capped at `limit`. "Most recently active" is the max
+    /// `at` of any event recorded for that cwd — a repo touched once months
+    /// ago but not since sorts behind one touched today. Used by `dira cloud
+    /// refresh --after-update` (DIRASH-0038) to enumerate other repos this
+    /// machine has worked in, so a stale `.dira/` pin elsewhere can be
+    /// surfaced without scanning the filesystem.
+    pub async fn distinct_event_cwds(&self, limit: u32) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT cwd FROM events WHERE cwd IS NOT NULL AND cwd != '' \
+             GROUP BY cwd ORDER BY MAX(at) DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("cwd"))
+            .collect())
+    }
+
     /// Count token rows with rowid strictly greater than `cursor` (the un-synced
     /// compute backlog). `cursor = None` counts every row, which is what an
     /// install that has not yet advanced [`crate::sync::META_TOKEN_CURSOR`] sees.
@@ -3275,6 +3296,65 @@ mod tests {
             activity: None,
             note: None,
         }
+    }
+
+    /// `distinct_event_cwds` returns the most-recently-active cwd first
+    /// (by max `at` per cwd, not insertion order), dedupes repeats, ignores
+    /// null/empty cwds, and honours `limit`.
+    #[tokio::test]
+    async fn distinct_event_cwds_is_most_recent_first_and_capped() {
+        let store = Store::open_in_memory().await.unwrap();
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(30);
+
+        let with_cwd = |id: &str, cwd: Option<&str>, at: OffsetDateTime| {
+            let mut ev = ev_at(id, "s", at, EventKind::UserPrompt);
+            ev.cwd = cwd.map(|c| c.to_string());
+            ev
+        };
+
+        // /repo-a: touched twice, most recently at `now`.
+        store
+            .append(&with_cwd(
+                "01A0",
+                Some("/repo-a"),
+                now - time::Duration::hours(5),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&with_cwd("01A1", Some("/repo-a"), now))
+            .await
+            .unwrap();
+        // /repo-b: touched once, earlier than /repo-a's latest.
+        store
+            .append(&with_cwd(
+                "01B0",
+                Some("/repo-b"),
+                now - time::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+        // /repo-c: touched once, the oldest.
+        store
+            .append(&with_cwd(
+                "01C0",
+                Some("/repo-c"),
+                now - time::Duration::hours(10),
+            ))
+            .await
+            .unwrap();
+        // null and empty cwds must never appear.
+        store.append(&with_cwd("01D0", None, now)).await.unwrap();
+        store
+            .append(&with_cwd("01E0", Some(""), now))
+            .await
+            .unwrap();
+
+        let all = store.distinct_event_cwds(10).await.unwrap();
+        assert_eq!(all, vec!["/repo-a", "/repo-b", "/repo-c"]);
+
+        let capped = store.distinct_event_cwds(2).await.unwrap();
+        assert_eq!(capped, vec!["/repo-a", "/repo-b"]);
     }
 
     /// Issue #74's residue: the writer prune only fires when a `SessionEnd`

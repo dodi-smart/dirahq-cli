@@ -95,6 +95,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0035 — A newer schema is refused loudly, never run against (active)
 - DIRASH-0036 — A pricing refresh appends and never drops a vendored id (active)
 - DIRASH-0037 — The portable hook yields to live user-scope wiring — no cache, no time window (active)
+- DIRASH-0038 — dira update refreshes the cwd repo's cloud pin through the new binary, never installs, never sweeps (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

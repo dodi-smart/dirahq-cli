@@ -421,3 +421,203 @@ async fn warns_when_a_committed_artifact_is_gitignored() {
         "{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `dira cloud refresh` (DIRASH-0038)
+// ---------------------------------------------------------------------------
+
+/// Replace `.dira/bootstrap.sh`'s `${DIRA_VERSION:-X.Y.Z}` pin with
+/// `new_version`, leaving everything else byte-identical — the same marker
+/// `cloud_init::existing_pin`/`status` read, spelled out here since these
+/// are black-box tests against the compiled binary.
+fn rewrite_pin(text: &str, new_version: &str) -> String {
+    let marker = "${DIRA_VERSION:-";
+    let start = text
+        .find(marker)
+        .expect("bootstrap must carry the pin marker")
+        + marker.len();
+    let end = start
+        + text[start..]
+            .find('}')
+            .expect("the pin marker must close with '}'");
+    format!("{}{new_version}{}", &text[..start], &text[end..])
+}
+
+/// Append an event whose `cwd` is `cwd` to the store at `db_path` — what
+/// `dira cloud refresh --after-update` reads (via `Store::distinct_event_cwds`)
+/// to learn which other repos this machine has worked in.
+async fn seed_event_cwd(db_path: &Path, cwd: &Path) {
+    let store = dira_core::Store::open(db_path)
+        .await
+        .expect("open the isolated store");
+    let event = dira_core::RawEvent {
+        id: ulid::Ulid::generate().to_string(),
+        at: time::OffsetDateTime::now_utc(),
+        session_id: "s1".to_string(),
+        harness: dira_contract::Harness::ClaudeCode,
+        kind: dira_core::EventKind::UserPrompt,
+        cwd: Some(cwd.display().to_string()),
+        project: None,
+        identity_email: None,
+        branch: None,
+        tool: None,
+        label: None,
+        activity: None,
+        note: None,
+    };
+    store.append(&event).await.expect("seed the event");
+    // `stale_known_repos` reads through `Store::open_readonly`, which opens
+    // `immutable(true)` and therefore never consults the WAL (see
+    // `Store::open_readonly`'s doc comment) — without a checkpoint here the
+    // row this just wrote sits in the WAL and the subprocess's readonly open
+    // never sees it.
+    store
+        .wal_checkpoint_truncate()
+        .await
+        .expect("checkpoint the seeded event into the main db file");
+}
+
+/// The end-to-end shape of DIRASH-0038: `dira update`'s post-swap step spawns
+/// `dira cloud refresh --after-update` from the cwd it was run in. This test
+/// drives that command directly (the daemon-restart spawn itself is never
+/// exercised in e2e — see the decision record) against two wired repos, A and
+/// B, both pinned behind `running`: A gets bumped, B is only *listed* as
+/// still stale (never written), because it is read from the local event log,
+/// not resolved as a live cwd.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_refresh_bumps_an_older_pin_and_lists_other_stale_repos() {
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let dir_a = tmp_a.path();
+    let dir_b = tmp_b.path();
+    git_init(dir_a);
+    git_init(dir_b);
+    let home = tempfile::tempdir().unwrap();
+    let mock = mock_release().await;
+
+    for dir in [dir_a, dir_b] {
+        let out = run_cloud_init(dir, &["--no-pin"], &mock.download_base());
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    // Rewind both pins behind `running`.
+    for dir in [dir_a, dir_b] {
+        let bootstrap = dir.join(".dira/bootstrap.sh");
+        let text = std::fs::read_to_string(&bootstrap).unwrap();
+        std::fs::write(&bootstrap, rewrite_pin(&text, "0.0.1")).unwrap();
+    }
+
+    let hook_a = dir_a.join(".dira/hook.sh");
+    let hook_mtime_before = std::fs::metadata(&hook_a).unwrap().modified().unwrap();
+
+    // Seed the isolated store (at `home`'s DIRA_DB_PATH) with an event whose
+    // cwd is B — the "other repos" advisory reads this, not the filesystem.
+    let db_path = home.path().join("isolated.db");
+    seed_event_cwd(&db_path, dir_b).await;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dira"));
+    cmd.arg("cloud")
+        .arg("refresh")
+        .arg("--after-update")
+        .current_dir(dir_a);
+    isolate_user_dirs(&mut cmd, home.path());
+    cmd.env("DIRA_DOWNLOAD_URL", mock.download_base());
+    let out = output_staged(&mut cmd).expect("spawn dira cloud refresh --after-update");
+    assert!(out.status.success(), "{out:?}");
+
+    // A's pin moved to `running`.
+    let bootstrap_a = std::fs::read_to_string(dir_a.join(".dira/bootstrap.sh")).unwrap();
+    assert!(
+        bootstrap_a.contains(env!("CARGO_PKG_VERSION")),
+        "{bootstrap_a}"
+    );
+    assert!(!bootstrap_a.contains("0.0.1"), "{bootstrap_a}");
+
+    // hook.sh content didn't change (this binary's template hasn't drifted),
+    // so it must not have been rewritten either.
+    let hook_mtime_after = std::fs::metadata(&hook_a).unwrap().modified().unwrap();
+    assert_eq!(
+        hook_mtime_before, hook_mtime_after,
+        "hook.sh must not be rewritten when its content is already current"
+    );
+
+    // B is untouched — only ever read, never written.
+    let bootstrap_b = std::fs::read_to_string(dir_b.join(".dira/bootstrap.sh")).unwrap();
+    assert!(bootstrap_b.contains("0.0.1"), "{bootstrap_b}");
+
+    // B is named in the "other repos" advisory (by its unique tempdir name —
+    // `git rev-parse --show-toplevel` may resolve a symlinked prefix
+    // differently than the raw tempdir path, but the unique leaf survives).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("other repo(s)"), "{stdout}");
+    let leaf = dir_b.file_name().unwrap().to_string_lossy();
+    assert!(stdout.contains(leaf.as_ref()), "{stdout}");
+    assert!(stdout.contains("0.0.1"), "{stdout}");
+}
+
+/// A repo with no `.dira/` at all: `--after-update` is silent and writes
+/// nothing (routine — every `dira update` run would otherwise print a line
+/// in every unwired repo); without the flag it says so explicitly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_refresh_outside_a_wired_repo_is_a_silent_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_init(dir);
+    let home = tempfile::tempdir().unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dira"));
+    cmd.arg("cloud")
+        .arg("refresh")
+        .arg("--after-update")
+        .current_dir(dir);
+    isolate_user_dirs(&mut cmd, home.path());
+    let out = output_staged(&mut cmd).expect("spawn dira cloud refresh --after-update");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "--after-update must print nothing for a never-wired repo: {out:?}"
+    );
+    assert!(snapshot(dir).is_empty(), "must create nothing");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dira"));
+    cmd.arg("cloud").arg("refresh").current_dir(dir);
+    isolate_user_dirs(&mut cmd, home.path());
+    let out = output_staged(&mut cmd).expect("spawn dira cloud refresh");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("nothing to refresh"), "{stdout}");
+    assert!(snapshot(dir).is_empty(), "must create nothing");
+}
+
+/// A pin newer than `running` is reported and left exactly alone, run by
+/// hand (no `--after-update`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_refresh_never_lowers_a_newer_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_init(dir);
+    let home = tempfile::tempdir().unwrap();
+    let mock = mock_release().await;
+
+    let out = run_cloud_init(dir, &["--no-pin"], &mock.download_base());
+    assert!(out.status.success(), "{out:?}");
+    let bootstrap = dir.join(".dira/bootstrap.sh");
+    let text = std::fs::read_to_string(&bootstrap).unwrap();
+    std::fs::write(&bootstrap, rewrite_pin(&text, "99.0.0")).unwrap();
+    let before = snapshot(dir);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dira"));
+    cmd.arg("cloud").arg("refresh").current_dir(dir);
+    isolate_user_dirs(&mut cmd, home.path());
+    cmd.env("DIRA_DOWNLOAD_URL", mock.download_base());
+    let out = output_staged(&mut cmd).expect("spawn dira cloud refresh");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("99.0.0"), "{stdout}");
+    assert!(stdout.contains("newer"), "{stdout}");
+    assert_eq!(
+        before,
+        snapshot(dir),
+        "a newer pin must never be touched, even by `cloud refresh`"
+    );
+}

@@ -8,7 +8,11 @@ instrumentation it simply vanishes from your record.
 `dira cloud init` "teleports" dira into those VMs: it generates portable,
 repo-committed artifacts that install dira inside the session VM, capture the
 harness's hook events, and sync signed attestations to your Dira cloud — the
-same metadata-only proofs your laptop produces.
+same metadata-only proofs your laptop produces. `dira onboard` runs this same
+writer against the current repo by default (its `cloud:repo` step, `--no-cloud`
+to skip), so a fresh machine setup wires cloud capture without a separate
+command; `dira cloud init` remains the standalone/CI-scriptable form. See
+[docs/getting-started.md](getting-started.md) for the onboarding flow itself.
 
 ## How it works
 
@@ -83,6 +87,21 @@ rather than dismissing:
   written it will never be committed, so a cloud VM cloning the repo never
   gets it. The fix is to add a negation rule (`!.dira/`, or the specific
   path) or remove the matching rule, then `git add` it.
+
+### Keeping the wiring current
+
+```console
+$ dira cloud refresh
+```
+
+Brings an existing `.dira/` wiring up to the running `dira`'s version. It
+never creates a wiring that isn't there (use `dira cloud init`/`dira onboard`
+for that) and never lowers the committed pin — a teammate on an older `dira`
+sees the repo as already current rather than downgrading it. `dira update`
+runs this automatically for the repo in your current directory right after a
+successful update, and separately lists (read-only) any other repos your
+local store has seen events from that still pin an older `dira`. Pass
+`--no-cloud` to `dira update` to skip that post-update step.
 
 ### 2. Mint a runner token
 

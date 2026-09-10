@@ -42,10 +42,12 @@ jobs:
           tool: cargo-edit
       - name: Install release tooling
         run: bun install --frozen-lockfile
+      # Link the org's shared semantic-release config into node_modules.
+      - uses: dodi-smart/.github/actions/semantic-release-config@v1
       - name: Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bunx semantic-release --extends ./.releaserc.js
+        run: bunx semantic-release --extends ./release.config.mjs
 
   # After stable releases on main, fast-forward the prerelease channel by merging
   # main back into develop so develop never lags behind production.

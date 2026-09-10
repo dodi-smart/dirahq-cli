@@ -4,20 +4,13 @@
   "private": true,
   "description": "Release & commit-convention tooling for the Dira CLI (cli + contract).",
   "scripts": {
-    "release": "semantic-release --extends ./.releaserc.js",
-    "release:dry-run": "semantic-release --dry-run --no-ci --extends ./.releaserc.js",
+    "release": "semantic-release --extends ./release.config.mjs",
+    "release:dry-run": "semantic-release --dry-run --no-ci --extends ./release.config.mjs",
     "commitlint": "commitlint"
   },
   "devDependencies": {
     "@commitlint/cli": "21.2.2",
     "@commitlint/config-conventional": "21.2.2",
-    "@semantic-release/changelog": "7.0.0",
-    "@semantic-release/commit-analyzer": "13.0.1",
-    "@semantic-release/exec": "7.1.0",
-    "@semantic-release/git": "11.0.1",
-    "@semantic-release/github": "12.0.9",
-    "@semantic-release/release-notes-generator": "14.1.1",
-    "conventional-changelog-conventionalcommits": "9.3.1",
     "semantic-release": "25.0.9",
     "semantic-release-scope-filter": "1.0.0"
   }

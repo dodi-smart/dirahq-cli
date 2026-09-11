@@ -4,6 +4,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [develop, main]
+  # Compiles on develop so the Swatinem/rust-cache entry PRs restore from is
+  # ever warm — a PR run can only read a base-branch cache, never write one
+  # another PR can use. Rust/Rust (windows) below are the only jobs that run
+  # here; the rest stay PR-only.
+  push:
+    branches: [develop]
   workflow_dispatch:
 
 concurrency:
@@ -96,7 +102,9 @@ jobs:
   rust:
     name: Rust (capture layer)
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false
+    # Also runs on push to develop (trusted, post-merge code) to compile and
+    # save the rust-cache entry PRs then restore from — see the `on:` comment.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     env:
       RUST_BACKTRACE: "1"
     steps:
@@ -112,7 +120,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add rustfmt clippy
+      # shared-key pins one entry both events read: PRs restore it (save-if is
+      # false there) instead of each writing a near-duplicate off the same base.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -142,7 +155,8 @@ jobs:
   rust-windows:
     name: Rust (windows)
     runs-on: windows-latest
-    if: github.event.pull_request.draft == false
+    # Also runs on push to develop — see the `rust` job and the `on:` comment.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     timeout-minutes: 30
     env:
       RUST_BACKTRACE: "1"
@@ -156,6 +170,9 @@ jobs:
           rustup default stable
           rustup component add clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test

@@ -27,10 +27,39 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           fetch-depth: 0
       - uses: wagoid/commitlint-github-action@v6
         with:
           configFile: commitlint.config.mjs
+
+  # The same lint the optional git hooks run, defined once in hk.pkl, with the
+  # tools pinned in mise.toml. `install_args` limits mise to the lint tools: a bare
+  # mise-action would also install everything else in mise.toml (rust, node, bun,
+  # just), none of which this job uses. rustfmt comes from the runner's rustup.
+  # Lightweight — stays on GitHub-hosted runners, same as commit-lint (D-0012).
+  lint:
+    name: Lint (hk)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: >-
+            aqua:jdx/hk
+            aqua:rhysd/actionlint
+            aqua:koalaman/shellcheck
+            aqua:crate-ci/typos
+            aqua:zizmorcore/zizmor
+            aqua:gitleaks/gitleaks
+      - name: hk check --all
+        run: hk check --all
 
   # Lint the shell that puts a binary on someone's PATH: POSIX-only shellcheck
   # plus canonical shfmt formatting. Both scripts here are install-path logic
@@ -45,6 +74,8 @@ jobs:
     if: github.event.pull_request.draft == false
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install shfmt
         uses: taiki-e/install-action@v2
         with:
@@ -66,6 +97,8 @@ jobs:
     if: github.event.pull_request.draft == false
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Invoke-ScriptAnalyzer install.ps1
         shell: pwsh
         run: |
@@ -83,6 +116,8 @@ jobs:
     if: github.event.pull_request.draft == false
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
@@ -109,6 +144,8 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Set up the Rust toolchain directly instead of via mise — mise's
       # `rust = "stable"` is a silent no-op on runners without rustup. The
       # GitHub-hosted images ship rustup, so this just pins stable and adds
@@ -162,6 +199,8 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Set up Rust toolchain
         shell: bash
         run: |

@@ -1,0 +1,16 @@
+# gitleaks config, picked up from the repo root by the hk gitleaks step.
+title = "dirahq-cli"
+
+[extend]
+useDefault = true
+
+# The hk step runs `gitleaks dir .`, which walks the working tree and does not
+# read .gitignore. `target/` and `node_modules/` are untracked build output that
+# CI never has and a developer's checkout can hold gigabytes of, so scanning them
+# is slow and reports hits in files that can never be committed.
+[[allowlists]]
+description = "untracked build output and installed dependencies"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)node_modules/''',
+]

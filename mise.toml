@@ -7,6 +7,16 @@ just = "latest"
 node = "24"
 bun = "latest"
 
+# Lint tools for the optional git hooks (hk.pkl) and the CI lint job. Pinned
+# here so Renovate bumps them; keep hk in step with the version named in the
+# `amends` and `import` lines of hk.pkl.
+"aqua:jdx/hk" = "2.4.0"
+"aqua:rhysd/actionlint" = "1.7.12"
+"aqua:koalaman/shellcheck" = "0.11.0"
+"aqua:crate-ci/typos" = "1.50.3"
+"aqua:zizmorcore/zizmor" = "1.30.1"
+"aqua:gitleaks/gitleaks" = "8.30.1"
+
 [env]
 RUST_BACKTRACE = "1"
 # Local-only default; the daemon falls back to XDG paths when unset.

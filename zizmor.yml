@@ -1,0 +1,63 @@
+# Config for zizmor, the workflow security linter that hk runs. Copy to
+# <repo>/zizmor.yml next to hk.pkl, which passes it with --config.
+#
+# Actions are pinned by a readable tag (`@v7`, and `@v1` for the shared
+# workflows), not a commit SHA, on purpose. The shared Renovate preset sets
+# `pinDigests: false` and holds a bump back for a release-age delay instead, so a
+# SHA pin would only make every update unreadable. Allow a ref pin everywhere, or
+# the linter reports every `uses:` in the repo. A bare `uses: owner/repo` with no
+# ref still fails.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": ref-pin
+  # The org's caller templates pass `secrets: inherit` to workflows this org owns.
+  # Only those callers are exempt; a new workflow that inherits still warns.
+  secrets-inherit:
+    ignore:
+      - agents.yml
+      - deps-verify.yml
+      - pr-checks.yml
+      - pr-review.yml
+      - release.yml
+      # This repo has no pr-checks.yml, so it keeps the standalone zavet caller.
+      - zavet-check.yml
+
+  # Findings in workflows that predate hk, adopted as they are. Each is a
+  # decision about the release pipeline or the token scopes, not a lint fix, so
+  # they are ignored per rule and per file (a new occurrence in another file
+  # still fails) and tracked as follow-ups in the pull request that added hk.
+  #
+  # ci.yml has no `permissions:` block and the repo default token is read/write.
+  # zavet-check.yml is a caller that needs the pull-request comment grant.
+  excessive-permissions:
+    ignore:
+      - build-release.yml
+      - ci.yml
+      - release.yml
+      - zavet-check.yml
+  # These checkouts either push (release, pricing sync, installer sync) or feed a
+  # signing/upload step, so `persist-credentials: false` needs a per-job look.
+  artipacked:
+    ignore:
+      - build-release.yml
+      - cloud-capture.yml
+      - pricing-sync.yml
+      - release.yml
+      - sync-install-script.yml
+  # build-release runs on `workflow_run` of the release workflow by design (D-0013).
+  dangerous-triggers:
+    ignore:
+      - build-release.yml
+  github-env:
+    ignore:
+      - build-release.yml
+  template-injection:
+    ignore:
+      - build-release.yml
+      - cloud-capture.yml
+  # The installer sync mints an org-wide App token to open a PR in the landing repo.
+  github-app:
+    ignore:
+      - sync-install-script.yml

@@ -17,6 +17,11 @@ bun = "latest"
 "aqua:zizmorcore/zizmor" = "1.30.1"
 "aqua:gitleaks/gitleaks" = "8.30.1"
 
+# Turn the hk git hooks on for this clone after every `mise install`
+# (it runs even when nothing needed installing). CI skips it.
+[hooks]
+postinstall = { run = '[ -n "$CI" ] || hk install --mise', shell = "sh -c" }
+
 [env]
 RUST_BACKTRACE = "1"
 # Local-only default; the daemon falls back to XDG paths when unset.

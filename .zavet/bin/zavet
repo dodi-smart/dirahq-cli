@@ -21,7 +21,8 @@ usage() {
 zavet — repo-local knowledge layer (decisions, guards, trailers)
 
 Usage:
-  zavet init [--prefix P]     Scaffold .zavet/ in the current git repo
+  zavet init [--prefix P] [--grok]
+                              Scaffold .zavet/ in the current git repo
                               (prefix derived from the repo name if omitted)
   zavet root                  Print repo toplevel (fails unless .zavet/ exists)
   zavet prefix [<NEW>]        Print the decision-id prefix, or change the one
@@ -79,7 +80,9 @@ Usage:
   zavet index                 Regenerate .zavet/INDEX.md, plus the generated
                               agent-context files (see rules / agents-md)
   zavet rules [--check]       Write .grok/rules/zavet.md — the standing rules
-                              and decision index, as Grok Build project rules
+                              and decision index, as Grok Build project rules.
+                              An explicit request, so it writes even where
+                              .grok/ does not exist yet
   zavet agents-md [--check]   Write the zavet block of ./AGENTS.md, for every
                               harness with no session-start hook of its own
   zavet context               Print the standing rules and decision index, for
@@ -87,13 +90,13 @@ Usage:
   zavet hook <kind> [--flavor claude|grok|cursor]
                               Run a guard hook over a harness event on stdin
                               (guard-edit, guard-commit, refresh)
-  zavet adapters [--check] [--cursor] [--hk]
+  zavet adapters [--check] [--cursor] [--grok] [--hk]
                               Refresh every cross-harness adapter in this repo:
-                              the vendored CLI, AGENTS.md, .grok/, and the git
-                              hook templates, plus .zavet/hk/Zavet.pkl when the
-                              repo has an hk.pkl (or --hk). --check reports
-                              drift, writes nothing, and exits 1 if anything is
-                              stale
+                              the vendored CLI, AGENTS.md, and the git hook
+                              templates, plus .grok/ when the repo has one (or
+                              --grok), and .zavet/hk/Zavet.pkl when the repo has
+                              an hk.pkl (or --hk). --check reports drift,
+                              writes nothing, and exits 1 if anything is stale
   zavet hooks [install|--check]
                               Install the git-hook enforcement floor by
                               pointing core.hooksPath at .zavet/githooks, or,
@@ -889,6 +892,7 @@ spec_frontmatter() {
 
 cmd_init() {
     prefix=""
+    _grokflag=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --prefix)
@@ -900,7 +904,8 @@ cmd_init() {
                 prefix=${1#--prefix=}
                 shift
                 ;;
-            *) die "usage: zavet init [--prefix <PREFIX>]" ;;
+            --grok) _grokflag=--grok; shift ;;
+            *) die "usage: zavet init [--prefix <PREFIX>] [--grok]" ;;
         esac
     done
     top=$(repo_toplevel) || die "not inside a git repository"
@@ -943,9 +948,14 @@ cmd_init() {
     # load-bearing part; adapters are re-runnable on their own (`zavet
     # adapters`), so this only downgrades the summary line, never the exit
     # status.
-    if cmd_adapters >/dev/null; then
-        printf 'zavet: cross-harness adapters written (AGENTS.md, %s, %s)\n' \
-            "$ZAVET_GROK_RULES" "$ZAVET_GITHOOKS_DIR"
+    # Unquoted on purpose: empty must expand to no argument, since a quoted
+    # empty string would reach cmd_adapters as an unknown flag.
+    # shellcheck disable=SC2086
+    if cmd_adapters $_grokflag >/dev/null; then
+        _written="AGENTS.md, $ZAVET_GITHOOKS_DIR"
+        # Grok is opt-in: only named when the adapter actually wrote it.
+        [ -d "$top/$ZAVET_GROK_DIR" ] && _written="AGENTS.md, $ZAVET_GROK_RULES, $ZAVET_GITHOOKS_DIR"
+        printf 'zavet: cross-harness adapters written (%s)\n' "$_written"
     else
         printf 'zavet: adapters not written — run zavet adapters\n' >&2
     fi
@@ -1927,6 +1937,8 @@ EOF
         _fn=${_pair%% *}
         _rel=${_pair#* }
         if [ ! -f "$root/$_rel" ]; then
+            # Grok is opt-in, like Cursor: no .grok/ means nobody asked for it.
+            [ "$_rel" = "$ZAVET_GROK_RULES" ] && [ ! -d "$root/$ZAVET_GROK_DIR" ] && continue
             printf 'adapter-missing\t%s\trun: zavet adapters\n' "$_rel"
             continue
         fi
@@ -2248,6 +2260,7 @@ ctx_payload() { # $1 = root, $2 = "hook" | "file"
     fi
 }
 
+ZAVET_GROK_DIR=".grok"
 ZAVET_GROK_RULES=".grok/rules/zavet.md"
 ZAVET_AGENTS_MD="AGENTS.md"
 MARK_AGENTS_START="<!-- zavet:agents:start -->"
@@ -2783,10 +2796,10 @@ EOF
 # added to one and forgotten in the others.
 #
 # Fields: renderer<TAB>repo-relative path<TAB>mode<TAB>optional
-adapters_table() { # $1 = want_cursor, $2 = want_hk
+adapters_table() { # $1 = want_cursor, $2 = want_hk, $3 = want_grok
     printf 'ctx_render_agents_md\t%s\t644\t0\n' "$ZAVET_AGENTS_MD"
-    printf 'ctx_render_rules\t%s\t644\t0\n' "$ZAVET_GROK_RULES"
-    printf 'ctx_render_grok_hooks\t%s\t644\t0\n' "$ZAVET_GROK_HOOKS"
+    [ "${3:-0}" -eq 1 ] && printf 'ctx_render_rules\t%s\t644\t1\n' "$ZAVET_GROK_RULES"
+    [ "${3:-0}" -eq 1 ] && printf 'ctx_render_grok_hooks\t%s\t644\t1\n' "$ZAVET_GROK_HOOKS"
     printf 'ctx_render_githook_commit_msg\t%s/commit-msg\t755\t0\n' "$ZAVET_GITHOOKS_DIR"
     printf 'ctx_render_githook_pre_commit\t%s/pre-commit\t755\t0\n' "$ZAVET_GITHOOKS_DIR"
     [ "$1" -eq 1 ] && printf 'ctx_render_cursor_hooks\t%s\t644\t1\n' "$ZAVET_CURSOR_HOOKS"
@@ -2797,19 +2810,24 @@ adapters_table() { # $1 = want_cursor, $2 = want_hk
 cmd_adapters() {
     _check=0
     _cursor=0
+    _grok=0
     _hk=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --check) _check=1; shift ;;
             --cursor) _cursor=1; shift ;;
+            --grok) _grok=1; shift ;;
             --hk) _hk=1; shift ;;
-            *) die "usage: zavet adapters [--check] [--cursor] [--hk]" ;;
+            *) die "usage: zavet adapters [--check] [--cursor] [--grok] [--hk]" ;;
         esac
     done
     root=$(zavet_root)
     # An existing .cursor/hooks.json means the repo already opted in; keep
     # refreshing it without needing the flag every time.
     [ -f "$root/$ZAVET_CURSOR_HOOKS" ] && _cursor=1
+    # Grok is opt-in the same way: `--grok`, or a `.grok/` the repo already has
+    # (every repo that ran zavet before this was opt-in does).
+    [ -d "$root/$ZAVET_GROK_DIR" ] && _grok=1
     # Same for hk: an hk.pkl means hk owns the hooks, and an existing module
     # means the repo already asked for it.
     { [ -f "$root/$ZAVET_HK_CONFIG" ] || [ -f "$root/$ZAVET_HK_MODULE" ]; } && _hk=1
@@ -2854,7 +2872,7 @@ cmd_adapters() {
         _wrote=1
         ctx_warn_ignored "$root" "$_rel"
     done <<EOF
-$(adapters_table "$_cursor" "$_hk")
+$(adapters_table "$_cursor" "$_hk" "$_grok")
 EOF
 
     if [ "$_check" -eq 1 ]; then
@@ -2866,9 +2884,17 @@ EOF
     # The git hooks exist now but do nothing until core.hooksPath points at
     # them, or hk runs them. Saying so beats a floor everyone believes is
     # installed.
+    #
+    # Under hk the useful next step is whichever piece is missing, not
+    # `zavet hooks install`, which only unsets a stale core.hooksPath there.
     if ! githook_floor_active "$root"; then
-        printf 'zavet: next step — "zavet hooks install" to activate the git-hook floor (%s)\n' \
-            "$ZAVET_GITHOOKS_DIR"
+        if hk_owns_hooks "$root"; then
+            hk_config_wired "$root" || hk_wire_hint
+            hk_hook_installed "$root" || hk_install_hint
+        else
+            printf 'zavet: next step — "zavet hooks install" to activate the git-hook floor (%s)\n' \
+                "$ZAVET_GITHOOKS_DIR"
+        fi
     fi
 }
 
@@ -2949,6 +2975,22 @@ cmd_hooks() {
     printf 'zavet: git-hook floor active (core.hooksPath=%s)\n' "$ZAVET_GITHOOKS_DIR"
 }
 
+# The two missing pieces of the floor under hk, worded once for both callers
+# (`hooks` prints them to stderr, `adapters` to stdout). They print to stdout;
+# a caller that wants stderr redirects.
+hk_wire_hint() {
+    printf 'zavet: %s does not run the zavet steps yet. Add:\n\n' "$ZAVET_HK_CONFIG"
+    printf '  import "./%s"\n\n' "$ZAVET_HK_MODULE"
+    printf '  hooks {\n'
+    printf '    ["commit-msg"] { steps { ["zavet-guard"] = Zavet.guard } }\n'
+    printf '    ["pre-commit"] { steps { ["zavet-nudge"] = Zavet.nudge } }\n'
+    printf '  }\n\n'
+}
+
+hk_install_hint() {
+    printf 'zavet: hk'"'"'s commit-msg hook is not installed — run "hk install" (or "hk install --mise")\n'
+}
+
 # The floor in a repo whose hooks hk owns. zavet never edits hk.pkl: it says
 # what to add and checks that it is there. The one thing it does change is its
 # own core.hooksPath from an earlier `hooks install`. Left set, git would read
@@ -2971,16 +3013,11 @@ hooks_via_hk() { # $1 = root, $2 = install|check, $3 = core.hooksPath
         printf 'zavet: no %s — run "zavet adapters"\n' "$ZAVET_HK_MODULE" >&2
         _ok=0
     elif ! hk_config_wired "$1"; then
-        printf 'zavet: %s does not run the zavet steps yet. Add:\n\n' "$ZAVET_HK_CONFIG" >&2
-        printf '  import "./%s"\n\n' "$ZAVET_HK_MODULE" >&2
-        printf '  hooks {\n' >&2
-        printf '    ["commit-msg"] { steps { ["zavet-guard"] = Zavet.guard } }\n' >&2
-        printf '    ["pre-commit"] { steps { ["zavet-nudge"] = Zavet.nudge } }\n' >&2
-        printf '  }\n\n' >&2
+        hk_wire_hint >&2
         _ok=0
     fi
     if ! hk_hook_installed "$1"; then
-        printf 'zavet: hk'"'"'s commit-msg hook is not installed — run "hk install" (or "hk install --mise")\n' >&2
+        hk_install_hint >&2
         _ok=0
     fi
     if [ "$_ok" -eq 0 ]; then

@@ -1,5 +1,5 @@
-# Config for zizmor, the workflow security linter that hk runs. Copy to
-# <repo>/zizmor.yml next to hk.pkl, which passes it with --config.
+# Config for zizmor, the workflow security linter that hk runs. hk.pkl passes it
+# with --config.
 #
 # Actions are pinned by a readable tag (`@v7`, and `@v1` for the shared
 # workflows), not a commit SHA, on purpose. The shared Renovate preset sets
@@ -21,7 +21,7 @@ rules:
       - pr-checks.yml
       - pr-review.yml
       - release.yml
-      # This repo has no pr-checks.yml, so it keeps the standalone zavet caller.
+      # The standalone zavet caller, for a repo that has no pr-checks.yml.
       - zavet-check.yml
 
   # Findings in workflows that predate hk, adopted as they are. Each is a
@@ -29,14 +29,12 @@ rules:
   # they are ignored per rule and per file (a new occurrence in another file
   # still fails) and tracked as follow-ups in the pull request that added hk.
   #
-  # ci.yml has no `permissions:` block and the repo default token is read/write.
-  # zavet-check.yml is a caller that needs the pull-request comment grant.
+  # Every job of ci.yml and the zavet-check.yml caller now declare their own
+  # minimal permissions, so neither is ignored. What stays is the release pipeline.
   excessive-permissions:
     ignore:
       - build-release.yml
-      - ci.yml
       - release.yml
-      - zavet-check.yml
   # These checkouts either push (release, pricing sync, installer sync) or feed a
   # signing/upload step, so `persist-credentials: false` needs a per-job look.
   artipacked:

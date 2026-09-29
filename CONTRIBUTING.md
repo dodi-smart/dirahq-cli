@@ -38,21 +38,15 @@ Pull requests whose commits are not signed off will be asked to amend.
 - "Dira" and the Dira logo are trademarks of Dodi Smart OOD and are not licensed for use
   in derivative or competing products.
 
-## Optional local git hooks
+## Git hooks
 
-The lint that CI runs (`Lint (hk)`) is defined once in `hk.pkl`, and the tools it needs are
-pinned in `mise.toml`. If you want the same checks on your machine before you push, set up
-the hooks once per clone:
+Lint runs as git hooks through [hk](https://hk.jdx.dev), configured in `hk.pkl`. Running `mise install` turns them on for your clone: the `postinstall` hook in `mise.toml` runs `hk install --mise`. CI skips it.
 
-```sh
-mise install        # the pinned lint tools (and the Rust, node and bun toolchains)
-hk install --mise   # git hooks: lint on commit, commit message and zavet guard on commit-msg
-```
-
-This is optional: CI runs the same checks, so nothing depends on your having the hooks. Run
-`hk check --all` at any time to lint the whole tree without committing. hk documents no Windows
-support, so the hooks are untested there: use WSL or rely on CI. The commit-msg hook only checks
-the conventional-commit shape; the mandatory scope list is still enforced by commitlint in CI.
+- Run the checks by hand with `hk check --all`, or fix what can be fixed with `hk fix --all`.
+- Skip the hooks for one commit with `HK=0 git commit ...`.
+- The hook config is shared by every worktree of the clone. On a branch without `hk.pkl` the hooks do nothing, as long as hk is available globally: `mise use -g aqua:jdx/hk@2.4.0`. Alternatively, install once per machine with `hk install --global --mise` (Git 2.54 or later), which skips repos without hk config.
+- zavet's guard and spec nudge run as hk steps (.zavet/hk/Zavet.pkl). Check them with .zavet/bin/zavet hooks --check.
+- The same lint runs in CI as `Lint (hk)`, so the hooks are a convenience. hk documents no Windows support, so the hooks are untested there: use WSL or rely on CI. The commit-msg hook only checks the conventional-commit shape; the mandatory scope list is still enforced by commitlint in CI.
 
 ## Trunk-based development
 

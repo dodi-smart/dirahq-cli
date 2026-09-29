@@ -23,6 +23,11 @@ concurrency:
 
 jobs:
   zavet:
+    # A caller can only hand down what its own job grants, so this is the union of
+    # what the shared workflow's jobs request (its `check` job).
+    permissions:
+      contents: read
+      pull-requests: write
     uses: dodi-smart/.github/.github/workflows/zavet-check.yml@v1
     secrets: inherit
     with:

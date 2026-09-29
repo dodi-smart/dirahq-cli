@@ -1,16 +1,21 @@
-# gitleaks config, picked up from the repo root by the hk gitleaks step.
+# Config for gitleaks, which hk runs. gitleaks reads it from the repo root.
 title = "dirahq-cli"
 
 [extend]
 useDefault = true
 
-# The hk step runs `gitleaks dir .`, which walks the working tree and does not
-# read .gitignore. `target/` and `node_modules/` are untracked build output that
-# CI never has and a developer's checkout can hold gigabytes of, so scanning them
-# is slow and reports hits in files that can never be committed.
+# The hk check step runs `gitleaks dir .`, which walks the working tree and does
+# not read .gitignore. Build output and installed dependencies are untracked, CI
+# never has them, and a developer's checkout can hold gigabytes of them, so
+# scanning them is slow and reports hits in files that can never be committed.
 [[allowlists]]
 description = "untracked build output and installed dependencies"
 paths = [
   '''(^|/)target/''',
   '''(^|/)node_modules/''',
+  '''(^|/)\.next/''',
 ]
+
+# To allow one exact fake value instead of a whole file, add an allowlist with
+# `regexTarget = "match"` and the value in `regexes`, so a real secret in the same
+# file is still caught. Never allow-list a real credential.

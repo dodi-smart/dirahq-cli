@@ -1,0 +1,22 @@
+# typos config, read from the repo root by the hk typos step.
+
+[default]
+# Base64 (a test certificate in httpclient.rs) reads as a run of short "words".
+extend-ignore-re = ['''[A-Za-z0-9+/]{40,}''']
+
+[default.extend-words]
+# Accepted spellings, mostly inside identifiers and recorded decisions that
+# cannot be reworded: `unparseable` is in function names and in append-only
+# .zavet records, `driveable` in a test name, `requireds` and `asess` in
+# identifiers, `flate` is the flate2 crate.
+unparseable = "unparseable"
+driveable = "driveable"
+requireds = "requireds"
+asess = "asess"
+flate = "flate"
+# Prefixes in prose: "mis-select", "mis-reads", "mis-orders".
+mis = "mis"
+# Test data and truncated strings: b"ba", "hel…", the BA/WD SDDL aliases, SQL DELETEs.
+ba = "ba"
+hel = "hel"
+delet = "delet"

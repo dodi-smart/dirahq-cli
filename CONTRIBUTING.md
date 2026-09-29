@@ -38,6 +38,22 @@ Pull requests whose commits are not signed off will be asked to amend.
 - "Dira" and the Dira logo are trademarks of Dodi Smart OOD and are not licensed for use
   in derivative or competing products.
 
+## Optional local git hooks
+
+The lint that CI runs (`Lint (hk)`) is defined once in `hk.pkl`, and the tools it needs are
+pinned in `mise.toml`. If you want the same checks on your machine before you push, set up
+the hooks once per clone:
+
+```sh
+mise install        # the pinned lint tools (and the Rust, node and bun toolchains)
+hk install --mise   # git hooks: lint on commit, commit message and zavet guard on commit-msg
+```
+
+This is optional: CI runs the same checks, so nothing depends on your having the hooks. Run
+`hk check --all` at any time to lint the whole tree without committing. hk documents no Windows
+support, so the hooks are untested there: use WSL or rely on CI. The commit-msg hook only checks
+the conventional-commit shape; the mandatory scope list is still enforced by commitlint in CI.
+
 ## Trunk-based development
 
 Open PRs against `develop`. `main` is the stable release channel; `develop` is the

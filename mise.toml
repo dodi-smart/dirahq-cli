@@ -10,7 +10,7 @@ bun = "latest"
 # Lint tools for the optional git hooks (hk.pkl) and the CI lint job. Pinned
 # here so Renovate bumps them; keep hk in step with the version named in the
 # `amends` and `import` lines of hk.pkl.
-"aqua:jdx/hk" = "2.4.0"
+"aqua:jdx/hk" = "2.5.0"
 "aqua:rhysd/actionlint" = "1.7.12"
 "aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:crate-ci/typos" = "1.50.3"

@@ -477,6 +477,12 @@
       "input": 2.0,
       "output": 10.0
     },
+    "gpt-6.1-sol": {
+      "cacheRead": 0.1,
+      "cacheWrite": 2.5,
+      "input": 2.0,
+      "output": 10.0
+    },
     "gpt-daybreak-blue-latest": {
       "cacheRead": 0.4,
       "cacheWrite": 5.0,

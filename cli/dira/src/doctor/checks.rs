@@ -839,6 +839,157 @@ pub(crate) struct CloudFacts {
     pub meta_probe: Option<Result<u16, String>>,
 }
 
+/// Facts for `zavet.spec_sources`, gathered in `doctor::gather`.
+#[derive(Debug, Default)]
+pub(crate) struct SpecSourceFacts {
+    /// The repo toplevel doctor was invoked from, when there is one.
+    pub repo_root: Option<std::path::PathBuf>,
+    /// Whether that toplevel carries `.zavet/`.
+    pub zavet_dir: bool,
+    /// `.zavet/config` exists but could not be read (permissions, not UTF-8).
+    /// Doctor cannot judge declarations it cannot see, so it skips.
+    pub config_unreadable: bool,
+    /// Frameworks whose directories exist (a `stat` probe).
+    pub detected: Vec<String>,
+    /// `(kind, root)` pairs declared by `spec-source:` lines.
+    pub declared: Vec<(String, String)>,
+    /// Captured units dira's index holds for the repo, excluding `removed`.
+    /// Zero when the repo is not indexed yet.
+    pub units: u64,
+    /// How many of [`SpecSourceFacts::units`] are `unresolved`.
+    pub unresolved: u64,
+}
+
+/// Collect [`SpecSourceFacts`] for the directory doctor was invoked from.
+/// Read-only by construction: `stat`, one config read, one index read.
+pub(crate) async fn gather_spec_sources(
+    cwd: Option<&Path>,
+    store: Option<&dira_core::Store>,
+    project: Option<&String>,
+) -> SpecSourceFacts {
+    let Some(dir) = cwd else {
+        return SpecSourceFacts::default();
+    };
+    let Some(root) = dira_core::project::toplevel(dir) else {
+        return SpecSourceFacts::default();
+    };
+    let zavet_dir = root.join(dira_core::zavet::ZAVET_DIR).is_dir();
+    let (cfg, config_unreadable) =
+        match std::fs::read_to_string(root.join(dira_core::zavet::CONFIG_PATH)) {
+            Ok(t) => (dira_core::zavet::parse_config(&t), false),
+            // No config file is an ordinary state (nothing declared yet).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Default::default(), false),
+            Err(_) => (Default::default(), true),
+        };
+    let (mut units, mut unresolved) = (0, 0);
+    if let (Some(s), Some(repo), true) = (store, project, zavet_dir) {
+        for c in s.zavet_source_counts(repo).await.unwrap_or_default() {
+            if c.state == "removed" {
+                continue;
+            }
+            units += c.units;
+            if c.state == "unresolved" {
+                unresolved += c.units;
+            }
+        }
+    }
+    SpecSourceFacts {
+        detected: dira_core::zavet_specs::detect_frameworks(&root)
+            .into_iter()
+            .map(|f| f.kind.to_string())
+            .collect(),
+        declared: cfg
+            .spec_sources
+            .iter()
+            .map(|d| (d.kind.clone(), d.root.clone()))
+            .collect(),
+        units,
+        unresolved,
+        zavet_dir,
+        config_unreadable,
+        repo_root: Some(root),
+    }
+}
+
+/// `zavet.spec_sources` — are the repo's spec-driven frameworks linked to zavet,
+/// and do their units resolve?
+///
+/// `skip` outside a repo or without `.zavet/` (nothing to judge — DIRASH-0022);
+/// `warn` when a framework is on disk but no `spec-source:` line declares it, or
+/// when captured units came back `unresolved`; `ok` otherwise. Never acts: the
+/// remedy is a command the user runs (`dira onboard`, `/zavet:spec-adopt`).
+pub(crate) fn zavet_spec_sources(f: &SpecSourceFacts) -> Check {
+    use dira_core::zavet_specs::kind_label;
+    const ID: &str = "zavet.spec_sources";
+    if f.repo_root.is_none() {
+        return Check::skip(ID, "not inside a git repo");
+    }
+    if !f.zavet_dir {
+        return Check::skip(ID, "this repo has no .zavet/ (fine unless you expected it)");
+    }
+    if f.config_unreadable {
+        return Check::skip(
+            ID,
+            ".zavet/config is not readable, so declarations cannot be judged",
+        );
+    }
+    let declared_kinds: Vec<&str> = f.declared.iter().map(|(k, _)| k.as_str()).collect();
+    let undeclared: Vec<&str> = f
+        .detected
+        .iter()
+        .map(String::as_str)
+        .filter(|k| !declared_kinds.contains(k))
+        .collect();
+    let unresolved = f.unresolved;
+    let detail = json!({
+        "detected": f.detected,
+        "declared": f.declared.iter().map(|(k, r)| json!({"kind": k, "root": r})).collect::<Vec<_>>(),
+        "units": f.units,
+        "unresolved": unresolved,
+    });
+    if !undeclared.is_empty() {
+        let names: Vec<&str> = undeclared.iter().map(|k| kind_label(k)).collect();
+        return Check::warn(
+            ID,
+            format!(
+                "{} found but not linked to zavet (no spec-source line in .zavet/config)",
+                names.join(", ")
+            ),
+        )
+        .remedy("dira onboard — links detected frameworks (or /zavet:spec-adopt in Claude Code)")
+        .detail(detail);
+    }
+    if unresolved > 0 {
+        return Check::warn(
+            ID,
+            format!(
+                "{} could not be resolved by zavet",
+                crate::render::plural(unresolved, "spec unit")
+            ),
+        )
+        .remedy("zavet specs --json — each unresolved row carries the reason")
+        .detail(detail);
+    }
+    if declared_kinds.is_empty() {
+        return Check::ok(ID, "no spec-driven framework in this repo").detail(detail);
+    }
+    let names: Vec<&str> = declared_kinds
+        .iter()
+        .map(|k| kind_label(k))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Check::ok(
+        ID,
+        format!(
+            "{} linked to zavet ({})",
+            names.join(", "),
+            crate::render::plural(f.units, "unit")
+        ),
+    )
+    .detail(detail)
+}
+
 /// Which cloud runtime this process is in, and whether the provisioning env
 /// a capture-and-sync session needs is present.
 ///
@@ -1079,6 +1230,7 @@ pub(crate) mod tests {
             project: Ok("github.com/acme/api".into()),
             update: super::super::UpdateFacts::default(),
             cloud: cloud_facts_plain(),
+            spec_sources: SpecSourceFacts::default(),
         }
     }
 
@@ -1960,5 +2112,156 @@ pub(crate) mod tests {
 
         let status = crate::cloud_init::status(dir.path(), &[]);
         assert_eq!(status.bootstrap, BootstrapState::Pinned("9.9.9".into()));
+    }
+
+    // --- zavet.spec_sources ------------------------------------------------
+
+    fn spec_facts() -> SpecSourceFacts {
+        SpecSourceFacts {
+            repo_root: Some(std::path::PathBuf::from("/work/api")),
+            zavet_dir: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn spec_sources_skip_outside_a_repo_and_without_zavet() {
+        let c = zavet_spec_sources(&SpecSourceFacts::default());
+        assert_eq!(c.level, Level::Skip);
+        let c = zavet_spec_sources(&SpecSourceFacts {
+            zavet_dir: false,
+            ..spec_facts()
+        });
+        assert_eq!(
+            c.level,
+            Level::Skip,
+            "no .zavet/ is absent evidence, never a verdict"
+        );
+    }
+
+    #[test]
+    fn a_detected_but_undeclared_framework_warns_and_points_at_onboard() {
+        let c = zavet_spec_sources(&SpecSourceFacts {
+            detected: vec!["openspec".into(), "speckit".into()],
+            declared: vec![("speckit".into(), "specs".into())],
+            ..spec_facts()
+        });
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.summary.contains("OpenSpec"), "{}", c.summary);
+        assert!(
+            !c.summary.contains("Spec Kit"),
+            "declared kinds are not nagged: {}",
+            c.summary
+        );
+        let remedy = c.remedy.as_deref().unwrap_or_default();
+        assert!(
+            remedy.contains("dira onboard") && remedy.contains("/zavet:spec-adopt"),
+            "{remedy}"
+        );
+    }
+
+    #[test]
+    fn unresolved_units_warn_and_a_clean_declared_repo_passes() {
+        let mut f = SpecSourceFacts {
+            detected: vec!["openspec".into()],
+            declared: vec![("openspec".into(), "openspec".into())],
+            units: 2,
+            unresolved: 1,
+            ..spec_facts()
+        };
+        let c = zavet_spec_sources(&f);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.summary.contains("1 spec unit "), "{}", c.summary);
+        (f.units, f.unresolved) = (1, 0);
+        let c = zavet_spec_sources(&f);
+        assert_eq!(c.level, Level::Ok);
+        assert!(
+            c.summary.contains("OpenSpec") && c.summary.contains("1 unit"),
+            "{}",
+            c.summary
+        );
+        // A repo with no framework at all passes quietly.
+        let c = zavet_spec_sources(&spec_facts());
+        assert_eq!(c.level, Level::Ok);
+    }
+
+    #[test]
+    fn an_unreadable_config_skips_and_framework_names_are_deduplicated() {
+        let c = zavet_spec_sources(&SpecSourceFacts {
+            detected: vec!["openspec".into()],
+            config_unreadable: true,
+            ..spec_facts()
+        });
+        assert_eq!(
+            c.level,
+            Level::Skip,
+            "declarations we cannot read are not evidence of none"
+        );
+        // Non-adjacent duplicates: `Vec::dedup` alone would print OpenSpec twice.
+        let c = zavet_spec_sources(&SpecSourceFacts {
+            declared: vec![
+                ("openspec".into(), "openspec".into()),
+                ("speckit".into(), "specs".into()),
+                ("openspec".into(), "other".into()),
+            ],
+            ..spec_facts()
+        });
+        assert_eq!(c.level, Level::Ok);
+        assert_eq!(c.summary.matches("OpenSpec").count(), 1, "{}", c.summary);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_zavet_config_is_reported_as_such() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(d.path())
+            .status()
+            .unwrap()
+            .success());
+        // A directory where the file should be: present, but unreadable.
+        std::fs::create_dir_all(d.path().join(".zavet/config")).unwrap();
+        let f = gather_spec_sources(Some(d.path()), None, None).await;
+        assert!(f.config_unreadable);
+        assert_eq!(zavet_spec_sources(&f).level, Level::Skip);
+        // An absent config is an ordinary empty declaration set.
+        std::fs::remove_dir(d.path().join(".zavet/config")).unwrap();
+        let f = gather_spec_sources(Some(d.path()), None, None).await;
+        assert!(!f.config_unreadable);
+    }
+
+    #[tokio::test]
+    async fn gathering_spec_facts_is_stat_only_and_reads_the_declared_sources() {
+        let d = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(d.path())
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(d.path().join(".zavet")).unwrap();
+        std::fs::write(
+            d.path().join(".zavet/config"),
+            "prefix: D\nspec-source: openspec openspec\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.path().join("openspec")).unwrap();
+        let before = std::fs::read_dir(d.path()).unwrap().count();
+        let f = gather_spec_sources(Some(d.path()), None, None).await;
+        assert!(f.zavet_dir);
+        assert_eq!(f.detected, vec!["openspec"]);
+        assert_eq!(
+            f.declared,
+            vec![("openspec".to_string(), "openspec".to_string())]
+        );
+        assert_eq!(
+            std::fs::read_dir(d.path()).unwrap().count(),
+            before,
+            "wrote nothing"
+        );
+        assert_eq!(zavet_spec_sources(&f).level, Level::Ok);
     }
 }

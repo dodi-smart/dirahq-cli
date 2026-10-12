@@ -16,7 +16,7 @@ use crate::state::AppState;
 use dira_core::model::EventKind;
 use dira_core::project::{self, CapturedCommit};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Minimum spacing between git polls for one repo. Keeps a tool-call burst from
@@ -31,6 +31,11 @@ const COMMIT_CAPTURE_LIMIT: usize = 200;
 /// Comfortably above a healthy `git log`, low enough that a wedged git is shed
 /// long before it could matter to a watching human.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for the source-spec resolve that follows a capture. Separate from
+/// [`CAPTURE_TIMEOUT`] on purpose: a slow plugin must cost the source specs of
+/// this sweep, never the commits the walk already recorded. The plugin runner
+/// bounds each of its two invocations to 5 s on its own; this caps the pair.
+const SOURCES_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Per-repo poll throttle. Lives in the single-threaded writer, so no lock.
 #[derive(Default)]
@@ -96,7 +101,18 @@ struct GitWalk {
     trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
     decisions: Vec<ZavetDecisionAt>,
     specs: Vec<ZavetSpecAt>,
+    /// Whether the zavet sweep ran for this walk (the repo is zavet-active).
+    zavet_active: bool,
+    /// A walked commit touched a declared spec-source root or `.zavet/config`,
+    /// so the source units are worth re-resolving after the walk.
+    source_trigger: bool,
+    /// Repo toplevel and id/source config the sweep resolved, handed on to the
+    /// post-walk source refresh so neither is read twice.
+    top: PathBuf,
+    cfg: ZavetConfig,
 }
+
+use crate::zavet::ZavetConfig;
 
 /// The trailer half of a sweep, on its own.
 ///
@@ -172,6 +188,7 @@ fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWa
         zavet.override_,
         crate::zavet::zavet_dir_exists(project::toplevel(root).as_deref().unwrap_or(root)),
     );
+    let top = project::toplevel(root).unwrap_or_else(|| root.to_path_buf());
     let sweep = if zavet_active && !commits.is_empty() {
         let refs: Vec<project::CommitRef> = commits
             .iter()
@@ -193,6 +210,10 @@ fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWa
         trailers: sweep.trailers,
         decisions: sweep.decisions,
         specs: sweep.specs,
+        zavet_active,
+        source_trigger: sweep.source_trigger,
+        top,
+        cfg: sweep.cfg,
     })
 }
 
@@ -209,6 +230,13 @@ pub struct ZavetSweep {
     pub trailers: Vec<(String, Vec<dira_core::store::ZavetTrailer>)>,
     pub decisions: Vec<ZavetDecisionAt>,
     pub specs: Vec<ZavetSpecAt>,
+    /// A commit in the walked range touched a declared spec-source root or
+    /// `.zavet/config` — see [`dira_core::zavet_specs::path_triggers_resolve`].
+    /// The sweep only DETECTS this; resolving shells out to the plugin and is
+    /// done by [`refresh_sources`] under its own budget.
+    pub source_trigger: bool,
+    /// The config this sweep resolved (id conventions + declared sources).
+    pub cfg: ZavetConfig,
 }
 
 /// The zavet portion of a walk: batched trailer parse over the walked shas,
@@ -231,11 +259,22 @@ pub fn zavet_sweep(root: &Path, commits: &[project::CommitRef]) -> ZavetSweep {
 
     let mut decisions = Vec::new();
     let mut specs = Vec::new();
+    let mut source_trigger = false;
     // Oldest first, so within one walk the INTRODUCING commit lands first and
     // the store's first-sight preservation keeps pointing at it. One
     // diff-tree per commit serves both the decision and the spec filter.
     for c in commits.iter().rev() {
-        for path in project::changed_paths(root, &c.sha) {
+        // Deletions count for the source trigger (a commit that removes a whole
+        // source root adds and modifies nothing) but never for blob capture.
+        let (changed, touched) = project::diff_paths(root, &c.sha);
+        if !source_trigger
+            && touched
+                .iter()
+                .any(|p| dira_core::zavet_specs::path_triggers_resolve(&cfg, p))
+        {
+            source_trigger = true;
+        }
+        for path in changed {
             let is_decision = dira_core::zavet::is_decision_path(&path);
             if !is_decision && !dira_core::zavet::is_spec_path(&path) {
                 continue;
@@ -272,6 +311,105 @@ pub fn zavet_sweep(root: &Path, commits: &[project::CommitRef]) -> ZavetSweep {
         trailers,
         decisions,
         specs,
+        source_trigger,
+        cfg,
+    }
+}
+
+/// Re-resolve the repo's source-backed spec units through the installed plugin
+/// and write them (plus `removed` marks) into the store.
+///
+/// Runs OFF the writer task and OFF the commit walk's blocking budget, under
+/// [`SOURCES_TIMEOUT`]: a wedged or missing plugin costs this sweep its source
+/// specs — never its commits. Fail-open end to end: an unresolved run changes
+/// nothing, and in particular marks nothing `removed`.
+///
+/// With no `spec-source:` lines declared the answer is known without asking the
+/// plugin (there are no units), but only when the config file really is there —
+/// a momentarily unreadable config must not read as "everything was deleted".
+///
+/// Returns what changed (all zero when nothing resolved).
+pub async fn refresh_sources(
+    state: &AppState,
+    repo: &str,
+    top: &Path,
+    cfg: &ZavetConfig,
+    session: Option<&str>,
+) -> crate::zavet_sources::Persisted {
+    use crate::zavet_sources::Persisted;
+    let units = if cfg.spec_sources.is_empty() {
+        if !top.join(crate::zavet::CONFIG_PATH).is_file() {
+            return Persisted::default();
+        }
+        Some(Vec::new())
+    } else {
+        let top = top.to_path_buf();
+        let join = tokio::task::spawn_blocking(move || {
+            crate::zavet_sources::resolve_blocking(&top, false)
+        });
+        match tokio::time::timeout(SOURCES_TIMEOUT, join).await {
+            Ok(Ok(units)) => units,
+            Ok(Err(e)) => {
+                tracing::debug!(repo, "source spec resolve task failed: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(repo, "source spec resolve timed out — skipped this sweep");
+                None
+            }
+        }
+    };
+    let Some(units) = units else {
+        return Persisted::default();
+    };
+    // Removals are the dangerous half of a resolve (DIRASH-0039). They need
+    // BOTH of:
+    //  - the resolving checkout is on the repo's default branch: the store is
+    //    keyed by canonical repo but a resolve sees one checkout, so a feature
+    //    branch or worktree that predates a unit would flap it removed/active;
+    //  - an empty answer for non-empty declarations is corroborated by every
+    //    declared root really being absent from the checkout (a plugin that
+    //    emitted nothing for a root that is still there is a failed resolve).
+    // Without them, seen units are still upserted but nothing is removed.
+    let allow_removals = {
+        let top = top.to_path_buf();
+        let roots: Vec<String> = cfg.spec_sources.iter().map(|d| d.root.clone()).collect();
+        let empty_answer = units.is_empty();
+        tokio::task::spawn_blocking(move || {
+            if !project::on_default_branch(&top) {
+                return false;
+            }
+            !(empty_answer && roots.iter().any(|r| top.join(r).exists()))
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if units.is_empty() && !cfg.spec_sources.is_empty() && !allow_removals {
+        // Nothing to upsert and nothing we may remove: a no-op either way.
+        tracing::debug!(
+            repo,
+            "empty source resolve not corroborated; changing nothing"
+        );
+        return Persisted::default();
+    }
+    match crate::zavet_sources::persist_units(&state.store, repo, &units, session, allow_removals)
+        .await
+    {
+        Ok(p) => {
+            if p.changed() {
+                tracing::info!(
+                    repo,
+                    upserted = p.upserted,
+                    removed = p.removed,
+                    "captured source-backed specs"
+                );
+            }
+            p
+        }
+        Err(e) => {
+            tracing::warn!("source spec persist failed for {repo}: {e}");
+            Persisted::default()
+        }
     }
 }
 
@@ -402,10 +540,65 @@ pub async fn capture_commits(state: &AppState, cwd: &str, canonical: &str) {
         }
     }
 
+    // Source-backed spec units (OpenSpec / Spec Kit / BMAD / superpowers) — only
+    // when a walked commit touched a declared root or `.zavet/config`.
+    let mut sources_changed = false;
+    if walk.zavet_active && walk.source_trigger {
+        sources_changed = refresh_sources(
+            state,
+            canonical,
+            &walk.top,
+            &walk.cfg,
+            source_session.as_deref(),
+        )
+        .await
+        .changed();
+    }
+    // Bind the session to a spec from facts only (exact `Spec:` trailer, else
+    // exact branch). After the source refresh so a unit introduced by these very
+    // commits is already known. An unambiguous live session is required, and an
+    // explicit `dira start --spec` is never overridden.
+    if walk.zavet_active {
+        if let Some(sid) = source_session.as_deref() {
+            let by_sha: HashMap<&str, Vec<String>> = walk
+                .trailers
+                .iter()
+                .map(|(sha, ts)| {
+                    (
+                        sha.as_str(),
+                        ts.iter()
+                            .filter(|t| t.key == "spec")
+                            .flat_map(|t| dira_core::zavet::spec_trailer_slugs(&t.value))
+                            .collect(),
+                    )
+                })
+                .collect();
+            // Newest commit first, as `git log` walked them.
+            let values: Vec<Vec<String>> = walk
+                .commits
+                .iter()
+                .filter_map(|c| by_sha.get(c.sha.as_str()).cloned())
+                .collect();
+            crate::zavet_sources::attribute_session(
+                &state.store,
+                &state.sessions,
+                sid,
+                canonical,
+                &values,
+                walk.git_ref.as_deref(),
+            )
+            .await;
+        }
+    }
+
     if let Err(e) = state.store.repo_baseline_set(canonical, &walk.head).await {
         tracing::warn!("repo baseline set failed for {canonical}: {e}");
     }
-    if !walk.trailers.is_empty() || !walk.decisions.is_empty() || !walk.specs.is_empty() {
+    if sources_changed
+        || !walk.trailers.is_empty()
+        || !walk.decisions.is_empty()
+        || !walk.specs.is_empty()
+    {
         // Fresh knowledge landed — nudge its channel (lossy; backstop covers).
         let _ = state.knowledge_sync.trigger.try_send(());
     }

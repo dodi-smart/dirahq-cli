@@ -46,6 +46,11 @@ pub struct RawEvent {
     /// surfaced on the session rollup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Spec slug the session works under (`dira start --spec <slug>`):
+    /// `openspec:add-csv-import`, `capture-pipeline`, …. The slug only, never
+    /// prose (D-0001). Surfaced on the session rollup as `SessionRollup.spec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
 }
 
 /// Session-id prefix reserved for `dira doctor --probe`'s end-to-end capture

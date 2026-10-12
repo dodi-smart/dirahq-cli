@@ -49,16 +49,15 @@
 
 use anyhow::Result;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// Marketplace name Claude Code registers `dirahq-zavet` under.
-pub const MARKETPLACE_NAME: &str = "dirahq";
+pub const MARKETPLACE_NAME: &str = dira_core::zavet_specs::MARKETPLACE_NAME;
 /// The repo slug passed to `claude plugin marketplace add`.
 pub const MARKETPLACE_REPO: &str = "dodi-smart/dirahq-zavet";
 /// `claude plugin list --json` / `installed_plugins.json` id: `<plugin>@<marketplace>`.
-pub const PLUGIN_ID: &str = "zavet@dirahq";
+pub const PLUGIN_ID: &str = dira_core::zavet_specs::PLUGIN_ID;
 
 /// A parsed `dira zavet install` invocation, independent of clap.
 #[derive(Debug, Clone)]
@@ -170,11 +169,10 @@ pub(crate) fn plugin_root() -> Option<String> {
 /// `claude`-backed detection before doing anything — so a false `None` costs
 /// one no-op command, never a wrong write.
 pub(crate) fn plugin_root_offline() -> Option<String> {
-    let home = home_dir().ok()?;
-    match detect_from_installed_plugins_json(&home)? {
-        Detection::Installed(info) => Some(resolve_plugin_root(&home, &info.install_path)),
-        Detection::NotInstalled | Detection::Unknown => None,
-    }
+    // One resolver for the CLI and the daemon (it also honours
+    // `DIRA_ZAVET_PLUGIN_ROOT`), so the two can never disagree about where
+    // the plugin is.
+    dira_core::zavet_specs::plugin_root_offline().map(|p| p.display().to_string())
 }
 
 /// Whether `claude` is on `PATH` — the precondition for every plugin
@@ -262,25 +260,6 @@ struct PluginListEntry {
     install_path: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct InstalledPluginsFile {
-    version: u64,
-    plugins: HashMap<String, Vec<InstalledPluginRecord>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InstalledPluginRecord {
-    scope: String,
-    #[serde(rename = "installPath")]
-    install_path: String,
-    version: String,
-}
-
-/// The `installed_plugins.json` schema this module knows how to read. Guards
-/// the fallback path: a future schema bump changes this number, and an old
-/// binary correctly refuses to trust a file it no longer understands.
-const KNOWN_INSTALLED_PLUGINS_SCHEMA: u64 = 2;
-
 /// Detect the current state of `zavet@dirahq`: `claude plugin list --json`
 /// first, falling back to `installed_plugins.json` (only when its top-level
 /// `"version"` is [`KNOWN_INSTALLED_PLUGINS_SCHEMA`]) only if that fails.
@@ -309,79 +288,26 @@ fn detect(runner: &dyn Runner, home: &Path) -> Detection {
 }
 
 fn detect_from_installed_plugins_json(home: &Path) -> Option<Detection> {
-    let path = home
-        .join(".claude")
-        .join("plugins")
-        .join("installed_plugins.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let file: InstalledPluginsFile = serde_json::from_str(&text).ok()?;
-    if file.version != KNOWN_INSTALLED_PLUGINS_SCHEMA {
-        return None;
-    }
-    Some(match file.plugins.get(PLUGIN_ID).and_then(|v| v.first()) {
-        Some(rec) => Detection::Installed(InstalledInfo {
-            version: rec.version.clone(),
-            scope: rec.scope.clone(),
-            install_path: rec.install_path.clone(),
-            enabled: None,
-        }),
-        None => Detection::NotInstalled,
-    })
+    // The registry reader lives in dira-core (`zavet_specs`) so the daemon's
+    // source-spec resolver and this module can never disagree about where the
+    // plugin is.
+    Some(
+        match dira_core::zavet_specs::installed_plugin_record(home)? {
+            Some(rec) => Detection::Installed(InstalledInfo {
+                version: rec.version,
+                scope: rec.scope,
+                install_path: rec.install_path,
+                enabled: None,
+            }),
+            None => Detection::NotInstalled,
+        },
+    )
 }
 
-#[derive(Debug, Deserialize)]
-struct MarketplaceEntry {
-    source: MarketplaceSource,
-    #[serde(rename = "installLocation")]
-    install_location: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MarketplaceSource {
-    source: String,
-    path: Option<String>,
-}
-
-/// Resolve the directory that actually holds the plugin's files.
-///
-/// Both detection sources report a versioned cache path
-/// (`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>`), but that
-/// directory only exists for `github`-sourced marketplaces. A `directory`
-/// source — which is how anyone *developing* zavet has it registered, and
-/// therefore the common case for `dira zavet status` — is loaded in place
-/// and never populates the cache, so the reported path names a directory
-/// that does not exist. Without this, the skew check would always degrade
-/// to "unknown" for exactly the people most likely to look at it.
-///
-/// Prefer the reported path when it really exists; otherwise fall back to
-/// the marketplace's own on-disk location.
+/// Resolve the directory that actually holds the plugin's files — see
+/// [`dira_core::zavet_specs::resolve_plugin_root`].
 fn resolve_plugin_root(home: &Path, reported: &str) -> String {
-    if Path::new(reported).is_dir() {
-        return reported.to_string();
-    }
-    marketplace_directory_location(home).unwrap_or_else(|| reported.to_string())
-}
-
-/// The on-disk location of the `dirahq` marketplace, but only when it is a
-/// `directory` source. A `github` source's `installLocation` points at the
-/// bare clone, not a usable plugin root, so it is deliberately ignored.
-fn marketplace_directory_location(home: &Path) -> Option<String> {
-    let path = home
-        .join(".claude")
-        .join("plugins")
-        .join("known_marketplaces.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let all: HashMap<String, MarketplaceEntry> = serde_json::from_str(&text).ok()?;
-    let entry = all.get(MARKETPLACE_NAME)?;
-    if entry.source.source != "directory" {
-        return None;
-    }
-    entry
-        .source
-        .path
-        .clone()
-        .or_else(|| entry.install_location.clone())
-        .filter(|p| Path::new(p).is_dir())
+    dira_core::zavet_specs::resolve_plugin_root(home, reported)
 }
 
 // ---------------------------------------------------------------------------

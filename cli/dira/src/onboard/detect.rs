@@ -121,6 +121,12 @@ pub(crate) struct State {
     /// construction so computing it here cannot break `--print`'s
     /// no-writes promise (DIRASH-0029 rule 3).
     pub cloud: Option<crate::cloud_init::RepoCloudStatus>,
+    /// Spec-driven frameworks present in the repo (`openspec`, `speckit`,
+    /// `bmad`, `superpowers`) — a `stat` probe, nothing read or spawned
+    /// (DIRASH-0029). Empty outside a repo.
+    pub spec_frameworks: Vec<String>,
+    /// The kinds `.zavet/config` already declares via `spec-source:` lines.
+    pub spec_declared: Vec<String>,
 }
 
 impl State {
@@ -235,6 +241,10 @@ pub(crate) async fn run(config: &dira_core::Config, cwd: &Path) -> State {
     let cloud = repo_root
         .as_ref()
         .map(|root| crate::cloud_init::status(root, crate::cloud_init::CLOUD_WIRABLE));
+    let (spec_frameworks, spec_declared) = match &repo_root {
+        Some(root) => spec_frameworks(root),
+        None => (Vec::new(), Vec::new()),
+    };
     let detected_harnesses = match dira_core::config::home_dir() {
         Ok(home) => harnesses(&home),
         // No resolvable `$HOME`: the old fallback probed `.` (cwd) instead,
@@ -258,7 +268,28 @@ pub(crate) async fn run(config: &dira_core::Config, cwd: &Path) -> State {
         device_linked: device_linked(config).await,
         knowledge: config.sync.knowledge,
         cloud,
+        spec_frameworks,
+        spec_declared,
     }
+}
+
+/// The spec-driven frameworks a repo carries and the kinds its `.zavet/config`
+/// already declares. `stat` calls and one file read — no writes, no spawns, so
+/// it is safe in the detection pass `--print` shares (DIRASH-0029 rule 3).
+pub(crate) fn spec_frameworks(root: &Path) -> (Vec<String>, Vec<String>) {
+    let detected = dira_core::zavet_specs::detect_frameworks(root)
+        .into_iter()
+        .map(|f| f.kind.to_string())
+        .collect();
+    (detected, declared_spec_kinds(root))
+}
+
+/// Kinds declared by `spec-source:` lines in the repo's `.zavet/config`,
+/// deduplicated, in file order.
+pub(crate) fn declared_spec_kinds(root: &Path) -> Vec<String> {
+    std::fs::read_to_string(root.join(dira_core::zavet::CONFIG_PATH))
+        .map(|t| dira_core::zavet_specs::declared_kinds(&dira_core::zavet::parse_config(&t)))
+        .unwrap_or_default()
 }
 
 /// Whether a device id is recorded in the store.
@@ -396,6 +427,8 @@ mod tests {
             device_linked: false,
             knowledge: dira_core::config::KnowledgeSyncMode::Off,
             cloud: None,
+            spec_frameworks: Vec::new(),
+            spec_declared: Vec::new(),
         };
 
         let ids: Vec<_> = state.wirable().iter().map(|h| h.probe.id).collect();
@@ -417,6 +450,8 @@ mod tests {
             device_linked: false,
             knowledge: dira_core::config::KnowledgeSyncMode::Off,
             cloud: None,
+            spec_frameworks: Vec::new(),
+            spec_declared: Vec::new(),
         };
         assert!(base.daemon_running());
         assert!(!base.supervised(), "a pidfile daemon dies with the session");

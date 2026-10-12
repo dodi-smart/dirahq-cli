@@ -401,6 +401,9 @@ pub struct LiveSession {
     /// in `dira status`/`watch` and on the synced rollup).
     pub activity: Option<String>,
     pub note: Option<String>,
+    /// Spec slug the session works under — first non-null across its events
+    /// (`dira start --spec`, or a capture-time resolution).
+    pub spec: Option<String>,
     pub started_at: OffsetDateTime,
     pub last_event_at: OffsetDateTime,
     pub last_signal_at: Option<OffsetDateTime>,
@@ -550,6 +553,7 @@ impl SessionRegistry {
                 label: ev.label.clone(),
                 activity: ev.activity.clone(),
                 note: ev.note.clone(),
+                spec: ev.spec.clone(),
                 started_at: ev.at,
                 last_event_at: ev.at,
                 last_signal_at: None,
@@ -597,6 +601,9 @@ impl SessionRegistry {
         }
         if entry.note.is_none() && ev.note.is_some() {
             entry.note = ev.note.clone();
+        }
+        if entry.spec.is_none() && ev.spec.is_some() {
+            entry.spec = ev.spec.clone();
         }
         if ev.branch.is_some() {
             entry.branch = ev.branch.clone();
@@ -720,6 +727,27 @@ impl SessionRegistry {
     /// the session alone.
     pub fn is_degenerate(&self, session_id: &str) -> bool {
         self.sessions.get(session_id).is_some_and(|s| !s.had_signal)
+    }
+
+    /// The spec slug a live session works under, if known.
+    pub fn spec_of(&self, session_id: &str) -> Option<String> {
+        self.sessions.get(session_id).and_then(|s| s.spec.clone())
+    }
+
+    /// Whether the registry has seen this session end (`SessionEnd` /
+    /// `ManualStop`). Absence is "no opinion", not "ended".
+    pub fn is_ended(&self, session_id: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|s| s.ended)
+    }
+
+    /// Bind a session to a spec unless it already has one (an explicit
+    /// `--spec` is never overridden by a capture-time resolution).
+    pub fn set_spec_if_none(&mut self, session_id: &str, spec: &str) {
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            if s.spec.is_none() {
+                s.spec = Some(spec.to_string());
+            }
+        }
     }
 
     /// Forget a session entirely — used when the writer prunes a degenerate
@@ -907,6 +935,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 
@@ -952,6 +981,38 @@ mod tests {
             reg.last_activity_at(),
             Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(150))
         );
+    }
+
+    /// The spec binding is first-non-null and sticky: a later event cannot
+    /// replace it, a capture-time resolution only fills a gap, and a replayed
+    /// log (hydrate) reproduces it.
+    #[test]
+    fn a_sessions_spec_is_first_non_null_and_never_overridden() {
+        let p = Some("github.com/acme/api");
+        let mut reg = SessionRegistry::default();
+        reg.observe(&ev("s1", EventKind::SessionStart, p), IDLE);
+        assert_eq!(reg.spec_of("s1"), None);
+        // A resolution fills the gap...
+        reg.set_spec_if_none("s1", "openspec:a");
+        assert_eq!(reg.spec_of("s1").as_deref(), Some("openspec:a"));
+        // ...and neither a second resolution nor a stamped event replaces it.
+        reg.set_spec_if_none("s1", "openspec:b");
+        let mut stamped = ev("s1", EventKind::UserPrompt, p);
+        stamped.spec = Some("openspec:c".into());
+        reg.observe(&stamped, IDLE);
+        assert_eq!(reg.spec_of("s1").as_deref(), Some("openspec:a"));
+
+        // An explicit spec on the opening event wins from the start, and a
+        // fresh registry replaying the log reproduces it.
+        let mut opening = ev("s2", EventKind::ManualStart, p);
+        opening.spec = Some("capture-pipeline".into());
+        let mut replay = SessionRegistry::default();
+        replay.observe(&opening, IDLE);
+        replay.set_spec_if_none("s2", "openspec:z");
+        assert_eq!(replay.spec_of("s2").as_deref(), Some("capture-pipeline"));
+        // Unknown session: no panic, no spec.
+        replay.set_spec_if_none("nope", "x");
+        assert_eq!(replay.spec_of("nope"), None);
     }
 
     #[test]

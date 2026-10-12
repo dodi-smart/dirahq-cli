@@ -107,7 +107,7 @@ const KNOBS: &[Knob] = &[
     },
     // The knowledge channel's consent tier. Unlike every other knob here this
     // one governs whether *content* — decision and spec bodies, trailer
-    // values, check commands — leaves the machine, so it is worth being
+    // values, check commands, framework requirement/task text — leaves the machine, so it is worth being
     // explicit about why it is settable at all: before this it was reachable
     // only by hand-editing `config.toml` or exporting
     // `DIRA_SYNC__KNOWLEDGE`, which made `dira onboard`'s consent step

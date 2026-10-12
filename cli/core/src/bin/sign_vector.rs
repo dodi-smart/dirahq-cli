@@ -80,6 +80,9 @@ pub fn build_vector() -> serde_json::Value {
             // cross-language vector, not just tolerated.
             runtime: Some("claude-web".to_string()),
             runtime_session_ref: Some("cse_01RUNTIME00000000000000000".to_string()),
+            // Populated so the 1.5 spec attribution is exercised by the
+            // cross-language vector, not just tolerated.
+            spec: Some("openspec:add-csv-import".to_string()),
         }],
         token_usage: vec![],
         artifacts: vec![],

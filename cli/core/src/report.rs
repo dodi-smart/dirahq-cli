@@ -183,6 +183,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 
@@ -283,6 +284,7 @@ mod tests {
                 label: None,
                 activity: None,
                 note: None,
+                spec: None,
             });
         }
         for i in 0..3 {
@@ -300,6 +302,7 @@ mod tests {
                 label: None,
                 activity: None,
                 note: None,
+                spec: None,
             });
         }
         for e in &all {

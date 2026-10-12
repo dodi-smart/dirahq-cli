@@ -187,6 +187,46 @@ fn print_changes_nothing_on_disk() {
     assert_eq!(before, walk(home), "--print must not touch the filesystem");
 }
 
+/// Spec-framework detection is a `stat` probe: a repo that carries OpenSpec and
+/// Spec Kit directories gets a "link ... to zavet spec sources" line in the plan,
+/// and the filesystem is still byte-for-byte unchanged afterwards (DIRASH-0029
+/// rule 3). Declared kinds are not offered again.
+#[test]
+fn print_plans_spec_framework_linking_and_still_changes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    let repo = home.join("repo");
+    std::fs::create_dir_all(repo.join(".zavet")).unwrap();
+    std::fs::write(
+        repo.join(".zavet/config"),
+        "prefix: D\nspec-source: speckit specs\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("openspec/changes")).unwrap();
+    std::fs::create_dir_all(repo.join(".specify")).unwrap();
+    std::fs::create_dir_all(repo.join("specs")).unwrap();
+    git_init(&repo);
+
+    let before = walk(home);
+    let out = run_onboard_in(home, &repo, &[], &["--print"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("link OpenSpec to zavet spec sources"),
+        "the undeclared framework is planned; got:\n{text}"
+    );
+    assert!(
+        !text.contains("Spec Kit to zavet"),
+        "an already-declared kind is not offered again; got:\n{text}"
+    );
+    assert_eq!(before, walk(home), "--print must not touch the filesystem");
+}
+
 /// The idempotency property, end to end: a first `--yes` run wires the
 /// harness, and an immediate second run reports it as already done rather
 /// than rewriting it. This is what makes `dira onboard` safe to re-run, which

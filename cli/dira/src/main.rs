@@ -212,6 +212,7 @@ git repo.",
 Examples:
   dira start --activity meeting --note \"sprint planning\"
   dira start --project github.com/acme/api --label deploy
+  dira start --spec openspec:add-csv-import   attribute the time to a spec
   dira stop                  close it when you're done"
     )]
     Start {
@@ -227,6 +228,11 @@ Examples:
         /// Free-text description for the session.
         #[arg(long, value_name = "TEXT")]
         note: Option<String>,
+        /// Spec the session works under, by slug (`openspec:add-csv-import`,
+        /// `capture-pipeline`). Shown per spec in the cloud; the slug is all
+        /// that is recorded.
+        #[arg(long, value_name = "SLUG")]
+        spec: Option<String>,
     },
     /// Stop a manual session: by handle, by --label, or --all. Bare = the only one open.
     #[command(
@@ -646,6 +652,27 @@ Examples:
         #[arg(long)]
         project: Option<String>,
         /// One JSON object instead of the rendered view.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the spec-framework units captured as living specs.
+    #[command(after_help = "\
+OpenSpec, Spec Kit, BMAD and superpowers units appear here as `<kind>:<id>`,
+with the framework's own lifecycle state, task progress, and the paths that
+`Spec:` trailers have tied to them (\"none yet\" until a commit cites one).
+Reads dira's index; nothing is run in your repo. Declare a framework with
+`dira onboard`, or `/zavet:spec-adopt` in Claude Code.
+
+Examples:
+  dira zavet specs           this repo, resolved from cwd
+  dira zavet specs --json    the same, machine-readable
+  dira zavet why openspec:add-csv-import
+                             one unit: record, commits, time cost")]
+    Specs {
+        /// Canonical repo (e.g. github.com/org/repo); default: resolve from cwd.
+        #[arg(long)]
+        project: Option<String>,
+        /// One JSON object instead of the rendered table.
         #[arg(long)]
         json: bool,
     },
@@ -1338,6 +1365,7 @@ async fn main() -> Result<()> {
         Command::Zavet {
             action: ZavetAction::Decisions { json: true, .. }
                 | ZavetAction::Wiki { json: true, .. }
+                | ZavetAction::Specs { json: true, .. }
         } | Command::Sessions { json: true }
     );
     let row_opts = match &cli.command {
@@ -1360,12 +1388,14 @@ async fn main() -> Result<()> {
             label,
             activity,
             note,
+            spec,
         } => Request::Start {
             project,
             label,
             activity,
             note,
             cwd,
+            spec,
         },
         Command::Stop { handle, label, all } => Request::Stop {
             selector: if all {
@@ -1435,6 +1465,7 @@ async fn main() -> Result<()> {
             ZavetAction::Decisions { project, .. } => {
                 Request::ZavetDecisions { cwd, repo: project }
             }
+            ZavetAction::Specs { project, .. } => Request::ZavetSpecs { cwd, repo: project },
             ZavetAction::Enable { project } => Request::ZavetSetMode {
                 cwd,
                 repo: project,

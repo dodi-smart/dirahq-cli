@@ -1,14 +1,15 @@
 ---
 title: Knowledge sync — the consent-gated second channel
-version: 1
+version: 2
 origin: session
 verified: false
 confidence: medium
-date: 2026-08-11
+date: 2026-10-12
 paths:
   - cli/core/src/sync/knowledge.rs
   - cli/dirad/src/knowledge_sync.rs
-decisions: [D-0001, D-0020, DIRASH-0028, DIRASH-0030]
+  - cli/dirad/src/zavet_sources.rs
+decisions: [D-0001, D-0020, DIRASH-0028, DIRASH-0030, DIRASH-0039]
 ---
 
 ## Overview
@@ -61,6 +62,34 @@ code rather than recorded as it was built.
   existed in the repo. A rolling window must not span history that predates
   the practice it measures.
 
+- **Source-backed specs** (OpenSpec, Spec Kit, BMAD, superpowers; DIRASH-0039)
+  ride the same `KnowledgeSpec` item with a `source` block.
+  - *Metadata tier, always:* kind/id/root, framework version, normalised and
+    native state, `state_changed_at`, `closed_on`, group, capabilities, risk,
+    unit-file blob oids, planned paths, shape counts, requirement and task ids
+    with their state, drift counts. `record_sha` is a hash of the sorted
+    unit-file oids, and the batch id also covers the source metadata, so a
+    state-only change (a `removed` mark keeps the same oids) is never
+    deduplicated away by the cloud.
+  - *Full tier only:* requirement and task text, the unit summary, tracker
+    refs, and the composed primary documents as `body_md` (capped at 64 KiB).
+    The daemon re-runs `zavet specs --json --with-text` through the installed
+    plugin for the repos with a changed unit in the window; text is used only if
+    the unit's file identity still matches the row being synced. No plugin or a
+    timeout means that window ships metadata only. The metadata retry
+    (`strip_content`) drops all of it again.
+  - `KnowledgeTrailerRef.spec_refs` carries, for each `Spec:` trailer, only the
+    comma-split values that exactly match a captured spec slug (native or
+    source). Those slugs already cross as `KnowledgeSpec.slug`, so this is
+    metadata at every tier and survives the strip; it is what lets the cloud
+    join commits to specs for a metadata-tier workspace.
+  - `KnowledgeRepoStats.spec_sources` (per declared kind/root: framework
+    version, unit count, counts by state; `removed` units are history, not
+    census) and `spec_cited_commits` (non-trivial commits in the window whose
+    `Spec:` names a captured slug; `None` when the repo has no spec). Both
+    stay in the metadata retry.
+  - `SessionRollup.spec` is the slug only (D-0001).
+
 ## Interfaces & data
 
 - Four cursors, in `meta`, because the four tables move differently:
@@ -103,6 +132,10 @@ code rather than recorded as it was built.
   the flush is gated on a cloud URL and a linked device, so the setting is
   recorded and inert until then.
 - A cursor advances only after the cloud acknowledges the chunk carrying it.
+- Source-unit text (requirements, tasks, summaries, tracker refs, composed
+  documents) is full-tier content: never stored locally, never sent below
+  `full`, and any new text-bearing field joins `strip_content` and
+  `KNOWLEDGE_DISCLOSURE` in the same commit.
 - This channel never touches `AttestationBatch`, and no type under `/contract`
   used by it may carry a content-named field that the wire denylist would
   reject on the billing side.

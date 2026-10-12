@@ -143,6 +143,7 @@ pub(crate) const CHECK_IDS: &[&str] = &[
     "cloud.runtime",
     "cloud.reachability",
     "cloud.bootstrap",
+    "zavet.spec_sources",
     // Opt-in: only ever emitted with `--probe`, because it spawns a child
     // process and writes+deletes a row. Keeping the default side-effect-free
     // is what makes `dira doctor` safe to run from install.sh and CI.
@@ -207,6 +208,8 @@ pub(crate) struct Facts {
     /// Cloud-runtime facts: detected runtime, provisioning env, committed
     /// teleport artifacts, and one reachability GET against the cloud.
     pub cloud: checks::CloudFacts,
+    /// Spec-framework adoption in the repo doctor was invoked from.
+    pub spec_sources: checks::SpecSourceFacts,
 }
 
 /// Everything the three `update.*` checks judge, gathered up front like the rest.
@@ -301,6 +304,11 @@ async fn gather(config: &Config, args: &Args) -> Facts {
         Some(dir) => dira_core::project::explain_project(dir),
         None => Err(dira_core::project::ProjectMiss::NotAGitRepo),
     };
+    // Spec-framework facts: `stat`s, one config read, and a read of the local
+    // index — no spawn, no write (DIRASH-0022: doctor reports, never acts).
+    let spec_sources =
+        checks::gather_spec_sources(cwd.as_deref(), store.as_ref().ok(), project.as_ref().ok())
+            .await;
 
     // Where an update would land, and what the last one left behind. Read-only:
     // `discover_install` only probes `PATH` and `symlink_metadata`, and the
@@ -379,6 +387,7 @@ async fn gather(config: &Config, args: &Args) -> Facts {
         cwd: cwd.map(|d| d.display().to_string()),
         project,
         cloud,
+        spec_sources,
         update: UpdateFacts {
             cache: crate::update::notice::cache_facts(),
             install_dir,
@@ -501,6 +510,7 @@ pub(crate) fn run_checks(f: &Facts, args: &Args) -> Vec<Check> {
     push(checks::cloud_runtime(&f.cloud));
     push(checks::cloud_reachability(&f.cloud, f.cloud_url.as_deref()));
     push(checks::cloud_bootstrap(&f.cloud));
+    push(checks::zavet_spec_sources(&f.spec_sources));
 
     out
 }

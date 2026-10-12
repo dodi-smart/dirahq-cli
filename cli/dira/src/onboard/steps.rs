@@ -234,9 +234,14 @@ pub(crate) async fn device(config: &Config, state: &mut State, ui: &mut dyn Ui) 
 /// is wrong or missing, nothing else catches it.
 pub(crate) const KNOWLEDGE_DISCLOSURE: &str = "\
 Knowledge sync is a separate channel from time tracking, with its own consent.
-  metadata  decision + spec ids, titles, status, guard globs, record hashes
+  metadata  decision + spec ids, titles, status, guard globs, record hashes,
+            and for spec frameworks (OpenSpec, Spec Kit, BMAD, superpowers)
+            their unit ids, states and counts
   full      all of the above, plus the record bodies, commit trailer values,
-            and guard check commands — the text of your decisions and specs";
+            and guard check commands — the text of your decisions and specs —
+            and, from spec frameworks, spec framework documents (proposals,
+            designs, task lists), requirement and task text, summaries and
+            tracker references";
 
 /// Step 7 — the knowledge consent tier.
 ///
@@ -393,7 +398,7 @@ pub(crate) fn zavet_repo(
             "zavet plugin not detected yet — restart Claude Code, then run `/zavet:init`".into(),
         );
     };
-    let bin = Path::new(&plugin_root).join("bin").join("zavet");
+    let bin = dira_core::zavet_specs::plugin_bin(Path::new(&plugin_root));
     if !bin.is_file() {
         return StepOutcome::Skipped(format!("no zavet binary at {}", bin.display()));
     }
@@ -428,6 +433,146 @@ pub(crate) fn zavet_repo(
         msg.push_str("; adapters not refreshed (run `zavet adapters` yourself)");
     }
     StepOutcome::Done(msg)
+}
+
+// ---------------------------------------------------------------------------
+// Step — zavet:specs. Link detected spec-driven frameworks to zavet.
+// ---------------------------------------------------------------------------
+
+/// What `zavet:specs` would do, from facts alone — shared by the step and the
+/// plan printout so the two cannot disagree (the `cloud_plan` pattern).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpecPlan {
+    /// Nothing to do because the work is already done (or there is none),
+    /// with the wording for `AlreadyDone`.
+    Done(String),
+    /// Cannot proceed, with the wording for `Skipped`.
+    Skip(String),
+    /// Frameworks present in the repo but not yet declared in `.zavet/config`.
+    Link(Vec<String>),
+}
+
+/// Decide the `zavet:specs` step from the detection state. `root` is read
+/// fresh by the caller where the state may be stale (the scaffold step may
+/// have created `.zavet/` since detection ran).
+pub(crate) fn spec_plan(opts: &Options, root: Option<&Path>, has_zavet_dir: bool) -> SpecPlan {
+    if opts.no_zavet {
+        return SpecPlan::Skip("--no-zavet".into());
+    }
+    let Some(root) = root else {
+        return SpecPlan::Skip("not inside a git repository".into());
+    };
+    if !has_zavet_dir {
+        return SpecPlan::Skip("no .zavet/ in this repo yet".into());
+    }
+    let (detected, declared) = super::detect::spec_frameworks(root);
+    if detected.is_empty() {
+        return SpecPlan::Done("no spec-driven framework detected".into());
+    }
+    let missing: Vec<String> = detected
+        .into_iter()
+        .filter(|k| !declared.contains(k))
+        .collect();
+    if missing.is_empty() {
+        return SpecPlan::Done("spec frameworks already linked to zavet".into());
+    }
+    SpecPlan::Link(missing)
+}
+
+/// "OpenSpec, Spec Kit" for a list of kinds.
+pub(crate) fn kind_names(kinds: &[String]) -> String {
+    kinds
+        .iter()
+        .map(|k| dira_core::zavet_specs::kind_label(k).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Step 6b — declare detected spec frameworks (OpenSpec, Spec Kit, BMAD,
+/// superpowers) as zavet spec sources, so their units become living specs.
+///
+/// Delegates to the installed plugin's own `zavet spec-sources --detect
+/// --write` — the adapters and the config dialect live once, in zavet. Like
+/// every step it returns a [`StepOutcome`] and never aborts the run
+/// (DIRASH-0029); and like `zavet_repo` it runs the plugin's binary, never the
+/// repo's vendored `.zavet/bin/zavet` (DIRASH-0024).
+///
+/// `has_zavet_dir` is re-read by the caller: the scaffold step directly above
+/// may have created `.zavet/` after detection ran, and a freshly scaffolded
+/// repo already had its frameworks linked by `zavet init`, which the config
+/// re-read here then reports as done.
+pub(crate) fn zavet_spec_sources(
+    runner: &dyn crate::zavet_install::Runner,
+    plugin_root: &dyn Fn() -> Option<String>,
+    state: &State,
+    opts: &Options,
+    has_zavet_dir: bool,
+    ui: &mut dyn Ui,
+) -> StepOutcome {
+    let missing = match spec_plan(opts, state.repo_root.as_deref(), has_zavet_dir) {
+        SpecPlan::Done(why) => return StepOutcome::AlreadyDone(why),
+        SpecPlan::Skip(why) => return StepOutcome::Skipped(why),
+        SpecPlan::Link(missing) => missing,
+    };
+    let Some(root) = state.repo_root.as_deref() else {
+        return StepOutcome::Skipped("not inside a git repository".into());
+    };
+    if cfg!(windows) {
+        return StepOutcome::Skipped(
+            "linking needs a POSIX shell — run `/zavet:spec-adopt` inside Claude Code instead"
+                .into(),
+        );
+    }
+    let Some(plugin_root) = plugin_root() else {
+        return StepOutcome::Skipped(format!(
+            "{} found, but the zavet plugin is not detected — install it, then run \
+             `/zavet:spec-adopt`",
+            kind_names(&missing)
+        ));
+    };
+    let bin = dira_core::zavet_specs::plugin_bin(Path::new(&plugin_root));
+    if !bin.is_file() {
+        return StepOutcome::Skipped(format!("no zavet binary at {}", bin.display()));
+    }
+    if !ui.confirm(
+        &format!(
+            "Link {} to zavet spec sources (adds spec-source lines to .zavet/config)?",
+            kind_names(&missing)
+        ),
+        true,
+    ) {
+        return StepOutcome::Skipped("declined".into());
+    }
+    let bin_str = bin.display().to_string();
+    let Some(out) = runner.run_in(root, &bin_str, &["spec-sources", "--detect", "--write"]) else {
+        return StepOutcome::Failed(format!("could not run {bin_str}"));
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return StepOutcome::Failed(format!(
+            "zavet spec-sources failed ({}) — an older zavet plugin may not know it; \
+             update with `dira zavet install --update`, or run `/zavet:spec-adopt`",
+            err.trim()
+        ));
+    }
+    // Report what actually landed, from the config, not from the command's
+    // exit code alone.
+    let declared = super::detect::declared_spec_kinds(root);
+    let linked: Vec<String> = missing
+        .iter()
+        .filter(|k| declared.contains(k))
+        .cloned()
+        .collect();
+    if linked.is_empty() {
+        return StepOutcome::Failed(
+            "zavet spec-sources ran but declared nothing — check `zavet spec-sources --detect`"
+                .into(),
+        );
+    }
+    StepOutcome::Done(format!(
+        "Linked {} \u{2192} zavet spec sources",
+        kind_names(&linked)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +880,8 @@ mod tests {
             device_linked: false,
             knowledge: KnowledgeSyncMode::Off,
             cloud: None,
+            spec_frameworks: Vec::new(),
+            spec_declared: Vec::new(),
         }
     }
 
@@ -786,7 +933,14 @@ mod tests {
         let writer = RecordingWriter::new();
         let _ = knowledge(&state(), &opts, &mut ui, &writer.as_fn());
         let t = ui.transcript();
-        for phrase in ["record bodies", "trailer values", "check commands"] {
+        for phrase in [
+            "record bodies",
+            "trailer values",
+            "check commands",
+            "spec framework documents (proposals,",
+            "designs, task lists), requirement and task text, summaries and",
+            "tracker references",
+        ] {
             assert!(
                 t.contains(phrase),
                 "consent text must mention {phrase:?}; got:\n{t}"
@@ -1551,5 +1705,226 @@ mod tests {
             "said: {:?}",
             ui.asked
         );
+    }
+
+    // --- zavet:specs -------------------------------------------------------
+
+    /// A plugin stand-in: records the argv and, like the real `spec-sources
+    /// --detect --write`, appends the missing lines to `.zavet/config`.
+    #[cfg(unix)]
+    struct LinkingPlugin {
+        calls: std::cell::RefCell<Vec<Vec<String>>>,
+        write: Option<&'static str>,
+        exit: i32,
+    }
+
+    #[cfg(unix)]
+    impl crate::zavet_install::Runner for LinkingPlugin {
+        fn run(&self, _p: &str, _a: &[&str]) -> Option<std::process::Output> {
+            panic!("the step must pin the repo with run_in")
+        }
+        fn run_in(&self, dir: &Path, _prog: &str, args: &[&str]) -> Option<std::process::Output> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            if let Some(lines) = self.write {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(dir.join(".zavet/config"))
+                    .unwrap();
+                f.write_all(lines.as_bytes()).unwrap();
+            }
+            #[cfg(unix)]
+            let status = {
+                use std::os::unix::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(self.exit << 8)
+            };
+            #[cfg(not(unix))]
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("exit 0")
+                .status()
+                .unwrap();
+            Some(std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr: b"boom".to_vec(),
+            })
+        }
+    }
+
+    /// A repo with `.zavet/`, an `openspec/` dir and a fake plugin root.
+    fn spec_fixture(config: &str) -> (tempfile::TempDir, tempfile::TempDir, State) {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".zavet")).unwrap();
+        std::fs::write(repo.path().join(".zavet/config"), config).unwrap();
+        std::fs::create_dir_all(repo.path().join("openspec")).unwrap();
+        let plugin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plugin.path().join("bin")).unwrap();
+        std::fs::write(plugin.path().join("bin/zavet"), "#!/bin/sh\n").unwrap();
+        let st = State {
+            repo_root: Some(repo.path().to_path_buf()),
+            has_zavet_dir: true,
+            ..state()
+        };
+        (repo, plugin, st)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spec_step_links_detected_frameworks_through_the_plugin_binary() {
+        let (repo, plugin, st) = spec_fixture("prefix: D\n");
+        let root = plugin.path().display().to_string();
+        let runner = LinkingPlugin {
+            calls: Default::default(),
+            write: Some("spec-source: openspec openspec\n"),
+            exit: 0,
+        };
+        let mut ui = ScriptedUi::new();
+        let out = zavet_spec_sources(
+            &runner,
+            &|| Some(root.clone()),
+            &st,
+            &Options::default(),
+            true,
+            &mut ui,
+        );
+        assert!(
+            matches!(&out, StepOutcome::Done(m) if m.contains("Linked OpenSpec")),
+            "got {out:?}"
+        );
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            &[vec![
+                "spec-sources".to_string(),
+                "--detect".into(),
+                "--write".into()
+            ]]
+        );
+        // A second run finds the line and does nothing.
+        let again = zavet_spec_sources(
+            &runner,
+            &|| Some(root.clone()),
+            &st,
+            &Options::default(),
+            true,
+            &mut ScriptedUi::new(),
+        );
+        assert!(
+            matches!(again, StepOutcome::AlreadyDone(_)),
+            "got {again:?}"
+        );
+        assert_eq!(runner.calls.borrow().len(), 1, "no second spawn");
+        drop(repo);
+    }
+
+    #[test]
+    fn spec_step_never_spawns_when_there_is_nothing_to_link_or_no_plugin() {
+        struct Boom;
+        impl crate::zavet_install::Runner for Boom {
+            fn run(&self, _p: &str, _a: &[&str]) -> Option<std::process::Output> {
+                panic!("must not spawn")
+            }
+        }
+        // Already declared.
+        let (_r, plugin, st) = spec_fixture("spec-source: openspec openspec\n");
+        let root = plugin.path().display().to_string();
+        let o = zavet_spec_sources(
+            &Boom,
+            &|| Some(root.clone()),
+            &st,
+            &Options::default(),
+            true,
+            &mut ScriptedUi::new(),
+        );
+        assert!(matches!(o, StepOutcome::AlreadyDone(_)), "got {o:?}");
+        // Plugin not found: skipped with the manual route, not failed.
+        let (_r, _p, st) = spec_fixture("prefix: D\n");
+        let o = zavet_spec_sources(
+            &Boom,
+            &|| None,
+            &st,
+            &Options::default(),
+            true,
+            &mut ScriptedUi::new(),
+        );
+        assert!(
+            matches!(&o, StepOutcome::Skipped(m) if m.contains("/zavet:spec-adopt")),
+            "got {o:?}"
+        );
+        // No .zavet/ yet.
+        let o = zavet_spec_sources(
+            &Boom,
+            &|| None,
+            &st,
+            &Options::default(),
+            false,
+            &mut ScriptedUi::new(),
+        );
+        assert!(matches!(o, StepOutcome::Skipped(_)), "got {o:?}");
+        // --no-zavet.
+        let opts = Options {
+            no_zavet: true,
+            ..Options::default()
+        };
+        let o = zavet_spec_sources(&Boom, &|| None, &st, &opts, true, &mut ScriptedUi::new());
+        assert!(matches!(o, StepOutcome::Skipped(_)), "got {o:?}");
+        // No framework at all.
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bare.path().join(".zavet")).unwrap();
+        let st = State {
+            repo_root: Some(bare.path().to_path_buf()),
+            has_zavet_dir: true,
+            ..state()
+        };
+        let o = zavet_spec_sources(
+            &Boom,
+            &|| None,
+            &st,
+            &Options::default(),
+            true,
+            &mut ScriptedUi::new(),
+        );
+        assert!(matches!(o, StepOutcome::AlreadyDone(_)), "got {o:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spec_step_reports_a_failing_plugin_without_aborting() {
+        let (_r, plugin, st) = spec_fixture("prefix: D\n");
+        let root = plugin.path().display().to_string();
+        let runner = LinkingPlugin {
+            calls: Default::default(),
+            write: None,
+            exit: 2,
+        };
+        let o = zavet_spec_sources(
+            &runner,
+            &|| Some(root.clone()),
+            &st,
+            &Options::default(),
+            true,
+            &mut ScriptedUi::new(),
+        );
+        assert!(
+            matches!(&o, StepOutcome::Failed(m) if m.contains("boom")),
+            "got {o:?}"
+        );
+        // Exit 0 but nothing declared is also a failure, not a false "linked".
+        let runner = LinkingPlugin {
+            calls: Default::default(),
+            write: None,
+            exit: 0,
+        };
+        let o = zavet_spec_sources(
+            &runner,
+            &|| Some(root.clone()),
+            &st,
+            &Options::default(),
+            true,
+            &mut ScriptedUi::new(),
+        );
+        assert!(matches!(o, StepOutcome::Failed(_)), "got {o:?}");
     }
 }

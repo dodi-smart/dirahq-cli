@@ -140,6 +140,11 @@ fn spec_to_wire(row: &ZavetSpecRow, tier: KnowledgeTier) -> KnowledgeSpec {
             KnowledgeTier::Full => row.body_md.clone(),
             KnowledgeTier::Metadata => None,
         },
+        // Source-backed units carry their framework provenance; the stored
+        // value is already text-free, and the full-tier text is overlaid by the
+        // daemon's flush (it re-reads it from the repo, never the store).
+        // Native specs carry none.
+        source: row.source.clone(),
     }
 }
 
@@ -154,6 +159,52 @@ fn trailer_to_wire(row: &ZavetTrailerSyncRow, tier: KnowledgeTier) -> KnowledgeT
             KnowledgeTier::Full => row.value.clone(),
             KnowledgeTier::Metadata => None,
         },
+        // Filled by `apply_spec_refs` once the captured spec slugs are known.
+        spec_refs: Vec::new(),
+    }
+}
+
+/// For each `spec` trailer in `rows`, the comma-split values that EXACTLY match
+/// a captured spec slug of the trailer's repo, keyed `(sha, seq)`. Slugs that
+/// match nothing are dropped: they are free text (a typo, a prose phrase) and
+/// only values that are already on the wire as `KnowledgeSpec.slug` may cross
+/// at the metadata tier. Uses [`crate::zavet::spec_trailer_slugs`], the same
+/// split the store's `zavet_trailer_values` uses.
+pub fn trailer_spec_refs(
+    rows: &[ZavetTrailerSyncRow],
+    known_slugs_by_repo: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+) -> std::collections::HashMap<(String, u32), Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    for row in rows.iter().filter(|r| r.key == "spec") {
+        let (Some(repo), Some(value)) = (row.repo.as_ref(), row.value.as_ref()) else {
+            continue;
+        };
+        let Some(known) = known_slugs_by_repo.get(repo) else {
+            continue;
+        };
+        let mut refs: Vec<String> = Vec::new();
+        for slug in crate::zavet::spec_trailer_slugs(value) {
+            if known.contains(&slug) && !refs.contains(&slug) {
+                refs.push(slug);
+            }
+        }
+        if !refs.is_empty() {
+            out.insert((row.sha.clone(), row.seq.max(0) as u32), refs);
+        }
+    }
+    out
+}
+
+/// Fill `spec_refs` on a batch's trailer refs from [`trailer_spec_refs`].
+/// Metadata at every tier: it survives `strip_content`.
+pub fn apply_spec_refs(
+    batch: &mut KnowledgeBatch,
+    refs: &std::collections::HashMap<(String, u32), Vec<String>>,
+) {
+    for t in batch.trailer_refs.iter_mut().filter(|t| t.key == "spec") {
+        if let Some(r) = refs.get(&(t.sha.clone(), t.seq)) {
+            t.spec_refs = r.clone();
+        }
     }
 }
 
@@ -191,12 +242,20 @@ pub fn knowledge_batch_id(batch: &KnowledgeBatch) -> String {
         ));
     }
     for s in &batch.specs {
-        ids.push(format!(
+        let mut id = format!(
             "s:{}:{}:{}",
             s.repo_canonical,
             s.slug,
             s.record_sha.as_deref().unwrap_or("")
-        ));
+        );
+        // A source unit's state, counts and drift move without its files (a
+        // `removed` mark keeps the same record_sha), and the cloud no-ops a
+        // repeated batchId — so the metadata participates in the identity.
+        if let Some(src) = &s.source {
+            id.push(':');
+            id.push_str(&serde_json::to_string(src).unwrap_or_default());
+        }
+        ids.push(id);
     }
     for t in &batch.trailer_refs {
         ids.push(format!("t:{}:{}", t.sha, t.seq));
@@ -505,5 +564,157 @@ mod tests {
                 .is_empty(),
             "the error-body caller's quiet fallback still yields a usable default"
         );
+    }
+
+    // -- source-backed specs ---------------------------------------------------
+
+    fn source_row(state: &str) -> ZavetSpecRow {
+        ZavetSpecRow {
+            repo: "github.com/acme/api".into(),
+            slug: "openspec:add-csv-import".into(),
+            path: "openspec/changes/add-csv-import/proposal.md".into(),
+            origin: Some("external".into()),
+            verified: Some(false),
+            content_hash: Some("rs1".into()),
+            // A row never holds text, whatever the resolver once returned.
+            body_md: None,
+            source: Some(dira_contract::SpecSource {
+                kind: "openspec".into(),
+                id: "add-csv-import".into(),
+                root: "openspec".into(),
+                state: state.into(),
+                requirement_refs: vec![dira_contract::RequirementRef {
+                    id: "R1".into(),
+                    state: "added".into(),
+                    scenarios: 2,
+                    capability: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_source_spec_maps_its_metadata_and_no_text_at_the_metadata_tier() {
+        let w = spec_to_wire(&source_row("active"), KnowledgeTier::Metadata);
+        let src = w.source.as_ref().expect("source rides the wire");
+        assert_eq!(
+            (src.kind.as_str(), src.state.as_str()),
+            ("openspec", "active")
+        );
+        assert_eq!(src.requirement_refs[0].id, "R1");
+        assert_eq!(w.record_sha.as_deref(), Some("rs1"));
+        assert!(w.body_md.is_none());
+        assert!(src.requirement_bodies.is_empty() && src.summary_md.is_none());
+        // A native spec carries none.
+        let native = spec_to_wire(&ZavetSpecRow::default(), KnowledgeTier::Full);
+        assert!(native.source.is_none());
+    }
+
+    #[test]
+    fn the_batch_id_moves_with_a_source_units_state_but_not_a_native_specs() {
+        let build = |state: &str| {
+            build_knowledge_batches(
+                "d",
+                "t",
+                KnowledgeTier::Metadata,
+                &[],
+                &[(1, source_row(state))],
+                &[],
+                &[],
+                Vec::new(),
+            )
+            .remove(0)
+            .batch
+            .batch_id
+        };
+        assert_eq!(build("active"), build("active"));
+        assert_ne!(
+            build("active"),
+            build("removed"),
+            "same record_sha, different state: the cloud must not dedupe the removal"
+        );
+    }
+
+    fn spec_trailer_row(
+        sha: &str,
+        seq: i64,
+        repo: Option<&str>,
+        value: &str,
+    ) -> ZavetTrailerSyncRow {
+        ZavetTrailerSyncRow {
+            rowid: seq,
+            sha: sha.into(),
+            repo: repo.map(str::to_string),
+            key: "spec".into(),
+            value: Some(value.into()),
+            decision_id: None,
+            seq,
+        }
+    }
+
+    #[test]
+    fn spec_refs_keep_only_exact_matches_to_captured_slugs_and_survive_the_strip() {
+        let repo = "github.com/acme/api";
+        let rows = vec![
+            spec_trailer_row(
+                "c1",
+                0,
+                Some(repo),
+                " openspec:add-csv-import , capture-pipeline,, typo-slug",
+            ),
+            spec_trailer_row("c2", 0, Some(repo), "openspec:add-csv-import-v2"),
+            spec_trailer_row("c3", 0, Some("github.com/other/repo"), "capture-pipeline"),
+            spec_trailer_row("c4", 0, None, "capture-pipeline"),
+            // A non-spec trailer is never touched.
+            ZavetTrailerSyncRow {
+                key: "why".into(),
+                ..spec_trailer_row("c5", 0, Some(repo), "capture-pipeline")
+            },
+        ];
+        let mut known = std::collections::HashMap::new();
+        known.insert(
+            repo.to_string(),
+            ["openspec:add-csv-import", "capture-pipeline"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let refs = trailer_spec_refs(&rows, &known);
+        assert_eq!(
+            refs.get(&("c1".into(), 0)).unwrap(),
+            &vec![
+                "openspec:add-csv-import".to_string(),
+                "capture-pipeline".to_string()
+            ],
+            "exact matches only; the typo is free text and stays off the wire"
+        );
+        assert_eq!(
+            refs.len(),
+            1,
+            "no match, other repo, no repo, non-spec key: all omitted"
+        );
+
+        let mut batch = build_knowledge_batches(
+            "d",
+            "t",
+            KnowledgeTier::Full,
+            &[],
+            &[],
+            &rows,
+            &[],
+            Vec::new(),
+        )
+        .remove(0)
+        .batch;
+        apply_spec_refs(&mut batch, &refs);
+        let c1 = batch.trailer_refs.iter().find(|t| t.sha == "c1").unwrap();
+        assert_eq!(c1.spec_refs.len(), 2);
+        assert!(c1.value.is_some());
+        batch.strip_content();
+        let c1 = batch.trailer_refs.iter().find(|t| t.sha == "c1").unwrap();
+        assert!(c1.value.is_none(), "the free text is content");
+        assert_eq!(c1.spec_refs.len(), 2, "the exact-match slugs are metadata");
     }
 }

@@ -6,3 +6,12 @@ prefix-aliases: D
 # Zero-padding width for minted ids. Fixed at scaffold time: an id minted at
 # one width never joins a shorthand ref resolved at another.
 id-width: 4
+# Spec frameworks whose units resolve into specs. Repeatable and flat:
+# `spec-source: <kind> <root> [<glob>...]`. Kinds: openspec speckit bmad
+# superpowers; anything else is ignored. Trailing globs are human-declared
+# coverage for the framework's units.
+spec-source: openspec openspec
+spec-source: speckit specs src/** docs/*.md
+spec-source: bmad _bmad-output
+spec-source: superpowers docs/superpowers
+spec-source: madeup docs/ignored

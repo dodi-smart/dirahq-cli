@@ -27,10 +27,10 @@ use dira_core::identity;
 use dira_core::signing::DeviceKey;
 use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
 use dira_core::sync::knowledge::{
-    build_knowledge_batches, knowledge_batch_id, parse_knowledge_response, KnowledgeChunk,
-    KnowledgeTier, KNOWLEDGE_CHUNK_ITEMS, META_KNOWLEDGE_DECISION_CURSOR,
-    META_KNOWLEDGE_GUARD_CURSOR, META_KNOWLEDGE_HEALTH, META_KNOWLEDGE_SPEC_CURSOR,
-    META_KNOWLEDGE_STATS_PREFIX, META_KNOWLEDGE_TRAILER_CURSOR,
+    apply_spec_refs, build_knowledge_batches, knowledge_batch_id, parse_knowledge_response,
+    trailer_spec_refs, KnowledgeChunk, KnowledgeTier, KNOWLEDGE_CHUNK_ITEMS,
+    META_KNOWLEDGE_DECISION_CURSOR, META_KNOWLEDGE_GUARD_CURSOR, META_KNOWLEDGE_HEALTH,
+    META_KNOWLEDGE_SPEC_CURSOR, META_KNOWLEDGE_STATS_PREFIX, META_KNOWLEDGE_TRAILER_CURSOR,
 };
 use dira_core::{config::KnowledgeSyncMode, project};
 use std::collections::HashSet;
@@ -272,7 +272,7 @@ async fn flush_knowledge(
     let repo_stats = compute_repo_stats(state).await;
 
     let now = crate::heartbeat::fmt_rfc3339(time::OffsetDateTime::now_utc());
-    let chunks = build_knowledge_batches(
+    let mut chunks = build_knowledge_batches(
         &device_id,
         &now,
         tier,
@@ -284,6 +284,35 @@ async fn flush_knowledge(
     );
     if chunks.is_empty() {
         return Ok(Outcome::Nothing);
+    }
+
+    // Commit -> spec binding. Metadata at every tier: only values that EXACTLY
+    // match a captured spec slug cross, and those slugs already ride as
+    // `KnowledgeSpec.slug`. Applied after the build so the pure core stays
+    // store-free; `strip_content` leaves it alone on the metadata retry.
+    let spec_refs = spec_refs_for(state, &trailers).await;
+    if !spec_refs.is_empty() {
+        for chunk in &mut chunks {
+            apply_spec_refs(&mut chunk.batch, &spec_refs);
+        }
+    }
+    // Full tier only: requirement/task text, summaries and composed documents of
+    // source-backed units, re-read from the repo through the plugin (never from
+    // the store, which holds none). The metadata retry strips all of it again.
+    if tier == KnowledgeTier::Full {
+        let overlay = source_text_overlay(state, &specs).await;
+        if !overlay.is_empty() {
+            for chunk in &mut chunks {
+                for s in &mut chunk.batch.specs {
+                    if let Some(t) = overlay.get(&(s.repo_canonical.clone(), s.slug.clone())) {
+                        if let Some(dst) = s.source.as_mut() {
+                            crate::zavet_sources::overlay_text(dst, &t.source);
+                        }
+                        s.body_md = t.body_md.clone();
+                    }
+                }
+            }
+        }
     }
 
     match post_chunks(state, device_key, client, &cloud_url, &chunks).await {
@@ -318,6 +347,109 @@ async fn flush_knowledge(
         Err(KError::ContentNotAllowed) => Err(metadata_rejected()),
         other => other,
     }
+}
+
+/// `(sha, seq) -> exact-match spec slugs` for the window's `Spec:` trailers.
+async fn spec_refs_for(
+    state: &AppState,
+    trailers: &[dira_core::store::ZavetTrailerSyncRow],
+) -> std::collections::HashMap<(String, u32), Vec<String>> {
+    let repos: HashSet<&str> = trailers
+        .iter()
+        .filter(|t| t.key == "spec")
+        .filter_map(|t| t.repo.as_deref())
+        .collect();
+    let mut known = std::collections::HashMap::new();
+    for repo in repos {
+        known.insert(
+            repo.to_string(),
+            crate::zavet_sources::known_slugs(&state.store, repo).await,
+        );
+    }
+    trailer_spec_refs(trailers, &known)
+}
+
+/// How many repos' source units are re-read through the plugin at once.
+const SOURCE_RESOLVE_CONCURRENCY: usize = 4;
+
+/// The full-tier text of one source unit.
+struct SourceText {
+    source: dira_contract::SpecSource,
+    body_md: Option<String>,
+}
+
+/// Re-run the plugin WITH text for the repos that have a changed source unit in
+/// this window, and key the result by `(repo, slug)`.
+///
+/// A unit's text is used only when its current file identity still matches the
+/// row being synced (`record_sha`): if the repo has moved on since the row was
+/// captured, the row is about to be re-captured and re-synced, and shipping
+/// newer text under an older identity would let the two disagree. Fail-open: no
+/// plugin, a timeout or no known working dir means this window ships its
+/// metadata without text, and the unit is re-sent when it next changes.
+async fn source_text_overlay(
+    state: &AppState,
+    specs: &[(i64, ZavetSpecRow)],
+) -> std::collections::HashMap<(String, String), SourceText> {
+    let mut by_repo: std::collections::BTreeMap<&str, Vec<&ZavetSpecRow>> = Default::default();
+    for (_, row) in specs {
+        if row
+            .source
+            .as_ref()
+            .is_some_and(|s| s.state != "removed" && s.state != "unresolved")
+        {
+            by_repo.entry(row.repo.as_str()).or_default().push(row);
+        }
+    }
+    // Repos resolve concurrently (each is its own plugin process under its own
+    // 12 s budget), a few at a time so a long repo list cannot fan out into a
+    // burst of Node/shell children.
+    let repos: Vec<_> = by_repo.into_iter().collect();
+    let mut out = std::collections::HashMap::new();
+    for group in repos.chunks(SOURCE_RESOLVE_CONCURRENCY) {
+        let resolved = futures::future::join_all(
+            group
+                .iter()
+                .map(|(repo, rows)| resolve_repo_text(state, repo, rows)),
+        )
+        .await;
+        out.extend(resolved.into_iter().flatten());
+    }
+    out
+}
+
+/// One repo's share of [`source_text_overlay`]: run the plugin with text and
+/// pair each current row with the unit whose identity still matches it.
+async fn resolve_repo_text(
+    state: &AppState,
+    repo: &str,
+    rows: &[&ZavetSpecRow],
+) -> Vec<((String, String), SourceText)> {
+    let Some(root) = crate::control::repo_root(state, repo) else {
+        return Vec::new();
+    };
+    let join =
+        tokio::task::spawn_blocking(move || crate::zavet_sources::resolve_blocking(&root, true));
+    let units = match tokio::time::timeout(StdDuration::from_secs(12), join).await {
+        Ok(Ok(Some(u))) => u,
+        _ => return Vec::new(),
+    };
+    let by_slug: std::collections::HashMap<&str, &dira_core::zavet_specs::ResolvedUnit> =
+        units.iter().map(|u| (u.slug.as_str(), u)).collect();
+    rows.iter()
+        .filter_map(|row| {
+            let unit = by_slug
+                .get(row.slug.as_str())
+                .filter(|u| Some(&u.record_sha) == row.content_hash.as_ref())?;
+            Some((
+                (row.repo.clone(), row.slug.clone()),
+                SourceText {
+                    source: unit.source.clone(),
+                    body_md: crate::zavet_sources::compose_body(&unit.docs),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The cloud answered `content_not_allowed` to a batch that already carried no
@@ -478,20 +610,17 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
     // no repos" — a confident wrong answer rather than a stale one. Every other
     // reader of this map recovers the guard and serves what it has; see
     // `control::lock_recover`'s note on staying stale-but-serving.
-    let dirs: Vec<(String, String)> = crate::control::lock_recover_map(&state.repo_dirs)
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+    let dirs: Vec<String> = crate::control::lock_recover_map(&state.repo_dirs)
+        .keys()
+        .cloned()
         .collect();
     let now = time::OffsetDateTime::now_utc();
     let now_str = crate::heartbeat::fmt_rfc3339(now);
     let mut out = Vec::new();
-    for (repo, dir) in dirs {
-        // Resolve the toplevel: `repo_dirs` holds whatever the last writer put
-        // there, which may be a subdirectory. Probing `.zavet/` against a subdir
-        // silently drops the repo from the snapshot, and the pathspecs below are
-        // `:(glob)`, i.e. cwd-relative, so they would not match either.
-        let raw = std::path::PathBuf::from(&dir);
-        let root = dira_core::project::toplevel(&raw).unwrap_or(raw);
+    for repo in dirs {
+        let Some(root) = crate::control::repo_root(state, &repo) else {
+            continue;
+        };
         if !root.join(".zavet").is_dir() {
             continue;
         }
@@ -518,6 +647,11 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
             .await
             .unwrap_or_default();
         let globs = coverage_globs(&decisions, &specs);
+        let spec_trailers = state
+            .store
+            .zavet_spec_trailer_values(&repo)
+            .await
+            .unwrap_or_default();
         let trailer_shas: HashSet<String> = state
             .store
             .zavet_trailer_shas(&repo)
@@ -554,6 +688,12 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
             .iter()
             .filter(|sha| trailer_shas.contains(*sha))
             .count() as u64;
+        let (spec_sources, spec_cited_commits) = spec_census(
+            &crate::zavet::read_config(&root),
+            &specs,
+            &spec_trailers,
+            &activity.nontrivial_commits,
+        );
         out.push(KnowledgeRepoStats {
             repo_canonical: repo.clone(),
             window_days: window,
@@ -563,10 +703,75 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
             trailer_commits,
             computed_at: now_str.clone(),
             zavet_since,
+            spec_sources,
+            spec_cited_commits,
         });
         let _ = state.store.meta_set(&key, &now_str).await;
     }
     out
+}
+
+/// The source-backed spec census for a repo's stats snapshot.
+///
+/// `spec_sources`: one entry per `spec-source:` declaration (kind + root), with
+/// the framework version read off its units and the unit count by normalised
+/// state (units marked `removed` are history, not census). `spec_cited_commits`:
+/// of the window's non-trivial commits, those whose `Spec:` trailer names at
+/// least one captured spec slug EXACTLY (native or source) — `None` when the
+/// repo has no spec at all, so a repo that never wrote one reads "not
+/// measured" rather than a flat zero.
+///
+/// Both are metadata, so they stay in the metadata-tier retry (only content is
+/// stripped; `repo_stats` is dropped from that retry for an unrelated reason).
+fn spec_census(
+    cfg: &dira_core::zavet::ZavetConfig,
+    specs: &[ZavetSpecRow],
+    spec_trailers: &[(String, String)],
+    nontrivial: &[String],
+) -> (Vec<dira_contract::RepoSpecSource>, Option<u32>) {
+    let mut sources: Vec<dira_contract::RepoSpecSource> = Vec::new();
+    for decl in &cfg.spec_sources {
+        if sources
+            .iter()
+            .any(|s| s.kind == decl.kind && s.root == decl.root)
+        {
+            continue;
+        }
+        let mut entry = dira_contract::RepoSpecSource {
+            kind: decl.kind.clone(),
+            root: decl.root.clone(),
+            ..Default::default()
+        };
+        for src in specs
+            .iter()
+            .filter_map(|s| s.source.as_ref())
+            .filter(|s| s.kind == decl.kind && s.root == decl.root && s.state != "removed")
+        {
+            entry.units += 1;
+            *entry
+                .by_state
+                .entry(dira_core::zavet_specs::normalize_state_bucket(&src.state).to_string())
+                .or_insert(0) += 1;
+            if entry.framework_version.is_none() {
+                entry.framework_version = src.framework_version.clone();
+            }
+        }
+        sources.push(entry);
+    }
+    if specs.is_empty() {
+        return (sources, None);
+    }
+    let known: HashSet<&str> = specs.iter().map(|s| s.slug.as_str()).collect();
+    let cited: HashSet<&str> = spec_trailers
+        .iter()
+        .filter(|(_, slug)| known.contains(slug.as_str()))
+        .map(|(sha, _)| sha.as_str())
+        .collect();
+    let n = nontrivial
+        .iter()
+        .filter(|sha| cited.contains(sha.as_str()))
+        .count() as u32;
+    (sources, Some(n))
 }
 
 /// The window the stats actually cover: `STATS_WINDOW_DAYS`, clamped down to the
@@ -951,5 +1156,266 @@ mod tests {
         let out = flush_knowledge(&state, &key, &state.http).await.unwrap();
         assert!(matches!(out, Outcome::Synced));
         assert!(cloud.requests("/api/v1/knowledge")[1].contains("D-0001"));
+    }
+
+    // -- source-backed specs on the wire ---------------------------------------
+
+    #[cfg(unix)]
+    mod source_wire {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        const REPO: &str = "github.com/acme/api";
+        /// The plugin root is a process-global env var; these tests take turns.
+        static PLUGIN_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        const ROW: &str = r##"{"v":1,"slug":"openspec:add-csv-import","kind":"openspec","id":"add-csv-import","root":"openspec","frameworkVersion":"0.9.1","title":"Add CSV import","state":"active","nativeState":"in-progress","primary":"openspec/changes/add-csv-import/proposal.md","files":[{"path":"openspec/changes/add-csv-import/proposal.md","oid":"o1"}],"firstCommit":"c1","lastCommit":"c2","paths":[],"requirements":[{"id":"R1","state":"added","scenarios":2,"text":"REQ-TEXT"}],"tasks":[{"id":"1.1","done":true,"text":"TASK-TEXT"}],"trackerRefs":["GH#123"],"summary":"SUMMARY-TEXT","docs":[{"path":"openspec/changes/add-csv-import/proposal.md","md":"# DOC-TEXT"}]}"##;
+
+        /// A fake plugin serving ROW, with text only when asked.
+        fn fake_plugin() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+            std::fs::write(dir.path().join("row.jsonl"), ROW).unwrap();
+            let bin = dir.path().join("bin/zavet");
+            std::fs::write(
+                &bin,
+                "#!/bin/sh\nd=\"$(dirname \"$0\")/..\"\n\
+                 case \"$1\" in\n\
+                   version) echo '{\"specs_json\":1}' ;;\n\
+                   specs) cat \"$d/row.jsonl\" ;;\n\
+                   *) exit 2 ;;\n\
+                 esac\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        }
+
+        /// A linked state holding one source unit (text-free, as the store
+        /// holds it) and a `Spec:` trailer citing it next to free text.
+        async fn state_with_unit(
+            cloud: &MockCloud,
+            knob: KnowledgeSyncMode,
+            repo_dir: &std::path::Path,
+        ) -> AppState {
+            let state = linked_state(cloud, knob).await;
+            let units = dira_core::zavet_specs::parse_rows(ROW, false);
+            crate::zavet_sources::persist_units(&state.store, REPO, &units, None, true)
+                .await
+                .unwrap();
+            state
+                .store
+                .zavet_record_trailers(
+                    Some(REPO),
+                    "sha2",
+                    &[ZavetTrailer {
+                        key: "spec".into(),
+                        value: "openspec:add-csv-import, free-text-typo".into(),
+                        decision_id: None,
+                    }],
+                )
+                .await
+                .unwrap();
+            crate::control::lock_recover_map(&state.repo_dirs)
+                .insert(REPO.to_string(), repo_dir.display().to_string());
+            state
+        }
+
+        #[tokio::test]
+        async fn metadata_tier_carries_unit_metadata_and_spec_refs_but_no_text() {
+            let _g = PLUGIN_ENV.lock().await;
+            let plugin = fake_plugin();
+            std::env::set_var(dira_core::zavet_specs::PLUGIN_ROOT_ENV, plugin.path());
+            let repo = tempfile::tempdir().unwrap();
+            let cloud = MockCloud::start(&["/api/v1/knowledge"]).await;
+            let state = state_with_unit(&cloud, KnowledgeSyncMode::Metadata, repo.path()).await;
+            cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+            flush_knowledge(&state, &DeviceKey::generate(), &state.http)
+                .await
+                .unwrap();
+            let body = &cloud.requests("/api/v1/knowledge")[0];
+            for text in [
+                "REQ-TEXT",
+                "TASK-TEXT",
+                "SUMMARY-TEXT",
+                "DOC-TEXT",
+                "GH#123",
+            ] {
+                assert!(
+                    !body.contains(text),
+                    "{text} must not cross at the metadata tier"
+                );
+            }
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let spec = &v["payload"]["specs"][0];
+            assert_eq!(spec["slug"], "openspec:add-csv-import");
+            assert_eq!(spec["source"]["kind"], "openspec");
+            assert_eq!(spec["source"]["state"], "active");
+            assert_eq!(spec["source"]["requirementRefs"][0]["id"], "R1");
+            assert_eq!(spec["source"]["counts"]["tasksDone"], 1);
+            assert!(spec.get("bodyMd").is_none());
+            // The comma list: only the exact slug survives as a spec ref.
+            let t = v["payload"]["trailerRefs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["key"] == "spec")
+                .expect("spec trailer");
+            assert_eq!(
+                t["specRefs"],
+                serde_json::json!(["openspec:add-csv-import"])
+            );
+            assert!(t.get("value").is_none(), "the free text is content");
+        }
+
+        #[tokio::test]
+        async fn full_tier_adds_the_text_and_the_metadata_retry_strips_it_again() {
+            let _g = PLUGIN_ENV.lock().await;
+            let plugin = fake_plugin();
+            std::env::set_var(dira_core::zavet_specs::PLUGIN_ROOT_ENV, plugin.path());
+            let repo = tempfile::tempdir().unwrap();
+            let cloud = MockCloud::start(&["/api/v1/knowledge"]).await;
+            let state = state_with_unit(&cloud, KnowledgeSyncMode::Full, repo.path()).await;
+            cloud.push(
+                "/api/v1/knowledge",
+                MockResp::status(400, r#"{"error":"content_not_allowed"}"#),
+            );
+            cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+            flush_knowledge(&state, &DeviceKey::generate(), &state.http)
+                .await
+                .unwrap();
+            let reqs = cloud.requests("/api/v1/knowledge");
+            assert_eq!(reqs.len(), 2);
+
+            // First attempt: full tier, text composed from the repo via the plugin.
+            let full: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+            let src = &full["payload"]["specs"][0]["source"];
+            assert_eq!(src["requirementBodies"][0]["md"], "REQ-TEXT");
+            assert_eq!(src["taskBodies"][0]["md"], "TASK-TEXT");
+            assert_eq!(src["summaryMd"], "SUMMARY-TEXT");
+            assert_eq!(src["trackerRefs"][0], "GH#123");
+            assert!(
+                full["payload"]["specs"][0]["bodyMd"]
+                    .as_str()
+                    .unwrap()
+                    .contains("DOC-TEXT"),
+                "primary docs compose into body_md"
+            );
+
+            // Retry: stripped to metadata, ids/counts/specRefs kept.
+            let meta: serde_json::Value = serde_json::from_str(&reqs[1]).unwrap();
+            for text in [
+                "REQ-TEXT",
+                "TASK-TEXT",
+                "SUMMARY-TEXT",
+                "DOC-TEXT",
+                "GH#123",
+            ] {
+                assert!(
+                    !reqs[1].contains(text),
+                    "{text} must be gone from the retry"
+                );
+            }
+            assert_eq!(meta["payload"]["tier"], "metadata");
+            assert_eq!(
+                meta["payload"]["specs"][0]["source"]["requirementRefs"][0]["id"],
+                "R1"
+            );
+            let t = meta["payload"]["trailerRefs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["key"] == "spec")
+                .unwrap();
+            assert_eq!(
+                t["specRefs"],
+                serde_json::json!(["openspec:add-csv-import"])
+            );
+        }
+
+        #[tokio::test]
+        async fn a_full_tier_flush_without_a_plugin_still_ships_the_metadata() {
+            let _g = PLUGIN_ENV.lock().await;
+            std::env::set_var(
+                dira_core::zavet_specs::PLUGIN_ROOT_ENV,
+                "/nonexistent/plugin",
+            );
+            let repo = tempfile::tempdir().unwrap();
+            let cloud = MockCloud::start(&["/api/v1/knowledge"]).await;
+            let state = state_with_unit(&cloud, KnowledgeSyncMode::Full, repo.path()).await;
+            cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+            flush_knowledge(&state, &DeviceKey::generate(), &state.http)
+                .await
+                .unwrap();
+            let body = &cloud.requests("/api/v1/knowledge")[0];
+            assert!(body.contains("openspec:add-csv-import"));
+            assert!(!body.contains("REQ-TEXT"), "no plugin, no text — fail open");
+        }
+
+        #[test]
+        fn the_census_counts_declared_sources_by_state_and_cited_commits() {
+            let cfg = dira_core::zavet::parse_config(
+                "spec-source: openspec openspec\nspec-source: speckit specs\n",
+            );
+            let mk = |slug: &str, kind: &str, root: &str, state: &str, fv: Option<&str>| {
+                dira_core::store::ZavetSpecRow {
+                    slug: slug.into(),
+                    source: Some(dira_contract::SpecSource {
+                        kind: kind.into(),
+                        id: slug.split(':').nth(1).unwrap_or(slug).into(),
+                        root: root.into(),
+                        state: state.into(),
+                        framework_version: fv.map(str::to_string),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+            };
+            let specs = vec![
+                mk(
+                    "openspec:a",
+                    "openspec",
+                    "openspec",
+                    "active",
+                    Some("0.9.1"),
+                ),
+                mk("openspec:b", "openspec", "openspec", "archived", None),
+                mk("openspec:c", "openspec", "openspec", "removed", None),
+                // A state outside the vocabulary buckets as `other`: it is a
+                // signed JSON key, and `__proto__` would be stripped by the
+                // cloud's zod and fail the batch's signature.
+                mk("openspec:d", "openspec", "openspec", "__proto__", None),
+                dira_core::store::ZavetSpecRow {
+                    slug: "capture-pipeline".into(),
+                    ..Default::default()
+                },
+            ];
+            let trailers = vec![
+                ("c1".to_string(), "openspec:a".to_string()),
+                ("c1".to_string(), "capture-pipeline".to_string()),
+                ("c2".to_string(), "typo".to_string()),
+                ("c3".to_string(), "capture-pipeline".to_string()),
+            ];
+            let nontrivial: Vec<String> =
+                ["c1", "c2", "c4"].iter().map(|s| s.to_string()).collect();
+            let (sources, cited) = spec_census(&cfg, &specs, &trailers, &nontrivial);
+            assert_eq!(sources.len(), 2);
+            assert_eq!(sources[0].kind, "openspec");
+            assert_eq!(sources[0].units, 3, "removed units are history, not census");
+            assert_eq!(sources[0].by_state.get("other"), Some(&1));
+            assert!(!sources[0].by_state.contains_key("__proto__"));
+            assert_eq!(sources[0].by_state.get("active"), Some(&1));
+            assert_eq!(sources[0].by_state.get("archived"), Some(&1));
+            assert_eq!(sources[0].framework_version.as_deref(), Some("0.9.1"));
+            assert_eq!((sources[1].kind.as_str(), sources[1].units), ("speckit", 0));
+            assert_eq!(
+                cited,
+                Some(1),
+                "only c1 is non-trivial AND cites a captured slug"
+            );
+            // No specs at all: not measured, rather than a flat zero.
+            let (_, none) = spec_census(&cfg, &[], &trailers, &nontrivial);
+            assert_eq!(none, None);
+        }
     }
 }

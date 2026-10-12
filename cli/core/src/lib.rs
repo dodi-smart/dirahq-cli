@@ -23,6 +23,7 @@ pub mod store;
 pub mod sync;
 pub mod tokens;
 pub mod zavet;
+pub mod zavet_specs;
 
 pub use config::Config;
 pub use model::{EventKind, RawEvent};

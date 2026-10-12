@@ -65,6 +65,7 @@ async fn start_at(state: &AppState, project: Option<&str>, cwd: &Path) -> Respon
             activity: None,
             note: None,
             cwd: Some(cwd.display().to_string()),
+            spec: None,
         },
     )
     .await

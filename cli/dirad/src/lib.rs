@@ -35,6 +35,7 @@ pub mod sync;
 pub(crate) mod test_support;
 pub mod writer;
 pub mod zavet;
+pub mod zavet_sources;
 
 use crate::state::{AppState, EventMsg, ProgressTracker, SessionRegistry};
 use crate::writer::QUEUE_CAPACITY;

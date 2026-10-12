@@ -1,16 +1,18 @@
 ---
 title: Zavet capture pipeline
-version: 7
+version: 8
 origin: session
 verified: false
 confidence: high
-date: 2026-08-14
+date: 2026-10-12
 paths:
   - cli/dirad/src/capture.rs
   - cli/dirad/src/zavet.rs
   - cli/core/src/zavet.rs
   - cli/core/src/project.rs
-decisions: [D-0001, DIRASH-0025, DIRASH-0026, DIRASH-0027, DIRASH-0028, DIRASH-0032]
+  - cli/core/src/zavet_specs.rs
+  - cli/dirad/src/zavet_sources.rs
+decisions: [D-0001, DIRASH-0025, DIRASH-0026, DIRASH-0027, DIRASH-0028, DIRASH-0032, DIRASH-0039]
 ---
 
 ## Overview
@@ -125,6 +127,46 @@ commit poll. No filesystem watcher, no extra daemon.
   CALLER'S checkout, which then got registered and captured under the NAMED
   repo.
 
+- **Source-backed spec units** (DIRASH-0039). `zavet_sweep` only *detects*
+  that a walked commit touched a declared `spec-source:` root or
+  `.zavet/config`; it never shells out. After the commit records, the capture
+  calls `refresh_sources`, which runs the installed plugin's
+  `zavet specs --json` under its own 12 s budget (the plugin runner adds a 5 s
+  deadline per invocation) so a slow plugin costs source specs, never commits.
+  Each unit is upserted as a spec (slug `<kind>:<id>`, origin `external`,
+  `verified` false, `path` = the unit's primary file, first/last sighting from
+  the plugin's git history). A unit whose files, path, coverage and metadata
+  already match the stored row writes nothing, so the knowledge cursor does not
+  move. A previously seen source slug absent from a fresh, *successful* resolve
+  becomes state `removed`; a failed resolve changes nothing. Removal is gated
+  twice more (DIRASH-0039): the resolving checkout must be on the repo's
+  default branch (`origin/HEAD`, else a local `main`/`master`; unknown counts as
+  "not default"), because the store is keyed by canonical repo but a resolve
+  sees one checkout, so an old feature branch or worktree would otherwise flap
+  units removed and back; and an EMPTY answer for non-empty declarations only
+  removes when every declared root is really absent from the checkout. Off the
+  default branch, seen units are still upserted but nothing is removed. A
+  runner whose output reader stalls is a timeout and output past 16 MiB is its
+  own error, never a short answer; a timeout kills the plugin's whole process
+  group. With no `spec-source:` lines declared but a readable `.zavet/config`
+  touched, the answer is known without asking the plugin and every source unit
+  is marked removed (default branch only). A unit with no commit is stored with
+  a NULL origin that the first real commit fills as a unit.
+- `dira zavet reindex` adds `.zavet/config` and each declared root to its
+  scoped, unbounded pathspec, then resolves once and skips unchanged units
+  (DIRASH-0028).
+- **Session attribution to a spec.** `dira start --spec <slug>` stamps
+  `events.spec` on the manual start; the writer stamps every later event of a
+  session that has a spec, and the live registry carries it into partial
+  rollups. For a hook session the capture binds a spec only from facts, in
+  order: the first walked commit's `Spec:` slug that exactly matches a captured
+  spec, else a branch that is exactly `<kind>/<id>` or whose final segment
+  equals exactly one source id. Ambiguity binds nothing, an explicit spec is
+  never overridden, and it needs the unambiguous live session `source_session`
+  already requires. Binding is best-effort: a session already ended in the
+  registry is skipped (its rollup is out, so a late binding could not reach the
+  cloud), and `removed`/`unresolved` units are not binding targets.
+
 ## Interfaces & data
 
 - Parsing lives in `dira-core::zavet` (pure, no IO): a shared YAML-subset
@@ -187,6 +229,8 @@ commit poll. No filesystem watcher, no extra daemon.
 - First-sight fields (`first_commit`, `created_at`, `source_session`) survive
   every later upsert: provenance points at the commit that INTRODUCED the
   record.
+- The repo's vendored `.zavet/bin/zavet` is never executed; source units come
+  only from the installed plugin (DIRASH-0039).
 - The knowledge sweep shares the walk's blocking budget and never touches the
   accounting hot path. The reindex path is the one exception and earns it by
   being user-initiated and off the poll: it takes no capture timeout, and it

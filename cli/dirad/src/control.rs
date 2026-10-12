@@ -39,6 +39,26 @@ pub fn lock_recover_map<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     lock_recover(m)
 }
 
+/// The repo's working-tree toplevel, resolved from the directory the daemon last
+/// observed for `repo` (`state.repo_dirs`); `None` when it has none.
+///
+/// Note what the map holds: whatever the last writer put there — a cwd an event
+/// happened to carry (often a subdirectory), or the toplevel `zavet sync`
+/// resolved. Probing `.zavet/` against a subdirectory silently drops the repo,
+/// and `:(glob)` pathspecs are cwd-relative, so every reader that touches the
+/// tree goes through this resolution. It shells out to git: call it from a
+/// blocking context.
+pub fn repo_root(state: &AppState, repo: &str) -> Option<std::path::PathBuf> {
+    let dir = lock_recover_map(&state.repo_dirs).get(repo).cloned()?;
+    Some(toplevel_or_self(dir))
+}
+
+/// `dir`'s repo toplevel, or `dir` itself when it is not inside a repo.
+pub fn toplevel_or_self(dir: impl Into<std::path::PathBuf>) -> std::path::PathBuf {
+    let raw = dir.into();
+    project::toplevel(&raw).unwrap_or(raw)
+}
+
 /// Record the working directory the daemon has observed for `repo`, returning
 /// whether this is the FIRST directory it has ever had for that repo.
 ///
@@ -107,7 +127,8 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             activity,
             note,
             cwd,
-        } => start(state, project, label, activity, note, cwd).await,
+            spec,
+        } => start(state, project, label, activity, note, cwd, spec).await,
         Request::Stop { selector } => stop(state, selector).await,
         Request::Log {
             duration_secs,
@@ -129,6 +150,7 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             crate::zavet::wiki(state, topic, cwd, repo).await
         }
         Request::ZavetDecisions { cwd, repo } => crate::zavet::decisions(state, cwd, repo).await,
+        Request::ZavetSpecs { cwd, repo } => crate::zavet::specs(state, cwd, repo).await,
         Request::ZavetSync { cwd, repo } => crate::zavet::sync(state, cwd, repo).await,
         Request::ZavetSetMode { cwd, repo, mode } => {
             crate::zavet::set_mode(state, cwd, repo, mode).await
@@ -377,7 +399,20 @@ async fn start(
     activity: Option<String>,
     note: Option<String>,
     cwd: Option<String>,
+    spec: Option<String>,
 ) -> Response {
+    // The slug rides the attestation wire (SessionRollup.spec), so it must be a
+    // slug and nothing else (D-0001): validate here, not just in the CLI.
+    if let Some(s) = spec.as_deref() {
+        if !dira_core::zavet_specs::is_valid_spec_slug(s) {
+            return Response::Error {
+                message: format!(
+                    "`{s}` is not a spec slug — pass the slug only, e.g. `openspec:add-csv-import` \
+                     or `capture-pipeline`"
+                ),
+            };
+        }
+    }
     let (project, identity, source) = resolve(project, cwd.clone());
     // Register the dira's working dir against its repo so the idle-ticker commit
     // poller can pick up commits made during a pure manual dira (no agent
@@ -391,7 +426,7 @@ async fn start(
     }
     let session_id = Ulid::generate().to_string();
     let handle = handle_of(&session_id);
-    let ev = manual_event(
+    let mut ev = manual_event(
         &session_id,
         EventKind::ManualStart,
         OffsetDateTime::now_utc(),
@@ -401,6 +436,7 @@ async fn start(
         activity,
         note,
     );
+    ev.spec = spec;
     if state.tx.send(EventMsg::Raw(Box::new(ev))).await.is_err() {
         return Response::Error {
             message: "daemon shutting down".into(),
@@ -866,6 +902,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 

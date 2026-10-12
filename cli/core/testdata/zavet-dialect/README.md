@@ -17,6 +17,7 @@ Both sides execute the same inputs and must produce these exact tables:
 | `expected/specs-meta.tsv` | `zavet specs` | `parse_spec` → `slug \t origin \t confidence \t date(or empty) \t title(or empty)` |
 | `expected/spec-paths.tsv` | `zavet spec-paths` | one row per path |
 | `expected/spec-checks.tsv` | `zavet spec-checks` | one row per check, `slug \t label \t command` |
+| `expected/spec-sources.tsv` | `zavet spec-sources` | `parse_config` → one row per `spec-source:` line, `kind \t root \t globs` (globs space-joined, empty when none) |
 
 Row order = filename sort order (the sh glob and the Rust walker both sort).
 
@@ -45,6 +46,15 @@ Row order = filename sort order (the sh glob and the Rust walker both sort).
 - `corrected-by:` is the errata pointer: the record stays `active` and keeps
   its body, and a pointer at a record that does not exist still parses
   (danglingness is a store-side finding, not a parse error)
+
+## `spec-source:` lines
+
+`config` also declares the repeatable, flat `spec-source: <kind> <root>
+[<glob>...]` lines that bind a spec-driven-development framework's units
+(OpenSpec, Spec Kit, BMAD, superpowers) into zavet's spec object. Only the
+four known kinds are kept: the corpus carries a `madeup` line precisely to pin
+that an unknown kind is IGNORED (it never reaches `spec-sources.tsv`). Rows
+follow file order, not sorted order. A trailing `/` on the root is dropped.
 
 ## The corpus `config`
 

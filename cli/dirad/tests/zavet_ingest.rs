@@ -68,6 +68,7 @@ fn open_session(state: &AppState, repo: &str) -> String {
         label: None,
         activity: None,
         note: None,
+        spec: None,
     };
     state
         .sessions

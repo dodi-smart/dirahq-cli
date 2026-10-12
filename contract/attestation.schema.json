@@ -354,6 +354,13 @@
           "description": "Harness session id, or daemon-issued ULID for manual sessions.",
           "type": "string"
         },
+        "spec": {
+          "description": "The spec slug this session worked under (`openspec:add-csv-import`,\n`capture-pipeline`, …) — the slug only, never prose (D-0001). Resolved\nproducer-side from an explicit `dira start --spec`, an exact `Spec:`\ntrailer on the session's commits, or an exact branch match; absent when\nnone applies. Lets the dashboard attribute time, agent share and tokens\nper spec. Optional + omitted-when-absent so pre-1.5 payloads stay\nbyte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "startedAt": {
           "type": "string"
         }

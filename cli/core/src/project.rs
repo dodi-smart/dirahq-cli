@@ -215,6 +215,39 @@ fn commit_trailers_chunked(
 /// initial commit. One call serves every zavet path filter (see
 /// `crate::zavet::{is_decision_path, is_spec_path}`) — don't diff-tree twice.
 pub fn changed_paths(root: &Path, sha: &str) -> Vec<String> {
+    changed_of(&diff_tree_status(root, sha))
+}
+
+/// [`changed_paths`] plus, from the SAME `diff-tree` call, every path the
+/// commit touched INCLUDING deletions and rename/copy sources — the set a "did
+/// this commit affect directory X" trigger needs. A commit that deletes a
+/// spec-source root adds and modifies nothing, so [`changed_paths`] alone would
+/// never notice it, and the units under that root would stay live forever.
+/// Returns `(changed, touched_incl_deleted)`.
+pub fn diff_paths(root: &Path, sha: &str) -> (Vec<String>, Vec<String>) {
+    let entries = diff_tree_status(root, sha);
+    let changed = changed_of(&entries);
+    let mut touched = Vec::new();
+    for (_, old, new) in entries {
+        touched.push(old);
+        touched.extend(new);
+    }
+    (changed, touched)
+}
+
+fn changed_of(entries: &[(char, String, Option<String>)]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|(status, old, new)| match status {
+            'A' | 'M' | 'R' | 'C' => Some(new.clone().unwrap_or_else(|| old.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(status letter, path, new path for renames/copies)` for each entry of a
+/// commit's `diff-tree --name-status`.
+fn diff_tree_status(root: &Path, sha: &str) -> Vec<(char, String, Option<String>)> {
     let Some(out) = git(
         root,
         &[
@@ -230,14 +263,11 @@ pub fn changed_paths(root: &Path, sha: &str) -> Vec<String> {
     };
     out.lines()
         .filter_map(|line| {
-            let (status, path) = line.split_once('\t')?;
-            // A(dded)/M(odified)/R(enamed; path is "old\tnew" — take the new).
-            let path = match status.chars().next()? {
-                'A' | 'M' => path,
-                'R' | 'C' => path.rsplit('\t').next()?,
-                _ => return None,
-            };
-            Some(path.to_string())
+            let mut it = line.split('\t');
+            let status = it.next()?.chars().next()?;
+            let first = it.next()?.to_string();
+            let second = it.next().map(str::to_string);
+            Some((status, first, second))
         })
         .collect()
 }
@@ -619,6 +649,39 @@ pub fn current_branch(root: &Path) -> Option<String> {
     }
 }
 
+/// The repo's default branch: `origin/HEAD`'s target (`git symbolic-ref
+/// refs/remotes/origin/HEAD`) when the remote advertised one, else `main` or
+/// `master` when such a local branch exists. `None` = unknown (callers must
+/// then treat the checkout as NOT the default branch).
+pub fn default_branch(root: &Path) -> Option<String> {
+    if let Some(r) = git(root, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]) {
+        if let Some(b) = r
+            .strip_prefix("refs/remotes/origin/")
+            .filter(|b| !b.is_empty())
+        {
+            return Some(b.to_string());
+        }
+    }
+    ["main", "master"].into_iter().find_map(|b| {
+        git(
+            root,
+            &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+        )
+        .map(|_| b.to_string())
+    })
+}
+
+/// Whether the checkout at `root` is on the repo's default branch. The store
+/// is keyed by canonical repo but a repo can have many checkouts (worktrees,
+/// feature branches); only the default branch is authoritative for "this
+/// source unit no longer exists" (DIRASH-0039).
+pub fn on_default_branch(root: &Path) -> bool {
+    match (current_branch(root), default_branch(root)) {
+        (Some(cur), Some(def)) => cur == def,
+        _ => false,
+    }
+}
+
 /// One commit as the knowledge sweep needs it: its sha and authored timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRef {
@@ -984,6 +1047,59 @@ mod tests {
         assert_eq!(commits[0].author_email, None);
         assert_eq!(commits[0].author_name, None);
         assert_eq!(commits[0].message, "");
+    }
+
+    #[test]
+    fn diff_paths_reports_deletions_that_changed_paths_ignores() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        run_git(p, &["init", "-q", "-b", "main"]);
+        run_git(p, &["config", "user.email", "t@t.dev"]);
+        run_git(p, &["config", "user.name", "T"]);
+        std::fs::create_dir_all(p.join("openspec")).unwrap();
+        std::fs::write(p.join("openspec/a.md"), "a").unwrap();
+        run_git(p, &["add", "-A"]);
+        run_git(p, &["commit", "-q", "-m", "add"]);
+        run_git(p, &["rm", "-q", "-r", "openspec"]);
+        run_git(p, &["commit", "-q", "-m", "drop"]);
+        let sha = super::git(p, &["rev-parse", "HEAD"]).unwrap();
+        assert!(super::changed_paths(p, &sha).is_empty());
+        let (changed, touched) = super::diff_paths(p, &sha);
+        assert!(changed.is_empty());
+        assert_eq!(touched, vec!["openspec/a.md"]);
+    }
+
+    #[test]
+    fn default_branch_prefers_origin_head_then_main_or_master() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        run_git(p, &["init", "-q", "-b", "trunk"]);
+        run_git(p, &["config", "user.email", "t@t.dev"]);
+        run_git(p, &["config", "user.name", "T"]);
+        run_git(p, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        // No origin/HEAD and neither main nor master: unknown, so "not default".
+        assert_eq!(super::default_branch(p), None);
+        assert!(!super::on_default_branch(p));
+        // origin/HEAD wins.
+        run_git(p, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        run_git(
+            p,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        assert_eq!(super::default_branch(p).as_deref(), Some("trunk"));
+        assert!(super::on_default_branch(p));
+        run_git(p, &["checkout", "-q", "-b", "feat/x"]);
+        assert!(!super::on_default_branch(p));
+        // Fallback: no origin/HEAD, a local `master`.
+        run_git(p, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        run_git(p, &["branch", "master", "trunk"]);
+        assert_eq!(super::default_branch(p).as_deref(), Some("master"));
+        run_git(p, &["checkout", "-q", "master"]);
+        assert!(super::on_default_branch(p));
     }
 
     // --- Squash-resilient session signals -----------------------------------

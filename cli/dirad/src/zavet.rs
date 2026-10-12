@@ -226,17 +226,6 @@ async fn working_tree_probe(
     .unwrap_or_default()
 }
 
-/// Resolve the repo toplevel once, off the async path.
-///
-/// Every git probe in a query needs it, and each used to shell out for its own
-/// copy. Resolving here also guarantees they all describe the same tree.
-async fn repo_root(workdir: Option<PathBuf>) -> Option<PathBuf> {
-    let dir = workdir?;
-    tokio::task::spawn_blocking(move || dira_core::project::toplevel(&dir).unwrap_or(dir))
-        .await
-        .ok()
-}
-
 /// Presence for one record path, or `None` when the probe could not look.
 fn presence_of(
     in_head: Option<&std::collections::HashSet<String>>,
@@ -400,18 +389,20 @@ async fn query_repo(
     // `dir_exists` stays `None`: it answers the `auto` probe for the tree this
     // process is standing in, and a named project is not that tree.
     if let Some(r) = repo {
-        if let Some(dir) = known_dir(state, &r) {
-            // The daemon already remembers a directory for `r` — trust it, and
-            // reuse the resolved toplevel as the root rather than discarding it
-            // once the config read is done.
-            let root = repo_root(Some(dir)).await;
-            let cfg = match root.clone() {
-                Some(root) => tokio::task::spawn_blocking(move || read_config(&root))
-                    .await
-                    .unwrap_or_default(),
-                None => ZavetConfig::default(),
-            };
-            return Ok((r, None, cfg, root));
+        // The daemon may already remember a directory for `r` — trust it, and
+        // reuse the resolved toplevel as the root rather than discarding it
+        // once the config read is done.
+        let (st, name) = (state.clone(), r.clone());
+        let known = tokio::task::spawn_blocking(move || crate::control::repo_root(&st, &name))
+            .await
+            .ok()
+            .flatten();
+        if let Some(top) = known {
+            let probe = top.clone();
+            let cfg = tokio::task::spawn_blocking(move || read_config(&probe))
+                .await
+                .unwrap_or_default();
+            return Ok((r, None, cfg, Some(top)));
         }
         // No directory on file for `r`. The caller's cwd is trusted ONLY IF it
         // demonstrably belongs to `r` — its own remote resolves to the exact
@@ -454,18 +445,22 @@ fn spec_view(s: &ZavetSpecRow, stale_commits: Option<u64>) -> ZavetSpecView {
         source_session: s.source_session.clone(),
         stale_commits,
         presence: None,
+        source: s
+            .source
+            .as_ref()
+            .map(|src| dira_core::protocol::ZavetSpecSourceView {
+                kind: src.kind.clone(),
+                id: src.id.clone(),
+                root: src.root.clone(),
+                state: src.state.clone(),
+                native_state: src.native_state.clone(),
+                framework_version: src.framework_version.clone(),
+                tasks_total: src.counts.tasks_total,
+                tasks_done: src.counts.tasks_done,
+                req_total: src.counts.req_total,
+                req_open: src.counts.req_open,
+            }),
     }
-}
-
-/// The directory the daemon last observed for `repo`, if any.
-///
-/// Note what it holds: whatever the last writer put there — a cwd an event
-/// happened to carry (often a subdirectory), or the toplevel `zavet sync`
-/// resolved. Readers that need the root resolve it (see [`repo_root`]).
-fn known_dir(state: &AppState, repo: &str) -> Option<PathBuf> {
-    crate::control::lock_recover_map(&state.repo_dirs)
-        .get(repo)
-        .map(PathBuf::from)
 }
 
 /// A spec's `(last_commit, paths)` — what [`spec_staleness`] needs to know.
@@ -671,7 +666,7 @@ fn guard_stat_views(stats: Vec<dira_core::store::ZavetGuardStat>) -> Vec<ZavetGu
 
 /// `Request::ZavetStatus`.
 pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
-    let (repo, dir_exists, _, _) = match query_repo(state, repo, cwd).await {
+    let (repo, dir_exists, cfg, root) = match query_repo(state, repo, cwd).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -687,7 +682,51 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
         .zavet_guard_event_stats(&repo, None)
         .await
         .unwrap_or_default();
+    // Spec frameworks: what the tree carries (a `stat` probe, no reads) and what
+    // `.zavet/config` declares, with the captured census per declaration.
+    let frameworks_detected = match root {
+        Some(root) => tokio::task::spawn_blocking(move || {
+            dira_core::zavet_specs::detect_frameworks(&root)
+                .into_iter()
+                .map(|f| f.kind.to_string())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let census = state
+        .store
+        .zavet_source_counts(&repo)
+        .await
+        .unwrap_or_default();
+    let mut spec_sources: Vec<dira_core::protocol::ZavetSpecSourceLine> = Vec::new();
+    for decl in &cfg.spec_sources {
+        if spec_sources
+            .iter()
+            .any(|l| l.kind == decl.kind && l.root == decl.root)
+        {
+            continue;
+        }
+        let mut line = dira_core::protocol::ZavetSpecSourceLine {
+            kind: decl.kind.clone(),
+            root: decl.root.clone(),
+            ..Default::default()
+        };
+        for c in census
+            .iter()
+            .filter(|c| c.kind == decl.kind && c.root == decl.root && c.state != "removed")
+        {
+            line.units += c.units as u32;
+            if c.state == "unresolved" {
+                line.unresolved += c.units as u32;
+            }
+        }
+        spec_sources.push(line);
+    }
     Response::ZavetStatus(Box::new(ZavetStatusView {
+        frameworks_detected,
+        spec_sources,
         repo,
         active,
         knob: state.config.modules.zavet.as_str().to_string(),
@@ -698,6 +737,39 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
         trailers: counts.trailers,
         guard_events: counts.guard_events,
         guard_stats: guard_stat_views(stats),
+    }))
+}
+
+/// `Request::ZavetSpecs` — the repo's source-backed spec units (OpenSpec, Spec
+/// Kit, BMAD, superpowers), read from the store. Native specs are `wiki`'s.
+pub async fn specs(state: &AppState, cwd: Option<String>, repo: Option<String>) -> Response {
+    let (repo, dir_exists, _cfg, _root) = match query_repo(state, repo, cwd).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let override_ = state.store.zavet_override_get(&repo).await.unwrap_or(None);
+    let active = effective_mode(
+        state.config.modules.zavet,
+        override_,
+        dir_exists.unwrap_or(false),
+    );
+    let rows = match state.store.zavet_specs_list(&repo).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Response::Error {
+                message: format!("zavet specs failed: {e}"),
+            }
+        }
+    };
+    let specs = rows
+        .iter()
+        .filter(|r| r.source.is_some())
+        .map(|r| spec_view(r, None))
+        .collect();
+    Response::ZavetSpecs(Box::new(dira_core::protocol::ZavetSpecsView {
+        repo,
+        active,
+        specs,
     }))
 }
 
@@ -913,6 +985,23 @@ const REINDEX_TRAILER_LIMIT: usize = 1000;
 /// returns only commits that touched these, not the whole log.
 const REINDEX_PATHS: [&str; 2] = [".zavet/decisions", ".zavet/specs"];
 
+/// [`REINDEX_PATHS`] plus what source-backed specs add: `.zavet/config` (where
+/// `spec-source:` lines live) and every declared source root, so the same
+/// scoped, unbounded walk reaches the commits that introduced those units
+/// (DIRASH-0028: explicit and path-scoped, never ambient).
+fn reindex_pathspecs(cfg: &ZavetConfig) -> Vec<String> {
+    let mut paths: Vec<String> = REINDEX_PATHS.iter().map(|p| p.to_string()).collect();
+    if !cfg.spec_sources.is_empty() {
+        paths.push(CONFIG_PATH.to_string());
+        for d in &cfg.spec_sources {
+            if !paths.contains(&d.root) {
+                paths.push(d.root.clone());
+            }
+        }
+    }
+    paths
+}
+
 /// `Request::ZavetReindex` (`dira zavet reindex`) — rebuild the knowledge index
 /// for the repo the caller is standing in, from full `.zavet/`-scoped history.
 ///
@@ -955,8 +1044,12 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
     // `cfg` comes from the resolve above rather than being re-read: it is a file
     // read, and this tree's config was already loaded to get here.
     let cfg = r.cfg;
+    let top_for_sources = top.clone();
+    let cfg_for_sources = cfg.clone();
     let walk = tokio::task::spawn_blocking(move || {
-        let records = dira_core::project::log_commit_refs(&top, &REINDEX_PATHS, None);
+        let pathspecs = reindex_pathspecs(&cfg);
+        let pathspecs: Vec<&str> = pathspecs.iter().map(String::as_str).collect();
+        let records = dira_core::project::log_commit_refs(&top, &pathspecs, None);
         let trailer_commits = dira_core::project::log_commit_refs(&top, &[], trailer_limit);
         let sweep = crate::capture::zavet_sweep(&top, &records);
         // Trailers only — the record parser costs a subprocess per commit and
@@ -984,6 +1077,7 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
     // `REINDEX_TRAILER_LIMIT` and only ever show up in `sweep.trailers`. Merge
     // both before recording rather than persisting only the bounded half.
     let trailer_rows = merge_trailer_windows(trailers, &sweep.trailers);
+    let source_trigger = sweep.source_trigger;
 
     // Content-hash short-circuit. Every upsert bumps `touched_seq`, which is the
     // knowledge-sync cursor — without this, each reindex would re-stamp every
@@ -1100,6 +1194,15 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         if ok {
             view.specs_indexed += 1;
         }
+    }
+    // Source-backed units: one resolve through the installed plugin, after the
+    // native records. `persist_units` skips every unit whose stored row already
+    // matches, so a repeat run writes — and re-pushes — nothing.
+    if source_trigger {
+        let p =
+            crate::capture::refresh_sources(state, &repo, &top_for_sources, &cfg_for_sources, None)
+                .await;
+        view.specs_indexed += (p.upserted + p.removed) as u64;
     }
     // Trailers are keyed `(sha, seq)` and inserted OR IGNORE, so re-recording a
     // sha already present is already a no-op — no hash check needed. The merged

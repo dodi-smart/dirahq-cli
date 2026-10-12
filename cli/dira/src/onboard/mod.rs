@@ -162,6 +162,24 @@ pub(crate) async fn run(config: &Config, mut opts: Options) -> Result<()> {
         ),
     ));
     results.push((
+        "zavet:specs".into(),
+        steps::zavet_spec_sources(
+            &crate::zavet_install::SystemRunner,
+            &|| {
+                crate::zavet_install::plugin_root_offline()
+                    .or_else(crate::zavet_install::plugin_root)
+            },
+            &state,
+            &opts,
+            // Re-stat: the scaffold step above may have just created it.
+            state
+                .repo_root
+                .as_deref()
+                .is_some_and(|r| r.join(dira_core::zavet::ZAVET_DIR).is_dir()),
+            ui.as_mut(),
+        ),
+    ));
+    results.push((
         "cloud:repo".into(),
         steps::cloud_repo(&steps::SystemApplier, &state, &opts, ui.as_mut()).await,
     ));
@@ -228,6 +246,28 @@ fn print_plan(state: &detect::State, opts: &Options) {
                 r.display()
             ),
             (Some(r), false) => println!("  · scaffold .zavet/ in {}", r.display()),
+        }
+        // The plan reads only what detection already learned (stats and one
+        // config read) — never the step's own fresh re-stat, which could see
+        // a `.zavet/` that does not exist yet.
+        let missing: Vec<String> = state
+            .spec_frameworks
+            .iter()
+            .filter(|k| !state.spec_declared.contains(k))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            if state.has_zavet_dir {
+                println!(
+                    "  · link {} to zavet spec sources",
+                    steps::kind_names(&missing)
+                );
+            } else {
+                println!(
+                    "  · link {} to zavet spec sources (with the new .zavet/)",
+                    steps::kind_names(&missing)
+                );
+            }
         }
     }
 
@@ -456,6 +496,8 @@ mod tests {
             device_linked: false,
             knowledge: KnowledgeSyncMode::Off,
             cloud: None,
+            spec_frameworks: Vec::new(),
+            spec_declared: Vec::new(),
         }
     }
 

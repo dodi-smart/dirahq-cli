@@ -165,6 +165,7 @@ pub fn print_json(resp: &Response) -> bool {
             false
         }
         Response::ZavetDecisions(v) => emit(v),
+        Response::ZavetSpecs(v) => emit(v),
         Response::ZavetSync(v) => emit(v),
         Response::ZavetWiki(v) => emit(v),
         Response::ZavetStatus(v) => emit(v),
@@ -264,6 +265,12 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
             print_zavet_decisions(v, opts);
             true
         }
+        Response::ZavetSpecs(v) => {
+            for line in zavet_specs_lines(v, terminal_cols() as usize) {
+                println!("{line}");
+            }
+            true
+        }
         Response::ZavetSearch {
             query,
             hits,
@@ -321,7 +328,7 @@ fn dot_sep() -> Seg {
 
 /// `1 commit` / `4 commits` — English pluralization for the counts these views
 /// print, in one place rather than inlined per call site.
-fn plural(n: u64, noun: &str) -> String {
+pub(crate) fn plural(n: u64, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 
@@ -1090,6 +1097,158 @@ fn print_zavet_status(v: &ZavetStatusView) {
     for line in metric_rows(&rows) {
         println!("{line}");
     }
+    for line in spec_framework_lines(v) {
+        println!("{line}");
+    }
+}
+
+/// The spec-framework lines of `dira zavet status`: what the working tree
+/// carries, and what `.zavet/config` declares with its captured census. Empty
+/// when there is nothing to say, so a repo without a spec framework sees no
+/// change.
+fn spec_framework_lines(v: &ZavetStatusView) -> Vec<String> {
+    use dira_core::zavet_specs::kind_label;
+    let mut out = Vec::new();
+    let declared: Vec<&str> = v.spec_sources.iter().map(|s| s.kind.as_str()).collect();
+    let undeclared: Vec<&str> = v
+        .frameworks_detected
+        .iter()
+        .map(String::as_str)
+        .filter(|k| !declared.contains(k))
+        .collect();
+    if v.spec_sources.is_empty() && undeclared.is_empty() {
+        return out;
+    }
+    out.push(String::new());
+    for s in &v.spec_sources {
+        let mut note = plural(u64::from(s.units), "unit");
+        if s.unresolved > 0 {
+            note.push_str(&format!(", {} unresolved", s.unresolved));
+        }
+        out.push(format!(
+            "{} {}   {}",
+            theme::paint(
+                &format!("{} {:<10}", theme::glyphs().square, "specs"),
+                Role::Knowledge
+            ),
+            theme::paint(kind_label(&s.kind), Role::Ink),
+            theme::paint(&format!("{} {note}", s.root), Role::Muted),
+        ));
+    }
+    if !undeclared.is_empty() {
+        let names: Vec<&str> = undeclared.iter().map(|k| kind_label(k)).collect();
+        out.push(format!(
+            "{} {}   {}",
+            theme::paint(
+                &format!("{} {:<10}", theme::glyphs().square, "detected"),
+                Role::Faint
+            ),
+            theme::paint(&names.join(", "), Role::Ink),
+            theme::paint(
+                "not linked to zavet — run `dira onboard` (or /zavet:spec-adopt)",
+                Role::Muted
+            ),
+        ));
+    }
+    out
+}
+
+/// `dira zavet specs` as lines — pure, so the layout is pinned by tests.
+///
+/// Columns: slug, kind, state, tasks done/total, paths (or "none yet" — a unit
+/// no commit has cited reads as such, never as covered).
+fn zavet_specs_lines(v: &dira_core::protocol::ZavetSpecsView, cols: usize) -> Vec<String> {
+    use dira_core::zavet_specs::kind_label;
+    if v.specs.is_empty() {
+        return wrap_words(
+            "no spec-framework units captured yet — declare a framework with `dira onboard` \
+             (or /zavet:spec-adopt), then commit, or run `dira zavet reindex`",
+            cols,
+        )
+        .iter()
+        .map(|l| theme::paint(l, Role::Faint))
+        .collect();
+    }
+    let rows: Vec<[String; 5]> = v
+        .specs
+        .iter()
+        .map(|s| {
+            let src = s.source.as_ref();
+            let tasks = match src {
+                Some(x) if x.tasks_total > 0 => format!("{}/{}", x.tasks_done, x.tasks_total),
+                _ => "-".to_string(),
+            };
+            let paths = if s.paths.is_empty() {
+                "none yet".to_string()
+            } else {
+                s.paths.join(", ")
+            };
+            [
+                s.slug.clone(),
+                src.map(|x| kind_label(&x.kind).to_string())
+                    .unwrap_or_default(),
+                src.map(|x| x.state.clone()).unwrap_or_default(),
+                tasks,
+                paths,
+            ]
+        })
+        .collect();
+    let head = ["SPEC", "KIND", "STATE", "TASKS", "PATHS"];
+    let mut w = [0usize; 5];
+    for (i, h) in head.iter().enumerate() {
+        w[i] = h.len();
+    }
+    for r in &rows {
+        for (i, c) in r.iter().enumerate() {
+            w[i] = w[i].max(display_width(c));
+        }
+    }
+    // Shrink the slug, then the paths, until the row fits the terminal.
+    let gaps = 2 * 4;
+    let fixed = w[1] + w[2] + w[3] + gaps;
+    let budget = cols.saturating_sub(fixed).max(24);
+    if w[0] + w[4] > budget {
+        w[0] = w[0].min((budget * 2 / 5).max(12));
+        w[4] = budget.saturating_sub(w[0]).max(8);
+    }
+    let cell = |s: &str, width: usize| {
+        let t = crate::format::truncate_cols(s, width);
+        let pad = width.saturating_sub(display_width(&t));
+        format!("{t}{}", " ".repeat(pad))
+    };
+    let mut out = vec![format!(
+        "{} {} {}",
+        theme::paint("specs", Role::Knowledge),
+        theme::paint(&v.repo, Role::Ink),
+        theme::paint(&plural(rows.len() as u64, "unit"), Role::Muted)
+    )];
+    out.push(String::new());
+    let h: Vec<String> = head
+        .iter()
+        .enumerate()
+        .map(|(i, c)| cell(c, w[i]))
+        .collect();
+    out.push(theme::paint(h.join("  ").trim_end(), Role::Muted));
+    for r in &rows {
+        let none_yet = r[4] == "none yet";
+        let state_role = match r[2].as_str() {
+            "removed" | "unresolved" => Role::Negative,
+            "archived" | "done" => Role::Faint,
+            _ => Role::Engaged,
+        };
+        out.push(format!(
+            "{}  {}  {}  {}  {}",
+            theme::paint(&cell(&r[0], w[0]), Role::Ink),
+            theme::paint(&cell(&r[1], w[1]), Role::Muted),
+            theme::paint(&cell(&r[2], w[2]), state_role),
+            theme::paint(&cell(&r[3], w[3]), Role::Muted),
+            theme::paint(
+                cell(&r[4], w[4]).trim_end(),
+                if none_yet { Role::Faint } else { Role::Muted }
+            ),
+        ));
+    }
+    out
 }
 
 /// The zavet metric block: `glyph label  value   note`, values right-aligned to
@@ -2919,6 +3078,127 @@ mod tests {
 
     /// Right-aligned columns are measured in cells, not chars — one ideograph
     /// is two columns wide.
+    /// Drop SGR escapes so a test reads the words, not the palette.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c == '\u{1b}' {
+                for d in it.by_ref() {
+                    if d == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn spec_unit(
+        slug: &str,
+        kind: &str,
+        state: &str,
+        done: u32,
+        total: u32,
+        paths: &[&str],
+    ) -> ZavetSpecView {
+        ZavetSpecView {
+            slug: slug.into(),
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            source: Some(dira_core::protocol::ZavetSpecSourceView {
+                kind: kind.into(),
+                id: slug.split(':').nth(1).unwrap_or(slug).into(),
+                root: kind.into(),
+                state: state.into(),
+                tasks_done: done,
+                tasks_total: total,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zavet_specs_table_shows_kind_state_tasks_and_none_yet() {
+        let v = dira_core::protocol::ZavetSpecsView {
+            repo: "github.com/acme/api".into(),
+            active: true,
+            specs: vec![
+                spec_unit("openspec:add-csv-import", "openspec", "active", 1, 3, &[]),
+                spec_unit(
+                    "speckit:001-cart",
+                    "speckit",
+                    "done",
+                    4,
+                    4,
+                    &["src/cart/**"],
+                ),
+                spec_unit("bmad:epic-x", "bmad", "proposed", 0, 0, &[]),
+            ],
+        };
+        for cols in [60, 80, 120] {
+            let text: Vec<String> = zavet_specs_lines(&v, cols)
+                .iter()
+                .map(|l| strip_ansi(l))
+                .collect();
+            let all = text.join("\n");
+            assert!(
+                all.contains("openspec:add-csv-import") || cols < 80,
+                "{all}"
+            );
+            assert!(
+                all.contains("OpenSpec") && all.contains("Spec Kit") && all.contains("BMAD"),
+                "{all}"
+            );
+            assert!(all.contains("1/3") && all.contains("4/4"), "{all}");
+            assert!(
+                all.contains("none yet") && all.contains("src/cart/**"),
+                "{all}"
+            );
+            for line in &text {
+                assert!(display_width(line) <= cols.max(80), "{cols}: {line:?}");
+            }
+        }
+        let empty = dira_core::protocol::ZavetSpecsView::default();
+        let t = zavet_specs_lines(&empty, 80).join(" ");
+        assert!(strip_ansi(&t).contains("dira onboard"), "{t}");
+    }
+
+    #[test]
+    fn status_lists_declared_sources_and_nudges_for_undeclared_frameworks() {
+        let mut v = ZavetStatusView::default();
+        assert!(
+            spec_framework_lines(&v).is_empty(),
+            "no frameworks, no lines"
+        );
+        v.frameworks_detected = vec!["openspec".into(), "bmad".into()];
+        v.spec_sources = vec![dira_core::protocol::ZavetSpecSourceLine {
+            kind: "openspec".into(),
+            root: "openspec".into(),
+            units: 3,
+            unresolved: 1,
+        }];
+        let text = spec_framework_lines(&v)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("OpenSpec") && text.contains("3 units, 1 unresolved"),
+            "{text}"
+        );
+        assert!(
+            text.contains("BMAD") && text.contains("dira onboard"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("detected   OpenSpec"),
+            "a declared kind is not nagged: {text}"
+        );
+    }
+
     #[test]
     fn truncate_cols_counts_display_cells() {
         assert_eq!(display_width("日本語"), 6);

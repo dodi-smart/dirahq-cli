@@ -424,6 +424,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         };
         state
             .sessions

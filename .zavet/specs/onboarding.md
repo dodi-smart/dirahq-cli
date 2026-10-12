@@ -1,10 +1,10 @@
 ---
 title: Onboarding — dira onboard and the installer handoff
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-09-09
+date: 2026-10-12
 paths:
   - cli/dira/src/onboard/**
   - cli/dira/src/which.rs
@@ -12,7 +12,7 @@ paths:
   - install.sh
   - install.ps1
   - docs/getting-started.md
-decisions: [D-0001, D-0004, D-0007, D-0009, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0030, DIRASH-0038]
+decisions: [D-0001, D-0004, D-0007, D-0009, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0030, DIRASH-0038, DIRASH-0039]
 checks:
   - cloud:repo step decision logic :: cargo test -p dira --bin dira -- onboard::steps::tests::cloud_repo
   - end-to-end: wires the repo and a second run is a no-op :: cargo test -p dira --test onboard_e2e yes_wires_the_repo_for_cloud_agents_and_a_second_run_is_a_noop
@@ -149,6 +149,25 @@ updates `State` in the same run, a device linked earlier in that run is
 correctly reported as linked here rather than stale-pending. See
 DIRASH-0030.
 
+### Spec-framework linking (`zavet:specs`)
+
+Detection learns which spec-driven frameworks the repo carries with `stat`
+calls only (`openspec/`, `.specify/` together with `specs/`, `_bmad/`,
+`docs/superpowers/`) plus one read of `.zavet/config` for the kinds already
+declared. It spawns nothing and writes nothing, so `--print` still leaves the
+filesystem byte-identical, and the plan prints "link OpenSpec, Spec Kit to
+zavet spec sources" for the undeclared ones.
+
+The step runs right after `zavet:repo`, re-stats `.zavet/` (the scaffold may
+have just created it), and, when the plugin is installed and frameworks are
+missing from the config, asks and then runs the *plugin's*
+`<plugin_root>/bin/zavet spec-sources --detect --write` pinned to the repo
+toplevel (never the repo's vendored copy, DIRASH-0024/0039). It reports from
+the config afterwards ("Linked OpenSpec, Spec Kit → zavet spec sources"), so an
+old plugin that exits 0 without writing is a failure, not a false success. It
+is a `StepOutcome`: a missing plugin is a skip that names `/zavet:spec-adopt`,
+a failing plugin is `Failed`, and neither aborts the run.
+
 ## Interfaces & data
 
 - `onboard::Options`: the parsed invocation, independent of clap.
@@ -199,6 +218,8 @@ DIRASH-0030.
 - A device linked earlier in a run is treated as linked by every step that
   runs later in that same run.
 - Detection reads the repo's cloud status without network or writes.
+- Spec-framework detection is `stat`-only; linking runs the installed plugin's
+  `spec-sources --detect --write`, never the repo's vendored zavet.
 - The bootstrap pin only moves forward.
 - A re-run writes only the delta and says what it was.
 

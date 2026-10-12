@@ -1,5 +1,5 @@
-7d7c7e12581c6ae7f40610a44dc7bbed1cf5e5dc  README.md
-adb2f344ac501444b335f5ba24533ebe3c865e35  config
+af8521233ffe4d9897896bd5c86a96eef6791443  README.md
+19435e1b1f9e313739d5298dd16eabb2f79983ac  config
 4968a1455d16fedbb678f588bb3cbbda8a773b87  decisions/D-0001-happy-inline.md
 31f136f882b328a757129602a189653d6de7502c  decisions/D-0002-block-guards.md
 6fb9485de60ae5bd4a7818a22fa650d40555b385  decisions/D-0003-default-status.md
@@ -23,6 +23,7 @@ d9ecab597df1042c37dbc6267155599a3972608e  expected/decisions-guards.tsv
 3c75517c9df6465b04a3d2a262f1304b3b504334  expected/decisions-meta.tsv
 4777e1b7e559034f6e7f4d7bfb3720b80743cfc7  expected/spec-checks.tsv
 b5f62609b5b9e1be4cf0dca02aa27ed0db4066eb  expected/spec-paths.tsv
+1b4ae8ff09ab3e0c1f2057f445054a781213aa9f  expected/spec-sources.tsv
 78450bc2a605d61bf0f76e7dc80223cb0e875933  expected/specs-meta.tsv
 6ec71ba10a7edb0e401147246661236445832072  specs/.hidden-template.md
 4bcecffedee29a6bb50b58377c32241cc66c4f3e  specs/block-paths.md

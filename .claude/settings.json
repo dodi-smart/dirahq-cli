@@ -1,0 +1,87 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "type": "command"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "type": "command"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/bootstrap.sh claude",
+            "timeout": 300,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

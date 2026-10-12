@@ -10,13 +10,24 @@ name: Zavet Check
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  # Runs the same decision checks (mostly `cargo test`) on develop so the
+  # rust-cache entry this job restores is warm instead of empty on every PR.
+  # The reusable workflow already skips its guard/comment steps outside
+  # `pull_request`, so a push run just compiles and verifies, nothing more.
+  push:
+    branches: [develop]
 
 concurrency:
-  group: zavet-${{ github.event.pull_request.number }}
+  group: zavet-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   zavet:
+    # A caller can only hand down what its own job grants, so this is the union of
+    # what the shared workflow's jobs request (its `check` job).
+    permissions:
+      contents: read
+      pull-requests: write
     uses: dodi-smart/.github/.github/workflows/zavet-check.yml@v1
     secrets: inherit
     with:

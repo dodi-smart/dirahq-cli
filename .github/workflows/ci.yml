@@ -4,6 +4,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [develop, main]
+  # Compiles on develop so the Swatinem/rust-cache entry PRs restore from is
+  # ever warm — a PR run can only read a base-branch cache, never write one
+  # another PR can use. Rust/Rust (windows) below are the only jobs that run
+  # here; the rest stay PR-only.
+  push:
+    branches: [develop]
   workflow_dispatch:
 
 concurrency:
@@ -18,13 +24,45 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           fetch-depth: 0
       - uses: wagoid/commitlint-github-action@v6
         with:
           configFile: commitlint.config.mjs
+
+  # The same lint the optional git hooks run, defined once in hk.pkl, with the
+  # tools pinned in mise.toml. `install_args` limits mise to the lint tools: a bare
+  # mise-action would also install everything else in mise.toml (rust, node, bun,
+  # just), none of which this job uses. rustfmt comes from the runner's rustup.
+  # Lightweight — stays on GitHub-hosted runners, same as commit-lint (D-0012).
+  lint:
+    name: Lint (hk)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: >-
+            aqua:jdx/hk
+            aqua:rhysd/actionlint
+            aqua:koalaman/shellcheck
+            aqua:crate-ci/typos
+            aqua:zizmorcore/zizmor
+            aqua:gitleaks/gitleaks
+      - name: hk check --all
+        run: hk check --all
 
   # Lint the shell that puts a binary on someone's PATH: POSIX-only shellcheck
   # plus canonical shfmt formatting. Both scripts here are install-path logic
@@ -37,8 +75,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install shfmt
         uses: taiki-e/install-action@v2
         with:
@@ -58,8 +100,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Invoke-ScriptAnalyzer install.ps1
         shell: pwsh
         run: |
@@ -75,8 +121,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
@@ -96,11 +146,17 @@ jobs:
   rust:
     name: Rust (capture layer)
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false
+    # Also runs on push to develop (trusted, post-merge code) to compile and
+    # save the rust-cache entry PRs then restore from — see the `on:` comment.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     env:
       RUST_BACKTRACE: "1"
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Set up the Rust toolchain directly instead of via mise — mise's
       # `rust = "stable"` is a silent no-op on runners without rustup. The
       # GitHub-hosted images ship rustup, so this just pins stable and adds
@@ -112,7 +168,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add rustfmt clippy
+      # shared-key pins one entry both events read: PRs restore it (save-if is
+      # false there) instead of each writing a near-duplicate off the same base.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -142,12 +203,17 @@ jobs:
   rust-windows:
     name: Rust (windows)
     runs-on: windows-latest
-    if: github.event.pull_request.draft == false
+    # Also runs on push to develop — see the `rust` job and the `on:` comment.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     timeout-minutes: 30
     env:
       RUST_BACKTRACE: "1"
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Set up Rust toolchain
         shell: bash
         run: |
@@ -156,6 +222,9 @@ jobs:
           rustup default stable
           rustup component add clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test

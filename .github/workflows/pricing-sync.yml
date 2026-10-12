@@ -103,13 +103,25 @@ jobs:
         # because the fetch above had never once succeeded far enough to reach
         # this step. Past `--`, libtest takes both filters.
         run: cargo test -p dira-core --lib -- pricing tokens
+      # The commit touches cli/core/pricing/, which DIRASH-0036 guards, so the
+      # zavet guard check requires a `Refs:` trailer naming it. Without one every
+      # refresh PR failed `zavet / check` (PR 151). A refresh built by the step
+      # above complies by construction, which is exactly what the trailer claims.
+      # `signoff` keeps the bot commit DCO-clean like every human one.
       - name: open PR
         uses: peter-evans/create-pull-request@v8
         with:
           base: develop
           branch: chore/pricing-sync
           title: "fix(cli): refresh model pricing from models.dev"
-          commit-message: "fix(cli): refresh model pricing from models.dev"
+          signoff: true
+          commit-message: |
+            fix(cli): refresh model pricing from models.dev
+
+            Append-only refresh of the bundled price table: fresh prices for ids
+            models.dev still publishes, last-known prices kept for ids it dropped.
+
+            Refs: DIRASH-0036
           body: |
             Automated refresh of `cli/core/pricing/models.json` from
             https://models.dev/api.json — review the diff for price changes and
@@ -119,3 +131,9 @@ jobs:
             patch to actually ship the new prices. Local cost figures are
             estimates only; the cloud keeps its own copy, is authoritative, and
             re-prices historical rows.
+
+            The refresh is append-only per DIRASH-0036, and the commit carries
+            `Refs: DIRASH-0036` for the zavet guard check. If a new Claude
+            generation appears (e.g. a `-5-5` point release), pin it in the
+            canary tests in `cli/core/src/pricing.rs`, otherwise it can
+            resolve by prefix to its older sibling's price unnoticed.

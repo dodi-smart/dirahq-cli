@@ -3,9 +3,13 @@
 #
 # The guard wall, for harnesses with no hook API. Same rule as the live hooks
 # and as `zavet check` in CI: one implementation, in `zavet gate`.
+#
+# `--emit=git` reports to dira under the `_git` kinds, so a repo running both
+# this floor and a live harness hook records both surfaces without either being
+# mistaken for the other.
 set -u
 [ -x "$(dirname -- "$0")/../bin/zavet" ] || exit 0
-reason=$("$(dirname -- "$0")/../bin/zavet" gate --staged --message-file "$1" --guards-only) && exit 0
+reason=$("$(dirname -- "$0")/../bin/zavet" gate --staged --message-file "$1" --guards-only --emit=git) && exit 0
 [ -n "$reason" ] || exit 0
 printf 'zavet: commit blocked by the guard wall.\n\n%s\n\n' "$reason" >&2
 printf 'Add the trailer to your commit message and commit again.\n' >&2

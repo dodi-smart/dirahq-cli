@@ -302,8 +302,10 @@ mod tests {
         for id in [
             // Anthropic (Claude Code): every generation in active use.
             "claude-opus-5",
+            "claude-opus-5-5",
             "claude-opus-4-8",
             "claude-sonnet-5",
+            "claude-sonnet-5-5",
             "claude-haiku-4-5",
             "claude-fable-5",
             "claude-fable-5-1",
@@ -335,6 +337,14 @@ mod tests {
         let (_, s46) = resolve("claude-sonnet-4-6").unwrap();
         assert_eq!(s5.input, 2.0);
         assert_eq!(s46.input, 3.0);
+
+        // The 5-5 point releases hit their own key, never the `-5` sibling by
+        // prefix — the trap `claude-fable-5-1` fell into. opus-5-5 is priced
+        // below opus-5, so a prefix hit would over-estimate it by 25%.
+        let (k, o55) = resolve("claude-opus-5-5").unwrap();
+        assert_eq!((k, o55.input, o55.output), ("claude-opus-5-5", 4.0, 20.0));
+        let (k, _) = resolve("claude-sonnet-5-5").unwrap();
+        assert_eq!(k, "claude-sonnet-5-5");
     }
 
     #[test]

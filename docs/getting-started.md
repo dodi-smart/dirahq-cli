@@ -16,7 +16,7 @@ Windows uses `irm https://dirahq.sh/install.ps1 | iex`; see [install.md](install
 
 ## What `dira onboard` does
 
-Six steps, in dependency order. Each one is idempotent and skippable, and the whole
+Seven steps, in dependency order. Each one is idempotent and skippable, and the whole
 command is safe to re-run — a second run reports what is already done and picks up the
 rest. There is no state file: every step re-derives its own status from the machine,
 which is the only version that cannot go stale.
@@ -27,7 +27,9 @@ which is the only version that cannot go stale.
 | **harnesses** | Wires every detected harness in one pass, at user scope |
 | **daemon** | Registers `dirad` with launchd / systemd --user / a scheduled task |
 | **device** | Links this device to the cloud — skippable |
-| **zavet** | Installs the knowledge plugin, scaffolds this repo's `.zavet/`, sets the knowledge sync tier |
+| **zavet** | Installs the knowledge plugin, scaffolds this repo's `.zavet/` |
+| **cloud** | Commits portable hooks + a pinned bootstrap so cloud agents (Claude Code on the web, Cursor cloud) capture this repo too |
+| **knowledge** | Sets the knowledge sync tier |
 | **verify** | Reports what is still open |
 
 Nothing aborts the run. A step that cannot proceed says why and the wizard continues;
@@ -95,6 +97,27 @@ placeholder. Restart Claude Code and run `/zavet:init` to write your repo's actu
 standing rules. Scaffolding needs a POSIX shell, so on Windows this step is skipped in
 favour of `/zavet:init`.
 
+### Cloud-agent wiring
+
+On by default: `dira onboard` commits five files a cloud runtime (Claude Code on the
+web, Cursor cloud agents) can actually use, since none of those sessions run inside your
+machine's own config — `.dira/hook.sh`, `.dira/bootstrap.sh` (pinned to the running
+`dira` version), `.dira/.gitattributes`, and portable hook entries in
+`.claude/settings.json` and `.cursor/hooks.json`. Skip it with `--no-cloud`, or when cwd
+is not inside a git repository (there is nowhere to commit into).
+
+Re-runs only apply the delta: a repo already wired at the current version reports
+`AlreadyDone` and writes nothing, and a stale one (an older pin, a hand-edited hook
+script) is offered exactly the lines that changed, not a blind rewrite. The pin only
+ever moves forward — a repo pinned to a version newer than the `dira` running onboarding
+is left alone, never lowered.
+
+Commit the wiring afterwards; it does nothing until it is in the repo cloud agents
+actually check out. See `dira cloud init --print` for the snippets and
+[cloud-runtimes.md](cloud-runtimes.md) for the per-environment setup (`DIRA_RUNNER_TOKEN`
+and host allowlisting), which is separate from this step and done once per cloud
+environment, not per repo.
+
 **The knowledge tier.** Knowledge sync is a channel of its own, with its own consent —
 separate from time tracking, and never implied by linking a device or by billing consent.
 The wizard asks about it explicitly:
@@ -130,16 +153,17 @@ dira daemon restart
 ## Flags
 
 ```
-dira onboard [--yes] [--print] [--no-service] [--no-zavet]
+dira onboard [--yes] [--print] [--no-service] [--no-zavet] [--no-cloud]
              [--harness <id>]... [--knowledge <off|metadata|full>]
 ```
 
 - `--yes` — accept every default without prompting. Wires all detected harnesses,
-  installs the service, installs zavet, sets knowledge to `full`, and skips device
-  linking (there is no way to invent a code). This is the CI/scripted form.
+  installs the service, installs zavet, wires cloud-agent capture into the repo, sets
+  knowledge to `full`, and skips device linking (there is no way to invent a code). This
+  is the CI/scripted form.
 - `--print` — show the plan and change nothing. Provably side-effect free: it does not
   even create the local database or invoke `claude`.
-- `--no-service` / `--no-zavet` — opt out of one step.
+- `--no-service` / `--no-zavet` / `--no-cloud` — opt out of one step.
 - `--harness <id>` — wire exactly these, bypassing detection. Repeatable. Accepts any
   spelling `dira init` accepts (`claude`, `codex`, `gemini`, `cursor`, `opencode`,
   `grok`). An unknown harness fails before any step runs.

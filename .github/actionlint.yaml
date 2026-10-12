@@ -1,0 +1,15 @@
+# Config for actionlint, which hk runs over .github/workflows. Read from here
+# automatically. Each ignore is scoped to one file and one message.
+paths:
+  .github/workflows/build-release.yml:
+    ignore:
+      # Style only: the three `>> "$GITHUB_OUTPUT"` lines could share one redirect.
+      # build-release.yml is a guarded release file, so it is left untouched.
+      - 'shellcheck reported issue in this script: SC2129'
+  .github/workflows/sync-install-script.yml:
+    ignore:
+      # actionlint's bundled action metadata predates create-github-app-token
+      # moving from `app-id` to `client-id` (v3 accepts both, `app-id` is
+      # deprecated), so it reports the current input as unknown.
+      - 'input "client-id" is not defined in action "actions/create-github-app-token@v3"'
+      - 'missing input "app-id" which is required by action "actions/create-github-app-token@v3"'

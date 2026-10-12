@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
       # The JS release tooling (semantic-release + plugins) runs under bun/node.
       # mise here only provides the Rust toolchain (cargo set-version), so install
       # bun + node explicitly rather than pinning them in the Rust repo's mise.toml.
@@ -42,10 +42,12 @@ jobs:
           tool: cargo-edit
       - name: Install release tooling
         run: bun install --frozen-lockfile
+      # Link the org's shared semantic-release config into node_modules.
+      - uses: dodi-smart/.github/actions/semantic-release-config@v1
       - name: Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bunx semantic-release --extends ./.releaserc.js
+        run: bunx semantic-release --extends ./release.config.mjs
 
   # After stable releases on main, fast-forward the prerelease channel by merging
   # main back into develop so develop never lags behind production.

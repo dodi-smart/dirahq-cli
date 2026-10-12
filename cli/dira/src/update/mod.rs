@@ -116,6 +116,30 @@ pub struct UpdateArgs {
     pub bin_dir: Option<PathBuf>,
     /// Do not refresh the zavet Claude Code plugin after updating dira.
     pub no_zavet: bool,
+    /// Don't refresh this repo's committed cloud wiring after the update.
+    pub no_cloud: bool,
+}
+
+/// A post-update step [`run`]'s success arm can take, as a value —
+/// separated from the printing/spawning so [`post_update_steps`] is a pure
+/// function `--no-zavet`/`--no-cloud` can be tested against directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostStep {
+    ZavetPlugin,
+    CloudRefresh,
+}
+
+/// Which post-update steps `run`'s success arm should take, honouring
+/// `--no-zavet` and `--no-cloud`. Order is the order they run in.
+pub(crate) fn post_update_steps(args: &UpdateArgs) -> Vec<PostStep> {
+    let mut steps = Vec::new();
+    if !args.no_zavet {
+        steps.push(PostStep::ZavetPlugin);
+    }
+    if !args.no_cloud {
+        steps.push(PostStep::CloudRefresh);
+    }
+    steps
 }
 
 /// An RAII scratch directory for the download/extract workspace, under
@@ -306,12 +330,30 @@ async fn run_update(
             );
             // Only after a genuinely successful swap-and-restart: a rolled-back
             // machine (the `Err` arm below) must never come out of this with a
-            // bumped plugin, and `--no-restart`/`--check` never reach this arm
-            // at all (see `zavet_install::refresh_plugin_after_update`'s doc —
-            // machine scope only, no repo writes, never errors).
-            if !args.no_zavet {
-                if let Some(line) = crate::zavet_install::refresh_plugin_after_update() {
-                    println!("{line}");
+            // bumped plugin or a refreshed cloud pin, and `--no-restart`/
+            // `--check` never reach this arm at all. Both steps run in the
+            // NEW binary (`bin_dir/dira`), never this process: the swap
+            // replaced the file by rename (D-0003), so this process still
+            // carries the old template and `env!("CARGO_PKG_VERSION")`
+            // still reads the old version — only the freshly installed
+            // binary can render either step's *new* output.
+            // - zavet: `zavet_install::refresh_plugin_after_update`'s doc —
+            //   machine scope only, no repo writes, never errors.
+            // - cloud: `cloud_init::refresh`/`run_refresh` (DIRASH-0038) —
+            //   only refreshes `.dira/` where it already exists, never
+            //   lowers a pin, never fails the exit code.
+            for step in post_update_steps(&args) {
+                match step {
+                    PostStep::ZavetPlugin => {
+                        if let Some(line) = crate::zavet_install::refresh_plugin_after_update() {
+                            println!("{line}");
+                        }
+                    }
+                    PostStep::CloudRefresh => {
+                        for line in cloud_refresh_after_update(&bin_dir) {
+                            println!("{line}");
+                        }
+                    }
                 }
             }
             Ok(())
@@ -329,6 +371,111 @@ async fn run_update(
             )))
         }
     }
+}
+
+/// The 90-second wall-clock budget [`cloud_refresh_after_update`] gives the
+/// spawned `dira cloud refresh --after-update`. Generous relative to what
+/// that command actually does (local file reads/writes plus one small
+/// digest fetch), but bounded — a hung child (e.g. a stalled network call)
+/// must not hang `dira update` itself.
+const CLOUD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Spawn the freshly installed `bin_dir/dira cloud refresh --after-update`
+/// and return the lines to print. This step must run in the **new** binary,
+/// not this process — see the caller's comment (D-0003). A spawn failure, a
+/// non-zero exit, or a run past [`CLOUD_REFRESH_TIMEOUT`] (killed) all
+/// collapse to the same one actionable fallback line rather than surfacing
+/// raw process plumbing to the user.
+fn cloud_refresh_after_update(bin_dir: &Path) -> Vec<String> {
+    cloud_refresh_after_update_with(bin_dir, CLOUD_REFRESH_TIMEOUT)
+}
+
+/// [`cloud_refresh_after_update`] with the wall-clock budget injected, so
+/// the timeout and pipe-draining paths are testable in milliseconds against
+/// a scripted `dira` rather than the real 90s.
+fn cloud_refresh_after_update_with(bin_dir: &Path, budget: std::time::Duration) -> Vec<String> {
+    fn fallback() -> Vec<String> {
+        vec![
+            "cloud wiring not refreshed — run `dira cloud refresh` in each repo that carries \
+             .dira/"
+                .to_string(),
+        ]
+    }
+
+    let dira = bin_dir.join("dira");
+    let mut child = match std::process::Command::new(&dira)
+        .args(["cloud", "refresh", "--after-update"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return fallback(),
+    };
+
+    // Drain both pipes on their own threads before polling for exit: a child
+    // that fills a pipe buffer while nobody reads it blocks forever, and the
+    // deadline below would then kill a perfectly healthy run.
+    let stdout_reader = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = out.read_to_string(&mut s);
+            s
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = err.read_to_string(&mut s);
+            s
+        })
+    });
+
+    let deadline = std::time::Instant::now() + budget;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => break None,
+        }
+    };
+    // Decide on the exit status BEFORE joining the readers. A killed child
+    // may leave a grandchild (its own `curl`, say) holding the pipe open, and
+    // joining a reader then blocks until that grandchild exits — the exact
+    // hang the budget exists to bound. On the fallback path the reader
+    // threads are simply dropped; they end when the pipe finally closes.
+    let Some(status) = status else {
+        return fallback();
+    };
+    if !status.success() {
+        return fallback();
+    }
+    let stdout = stdout_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    // The child's own `warning:` lines ride along so a failed digest fetch
+    // is not silently swallowed by the update's success banner.
+    let mut lines: Vec<String> = stderr
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.extend(stdout.lines().filter(|l| !l.is_empty()).map(str::to_string));
+    lines
 }
 
 /// Interpret [`replace::discover_install`]'s guard into a usable `bin_dir`,
@@ -535,6 +682,34 @@ mod tests {
     fn channel_label_matches_the_flag_spelling() {
         assert_eq!(Channel::Stable.label(), "stable");
         assert_eq!(Channel::Prerelease.label(), "prerelease");
+    }
+
+    #[test]
+    fn post_update_steps_honour_no_zavet_and_no_cloud() {
+        let all = UpdateArgs::default();
+        assert_eq!(
+            post_update_steps(&all),
+            vec![PostStep::ZavetPlugin, PostStep::CloudRefresh]
+        );
+
+        let no_zavet = UpdateArgs {
+            no_zavet: true,
+            ..Default::default()
+        };
+        assert_eq!(post_update_steps(&no_zavet), vec![PostStep::CloudRefresh]);
+
+        let no_cloud = UpdateArgs {
+            no_cloud: true,
+            ..Default::default()
+        };
+        assert_eq!(post_update_steps(&no_cloud), vec![PostStep::ZavetPlugin]);
+
+        let neither = UpdateArgs {
+            no_zavet: true,
+            no_cloud: true,
+            ..Default::default()
+        };
+        assert!(post_update_steps(&neither).is_empty());
     }
 
     #[test]
@@ -760,5 +935,112 @@ mod tests {
             wd.path().to_path_buf()
         };
         assert!(!path.exists());
+    }
+
+    // --- the post-update cloud refresh spawn (DIRASH-0038) -------------------
+
+    /// A scripted `dira` in a fresh bin dir: the spawn helper only ever runs
+    /// `<bin_dir>/dira cloud refresh --after-update`, so a shell script by
+    /// that name stands in for the freshly installed binary.
+    #[cfg(unix)]
+    fn scripted_dira(body: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dira");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    const FALLBACK_MARKER: &str = "cloud wiring not refreshed";
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The child's stdout lines are relayed as they are, and its stderr
+    /// warnings ride along ahead of them — a failed digest fetch must not be
+    /// swallowed by the update's success banner.
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_refresh_relays_stdout_and_stderr_lines() {
+        let dir = scripted_dira(
+            "test \"$1 $2 $3\" = \"cloud refresh --after-update\" || exit 9\n\
+             echo 'warning: digests unavailable' >&2\n\
+             echo 'refreshed cloud wiring in /r: bootstrap pin v0.1.0 → v0.2.0'\n\
+             echo ''\n\
+             echo '1 other repo(s) still pin an older dira'",
+        );
+        let lines = cloud_refresh_after_update_with(dir.path(), BUDGET);
+        assert_eq!(
+            lines,
+            vec![
+                "warning: digests unavailable".to_string(),
+                "refreshed cloud wiring in /r: bootstrap pin v0.1.0 → v0.2.0".to_string(),
+                "1 other repo(s) still pin an older dira".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_zero_exit_collapses_to_the_fallback_line() {
+        let dir = scripted_dira("echo 'half done'; exit 3");
+        let lines = cloud_refresh_after_update_with(dir.path(), BUDGET);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(FALLBACK_MARKER), "{lines:?}");
+        assert!(lines[0].contains("dira cloud refresh"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_missing_binary_collapses_to_the_fallback_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = cloud_refresh_after_update_with(dir.path(), BUDGET);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(FALLBACK_MARKER), "{lines:?}");
+    }
+
+    /// A hung child is killed at the budget and reported as the fallback,
+    /// so a stalled digest fetch inside the child can never hang `dira
+    /// update` itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_past_the_budget_is_killed_and_reported_as_the_fallback() {
+        let dir = scripted_dira("sleep 30");
+        let started = std::time::Instant::now();
+        let lines =
+            cloud_refresh_after_update_with(dir.path(), std::time::Duration::from_millis(300));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "must not wait for the child's own 30s"
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(FALLBACK_MARKER), "{lines:?}");
+    }
+
+    /// Regression: the pipes are drained while the child runs. A child that
+    /// writes more than a pipe buffer (64 KiB) before exiting used to block
+    /// forever on a full pipe nobody was reading, and the deadline would
+    /// then kill a healthy run.
+    #[cfg(unix)]
+    #[test]
+    fn a_chatty_child_never_deadlocks_on_a_full_pipe() {
+        // 4000 lines × ~64 bytes ≈ 256 KiB on stdout, and the same on stderr.
+        let dir = scripted_dira(
+            "i=0; while [ $i -lt 4000 ]; do \
+               echo \"line $i ................................................\"; \
+               echo \"err $i .................................................\" >&2; \
+               i=$((i+1)); done",
+        );
+        let started = std::time::Instant::now();
+        let lines = cloud_refresh_after_update_with(dir.path(), BUDGET);
+        assert!(
+            started.elapsed() < BUDGET,
+            "a healthy child must finish well inside the budget, not be killed at it"
+        );
+        assert_eq!(
+            lines.len(),
+            8000,
+            "every line relayed, none lost: {}",
+            lines.len()
+        );
+        assert!(lines.iter().all(|l| !l.contains(FALLBACK_MARKER)));
     }
 }

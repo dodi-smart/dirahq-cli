@@ -35,17 +35,17 @@ jobs:
         with:
           path: dirahq-cli
 
-      # Org-level app credentials, same pattern as ci.yml's check-runners job
-      # and build-release.yml's check-runners job. Scoping by `owner` alone
-      # (no `repositories` list) grants the token access to every repo the
-      # App installation covers in this org, which is what lets a workflow
-      # running in the private dirahq-cli repo open a PR against the public
-      # dirahq-landing repo.
+      # App credentials as repo secrets: this repo is public, so the org-level
+      # copies do not reach it. `client-id` is the current input name; `app-id`
+      # is deprecated upstream and the org standardised on one name. Scoping
+      # by `owner` alone (no `repositories` list) grants the token access to
+      # every repo the App installation covers, which is what lets this
+      # workflow open a PR against the landing repo.
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.GH_APP_ID }}
+          client-id: ${{ secrets.GH_APP_CLIENT_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 

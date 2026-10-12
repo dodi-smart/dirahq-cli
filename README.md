@@ -62,11 +62,12 @@ dira onboard
 ```
 
 One command: detects your harnesses and wires them all, registers `dirad` as a login
-service so it survives reboots, offers to link this device, and installs the zavet
-knowledge layer. Every step is skippable, and re-running it is safe — it reports what is
-already done and picks up the rest. `dira onboard --yes` accepts every default without
-prompting; `--print` shows the plan and changes nothing. See
-[docs/getting-started.md](docs/getting-started.md).
+service so it survives reboots, offers to link this device, wires the current repo for
+cloud agents (Claude Code on the web, Cursor cloud agents — see below; `--no-cloud` to
+skip), and installs the zavet knowledge layer. Every step is skippable, and re-running it
+is safe — it reports what is already done and picks up the rest, writing only what
+changed. `dira onboard --yes` accepts every default without prompting; `--print` shows
+the plan and changes nothing. See [docs/getting-started.md](docs/getting-started.md).
 
 ```sh
 dira status           # today's summary — engaged, agent, compute, unbilled
@@ -76,9 +77,10 @@ dira doctor           # is capture actually working? (add --probe to prove it en
 Prefer to do it yourself? Every step `onboard` runs is its own command — `dira init`,
 `dira daemon install`, `dira device link`, `dira zavet install`.
 
-Stay current with `dira update` — sha256-verified, atomic, restarts the daemon for you.
-See [docs/install.md](docs/install.md) for every flag/env var, air-gapped installs, and
-troubleshooting.
+Stay current with `dira update` — sha256-verified, atomic, restarts the daemon for you,
+and refreshes the current repo's cloud wiring to the new version afterward (`--no-cloud`
+to opt out). See [docs/install.md](docs/install.md) for every flag/env var, air-gapped
+installs, and troubleshooting.
 
 ## Build from source
 
@@ -127,11 +129,16 @@ normalized into Dira's shared event set in `cli/sources`.
 ### Cloud agent runtimes
 
 Agents that run in the cloud — Claude Code on the web, Cursor cloud agents — get captured
-too: `dira cloud init` generates portable, repo-committed wiring (`.dira/hook.sh`,
-`.dira/bootstrap.sh`, project hook configs) that installs dira inside each session VM,
-captures its hook events, and syncs attestations from there. The generated bootstrap ships
-with a sha256 digest pinned at commit time (`--no-pin` to opt out), so a session VM verifies
-its own download without a second network round trip. See
+too: `dira onboard` wires the current repo for this by default (`cloud:repo`), or run
+`dira cloud init` directly (the standalone/CI-scriptable form) to generate the same
+portable, repo-committed wiring (`.dira/hook.sh`, `.dira/bootstrap.sh`, project hook
+configs) that installs dira inside each session VM, captures its hook events, and syncs
+attestations from there. The generated bootstrap ships with a sha256 digest pinned at
+commit time (`--no-pin` to opt out), so a session VM verifies its own download without a
+second network round trip. Commit the generated files. `dira cloud refresh` brings an
+existing wiring up to the running dira's version (the pin only ever moves forward);
+`dira update` runs it automatically for the current repo after a successful update.
+`--no-cloud` opts either `dira onboard` or `dira update` out. See
 [docs/cloud-runtimes.md](docs/cloud-runtimes.md).
 
 ## Cloud sync (optional)

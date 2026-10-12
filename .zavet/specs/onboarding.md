@@ -1,17 +1,24 @@
 ---
 title: Onboarding — dira onboard and the installer handoff
-version: 1
+version: 2
 origin: session
 verified: false
 confidence: high
-date: 2026-08-13
+date: 2026-09-09
 paths:
   - cli/dira/src/onboard/**
   - cli/dira/src/which.rs
+  - cli/dira/src/cloud_init.rs
   - install.sh
   - install.ps1
   - docs/getting-started.md
-decisions: [D-0001, D-0004, D-0007, D-0009, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0030]
+decisions: [D-0001, D-0004, D-0007, D-0009, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0030, DIRASH-0038]
+checks:
+  - cloud:repo step decision logic :: cargo test -p dira --bin dira -- onboard::steps::tests::cloud_repo
+  - end-to-end: wires the repo and a second run is a no-op :: cargo test -p dira --test onboard_e2e yes_wires_the_repo_for_cloud_agents_and_a_second_run_is_a_noop
+  - end-to-end: an older pin is refreshed without touching current files :: cargo test -p dira --test onboard_e2e an_older_pin_is_refreshed_without_touching_current_files
+  - end-to-end: a newer pin is left alone :: cargo test -p dira --test onboard_e2e a_newer_pin_is_left_alone
+  - end-to-end: --no-cloud skips the repo wiring :: cargo test -p dira --test onboard_e2e no_cloud_skips_the_repo_wiring
 ---
 
 ## Overview
@@ -40,11 +47,17 @@ None of them abort the run, in the dependency order `mod::run` calls them:
 | device | Prompts for a link code; blank skips. A successful link updates `State` in place, so every later step in the same run sees it linked | already linked, blank input |
 | zavet | Installs the zavet Claude Code plugin | `--no-zavet`, `claude` not on `PATH`, already installed |
 | zavet:repo | Scaffolds `.zavet/` in the current repo via the plugin's own `bin/zavet` | `--no-zavet`, not a git repo, `.zavet/` already present, Windows |
+| cloud:repo | Wires the current repo for cloud agents exactly like `dira cloud init` (`.dira/hook.sh`, `.dira/bootstrap.sh` pinned to the running dira's version with release digests, `.dira/.gitattributes`, portable hook entries in the project `.claude/settings.json` and `.cursor/hooks.json`, both harnesses by default since the repo is shared) | `--no-cloud`, not a git repo, declined, `--harness` names no cloud-capable harness |
 | knowledge | Asks (or applies `--knowledge`) the content-sync tier; last, so the value is on disk before the daemon's next start | tier already matches |
 
-Knowledge is last on purpose (see "Knowledge consent" below); zavet's two
-steps run before it. After all seven, `run()` prints a closing summary (one
-line per `StepOutcome`) and an open-items block. **Neither is a step**:
+`cloud:repo` sits between `zavet:repo` and `knowledge` on purpose: both
+`zavet:repo` and `cloud:repo` are repo-scoped (they act on the current
+working directory's repo, unlike every other step, which acts on the
+machine), so they stay adjacent rather than interleaved with machine-scoped
+steps; knowledge stays last regardless (see "Knowledge consent" below), since
+its value must be on disk before the daemon's next start. After all seven,
+`run()` prints a closing summary (one line per `StepOutcome`) and an
+open-items block. **Neither is a step**:
 neither returns a `StepOutcome` nor appears in the `results` vec the summary
 renders from. They are `print_summary`/`print_open_items` in `mod.rs`, not
 entries the wizard iterates.
@@ -78,6 +91,17 @@ sidecars on a WAL-mode database), never `Store::open`, which would migrate and
 write. Plugin presence uses `zavet_install::plugin_root_offline()`, which
 reads `installed_plugins.json` rather than spawning `claude` (which
 bootstraps `~/.claude.json`). See DIRASH-0029.
+
+`cloud:repo`'s detection is `cloud_init::status`, and it holds to the same
+rule by construction rather than by a second, hand-maintained probe: it
+compares each generated artifact against the running binary's own template,
+reads the bootstrap's embedded pin as a semver relation against the running
+version, and runs the writer's own hook-injection logic against a **scratch
+copy** of each project config file to count what it would change, never the
+real file. Nothing here fetches digests (that only happens in `apply`) or
+touches the filesystem outside the scratch copy, so the read is both
+write-free and network-free, and the reader cannot silently drift from what
+the writer would actually do.
 
 ### Modes
 
@@ -148,6 +172,15 @@ DIRASH-0030.
   recording stub instead of touching the developer's real `config.toml`.
 - `Store::open_readonly`: read-only, immutable, never migrates; what
   detection's device-link probe opens an existing db with.
+- `cloud_init::status` / `cloud_init::apply`: the read/write pair behind
+  `cloud:repo` and `dira cloud refresh` alike. `status` is the write- and
+  network-free detector described above; `apply` is the one function that
+  actually fetches digests and writes the artifacts, called from `cloud:repo`,
+  `dira cloud init` and `dira cloud refresh` — never from detection.
+- `onboard::steps::CloudApplier`: the seam `cloud:repo` calls `cloud_init`
+  through, so the step's decision logic (what to run, what to tell the user)
+  can be unit-tested against a fake without touching the filesystem.
+  `SystemApplier` is the real implementation, wired in production.
 
 ## Invariants
 
@@ -165,6 +198,9 @@ DIRASH-0030.
   disclosure of what `full` sends.
 - A device linked earlier in a run is treated as linked by every step that
   runs later in that same run.
+- Detection reads the repo's cloud status without network or writes.
+- The bootstrap pin only moves forward.
+- A re-run writes only the delta and says what it was.
 
 ## Open Questions
 

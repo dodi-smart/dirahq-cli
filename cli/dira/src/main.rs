@@ -95,7 +95,7 @@ enum Command {
     /// Set this machine up end to end: harnesses, daemon service, cloud link, zavet.
     #[command(
         long_about = "\
-One command from a fresh install to actually capturing. Runs six steps in
+One command from a fresh install to actually capturing. Runs eight steps in
 dependency order, each idempotent and skippable, and is safe to re-run — a
 second run reports what is already done and picks up the rest.
 
@@ -104,14 +104,16 @@ second run reports what is already done and picks up the rest.
   3. daemon     install dirad as a login service so it survives reboots
   4. device     link this device to the cloud (skippable — local capture works
                 unlinked; only sync and billables need it)
-  5. zavet      install the knowledge plugin, scaffold this repo's .zavet/,
-                and set the knowledge sync tier
-  6. verify     tell you what is still open
+  5. zavet      install the knowledge plugin and scaffold this repo's .zavet/
+  6. cloud      commit portable hooks + a pinned bootstrap so cloud agents
+                (Claude Code on the web, Cursor cloud) capture this repo too
+  7. knowledge  set the knowledge sync tier
+  8. verify     tell you what is still open
 
 Nothing here aborts on failure: a step that cannot run says why, and the
 summary collects what is left. `dira init`, `dira daemon install`, `dira
-device link` and `dira zavet install` all remain available individually —
-this command is a guided path through them, not a replacement.",
+device link`, `dira zavet install` and `dira cloud init` all remain available
+individually — this command is a guided path through them, not a replacement.",
         after_help = "\
 Examples:
   dira onboard                     the guided flow
@@ -120,7 +122,8 @@ Examples:
   dira onboard --harness claude --harness codex
                                    wire exactly these, skipping detection
   dira onboard --knowledge metadata
-                                   set up everything, but never send record bodies"
+                                   set up everything, but never send record bodies
+  dira onboard --no-cloud          skip committing cloud-agent wiring into this repo"
     )]
     Onboard {
         /// Accept every default without prompting (implies knowledge=full).
@@ -135,6 +138,9 @@ Examples:
         /// Don't install zavet or scaffold this repo's knowledge layer.
         #[arg(long)]
         no_zavet: bool,
+        /// Don't commit cloud-agent capture wiring (.dira/, project hook configs) into this repo.
+        #[arg(long)]
+        no_cloud: bool,
         /// Wire exactly this harness, bypassing detection. Repeatable.
         #[arg(long, value_name = "HARNESS")]
         harness: Vec<String>,
@@ -523,7 +529,10 @@ upgrading to a newer one.
 
 After a successful swap-and-restart, an already-installed zavet Claude Code
 plugin is also refreshed (marketplace + plugin update, machine scope only —
-never writes to a repo). Pass --no-zavet to skip that.",
+never writes to a repo). Pass --no-zavet to skip that. This repo's committed
+cloud wiring (.dira/), if it already exists, is also refreshed to the new
+version through the freshly installed binary — pass --no-cloud to skip
+that. Neither step ever creates artifacts a repo didn't already opt into.",
         after_help = "\
 Examples:
   dira update --check               is a newer release available?
@@ -531,7 +540,8 @@ Examples:
   dira update --channel prerelease  opt into a prerelease build
   dira update --version 0.2.0       pin to (or downgrade to) an exact version
   dira update --no-restart          swap the binaries, leave the running daemon alone
-  dira update --no-zavet            skip the post-update zavet plugin refresh"
+  dira update --no-zavet            skip the post-update zavet plugin refresh
+  dira update --no-cloud            skip the post-update cloud wiring refresh"
     )]
     Update {
         /// Resolve only — report what's available, change nothing.
@@ -555,6 +565,9 @@ Examples:
         /// Do not refresh the zavet Claude Code plugin after updating dira.
         #[arg(long)]
         no_zavet: bool,
+        /// Don't refresh this repo's committed cloud wiring after the update.
+        #[arg(long)]
+        no_cloud: bool,
     },
     /// Zavet knowledge module: what the tracked time produced, and why.
     #[command(
@@ -810,6 +823,21 @@ Idempotent: re-running only rewrites what drifted.")]
         #[arg(long)]
         no_pin: bool,
     },
+    /// Refresh this repo's committed cloud wiring (.dira/ pin + hook.sh) to this dira's version.
+    #[command(after_help = "\
+Refresh this repo's committed cloud wiring (.dira/ pin + hook.sh) to this
+dira's version. Never creates it — run `dira cloud init`/`dira onboard` for
+that — and never lowers a newer pin.
+
+Run automatically after a successful `dira update` (DIRASH-0038); run it by
+hand any time to catch a repo up without waiting for the next update.")]
+    Refresh {
+        /// Internal: set by `dira update`'s post-swap step. Quieter on the
+        /// already-current / never-wired paths, and lists other repos this
+        /// machine has seen that still pin an older dira.
+        #[arg(long)]
+        after_update: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1033,6 +1061,7 @@ async fn main() -> Result<()> {
             print,
             no_service,
             no_zavet,
+            no_cloud,
             harness,
             knowledge,
         } => {
@@ -1064,6 +1093,7 @@ async fn main() -> Result<()> {
                     print: *print,
                     no_service: *no_service,
                     no_zavet: *no_zavet,
+                    no_cloud: *no_cloud,
                     harness: ids,
                     knowledge,
                 },
@@ -1104,6 +1134,9 @@ async fn main() -> Result<()> {
                     print,
                     no_pin,
                 } => cloud_init::run(harness, *print, *no_pin).await,
+                CloudAction::Refresh { after_update } => {
+                    cloud_init::run_refresh(&config, *after_update).await
+                }
             };
         }
         Command::Watch { interval } => {
@@ -1210,6 +1243,7 @@ async fn main() -> Result<()> {
             no_restart,
             bin_dir,
             no_zavet,
+            no_cloud,
         } => {
             return update::run(
                 &config,
@@ -1221,6 +1255,7 @@ async fn main() -> Result<()> {
                     no_restart: *no_restart,
                     bin_dir: bin_dir.clone(),
                     no_zavet: *no_zavet,
+                    no_cloud: *no_cloud,
                 },
             )
             .await;

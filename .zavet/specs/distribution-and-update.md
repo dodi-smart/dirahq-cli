@@ -1,18 +1,26 @@
 ---
 title: Distribution and self-update
-version: 9
+version: 10
 origin: session
 verified: false
 confidence: high
-date: 2026-08-14
+date: 2026-09-09
 paths:
   - install.sh
   - install.ps1
   - cli/dira/src/update/**
+  - cli/dira/src/cloud_init.rs
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0024, DIRASH-0029, DIRASH-0031]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038]
+checks:
+  - the post-update steps honour --no-zavet and --no-cloud :: cargo test -p dira --bin dira -- update::tests::post_update_steps_honour_no_zavet_and_no_cloud
+  - refresh never creates artifacts and never lowers a pin :: cargo test -p dira --bin dira -- cloud_init::tests::refresh_never_creates_artifacts_and_never_downgrades
+  - distinct_event_cwds is most-recent-first and capped :: cargo test -p dira-core --lib -- store::tests::distinct_event_cwds_is_most_recent_first_and_capped
+  - cloud refresh bumps an older pin and lists other stale repos :: cargo test -p dira --test cloud_init_e2e cloud_refresh_bumps_an_older_pin_and_lists_other_stale_repos
+  - a repo without .dira/ is a silent no-op :: cargo test -p dira --test cloud_init_e2e cloud_refresh_outside_a_wired_repo_is_a_silent_noop
+  - a newer pin is left alone :: cargo test -p dira --test cloud_init_e2e cloud_refresh_never_lowers_a_newer_pin
 ---
 
 ## Overview
@@ -123,6 +131,19 @@ both executables and restarts whatever is supervising the daemon.
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
   is safe in a script.
+- After a successful swap-and-restart, `dira update` also spawns the freshly
+  installed `bin_dir/dira cloud refresh --after-update` (DIRASH-0038): it
+  refreshes the *cwd repo's* committed cloud wiring (`.dira/hook.sh` +
+  `.dira/bootstrap.sh`'s pin, and any harness config already wired) up to the
+  new version, and lists (never writes) other repos the local event log has
+  seen that still pin an older dira. `dira cloud refresh` is also a standalone
+  command — run it by hand any time. Both only ever touch a repo whose
+  `.dira/` already exists (never create it — that's `dira cloud init` /
+  `dira onboard`'s job) and never lower a pin newer than the running `dira`.
+  `--no-cloud` skips the step on `dira update`; under `--after-update` a
+  failure is one printed line, never a non-zero exit — a step glued to every
+  update must never turn its success into a failure over something as
+  recoverable as running `dira cloud refresh` by hand later.
 - Every network step is time-bounded, both by inactivity and by total
   duration, and the artifact download is also retried and size-capped. The
   download makes up to 4 attempts on a 500ms-seeded ladder capped at 4s,
@@ -282,8 +303,15 @@ both executables and restarts whatever is supervising the daemon.
 ## Invariants
 
 - `dira update` may refresh the zavet *plugin* (machine scope, the blast radius
-  it already has) but never a repo's adapters or git hooks (DIRASH-0024). No cwd
-  is resolved anywhere in that path.
+  it already has) but never a repo's adapters or git hooks (DIRASH-0024). It may
+  also refresh dira's own generated `.dira/` cloud-wiring artifacts in the cwd
+  repo the update was run from (DIRASH-0038) — but only when they already
+  exist (never creates them), only upward (never lowers a pin), via the
+  freshly installed binary (not the old process — see the next bullet's
+  D-0003 note applied to this step too), and opt-out (`--no-cloud`). It never
+  touches zavet adapters/hooks and never writes to any *other* repo — other
+  repos the local event log has seen are only listed, read-only. Beyond that
+  one cwd repo's own `.dira/`, no cwd is resolved anywhere in this path.
 - The plugin refresh runs only inside the successful swap-and-restart arm: never
   on `--no-restart`, never on `--check` (D-0006 keeps that path free of network
   I/O), and never after a rollback. A rolled-back machine must not come out of

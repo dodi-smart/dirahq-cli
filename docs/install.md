@@ -309,6 +309,11 @@ restarted after a successful swap (see `dira daemon restart` and the
 [troubleshooting](#troubleshooting) table below for how that's supervised). A daemon that
 wasn't running beforehand is left stopped.
 
+**Post-update cloud refresh.** After a successful update, the newly installed binary
+refreshes the current repo's `.dira/` cloud wiring (if any) to the new version and lists
+other repos your local store has seen events from that still pin an older `dira`. Pass
+`--no-cloud` to skip this. See [docs/cloud-runtimes.md](cloud-runtimes.md).
+
 **The passive update notice.** Separately from `dira update` itself, `dira status`, `dira
 version`, and `dira daemon status` print a rate-limited "update available" notice to
 **stderr** (never stdout, so `dira status | cat` stays byte-identical) when a newer release

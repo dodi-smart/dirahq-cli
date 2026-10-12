@@ -1,3 +1,9 @@
+## [0.8.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.7.0...v0.8.0) (2026-10-12)
+
+### ✨ Features
+
+* **cli:** first-class OpenSpec, Spec Kit, BMAD and superpowers spec sources (contract 1.5.0) ([f843944](https://github.com/dodi-smart/dirahq-cli/commit/f843944d46f2c7b9edcb5cee1fb52e51b0f74632))
+
 ## [0.7.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.6.0...v0.7.0) (2026-10-12)
 
 ### ✨ Features

@@ -46,6 +46,7 @@ fn manual_tick_with_repo(session: &str, at: OffsetDateTime) -> RawEvent {
         label: None,
         activity: None,
         note: None,
+        spec: None,
     }
 }
 

@@ -1,0 +1,4 @@
+openspec	openspec	
+speckit	specs	src/** docs/*.md
+bmad	_bmad-output	
+superpowers	docs/superpowers	

@@ -225,10 +225,17 @@ async fn process_message(
         }
         _ => None,
     };
-    let ev = match msg {
+    let mut ev = match msg {
         EventMsg::Raw(ev) => *ev,
         EventMsg::Hook { norm, harness, at } => enrich(norm, harness, at, cache),
     };
+    // A session already bound to a spec (an explicit `dira start --spec`, or a
+    // capture-time resolution) stamps every later event, so any window of the
+    // log carries it — a rollup built from a slice that misses the first event
+    // must still name the spec.
+    if ev.spec.is_none() {
+        ev.spec = crate::control::lock_recover(&state.sessions).spec_of(&ev.session_id);
+    }
 
     // A `dira doctor --probe` row is a transport test, not a session. It takes
     // the store append and nothing else: no coalescing watermark, no
@@ -579,6 +586,7 @@ fn enrich(
         label: None,
         activity: None,
         note: None,
+        spec: None,
     }
 }
 
@@ -920,6 +928,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 

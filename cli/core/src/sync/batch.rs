@@ -119,6 +119,8 @@ pub struct PartialSession {
     pub note: Option<String>,
     /// Operational tag for a manual session, if set (`--label`).
     pub label: Option<String>,
+    /// Spec slug the session works under, if set (`dira start --spec`).
+    pub spec: Option<String>,
 }
 
 /// Build an attestation batch from a window of events, token rows, and artifacts.
@@ -248,6 +250,7 @@ fn assemble_batch(
             branch: p.branch.clone(),
             note: p.note.clone(),
             label: p.label.clone(),
+            spec: p.spec.clone(),
             // Stamped by the daemon at flush time (a property of the running
             // environment, not of the stored events) — see dirad's sync loop.
             runtime: None,
@@ -682,6 +685,8 @@ fn build_sessions(
         /// events (manual sessions; agent sessions leave these None).
         note: Option<String>,
         label: Option<String>,
+        /// First non-null spec slug across the session's events.
+        spec: Option<String>,
     }
 
     // Sessions that END in THIS window's slice ONLY — never from `history` (see the
@@ -732,6 +737,7 @@ fn build_sessions(
                 event_times: Vec::new(),
                 note: e.note.clone(),
                 label: e.label.clone(),
+                spec: e.spec.clone(),
             });
         entry.event_times.push(crate::accounting::AgentSample {
             at: e.at,
@@ -765,6 +771,9 @@ fn build_sessions(
         }
         if entry.label.is_none() && e.label.is_some() {
             entry.label = e.label.clone();
+        }
+        if entry.spec.is_none() && e.spec.is_some() {
+            entry.spec = e.spec.clone();
         }
         if matches!(e.kind, EventKind::SessionEnd | EventKind::ManualStop) {
             entry.ended = true;
@@ -806,6 +815,7 @@ fn build_sessions(
                 branch,
                 note: a.note,
                 label: a.label,
+                spec: a.spec,
                 // Stamped by the daemon at flush time (a property of the running
                 // environment, not of the stored events) — see dirad's sync loop.
                 runtime: None,
@@ -1007,6 +1017,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 
@@ -1728,6 +1739,7 @@ mod tests {
             branch: Some("feat/x".into()),
             note: None,
             label: None,
+            spec: None,
         }];
         let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, AGENT, NOW);
         let s = batch
@@ -1743,6 +1755,56 @@ mod tests {
         assert_eq!(s.prompts, Some(7));
         assert_eq!(s.branch.as_deref(), Some("feat/x"));
         assert_eq!(s.identity_email, "dev@example.com");
+    }
+
+    /// `SessionRollup.spec` is the first non-null spec across the session's
+    /// events — ended rollups read it from the log, partials carry it from the
+    /// live registry.
+    #[test]
+    fn a_rollup_carries_the_sessions_spec_slug() {
+        let mut stamped = ev("s1", 10, EventKind::UserPrompt, "p");
+        stamped.spec = Some("openspec:add-csv-import".into());
+        // Real activity in both sessions, so neither is a degenerate rollup the
+        // batch would retain-filter away.
+        let window = vec![
+            ev("s1", 0, EventKind::SessionStart, "p"),
+            stamped,
+            ev("s1", 20, EventKind::PreTool, "p"),
+            ev("s1", 30, EventKind::PostTool, "p"),
+            ev("s1", 40, EventKind::SessionEnd, "p"),
+            ev("s2", 0, EventKind::SessionStart, "p"),
+            ev("s2", 10, EventKind::UserPrompt, "p"),
+            ev("s2", 20, EventKind::PreTool, "p"),
+            ev("s2", 30, EventKind::PostTool, "p"),
+            ev("s2", 40, EventKind::SessionEnd, "p"),
+        ];
+        let batch = build_batch(&window, &[], &[], "d", IDLE, AGENT, NOW);
+        let spec_of = |id: &str| {
+            batch
+                .sessions
+                .iter()
+                .find(|s| s.session_id == id)
+                .and_then(|s| s.spec.clone())
+        };
+        assert_eq!(spec_of("s1").as_deref(), Some("openspec:add-csv-import"));
+        assert_eq!(spec_of("s2"), None, "no spec, no field");
+
+        let partials = vec![PartialSession {
+            session_id: "long".into(),
+            harness: Harness::ClaudeCode,
+            kind: SessionKind::Agent,
+            repo_canonical: Some("p".into()),
+            identity_email: Some("dev@example.com".into()),
+            started_at: OffsetDateTime::UNIX_EPOCH,
+            active_seconds: 10,
+            prompts: Some(1),
+            branch: None,
+            note: None,
+            label: None,
+            spec: Some("capture-pipeline".into()),
+        }];
+        let b = build_batch_with_partials(&[], &[], &[], &partials, "d", IDLE, AGENT, NOW);
+        assert_eq!(b.sessions[0].spec.as_deref(), Some("capture-pipeline"));
     }
 
     #[test]
@@ -1766,6 +1828,7 @@ mod tests {
             branch: None,
             note: None,
             label: None,
+            spec: None,
         }];
         let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, AGENT, NOW);
         let rollups: Vec<_> = batch
@@ -1794,6 +1857,7 @@ mod tests {
             branch: None,
             note: None,
             label: None,
+            spec: None,
         }];
         let batch = build_batch_with_partials(&[], &[], &[], &partials, "d", IDLE, AGENT, NOW);
         assert!(

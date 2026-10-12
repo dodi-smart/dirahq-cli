@@ -1,16 +1,16 @@
 ---
 title: Diagnostics — dira doctor and the capture probe
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
-date: 2026-09-09
+date: 2026-10-12
 paths:
   - cli/dira/src/doctor/**
   - cli/dirad/src/probe.rs
   - cli/dira/src/hook_health.rs
   - cli/dira/src/init.rs
-decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029, DIRASH-0033]
+decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029, DIRASH-0033, DIRASH-0039]
 checks:
   - a stale hook.sh warns and names dira onboard :: cargo test -p dira --bin dira -- doctor::checks::tests::a_stale_hook_sh_warns_with_onboard_as_the_remedy
   - a present but unwired harness config warns :: cargo test -p dira --bin dira -- doctor::checks::tests::a_present_but_unwired_harness_config_warns
@@ -159,6 +159,15 @@ or yields (see Behavior below).
   None ever returns `fail`. They share one `UpdateFacts` gather, and reuse
   `update::replace`'s own PATH-entry probe and sidecar listing rather than
   re-deriving either, so they cannot disagree with what the updater does.
+- `zavet.spec_sources` reports whether the repo's spec-driven frameworks are
+  linked to zavet. It `skip`s outside a git repo and when the repo has no
+  `.zavet/` (nothing to judge). It `warn`s when a framework is on disk (a `stat`
+  probe) but no `spec-source:` line in `.zavet/config` declares it, with
+  `dira onboard` (or `/zavet:spec-adopt` in Claude Code) as the remedy, and when
+  dira's index holds units that came back `unresolved` from the plugin. Otherwise
+  it is `ok`. Its gather is `stat`, one config read and one read of the local
+  index: it never runs the plugin and never writes (DIRASH-0022), so
+  "unresolved" is the daemon's last captured verdict, not a fresh resolve.
 - `--probe` runs last and only on request. It spawns a child and writes+deletes
   a row, so keeping the default side-effect-free is what makes a bare
   `dira doctor` safe for `install.sh` and CI.

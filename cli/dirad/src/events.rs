@@ -55,6 +55,8 @@ pub fn manual_event(
         label,
         activity,
         note,
+        // Threaded from `dira start --spec` by the control layer (W4).
+        spec: None,
     }
 }
 

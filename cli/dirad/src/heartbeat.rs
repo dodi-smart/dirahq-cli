@@ -1208,6 +1208,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
             had_signal: true,
             started_at: OffsetDateTime::UNIX_EPOCH,
             last_event_at,

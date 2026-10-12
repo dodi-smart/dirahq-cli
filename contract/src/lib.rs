@@ -22,10 +22,11 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.4.0";
+pub const SCHEMA_VERSION: &str = "1.5.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -172,6 +173,15 @@ pub struct SessionRollup {
     /// Optional + omitted-when-absent so older payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_session_ref: Option<String>,
+    /// The spec slug this session worked under (`openspec:add-csv-import`,
+    /// `capture-pipeline`, …) — the slug only, never prose (D-0001). Resolved
+    /// producer-side from an explicit `dira start --spec`, an exact `Spec:`
+    /// trailer on the session's commits, or an exact branch match; absent when
+    /// none applies. Lets the dashboard attribute time, agent share and tokens
+    /// per spec. Optional + omitted-when-absent so pre-1.5 payloads stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
 }
 
 /// Token usage for a session/turn. Cost is always an estimate, separate from time.
@@ -568,6 +578,12 @@ impl KnowledgeBatch {
             for c in &mut s.checks {
                 c.command = None;
             }
+            if let Some(src) = &mut s.source {
+                src.requirement_bodies.clear();
+                src.task_bodies.clear();
+                src.summary_md = None;
+                src.tracker_refs.clear();
+            }
         }
         for t in &mut self.trailer_refs {
             t.value = None;
@@ -721,6 +737,196 @@ pub struct KnowledgeSpec {
     /// batch is full-tier. Allowlisted in the no-content-fields invariant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
+    /// Set only for source-backed units (OpenSpec, Spec Kit, BMAD,
+    /// superpowers) — see [`SpecSource`]. `path` then holds the unit's primary
+    /// document and `first_commit`/`last_commit`/`created_at`/`updated_at`
+    /// carry the unit's git history. Absent for native zavet specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SpecSource>,
+}
+
+/// Spec-framework provenance and shape for a source-backed [`KnowledgeSpec`]
+/// (slug `<kind>:<id>`, `origin: external`, never `verified`).
+///
+/// Everything outside the "full tier" block is metadata: identifiers, enums,
+/// counts, timestamps and blob oids — requirement and task *ids* are
+/// identifiers the framework itself prints, not prose. The full-tier block is
+/// consent-gated exactly like `bodyMd`: cleared by
+/// [`KnowledgeBatch::strip_content`] and pinned in the no-content-fields
+/// invariant. Assignees and any personal frontmatter fields never cross.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecSource {
+    /// `openspec` | `speckit` | `bmad` | `superpowers` (open set).
+    pub kind: String,
+    /// The unit id within its framework, e.g. `add-csv-import`.
+    pub id: String,
+    /// Declared source root, repo-relative (`openspec`, `specs`, …).
+    pub root: String,
+    /// The framework's own version, when it can be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_version: Option<String>,
+    /// Normalised lifecycle: `proposed` | `active` | `in-progress` | `review` |
+    /// `done` | `archived` | `removed` | `unresolved`.
+    pub state: String,
+    /// The framework's own state word, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_state: Option<String>,
+    /// RFC 3339 instant dira observed `state` change (stamped producer-side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_changed_at: Option<String>,
+    /// The date the unit closed (`2026-09-30`), when the framework records one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_on: Option<String>,
+    /// Initiative / epic / capability / feature grouping, when the kind has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<SpecGroup>,
+    /// OpenSpec capability directory names touched by the unit's deltas.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// `low` | `medium` | `high` (BMAD epic frontmatter only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    /// The unit's files with their git blob oids (identity pointers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unit_files: Vec<UnitFile>,
+    /// Paths the framework *claims* the unit will touch — a claim, never
+    /// coverage (coverage stays in `KnowledgeSpec.paths`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planned_paths: Vec<String>,
+    /// Requirement / scenario / task shape counts.
+    #[serde(default)]
+    pub counts: SpecCounts,
+    /// Requirement ids with state — ids only, never the requirement text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirement_refs: Vec<RequirementRef>,
+    /// Task ids with progress — ids only, never the task text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_refs: Vec<TaskRef>,
+    /// Planned-vs-touched drift counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<SpecDrift>,
+    /// CONTENT (consent-gated): requirement text by id. Empty unless the
+    /// batch is full-tier. Named `*_bodies`, never `*_body`, so the whole-token
+    /// denylist stays meaningful; allowlisted by exact path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirement_bodies: Vec<BodyRef>,
+    /// CONTENT (consent-gated): task text by id. Empty unless full-tier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_bodies: Vec<BodyRef>,
+    /// CONTENT (consent-gated): the unit summary (proposal "Why", Spec Kit
+    /// summary, epic description). `None` unless full-tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_md: Option<String>,
+    /// CONTENT (consent-gated): tracker references (`GH#123`, `PROJ-42`) from
+    /// framework frontmatter. Empty unless full-tier — they can name private
+    /// trackers, so they ride with the content tier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracker_refs: Vec<String>,
+}
+
+/// A spec unit's grouping (BMAD initiative / epic, Spec Kit feature number,
+/// OpenSpec capability).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecGroup {
+    /// `initiative` | `epic` | `capability` | `feature` (open set).
+    pub kind: String,
+    /// The group's identifier.
+    pub id: String,
+}
+
+/// One file of a spec unit, identified by git blob oid (never its bytes).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UnitFile {
+    /// Repo-relative path.
+    pub path: String,
+    /// Git blob oid.
+    pub oid: String,
+}
+
+/// Shape counts of a spec unit. All metadata; zero when the kind has no such
+/// concept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecCounts {
+    #[serde(default)]
+    pub req_total: u32,
+    #[serde(default)]
+    pub req_added: u32,
+    #[serde(default)]
+    pub req_modified: u32,
+    #[serde(default)]
+    pub req_removed: u32,
+    #[serde(default)]
+    pub req_renamed: u32,
+    #[serde(default)]
+    pub req_open: u32,
+    #[serde(default)]
+    pub scenarios: u32,
+    #[serde(default)]
+    pub tasks_total: u32,
+    #[serde(default)]
+    pub tasks_done: u32,
+    #[serde(default)]
+    pub tasks_parallel: u32,
+    #[serde(default)]
+    pub stories: u32,
+    /// Story counts by status word (BMAD), e.g. `{"done": 3, "ready": 2}`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub story_status: BTreeMap<String, u32>,
+}
+
+/// A requirement's id and state. The id (`R1`, `FR-001`) is an identifier; the
+/// requirement text is full-tier only ([`SpecSource::requirement_bodies`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequirementRef {
+    pub id: String,
+    /// `added` | `modified` | `removed` | `renamed` | `open` | `declared`.
+    pub state: String,
+    #[serde(default)]
+    pub scenarios: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+}
+
+/// A task's id and progress. The task text is full-tier only
+/// ([`SpecSource::task_bodies`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRef {
+    pub id: String,
+    #[serde(default)]
+    pub done: bool,
+    /// The user story the task belongs to (`US1`), when the kind has them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story: Option<String>,
+    #[serde(default)]
+    pub parallel: bool,
+    /// `backlog` | `ready` | `in-progress` | `review` | `done` (BMAD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Planned-vs-touched drift counts for a spec unit. No "satisfied" or
+/// "compliant" judgement is ever carried.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecDrift {
+    pub planned_untouched: u32,
+    pub touched_unplanned: u32,
+    pub edited_with_implementation: bool,
+}
+
+/// A requirement or task id with its markdown text — CONTENT (consent-gated),
+/// only ever inside the allowlisted [`SpecSource`] full-tier fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyRef {
+    pub id: String,
+    pub md: String,
 }
 
 /// One commit trailer occurrence: the key and the decision it references.
@@ -748,6 +954,14 @@ pub struct KnowledgeTrailerRef {
     /// word `value`, so the metadata-tier test pins its absence explicitly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// For a `spec` trailer: the comma-split values that EXACTLY match a
+    /// captured spec slug. Those slugs already cross as `KnowledgeSpec.slug`,
+    /// so this is metadata at every tier and survives
+    /// [`KnowledgeBatch::strip_content`] — it is what lets a metadata-tier
+    /// workspace join commits to specs (per-spec effort and throughput).
+    /// Never free text: a value that is not a known slug is simply absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_refs: Vec<String>,
 }
 
 /// One guard event (shown / blocked / complied / overridden / superseded) —
@@ -793,7 +1007,8 @@ pub struct KnowledgeRepoStats {
     pub window_days: u32,
     /// Distinct paths touched by commits inside the window.
     pub active_paths: u64,
-    /// Of those, paths covered by an active guard glob or a verified spec.
+    /// Of those, paths covered by an active guard glob or any captured spec
+    /// (every spec contributes its globs, verified or not — D-0017).
     pub covered_paths: u64,
     /// Non-merge commits in the window touching non-`.zavet/` paths.
     pub nontrivial_commits: u64,
@@ -809,6 +1024,32 @@ pub struct KnowledgeRepoStats {
     /// Optional and skipped when absent so older payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zavet_since: Option<String>,
+    /// Spec frameworks declared via `spec-source:` in `.zavet/config`, with
+    /// unit counts by normalised state. Metadata (kinds, roots, counts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_sources: Vec<RepoSpecSource>,
+    /// Of `nontrivial_commits`, those citing any captured spec slug in a
+    /// `Spec:` trailer. Sits next to `trailer_commits`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_cited_commits: Option<u32>,
+}
+
+/// One declared spec-framework source in a repo, with its unit census.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoSpecSource {
+    /// `openspec` | `speckit` | `bmad` | `superpowers`.
+    pub kind: String,
+    /// Declared root, repo-relative.
+    pub root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_version: Option<String>,
+    /// Number of units found under the root.
+    #[serde(default)]
+    pub units: u32,
+    /// Unit counts by normalised state.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_state: BTreeMap<String, u32>,
 }
 
 /// The cloud's typed response to a successful `POST /api/v1/knowledge`.
@@ -1014,6 +1255,15 @@ mod tests {
         "payload.specs[].bodyMd",
         "payload.decisions[].checks[].command",
         "payload.specs[].checks[].command",
+        // Spec-source full tier (1.5). The container paths hold no denied
+        // token themselves; they are listed so the metadata-tier test proves
+        // `strip_content` empties every one of them.
+        "payload.specs[].source.requirementBodies",
+        "payload.specs[].source.requirementBodies[].md",
+        "payload.specs[].source.taskBodies",
+        "payload.specs[].source.taskBodies[].md",
+        "payload.specs[].source.summaryMd",
+        "payload.specs[].source.trackerRefs",
     ];
 
     // Split a field name (snake_case on disk, camelCase on the wire) into its
@@ -1057,6 +1307,71 @@ mod tests {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A fully-populated full-tier spec source (every field set).
+    fn full_spec_source() -> SpecSource {
+        SpecSource {
+            kind: "openspec".into(),
+            id: "add-csv-import".into(),
+            root: "openspec".into(),
+            framework_version: Some("0.9.1".into()),
+            state: "active".into(),
+            native_state: Some("in-progress".into()),
+            state_changed_at: Some("2026-09-30T10:00:00Z".into()),
+            closed_on: Some("2026-09-30".into()),
+            group: Some(SpecGroup {
+                kind: "capability".into(),
+                id: "csv-import".into(),
+            }),
+            capabilities: vec!["csv-import".into()],
+            risk: Some("low".into()),
+            unit_files: vec![UnitFile {
+                path: "openspec/changes/add-csv-import/proposal.md".into(),
+                oid: "blob3".into(),
+            }],
+            planned_paths: vec!["src/import/csv.ts".into()],
+            counts: SpecCounts {
+                req_total: 3,
+                req_added: 2,
+                req_modified: 1,
+                scenarios: 4,
+                tasks_total: 5,
+                tasks_done: 2,
+                tasks_parallel: 1,
+                stories: 2,
+                story_status: BTreeMap::from([("done".into(), 1)]),
+                ..Default::default()
+            },
+            requirement_refs: vec![RequirementRef {
+                id: "R1".into(),
+                state: "added".into(),
+                scenarios: 2,
+                capability: Some("csv-import".into()),
+            }],
+            task_refs: vec![TaskRef {
+                id: "1.2".into(),
+                done: true,
+                story: Some("US1".into()),
+                parallel: false,
+                status: Some("done".into()),
+            }],
+            drift: Some(SpecDrift {
+                planned_untouched: 1,
+                touched_unplanned: 3,
+                edited_with_implementation: false,
+            }),
+            requirement_bodies: vec![BodyRef {
+                id: "R1".into(),
+                md: "full-tier requirement prose".into(),
+            }],
+            task_bodies: vec![BodyRef {
+                id: "1.2".into(),
+                md: "full-tier task prose".into(),
+            }],
+            summary_md: Some("full-tier summary prose".into()),
+            tracker_refs: vec!["GH#123".into()],
         }
     }
 
@@ -1115,6 +1430,7 @@ mod tests {
                     command: Some("full-tier command".into()),
                 }],
                 body_md: Some("## Overview\nfull-tier prose".into()),
+                source: Some(full_spec_source()),
             }],
             trailer_refs: vec![KnowledgeTrailerRef {
                 repo_canonical: Some("github.com/acme/api".into()),
@@ -1123,6 +1439,7 @@ mod tests {
                 key: "refs".into(),
                 decision_id: Some("D-0001".into()),
                 value: Some("D-0001 full-tier prose".into()),
+                spec_refs: vec!["openspec:add-csv-import".into()],
             }],
             guard_events: vec![KnowledgeGuardEvent {
                 id: "01J0EVENT".into(),
@@ -1142,6 +1459,14 @@ mod tests {
                 trailer_commits: 25,
                 computed_at: "t".into(),
                 zavet_since: Some("2026-06-01T00:00:00Z".into()),
+                spec_sources: vec![RepoSpecSource {
+                    kind: "openspec".into(),
+                    root: "openspec".into(),
+                    framework_version: Some("0.9.1".into()),
+                    units: 3,
+                    by_state: BTreeMap::from([("active".into(), 2), ("archived".into(), 1)]),
+                }],
+                spec_cited_commits: Some(12),
             }],
         }
     }
@@ -1199,6 +1524,8 @@ mod tests {
                     // Populated so the content-token walk covers the 1.4 fields.
                     runtime: Some("claude-web".into()),
                     runtime_session_ref: Some("cse".into()),
+                    // Populated so the content-token walk covers the 1.5 field.
+                    spec: Some("openspec:add-csv-import".into()),
                 }],
                 token_usage: vec![TokenUsage {
                     id: "t".into(),
@@ -1358,6 +1685,130 @@ mod tests {
     }
 
     #[test]
+    fn strip_content_clears_every_spec_source_full_tier_field() {
+        let mut batch = full_knowledge_batch();
+        batch.strip_content();
+        let src = batch.specs[0].source.as_ref().expect("source survives");
+        assert!(src.requirement_bodies.is_empty());
+        assert!(src.task_bodies.is_empty());
+        assert!(src.summary_md.is_none());
+        assert!(src.tracker_refs.is_empty());
+        // Metadata survives the strip.
+        assert_eq!(src.kind, "openspec");
+        assert_eq!(src.requirement_refs[0].id, "R1");
+        assert_eq!(src.task_refs[0].id, "1.2");
+        assert_eq!(src.unit_files[0].oid, "blob3");
+        assert_eq!(src.counts.tasks_done, 2);
+        assert_eq!(
+            batch.trailer_refs[0].spec_refs,
+            vec!["openspec:add-csv-import"]
+        );
+        assert_eq!(batch.repo_stats[0].spec_sources[0].units, 3);
+        assert_eq!(batch.repo_stats[0].spec_cited_commits, Some(12));
+        let json = serde_json::to_string(&batch).unwrap();
+        for gone in [
+            "requirementBodies",
+            "taskBodies",
+            "summaryMd",
+            "trackerRefs",
+            "full-tier requirement prose",
+            "full-tier task prose",
+            "full-tier summary prose",
+        ] {
+            assert!(!json.contains(gone), "metadata tier leaked `{gone}`");
+        }
+    }
+
+    #[test]
+    fn spec_source_roundtrips_camel_case_and_pre_1_5_payloads_parse() {
+        let batch = full_knowledge_batch();
+        let json = serde_json::to_string(&batch).unwrap();
+        for key in [
+            "\"source\":{",
+            "\"frameworkVersion\"",
+            "\"nativeState\"",
+            "\"stateChangedAt\"",
+            "\"closedOn\"",
+            "\"unitFiles\"",
+            "\"plannedPaths\"",
+            "\"reqTotal\":3",
+            "\"storyStatus\"",
+            "\"requirementRefs\"",
+            "\"taskRefs\"",
+            "\"plannedUntouched\":1",
+            "\"editedWithImplementation\":false",
+            "\"specRefs\":[\"openspec:add-csv-import\"]",
+            "\"specSources\"",
+            "\"byState\"",
+            "\"specCitedCommits\":12",
+        ] {
+            assert!(json.contains(key), "missing wire key {key}");
+        }
+        let back: KnowledgeBatch = serde_json::from_str(&json).unwrap();
+        let src = back.specs[0].source.as_ref().unwrap();
+        assert_eq!(src.requirement_bodies[0].md, "full-tier requirement prose");
+        assert_eq!(src.counts.story_status.get("done"), Some(&1));
+        assert_eq!(back.repo_stats[0].spec_sources[0].by_state["active"], 2);
+
+        // A pre-1.5 (1.4) batch — none of the new keys — still deserializes.
+        let mut old = serde_json::to_value(&batch).unwrap();
+        old["specs"][0].as_object_mut().unwrap().remove("source");
+        old["trailerRefs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("specRefs");
+        let rs = old["repoStats"][0].as_object_mut().unwrap();
+        rs.remove("specSources");
+        rs.remove("specCitedCommits");
+        let old: KnowledgeBatch = serde_json::from_value(old).unwrap();
+        assert!(old.specs[0].source.is_none());
+        assert!(old.trailer_refs[0].spec_refs.is_empty());
+        assert!(old.repo_stats[0].spec_sources.is_empty());
+        assert_eq!(old.repo_stats[0].spec_cited_commits, None);
+
+        // And absent, none of the keys reach the wire (byte-identical to 1.4).
+        let mut bare = batch;
+        bare.specs[0].source = None;
+        bare.trailer_refs[0].spec_refs.clear();
+        bare.repo_stats[0].spec_sources.clear();
+        bare.repo_stats[0].spec_cited_commits = None;
+        let json = serde_json::to_string(&bare).unwrap();
+        for absent in ["\"source\"", "specRefs", "specSources", "specCitedCommits"] {
+            assert!(!json.contains(absent), "`{absent}` should be omitted");
+        }
+    }
+
+    #[test]
+    fn session_spec_roundtrips_and_is_omitted_when_none() {
+        let mut s = SessionRollup {
+            session_id: "s".into(),
+            harness: Harness::ClaudeCode,
+            kind: SessionKind::Agent,
+            repo_canonical: None,
+            identity_email: "e".into(),
+            started_at: "t".into(),
+            ended_at: None,
+            agent_wall_seconds: 1,
+            prompts: None,
+            branch: None,
+            note: None,
+            label: None,
+            runtime: None,
+            runtime_session_ref: None,
+            spec: Some("bmad:epic-1".into()),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"spec\":\"bmad:epic-1\""));
+        let back: SessionRollup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.spec.as_deref(), Some("bmad:epic-1"));
+        s.spec = None;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("spec"));
+        let old: SessionRollup = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.spec, None);
+    }
+
+    #[test]
     fn knowledge_envelope_roundtrips_camel_case() {
         let env = KnowledgeEnvelope {
             schema_version: SCHEMA_VERSION.into(),
@@ -1481,6 +1932,7 @@ mod tests {
             label: None,
             runtime: Some("claude-web".into()),
             runtime_session_ref: Some("cse_01".into()),
+            spec: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"runtime\":\"claude-web\""));

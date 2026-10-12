@@ -1222,6 +1222,7 @@ fn partial_rollups(
             branch: s.branch,
             note: s.note,
             label: s.label,
+            spec: s.spec,
         })
         .collect()
 }
@@ -1384,6 +1385,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 
@@ -1410,6 +1412,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 

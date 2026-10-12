@@ -27,6 +27,10 @@ pub enum Request {
         note: Option<String>,
         /// Working dir to resolve a project from when `project` is omitted.
         cwd: Option<String>,
+        /// Spec slug the session works under (`--spec openspec:add-csv-import`).
+        /// The slug only — never prose (D-0001). Absent from older clients.
+        #[serde(default)]
+        spec: Option<String>,
     },
     /// Stop one or more manual sessions.
     Stop { selector: StopSelector },
@@ -90,6 +94,12 @@ pub enum Request {
     },
     /// List a repo's captured decisions.
     ZavetDecisions {
+        cwd: Option<String>,
+        repo: Option<String>,
+    },
+    /// List a repo's source-backed spec units — OpenSpec, Spec Kit, BMAD and
+    /// superpowers units captured as living specs (`dira zavet specs`).
+    ZavetSpecs {
         cwd: Option<String>,
         repo: Option<String>,
     },
@@ -316,6 +326,8 @@ pub enum Response {
     ZavetStatus(Box<ZavetStatusView>),
     /// `ZavetWhy`.
     ZavetWhy(Box<ZavetWhyView>),
+    /// `ZavetSpecs`. Only a CLI new enough to send `ZavetSpecs` can receive it.
+    ZavetSpecs(Box<ZavetSpecsView>),
     /// `ZavetDecisions`.
     ZavetDecisions(Box<ZavetDecisionsView>),
     /// `ZavetWhy` with an ambiguous free-text query: ranked matches instead
@@ -680,6 +692,56 @@ pub struct ZavetStatusView {
     pub guard_events: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guard_stats: Vec<ZavetGuardStatView>,
+    /// Spec frameworks whose directories exist in the working tree (a `stat`
+    /// probe: `openspec`, `speckit`, `bmad`, `superpowers`). Empty when the
+    /// daemon has no working directory for the repo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frameworks_detected: Vec<String>,
+    /// Frameworks declared via `spec-source:` in `.zavet/config`, with how many
+    /// units the daemon has captured under each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_sources: Vec<ZavetSpecSourceLine>,
+}
+
+/// One declared spec-framework source and its captured census
+/// (`dira zavet status`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecSourceLine {
+    pub kind: String,
+    pub root: String,
+    /// Units captured under this declaration (excluding `removed`).
+    pub units: u32,
+    /// Of those, units the plugin could not resolve (`unresolved`).
+    pub unresolved: u32,
+}
+
+/// Source-backed spec units for one repo (`dira zavet specs`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecsView {
+    pub repo: String,
+    /// Whether zavet is active for the repo.
+    pub active: bool,
+    /// Source-backed units only, ordered by slug.
+    pub specs: Vec<ZavetSpecView>,
+}
+
+/// Framework provenance of a source-backed spec, as `dira zavet specs` shows it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZavetSpecSourceView {
+    pub kind: String,
+    pub id: String,
+    pub root: String,
+    /// Normalised lifecycle state.
+    pub state: String,
+    /// The framework's own state word, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_version: Option<String>,
+    pub tasks_total: u32,
+    pub tasks_done: u32,
+    pub req_total: u32,
+    pub req_open: u32,
 }
 
 /// What one `dira zavet reindex` walk saw and what it actually wrote.
@@ -936,6 +998,9 @@ pub struct ZavetSpecView {
     /// Whether this spec's file is on the caller's branch; `None` = unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence: Option<ZavetPresence>,
+    /// Framework provenance for a source-backed unit; `None` for a native spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ZavetSpecSourceView>,
 }
 
 /// One ranked spec hit for a free-text `why`/`wiki` query.

@@ -43,6 +43,11 @@ pub struct ZavetConfig {
     /// Zero-padding width for canonical ids. Fixed per repo: an id minted at
     /// one width would never join a shorthand ref resolved at another.
     pub id_width: usize,
+    /// Spec-framework sources declared by `spec-source:` lines, in file order.
+    /// Only the four known kinds survive parsing; an unknown kind is ignored
+    /// (the plugin reports it as unknown — dira never acts on a framework it
+    /// has no adapter for). Empty for every repo that never declared one.
+    pub spec_sources: Vec<SpecSourceDecl>,
 }
 
 impl Default for ZavetConfig {
@@ -50,8 +55,67 @@ impl Default for ZavetConfig {
         Self {
             prefixes: vec![DEFAULT_PREFIX.to_string()],
             id_width: DEFAULT_ID_WIDTH,
+            spec_sources: Vec::new(),
         }
     }
+}
+
+/// The spec-framework kinds a `spec-source:` line may name. Anything else is
+/// ignored at parse time.
+pub const SPEC_SOURCE_KINDS: &[&str] = &["openspec", "speckit", "bmad", "superpowers"];
+
+/// One `spec-source: <kind> <root> [<glob>...]` declaration from
+/// `.zavet/config`. The optional globs are human-declared coverage for the
+/// framework's units (design §4.1); `root` is repo-relative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecSourceDecl {
+    /// One of [`SPEC_SOURCE_KINDS`].
+    pub kind: String,
+    /// Repo-relative root directory of the framework's units.
+    pub root: String,
+    /// Declared coverage globs; empty when none were given.
+    pub globs: Vec<String>,
+}
+
+/// Split a `Spec:` trailer value into its slugs: comma-separated, each trimmed,
+/// empties dropped. `"a, b,, c "` -> `["a", "b", "c"]`. Order is preserved and
+/// duplicates are kept (callers dedupe where it matters). This is the ONE
+/// definition of how a `Spec:` value names specs — the store's
+/// `zavet_trailer_values` split and the capture-time binding both use it, so a
+/// slug can never match in one place and not the other.
+pub fn spec_trailer_slugs(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Normalise a `spec-source` root the way the plugin does and return it, or
+/// `None` when it is unusable: leading `./` segments and trailing `/` are
+/// stripped; the result must be non-empty, repo-relative, free of `..` / `.`
+/// segments and backslashes, and must not be the repo root (`.`) or live in
+/// the knowledge layer (`.zavet`, `.zavet/...`). dira walks and shells out
+/// against this path, so a root that escapes the repo is dropped rather than
+/// trusted. Parity with the plugin matters: a root one side keeps and the
+/// other drops would make `path_triggers_resolve` and the resolver disagree.
+fn normalize_spec_root(root: &str) -> Option<String> {
+    let mut r = root;
+    while let Some(rest) = r.strip_prefix("./") {
+        r = rest.trim_start_matches('/');
+    }
+    let r = r.trim_end_matches('/');
+    let ok = !r.is_empty()
+        && r != "."
+        && !r.starts_with('/')
+        && !r.contains('\\')
+        && !r
+            .split('/')
+            .any(|seg| seg == ".." || seg == "." || seg.is_empty())
+        && r != ".zavet"
+        && !r.starts_with(".zavet/");
+    ok.then(|| r.to_string())
 }
 
 /// A well-formed prefix as it appears in a FILENAME: uppercase only.
@@ -127,6 +191,23 @@ pub fn parse_config(text: &str) -> ZavetConfig {
                     if is_prefix_filename(p) && !retired.iter().any(|r| r == p) {
                         retired.push(p.to_string());
                     }
+                }
+            }
+            "spec-source" => {
+                let mut parts = value.split_whitespace();
+                let (Some(kind), Some(root)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                if let Some(root) = SPEC_SOURCE_KINDS
+                    .contains(&kind)
+                    .then(|| normalize_spec_root(root))
+                    .flatten()
+                {
+                    cfg.spec_sources.push(SpecSourceDecl {
+                        kind: kind.to_string(),
+                        root,
+                        globs: parts.map(str::to_string).collect(),
+                    });
                 }
             }
             "id-width" => {
@@ -1005,6 +1086,7 @@ mod tests {
         let cfg = ZavetConfig {
             prefixes: vec!["CLOUD".to_string()],
             id_width: 5,
+            ..ZavetConfig::default()
         };
         let prose = "UTF-8 and SHA-256 per RFC-2119; see CVE-2024 and AES-128. \
                      The decision is CLOUD-42.";
@@ -1021,6 +1103,7 @@ mod tests {
         let cfg = ZavetConfig {
             prefixes: vec!["CLOUD".to_string(), "D".to_string()],
             id_width: 5,
+            ..ZavetConfig::default()
         };
         assert_eq!(
             scan_all_decision_refs("D-41 then CLOUD-42", &cfg),
@@ -1035,6 +1118,7 @@ mod tests {
         let cfg = ZavetConfig {
             prefixes: vec!["D".to_string(), "DB".to_string()],
             id_width: 4,
+            ..ZavetConfig::default()
         };
         assert_eq!(
             scan_all_decision_refs("D-1 and DB-2", &cfg),
@@ -1050,6 +1134,91 @@ mod tests {
             assert_eq!(cfg.prefixes, vec!["D".to_string()], "text: {text:?}");
             assert_eq!(cfg.id_width, DEFAULT_ID_WIDTH);
         }
+    }
+
+    #[test]
+    fn config_collects_repeatable_spec_sources_in_order() {
+        let cfg = parse_config(
+            "prefix: D\n\
+             spec-source: openspec openspec\n\
+             spec-source: speckit specs src/** docs/*.md   # trailing comment\n\
+             spec-source: bmad _bmad-output/\n\
+             spec-source: superpowers docs/superpowers\n",
+        );
+        let got: Vec<(&str, &str, Vec<&str>)> = cfg
+            .spec_sources
+            .iter()
+            .map(|d| {
+                (
+                    d.kind.as_str(),
+                    d.root.as_str(),
+                    d.globs.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("openspec", "openspec", vec![]),
+                ("speckit", "specs", vec!["src/**", "docs/*.md"]),
+                ("bmad", "_bmad-output", vec![]),
+                ("superpowers", "docs/superpowers", vec![]),
+            ]
+        );
+        // The id conventions are untouched by the new lines.
+        assert_eq!(cfg.prefixes, vec!["D".to_string()]);
+    }
+
+    #[test]
+    fn config_ignores_unknown_kinds_and_unsafe_or_incomplete_spec_sources() {
+        let cfg = parse_config(
+            "spec-source: madeup docs/x\n\
+             spec-source: openspec\n\
+             spec-source:\n\
+             spec-source: openspec /etc\n\
+             spec-source: openspec ../escape\n\
+             spec-source: openspec a/../b\n\
+             spec-source: bmad ok-root\n",
+        );
+        assert_eq!(cfg.spec_sources.len(), 1);
+        assert_eq!(cfg.spec_sources[0].kind, "bmad");
+        assert!(parse_config("").spec_sources.is_empty());
+    }
+
+    #[test]
+    fn spec_source_roots_normalise_like_the_plugin() {
+        let cfg = parse_config(
+            "spec-source: openspec ./openspec/\n\
+             spec-source: bmad ././_bmad-output\n\
+             spec-source: speckit .\n\
+             spec-source: speckit ./\n\
+             spec-source: superpowers .zavet\n\
+             spec-source: superpowers ./.zavet/specs\n\
+             spec-source: openspec a/./b\n\
+             spec-source: openspec a//b\n",
+        );
+        let roots: Vec<&str> = cfg.spec_sources.iter().map(|d| d.root.as_str()).collect();
+        assert_eq!(roots, vec!["openspec", "_bmad-output"]);
+        // The trigger path matches the NORMALISED root.
+        assert!(crate::zavet_specs::path_triggers_resolve(
+            &cfg,
+            "openspec/changes/x/proposal.md"
+        ));
+    }
+
+    #[test]
+    fn spec_trailer_slugs_splits_trims_and_drops_empties() {
+        assert_eq!(spec_trailer_slugs("a"), vec!["a"]);
+        assert_eq!(
+            spec_trailer_slugs(" openspec:add-csv-import ,capture-pipeline,, "),
+            vec!["openspec:add-csv-import", "capture-pipeline"]
+        );
+        assert_eq!(spec_trailer_slugs("a,a"), vec!["a", "a"]);
+        assert!(spec_trailer_slugs("").is_empty());
+        assert!(spec_trailer_slugs(" , ,").is_empty());
+        // Only commas separate: a slug with an internal space stays one slug
+        // (it will simply not match any captured spec).
+        assert_eq!(spec_trailer_slugs("two words"), vec!["two words"]);
     }
 
     #[test]
@@ -1178,6 +1347,7 @@ mod tests {
         let cfg = ZavetConfig {
             prefixes: vec!["CLOUD".to_string(), "D".to_string()],
             id_width: 5,
+            ..ZavetConfig::default()
         };
         let ts = normalize_trailers(
             &[
@@ -1203,6 +1373,7 @@ mod tests {
         let cfg = ZavetConfig {
             prefixes: vec!["CLOUD".to_string()],
             id_width: 5,
+            ..ZavetConfig::default()
         };
         let doc = "---\nid: CLOUD-42\ntitle: T\nstatus: active\nsupersedes: CLOUD-00007\n\
                    corrected-by: CLOUD-9\nguards:\n  - src/**\n---\n\nbody\n";
@@ -1224,6 +1395,7 @@ mod tests {
         let cfg = ZavetConfig {
             prefixes: vec!["CLOUD".to_string(), "D".to_string()],
             id_width: 5,
+            ..ZavetConfig::default()
         };
         let doc = "---\ntitle: Sync\ndecisions: [CLOUD-1, D-7]\n---\n\n\
                    Per CLOUD-42 and D-7 again. Encoded as UTF-8, hashed with \
@@ -1396,7 +1568,7 @@ mod tests {
             prefixes in proptest::collection::vec("[A-Z][A-Z0-9]{0,5}", 1..4),
             width in 1usize..9,
         ) {
-            let cfg = ZavetConfig { prefixes, id_width: width };
+            let cfg = ZavetConfig { prefixes, id_width: width, ..ZavetConfig::default() };
             let _ = scan_all_decision_refs(&s, &cfg);
         }
 

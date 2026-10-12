@@ -39,6 +39,7 @@ fn ev(session: &str, kind: EventKind, at: OffsetDateTime) -> RawEvent {
         label: None,
         activity: None,
         note: None,
+        spec: None,
     }
 }
 
@@ -343,6 +344,7 @@ async fn zavet_why_resolves_specs_and_links_both_ways() {
         body_md: Some("## Overview\nThe sweep batches trailer parsing.".into()),
         content_hash: None,
         checks: Vec::new(),
+        source: None,
     };
     state
         .store

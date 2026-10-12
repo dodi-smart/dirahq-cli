@@ -28,6 +28,22 @@
     "sig"
   ],
   "$defs": {
+    "BodyRef": {
+      "description": "A requirement or task id with its markdown text — CONTENT (consent-gated),\nonly ever inside the allowlisted [`SpecSource`] full-tier fields.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "md": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "md"
+      ]
+    },
     "KnowledgeBatch": {
       "description": "The unit of knowledge sync: zavet decisions, specs, trailer refs, guard\nevents, and per-repo coverage stats captured locally.\n\nIdempotent by `batchId` (deterministic over the covered items + tier, so a\ncrash-retry re-sends identical bytes) and by per-item natural keys cloud-side\n— wipe-and-resync reproduces cloud state.\n\n**Tiering.** At `tier: \"metadata\"` (the default when the channel is enabled\nat all) every content field — `bodyMd` on decisions and specs, `value` on\ntrailer refs — is `None`/absent: ids, slugs, titles, status, globs, shas,\ntrailer keys + decision refs, and counts are enough for dashboards to show\nstructure, cost, and guard telemetry without any prose. `tier: \"full\"`\npopulates them, and only a workspace that separately opted in stores them.\n[`KnowledgeBatch::strip_content`] is the producer-side downgrade.",
       "type": "object",
@@ -306,7 +322,7 @@
           "type": "string"
         },
         "coveredPaths": {
-          "description": "Of those, paths covered by an active guard glob or a verified spec.",
+          "description": "Of those, paths covered by an active guard glob or any captured spec\n(every spec contributes its globs, verified or not — D-0017).",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
@@ -320,6 +336,22 @@
         "repoCanonical": {
           "description": "Canonical repo ref.",
           "type": "string"
+        },
+        "specCitedCommits": {
+          "description": "Of `nontrivial_commits`, those citing any captured spec slug in a\n`Spec:` trailer. Sits next to `trailer_commits`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "specSources": {
+          "description": "Spec frameworks declared via `spec-source:` in `.zavet/config`, with\nunit counts by normalised state. Metadata (kinds, roots, counts).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RepoSpecSource"
+          }
         },
         "trailerCommits": {
           "description": "Of those, commits carrying at least one knowledge trailer.",
@@ -441,6 +473,17 @@
           "description": "Filename-stem identity, e.g. `capture-pipeline`.",
           "type": "string"
         },
+        "source": {
+          "description": "Set only for source-backed units (OpenSpec, Spec Kit, BMAD,\nsuperpowers) — see [`SpecSource`]. `path` then holds the unit's primary\ndocument and `first_commit`/`last_commit`/`created_at`/`updated_at`\ncarry the unit's git history. Absent for native zavet specs.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpecSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "sourceSession": {
           "type": [
             "string",
@@ -513,6 +556,13 @@
           "description": "Commit sha carrying the trailer.",
           "type": "string"
         },
+        "specRefs": {
+          "description": "For a `spec` trailer: the comma-split values that EXACTLY match a\ncaptured spec slug. Those slugs already cross as `KnowledgeSpec.slug`,\nso this is metadata at every tier and survives\n[`KnowledgeBatch::strip_content`] — it is what lets a metadata-tier\nworkspace join commits to specs (per-spec effort and throughput).\nNever free text: a value that is not a known slug is simply absent.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "value": {
           "description": "CONTENT (consent-gated): the trailer's free text. `None` unless the\nbatch is full-tier (policy-gated: the token denylist cannot see the\nword `value`, so the metadata-tier test pins its absence explicitly).",
           "type": [
@@ -525,6 +575,415 @@
         "sha",
         "seq",
         "key"
+      ]
+    },
+    "RepoSpecSource": {
+      "description": "One declared spec-framework source in a repo, with its unit census.",
+      "type": "object",
+      "properties": {
+        "byState": {
+          "description": "Unit counts by normalised state.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "frameworkVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "`openspec` | `speckit` | `bmad` | `superpowers`.",
+          "type": "string"
+        },
+        "root": {
+          "description": "Declared root, repo-relative.",
+          "type": "string"
+        },
+        "units": {
+          "description": "Number of units found under the root.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind",
+        "root"
+      ]
+    },
+    "RequirementRef": {
+      "description": "A requirement's id and state. The id (`R1`, `FR-001`) is an identifier; the\nrequirement text is full-tier only ([`SpecSource::requirement_bodies`]).",
+      "type": "object",
+      "properties": {
+        "capability": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "scenarios": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "state": {
+          "description": "`added` | `modified` | `removed` | `renamed` | `open` | `declared`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "state"
+      ]
+    },
+    "SpecCounts": {
+      "description": "Shape counts of a spec unit. All metadata; zero when the kind has no such\nconcept.",
+      "type": "object",
+      "properties": {
+        "reqAdded": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "reqModified": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "reqOpen": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "reqRemoved": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "reqRenamed": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "reqTotal": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "scenarios": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "stories": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "storyStatus": {
+          "description": "Story counts by status word (BMAD), e.g. `{\"done\": 3, \"ready\": 2}`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "tasksDone": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "tasksParallel": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "tasksTotal": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        }
+      }
+    },
+    "SpecDrift": {
+      "description": "Planned-vs-touched drift counts for a spec unit. No \"satisfied\" or\n\"compliant\" judgement is ever carried.",
+      "type": "object",
+      "properties": {
+        "editedWithImplementation": {
+          "type": "boolean"
+        },
+        "plannedUntouched": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "touchedUnplanned": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "plannedUntouched",
+        "touchedUnplanned",
+        "editedWithImplementation"
+      ]
+    },
+    "SpecGroup": {
+      "description": "A spec unit's grouping (BMAD initiative / epic, Spec Kit feature number,\nOpenSpec capability).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The group's identifier.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`initiative` | `epic` | `capability` | `feature` (open set).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
+    },
+    "SpecSource": {
+      "description": "Spec-framework provenance and shape for a source-backed [`KnowledgeSpec`]\n(slug `<kind>:<id>`, `origin: external`, never `verified`).\n\nEverything outside the \"full tier\" block is metadata: identifiers, enums,\ncounts, timestamps and blob oids — requirement and task *ids* are\nidentifiers the framework itself prints, not prose. The full-tier block is\nconsent-gated exactly like `bodyMd`: cleared by\n[`KnowledgeBatch::strip_content`] and pinned in the no-content-fields\ninvariant. Assignees and any personal frontmatter fields never cross.",
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "description": "OpenSpec capability directory names touched by the unit's deltas.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "closedOn": {
+          "description": "The date the unit closed (`2026-09-30`), when the framework records one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "counts": {
+          "description": "Requirement / scenario / task shape counts.",
+          "$ref": "#/$defs/SpecCounts",
+          "default": {
+            "reqAdded": 0,
+            "reqModified": 0,
+            "reqOpen": 0,
+            "reqRemoved": 0,
+            "reqRenamed": 0,
+            "reqTotal": 0,
+            "scenarios": 0,
+            "stories": 0,
+            "tasksDone": 0,
+            "tasksParallel": 0,
+            "tasksTotal": 0
+          }
+        },
+        "drift": {
+          "description": "Planned-vs-touched drift counts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpecDrift"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frameworkVersion": {
+          "description": "The framework's own version, when it can be read.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group": {
+          "description": "Initiative / epic / capability / feature grouping, when the kind has one.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpecGroup"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "description": "The unit id within its framework, e.g. `add-csv-import`.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`openspec` | `speckit` | `bmad` | `superpowers` (open set).",
+          "type": "string"
+        },
+        "nativeState": {
+          "description": "The framework's own state word, verbatim.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plannedPaths": {
+          "description": "Paths the framework *claims* the unit will touch — a claim, never\ncoverage (coverage stays in `KnowledgeSpec.paths`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "requirementBodies": {
+          "description": "CONTENT (consent-gated): requirement text by id. Empty unless the\nbatch is full-tier. Named `*_bodies`, never `*_body`, so the whole-token\ndenylist stays meaningful; allowlisted by exact path.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BodyRef"
+          }
+        },
+        "requirementRefs": {
+          "description": "Requirement ids with state — ids only, never the requirement text.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RequirementRef"
+          }
+        },
+        "risk": {
+          "description": "`low` | `medium` | `high` (BMAD epic frontmatter only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "root": {
+          "description": "Declared source root, repo-relative (`openspec`, `specs`, …).",
+          "type": "string"
+        },
+        "state": {
+          "description": "Normalised lifecycle: `proposed` | `active` | `in-progress` | `review` |\n`done` | `archived` | `removed` | `unresolved`.",
+          "type": "string"
+        },
+        "stateChangedAt": {
+          "description": "RFC 3339 instant dira observed `state` change (stamped producer-side).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summaryMd": {
+          "description": "CONTENT (consent-gated): the unit summary (proposal \"Why\", Spec Kit\nsummary, epic description). `None` unless full-tier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskBodies": {
+          "description": "CONTENT (consent-gated): task text by id. Empty unless full-tier.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BodyRef"
+          }
+        },
+        "taskRefs": {
+          "description": "Task ids with progress — ids only, never the task text.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskRef"
+          }
+        },
+        "trackerRefs": {
+          "description": "CONTENT (consent-gated): tracker references (`GH#123`, `PROJ-42`) from\nframework frontmatter. Empty unless full-tier — they can name private\ntrackers, so they ride with the content tier.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unitFiles": {
+          "description": "The unit's files with their git blob oids (identity pointers).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UnitFile"
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "root",
+        "state"
+      ]
+    },
+    "TaskRef": {
+      "description": "A task's id and progress. The task text is full-tier only\n([`SpecSource::task_bodies`]).",
+      "type": "object",
+      "properties": {
+        "done": {
+          "type": "boolean",
+          "default": false
+        },
+        "id": {
+          "type": "string"
+        },
+        "parallel": {
+          "type": "boolean",
+          "default": false
+        },
+        "status": {
+          "description": "`backlog` | `ready` | `in-progress` | `review` | `done` (BMAD).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "story": {
+          "description": "The user story the task belongs to (`US1`), when the kind has them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "UnitFile": {
+      "description": "One file of a spec unit, identified by git blob oid (never its bytes).",
+      "type": "object",
+      "properties": {
+        "oid": {
+          "description": "Git blob oid.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Repo-relative path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "oid"
       ]
     }
   }

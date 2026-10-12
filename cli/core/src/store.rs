@@ -11,7 +11,7 @@ use crate::project::CapturedCommit;
 use crate::sync::{ArtifactRow, TokenRow};
 use crate::tokens::TokenTurn;
 use crate::Error;
-use dira_contract::Harness;
+use dira_contract::{Harness, SpecSource};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
@@ -129,8 +129,8 @@ impl Store {
     pub async fn append(&self, ev: &RawEvent) -> Result<(), Error> {
         sqlx::query(
             "INSERT INTO events
-                (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity, note)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity, note, spec)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(&ev.id)
         .bind(ev.at.format(&Rfc3339).map_err(Error::time)?)
@@ -145,6 +145,7 @@ impl Store {
         .bind(&ev.label)
         .bind(&ev.activity)
         .bind(&ev.note)
+        .bind(&ev.spec)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -381,6 +382,20 @@ impl Store {
     /// nothing that ever reached the cloud is affected.
     pub async fn delete_session_events(&self, session_id: &str) -> Result<u64, Error> {
         let res = sqlx::query("DELETE FROM events WHERE session_id = ?1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Bind `session_id` to the spec slug it works under: stamp `spec` on every
+    /// stored event of the session that has none. Idempotent, and never
+    /// overwrites an existing value (an explicit `dira start --spec` wins over a
+    /// capture-time resolution). Event ids and the sync cursors are untouched, so
+    /// this never replays anything. Returns the number of rows stamped.
+    pub async fn session_spec_set(&self, session_id: &str, spec: &str) -> Result<u64, Error> {
+        let res = sqlx::query("UPDATE events SET spec = ?1 WHERE session_id = ?2 AND spec IS NULL")
+            .bind(spec)
             .bind(session_id)
             .execute(&self.pool)
             .await?;
@@ -1113,6 +1128,22 @@ impl Store {
             .bind(seq as i64)
             .execute(&mut *tx)
             .await?;
+            // `Spec:` is the one list-valued key: split it so a lookup is an
+            // exact match on one slug (INSERT OR IGNORE keeps a re-walk a no-op).
+            if t.key == "spec" {
+                for slug in crate::zavet::spec_trailer_slugs(&t.value) {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO zavet_trailer_values (sha, repo, key, value)
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )
+                    .bind(sha)
+                    .bind(repo)
+                    .bind(&t.key)
+                    .bind(slug)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -1446,14 +1477,11 @@ impl Store {
         seq: i64,
         limit: i64,
     ) -> Result<Vec<(i64, ZavetSpecRow)>, Error> {
-        let rows = sqlx::query(
-            "SELECT repo, slug, title, version, origin, verified, confidence, date,
-                    path, body_md, content_hash,
-                    first_commit, last_commit, created_at, updated_at,
-                    source_session, touched_seq
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ZAVET_SPEC_COLS}, touched_seq
              FROM zavet_specs WHERE touched_seq > ?1
-             ORDER BY touched_seq ASC LIMIT ?2",
-        )
+             ORDER BY touched_seq ASC LIMIT ?2"
+        )))
         .bind(seq)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -1606,6 +1634,26 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.iter().map(|r| r.get("sha")).collect())
+    }
+
+    /// Every `(sha, slug)` pair of `Spec:` trailer values recorded for `repo`
+    /// (one row per comma-separated item — see `zavet_trailer_values`). The
+    /// caller intersects it with the captured spec slugs: only an exact match
+    /// counts as a spec citation.
+    pub async fn zavet_spec_trailer_values(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        let rows = sqlx::query(
+            "SELECT sha, value FROM zavet_trailer_values WHERE repo = ?1 AND key = 'spec'",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("sha"), r.get("value")))
+            .collect())
     }
 
     /// The decisions `id` corrects — the reverse of `corrected_by`, so a
@@ -1910,13 +1958,69 @@ impl Store {
         source_session: Option<&str>,
     ) -> Result<(), Error> {
         let mut tx = self.pool.begin().await?;
+        Self::upsert_spec_in(&mut tx, repo, cap, commit_sha, authored_at, source_session).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::zavet_upsert_spec`] for many captures in ONE transaction: one
+    /// commit (one fsync) for a whole source-unit sweep instead of one per
+    /// unit, and a sweep that is all-or-nothing. Writes apply in order, so a
+    /// slug may appear twice (first sight, then latest sighting).
+    pub async fn zavet_upsert_specs(
+        &self,
+        repo: &str,
+        source_session: Option<&str>,
+        writes: &[ZavetSpecWrite<'_>],
+    ) -> Result<(), Error> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for w in writes {
+            Self::upsert_spec_in(
+                &mut tx,
+                repo,
+                w.cap,
+                w.commit_sha,
+                w.authored_at,
+                source_session,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn upsert_spec_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        repo: &str,
+        cap: &ZavetSpecCapture,
+        commit_sha: &str,
+        authored_at: Option<&str>,
+        source_session: Option<&str>,
+    ) -> Result<(), Error> {
+        let src = cap.source.as_ref();
+        let observed_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(Error::time)?;
+        // Text never lands locally: strip the full-tier fields before
+        // serializing (the text is re-read from the repo at full-tier sync).
+        let source_json = src
+            .map(|x| serde_json::to_string(&strip_source_text(x)))
+            .transpose()
+            .map_err(|e| Error::Decode(e.to_string()))?;
         sqlx::query(
             "INSERT INTO zavet_specs
                 (repo, slug, title, version, origin, verified, confidence, date,
                  path, body_md, content_hash,
                  first_commit, last_commit, created_at, updated_at, source_session,
+                 source_kind, source_state, state_changed_at, source_json,
                  touched_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?13, ?14,
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     NULLIF(?12, ''), NULLIF(?12, ''), ?13, ?13,
+                     CASE WHEN NULLIF(?12, '') IS NULL THEN NULL ELSE ?14 END,
+                     ?15, ?16, ?17, ?18,
                      (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_specs))
              ON CONFLICT(repo, slug) DO UPDATE SET
                 title = excluded.title,
@@ -1928,8 +2032,41 @@ impl Store {
                 path = excluded.path,
                 body_md = excluded.body_md,
                 content_hash = excluded.content_hash,
-                last_commit = excluded.last_commit,
+                -- A sighting with no commit (a source unit whose resolver
+                -- reported none) never blanks a commit already on record.
+                last_commit = COALESCE(excluded.last_commit, zavet_specs.last_commit),
+                -- First sight is preserved, EXCEPT a row that has none (NULL or
+                -- the legacy empty string): the first real commit fills the
+                -- whole first-sight triple together, with attribution read from
+                -- the `artifacts` row for that commit and never from the
+                -- ambient session (DIRASH-0032).
+                first_commit = CASE
+                    WHEN excluded.first_commit IS NOT NULL
+                         AND COALESCE(zavet_specs.first_commit, '') = ''
+                        THEN excluded.first_commit
+                    ELSE zavet_specs.first_commit END,
+                created_at = CASE
+                    WHEN excluded.first_commit IS NOT NULL
+                         AND COALESCE(zavet_specs.first_commit, '') = ''
+                        THEN excluded.created_at
+                    ELSE zavet_specs.created_at END,
+                source_session = CASE
+                    WHEN excluded.first_commit IS NOT NULL
+                         AND COALESCE(zavet_specs.first_commit, '') = ''
+                        THEN (SELECT a.source_session FROM artifacts a
+                              WHERE a.sha = excluded.first_commit)
+                    ELSE zavet_specs.source_session END,
                 updated_at = excluded.updated_at,
+                source_kind = excluded.source_kind,
+                source_json = excluded.source_json,
+                -- Stamp the observation instant only when the normalised state
+                -- actually changed (or first appears); an unchanged re-capture
+                -- keeps the original stamp.
+                state_changed_at = CASE
+                    WHEN zavet_specs.source_state IS NOT excluded.source_state
+                        THEN excluded.state_changed_at
+                    ELSE zavet_specs.state_changed_at END,
+                source_state = excluded.source_state,
                 touched_seq = (SELECT COALESCE(MAX(touched_seq), 0) + 1 FROM zavet_specs)",
         )
         .bind(repo)
@@ -1946,12 +2083,16 @@ impl Store {
         .bind(commit_sha)
         .bind(authored_at)
         .bind(source_session)
-        .execute(&mut *tx)
+        .bind(src.map(|x| x.kind.as_str()))
+        .bind(src.map(|x| x.state.as_str()))
+        .bind(src.map(|_| observed_at))
+        .bind(source_json)
+        .execute(&mut **tx)
         .await?;
         sqlx::query("DELETE FROM zavet_spec_paths WHERE repo = ?1 AND slug = ?2")
             .bind(repo)
             .bind(&cap.slug)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         for glob in &cap.paths {
             sqlx::query(
@@ -1960,13 +2101,13 @@ impl Store {
             .bind(repo)
             .bind(&cap.slug)
             .bind(glob)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         sqlx::query("DELETE FROM zavet_spec_decisions WHERE repo = ?1 AND slug = ?2")
             .bind(repo)
             .bind(&cap.slug)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         for id in &cap.decisions {
             sqlx::query(
@@ -1976,12 +2117,55 @@ impl Store {
             .bind(repo)
             .bind(&cap.slug)
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
-        replace_checks(&mut tx, repo, "spec", &cap.slug, &cap.checks).await?;
-        tx.commit().await?;
+        replace_checks(tx, repo, "spec", &cap.slug, &cap.checks).await?;
         Ok(())
+    }
+
+    /// Every spec slug in `repo` with its source state (`None` for a native
+    /// spec). The cheap read for callers that only need identity: no bodies,
+    /// no child tables.
+    pub async fn zavet_spec_slugs(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<(String, Option<String>)>, Error> {
+        let rows = sqlx::query("SELECT slug, source_state FROM zavet_specs WHERE repo = ?1")
+            .bind(repo)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("slug"), r.get("source_state")))
+            .collect())
+    }
+
+    /// Source-backed units in `repo` counted per `(kind, declared root, state)`
+    /// — the census `dira zavet status` and `dira doctor` print, without
+    /// loading a single row body.
+    pub async fn zavet_source_counts(&self, repo: &str) -> Result<Vec<ZavetSourceCount>, Error> {
+        let rows = sqlx::query(
+            "SELECT source_kind AS kind,
+                    COALESCE(json_extract(source_json, '$.root'), '') AS root,
+                    source_state AS state,
+                    COUNT(*) AS units
+             FROM zavet_specs
+             WHERE repo = ?1 AND source_kind IS NOT NULL
+             GROUP BY source_kind, root, source_state",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ZavetSourceCount {
+                kind: r.get("kind"),
+                root: r.get("root"),
+                state: r.get::<Option<String>, _>("state").unwrap_or_default(),
+                units: r.get::<i64, _>("units") as u64,
+            })
+            .collect())
     }
 
     /// One spec with its paths and decision links, or `None`.
@@ -1990,12 +2174,9 @@ impl Store {
         repo: &str,
         slug: &str,
     ) -> Result<Option<ZavetSpecRow>, Error> {
-        let row = sqlx::query(
-            "SELECT repo, slug, title, version, origin, verified, confidence, date,
-                    path, body_md, content_hash,
-                    first_commit, last_commit, created_at, updated_at, source_session
-             FROM zavet_specs WHERE repo = ?1 AND slug = ?2",
-        )
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ZAVET_SPEC_COLS} FROM zavet_specs WHERE repo = ?1 AND slug = ?2"
+        )))
         .bind(repo)
         .bind(slug)
         .fetch_optional(&self.pool)
@@ -2030,12 +2211,9 @@ impl Store {
     /// Children come from two bulk queries grouped in memory, not per-spec
     /// lookups.
     pub async fn zavet_specs_list(&self, repo: &str) -> Result<Vec<ZavetSpecRow>, Error> {
-        let rows = sqlx::query(
-            "SELECT repo, slug, title, version, origin, verified, confidence, date,
-                    path, body_md, content_hash,
-                    first_commit, last_commit, created_at, updated_at, source_session
-             FROM zavet_specs WHERE repo = ?1 ORDER BY slug ASC",
-        )
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ZAVET_SPEC_COLS} FROM zavet_specs WHERE repo = ?1 ORDER BY slug ASC"
+        )))
         .bind(repo)
         .fetch_all(&self.pool)
         .await?;
@@ -2134,8 +2312,8 @@ impl Store {
             "SELECT shas.sha AS sha, a.message AS message, a.authored_at AS authored_at,
                     a.source_session AS source_session
              FROM (
-                SELECT DISTINCT sha FROM zavet_trailers
-                    WHERE repo = ?1 AND key = 'spec' AND TRIM(value) = ?2
+                SELECT DISTINCT sha FROM zavet_trailer_values
+                    WHERE repo = ?1 AND key = 'spec' AND value = ?2
                 UNION
                 SELECT first_commit AS sha FROM zavet_specs
                     WHERE repo = ?1 AND slug = ?2 AND first_commit IS NOT NULL
@@ -2164,8 +2342,8 @@ impl Store {
         let rows = sqlx::query(
             "SELECT DISTINCT s FROM (
                 SELECT a.source_session AS s FROM artifacts a
-                    JOIN zavet_trailers t ON t.sha = a.sha
-                    WHERE t.repo = ?1 AND t.key = 'spec' AND TRIM(t.value) = ?2
+                    JOIN zavet_trailer_values t ON t.sha = a.sha
+                    WHERE t.repo = ?1 AND t.key = 'spec' AND t.value = ?2
                       AND a.source_session IS NOT NULL
                 UNION
                 SELECT a.source_session AS s FROM artifacts a
@@ -2345,6 +2523,10 @@ pub struct ZavetSpecCapture {
     pub body_md: Option<String>,
     /// Git blob sha of the file at the capturing commit.
     pub content_hash: Option<String>,
+    /// Framework provenance for a source-backed unit (slug `<kind>:<id>`);
+    /// `None` for native specs. Only the metadata part is ever stored — the
+    /// upsert strips requirement/task text, summary and tracker refs.
+    pub source: Option<SpecSource>,
 }
 
 /// A stored decision row plus its guard globs.
@@ -2482,6 +2664,24 @@ pub struct ZavetCounts {
     pub specs_total: u64,
 }
 
+/// One bucket of [`Store::zavet_source_counts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZavetSourceCount {
+    pub kind: String,
+    /// The unit's declared source root, repo-relative.
+    pub root: String,
+    pub state: String,
+    pub units: u64,
+}
+
+/// One write in a [`Store::zavet_upsert_specs`] batch.
+#[derive(Debug, Clone, Copy)]
+pub struct ZavetSpecWrite<'a> {
+    pub cap: &'a ZavetSpecCapture,
+    pub commit_sha: &'a str,
+    pub authored_at: Option<&'a str>,
+}
+
 /// A stored spec row plus its path globs and decision links.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZavetSpecRow {
@@ -2504,6 +2704,55 @@ pub struct ZavetSpecRow {
     pub paths: Vec<String>,
     pub decisions: Vec<String>,
     pub checks: Vec<ZavetCheck>,
+    /// Framework provenance and shape for a source-backed unit, rebuilt from
+    /// `source_json` with the dedicated columns overlaid (they are the
+    /// authoritative `kind` / `state` / `state_changed_at`). Never
+    /// carries text — only the metadata tier is stored locally.
+    pub source: Option<SpecSource>,
+}
+
+/// The `zavet_specs` columns every spec read selects (the row mapper
+/// [`row_to_zavet_spec`] reads exactly these).
+const ZAVET_SPEC_COLS: &str = "repo, slug, title, version, origin, verified, confidence, date, \
+     path, body_md, content_hash, first_commit, last_commit, created_at, updated_at, \
+     source_session, source_kind, source_state, state_changed_at, source_json";
+
+/// A copy of `src` with every full-tier (consent-gated) field cleared — what
+/// the local store may persist.
+fn strip_source_text(src: &SpecSource) -> SpecSource {
+    let mut s = src.clone();
+    s.requirement_bodies.clear();
+    s.task_bodies.clear();
+    s.summary_md = None;
+    s.tracker_refs.clear();
+    s
+}
+
+/// Rebuild the stored [`SpecSource`] from a `zavet_specs` row, or `None` for a
+/// native spec. A corrupt `source_json` degrades to the bare columns rather
+/// than failing the read.
+fn row_source(row: &sqlx::sqlite::SqliteRow) -> Option<SpecSource> {
+    let kind: Option<String> = row.get("source_kind");
+    let kind = kind?;
+    let json: Option<String> = row.get("source_json");
+    let mut src = json
+        .and_then(|j| serde_json::from_str::<SpecSource>(&j).ok())
+        .unwrap_or_default();
+    if src.id.is_empty() {
+        // A corrupt `source_json` still yields the unit id: the slug is
+        // `<kind>:<id>`.
+        let slug: String = row.get("slug");
+        src.id = slug
+            .strip_prefix(&format!("{kind}:"))
+            .unwrap_or(&slug)
+            .to_string();
+    }
+    src.kind = kind;
+    if let Some(state) = row.get::<Option<String>, _>("source_state") {
+        src.state = state;
+    }
+    src.state_changed_at = row.get("state_changed_at");
+    Some(src)
 }
 
 fn row_to_zavet_spec(row: &sqlx::sqlite::SqliteRow) -> ZavetSpecRow {
@@ -2527,6 +2776,7 @@ fn row_to_zavet_spec(row: &sqlx::sqlite::SqliteRow) -> ZavetSpecRow {
         paths: Vec::new(),
         decisions: Vec::new(),
         checks: Vec::new(),
+        source: row_source(row),
     }
 }
 
@@ -2675,6 +2925,7 @@ fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
         label: row.get("label"),
         activity: row.get("activity"),
         note: row.get("note"),
+        spec: row.get("spec"),
     })
 }
 
@@ -2698,6 +2949,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 
@@ -2992,6 +3244,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         };
         // id-order != at-order: 01C has a HIGHER id but an OLDER `at` than 01B.
         store
@@ -3061,6 +3314,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         };
         // Session s1 spans multiple ids; s2 is a different session entirely.
         store.append(&mk("01A", "s1", 0)).await.unwrap();
@@ -3295,6 +3549,7 @@ mod tests {
             label: None,
             activity: None,
             note: None,
+            spec: None,
         }
     }
 
@@ -3925,7 +4180,77 @@ mod tests {
                 label: "sweep covers every route".into(),
                 command: "run-the-sweep".into(),
             }],
+            source: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_empty_origin_is_stored_null_and_filled_as_a_unit_by_the_first_real_commit() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        let cap = spec("openspec:x", &[], &[]);
+        // A sighting with no commit: NULL, never "", and no ambient attribution.
+        store
+            .zavet_upsert_spec(repo, &cap, "", None, Some("ambient"))
+            .await
+            .unwrap();
+        let s = store
+            .zavet_spec_get(repo, "openspec:x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (s.first_commit.as_deref(), s.last_commit.as_deref()),
+            (None, None)
+        );
+        assert_eq!(s.source_session, None);
+
+        // The attributing artifact row for the commit that will fill the origin.
+        sqlx::query(
+            "INSERT INTO artifacts (sha, kind, source_session) VALUES ('c1', 'commit', 'real-session')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        // First real commit fills the triple together; attribution comes from
+        // `artifacts`, never from the session passed in (DIRASH-0032).
+        store
+            .zavet_upsert_spec(
+                repo,
+                &cap,
+                "c1",
+                Some("2026-07-01T00:00:00Z"),
+                Some("other"),
+            )
+            .await
+            .unwrap();
+        let s = store
+            .zavet_spec_get(repo, "openspec:x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.first_commit.as_deref(), Some("c1"));
+        assert_eq!(s.created_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(s.source_session.as_deref(), Some("real-session"));
+
+        // Once set, the origin is never moved by a later sighting, and a
+        // commit-less sighting never blanks last_commit.
+        store
+            .zavet_upsert_spec(repo, &cap, "c2", Some("2026-08-01T00:00:00Z"), None)
+            .await
+            .unwrap();
+        store
+            .zavet_upsert_spec(repo, &cap, "", None, None)
+            .await
+            .unwrap();
+        let s = store
+            .zavet_spec_get(repo, "openspec:x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.first_commit.as_deref(), Some("c1"));
+        assert_eq!(s.last_commit.as_deref(), Some("c2"));
     }
 
     #[tokio::test]
@@ -4090,6 +4415,353 @@ mod tests {
             .unwrap();
         let counts = store.zavet_counts("github.com/o/r").await.unwrap();
         assert_eq!(counts.trailers, 2);
+    }
+
+    fn spec_trailer(value: &str) -> ZavetTrailer {
+        ZavetTrailer {
+            key: "spec".into(),
+            value: value.into(),
+            decision_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn spec_trailer_lookup_matches_one_slug_in_a_comma_list_exactly() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        for (sha, session) in [("c1", "s1"), ("c2", "s2"), ("c3", "s3")] {
+            let c = CapturedCommit {
+                sha: sha.into(),
+                authored_at: Some("2026-01-02T00:00:00Z".into()),
+                author_email: None,
+                author_name: None,
+                message: "feat: x".into(),
+                additions: 1,
+                deletions: 0,
+                patch_id: None,
+            };
+            store
+                .record_commit(&c, Some(repo), None, Some(session), None)
+                .await
+                .unwrap();
+        }
+        // c1 cites two specs, with stray whitespace and an empty item; c2 cites
+        // a longer slug that merely CONTAINS the first; c3 cites it plainly.
+        store
+            .zavet_record_trailers(
+                Some(repo),
+                "c1",
+                &[spec_trailer("  openspec:add-csv , capture-pipeline,, ")],
+            )
+            .await
+            .unwrap();
+        store
+            .zavet_record_trailers(Some(repo), "c2", &[spec_trailer("openspec:add-csv-v2")])
+            .await
+            .unwrap();
+        store
+            .zavet_record_trailers(Some(repo), "c3", &[spec_trailer("capture-pipeline")])
+            .await
+            .unwrap();
+        // Re-walking is a no-op for the split table too.
+        store
+            .zavet_record_trailers(
+                Some(repo),
+                "c1",
+                &[spec_trailer("  openspec:add-csv , capture-pipeline,, ")],
+            )
+            .await
+            .unwrap();
+
+        let shas = |refs: Vec<ZavetCommitRef>| {
+            let mut v: Vec<String> = refs.into_iter().map(|r| r.sha).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            shas(
+                store
+                    .zavet_commits_for_spec(repo, "openspec:add-csv")
+                    .await
+                    .unwrap()
+            ),
+            vec!["c1"],
+            "exact match: the -v2 slug must not match, and the list item must"
+        );
+        assert_eq!(
+            shas(
+                store
+                    .zavet_commits_for_spec(repo, "capture-pipeline")
+                    .await
+                    .unwrap()
+            ),
+            vec!["c1", "c3"]
+        );
+        assert_eq!(
+            store
+                .zavet_sessions_for_spec(repo, "capture-pipeline")
+                .await
+                .unwrap(),
+            vec!["s1".to_string(), "s3".to_string()]
+        );
+        let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM zavet_trailer_values")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .get("n");
+        assert_eq!(n, 4, "c1 x2, c2 x1, c3 x1 — no duplicates, no empties");
+    }
+
+    #[tokio::test]
+    async fn migration_0006_backfills_existing_spec_trailers_by_comma_split() {
+        // Apply 0001..0005 by hand, insert pre-0006 trailers, then run 0006:
+        // the recursive-CTE backfill must split exactly like spec_trailer_slugs.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().in_memory(true))
+            .await
+            .unwrap();
+        for sql in [
+            include_str!("../migrations/0001_init.sql"),
+            include_str!("../migrations/0002_zavet.sql"),
+            include_str!("../migrations/0003_zavet_specs.sql"),
+            include_str!("../migrations/0004_zavet_sync.sql"),
+            include_str!("../migrations/0005_zavet_checks.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+        for (sha, seq, key, value) in [
+            ("a", 0, "spec", " one , two ,,three"),
+            ("b", 0, "spec", "solo"),
+            ("c", 0, "spec", " , "),
+            ("d", 0, "refs", "x, y"),
+        ] {
+            sqlx::query(
+                "INSERT INTO zavet_trailers (sha, repo, key, value, seq)
+                 VALUES (?1, 'r', ?2, ?3, ?4)",
+            )
+            .bind(sha)
+            .bind(key)
+            .bind(value)
+            .bind(seq)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(include_str!("../migrations/0006_spec_sources.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows = sqlx::query("SELECT sha, value FROM zavet_trailer_values ORDER BY sha, value")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let got: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.get("sha"), r.get("value")))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), "one".to_string()),
+                ("a".to_string(), "three".to_string()),
+                ("a".to_string(), "two".to_string()),
+                ("b".to_string(), "solo".to_string()),
+            ],
+            "only `spec` trailers split; blank items vanish"
+        );
+    }
+
+    fn source_spec(state: &str) -> ZavetSpecCapture {
+        let mut cap = spec("openspec:add-csv-import", &["src/import/**"], &[]);
+        cap.origin = "external".into();
+        cap.verified = Some(false);
+        cap.body_md = None;
+        cap.path = "openspec/changes/add-csv-import/proposal.md".into();
+        cap.source = Some(SpecSource {
+            kind: "openspec".into(),
+            id: "add-csv-import".into(),
+            root: "openspec".into(),
+            state: state.into(),
+            native_state: Some("in-progress".into()),
+            requirement_refs: vec![dira_contract::RequirementRef {
+                id: "R1".into(),
+                state: "added".into(),
+                scenarios: 2,
+                capability: None,
+            }],
+            // Full-tier fields the caller must never see persisted.
+            requirement_bodies: vec![dira_contract::BodyRef {
+                id: "R1".into(),
+                md: "SECRET requirement prose".into(),
+            }],
+            summary_md: Some("SECRET summary prose".into()),
+            tracker_refs: vec!["GH#123".into()],
+            ..Default::default()
+        });
+        cap
+    }
+
+    #[tokio::test]
+    async fn source_backed_spec_round_trips_without_text_and_stamps_state_changes() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        let slug = "openspec:add-csv-import";
+        store
+            .zavet_upsert_spec(repo, &source_spec("active"), "sA", None, None)
+            .await
+            .unwrap();
+        let first = store.zavet_spec_get(repo, slug).await.unwrap().unwrap();
+        let src = first.source.as_ref().expect("source columns round-trip");
+        assert_eq!(src.kind, "openspec");
+        assert_eq!(src.id, "add-csv-import");
+        assert_eq!(src.root, "openspec");
+        assert_eq!(src.state, "active");
+        assert_eq!(src.native_state.as_deref(), Some("in-progress"));
+        assert_eq!(src.requirement_refs[0].id, "R1");
+        let stamped = src
+            .state_changed_at
+            .clone()
+            .expect("first sight is stamped");
+
+        // Text never lands locally — not in the JSON column, nowhere.
+        let raw: String = sqlx::query("SELECT source_json FROM zavet_specs WHERE slug = ?1")
+            .bind(slug)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .get("source_json");
+        assert!(!raw.contains("SECRET") && !raw.contains("GH#123"), "{raw}");
+        assert!(src.requirement_bodies.is_empty() && src.summary_md.is_none());
+
+        // Same state re-captured: the stamp is preserved.
+        store
+            .zavet_upsert_spec(repo, &source_spec("active"), "sB", None, None)
+            .await
+            .unwrap();
+        let again = store.zavet_spec_get(repo, slug).await.unwrap().unwrap();
+        assert_eq!(
+            again.source.as_ref().unwrap().state_changed_at.as_deref(),
+            Some(stamped.as_str())
+        );
+
+        // A transition restamps (and the listing / sync window carry it too).
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store
+            .zavet_upsert_spec(repo, &source_spec("archived"), "sC", None, None)
+            .await
+            .unwrap();
+        let moved = store.zavet_spec_get(repo, slug).await.unwrap().unwrap();
+        let ms = moved.source.as_ref().unwrap();
+        assert_eq!(ms.state, "archived");
+        assert_ne!(ms.state_changed_at.as_deref(), Some(stamped.as_str()));
+        let listed = store.zavet_specs_list(repo).await.unwrap();
+        assert_eq!(listed[0].source.as_ref().unwrap().state, "archived");
+        let window = store.zavet_specs_since(0, 10).await.unwrap();
+        assert_eq!(window[0].1.source.as_ref().unwrap().state, "archived");
+    }
+
+    #[tokio::test]
+    async fn slugs_and_source_counts_read_without_loading_rows_and_batches_commit_together() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        let mut gone = source_spec("removed");
+        gone.slug = "openspec:old".into();
+        let live = source_spec("active");
+        let native = spec("auth-flow", &[], &[]);
+        // One transaction: first sight then latest sighting of a slug, plus others.
+        store
+            .zavet_upsert_specs(
+                repo,
+                None,
+                &[
+                    ZavetSpecWrite {
+                        cap: &live,
+                        commit_sha: "sA",
+                        authored_at: None,
+                    },
+                    ZavetSpecWrite {
+                        cap: &live,
+                        commit_sha: "sB",
+                        authored_at: None,
+                    },
+                    ZavetSpecWrite {
+                        cap: &gone,
+                        commit_sha: "",
+                        authored_at: None,
+                    },
+                    ZavetSpecWrite {
+                        cap: &native,
+                        commit_sha: "sC",
+                        authored_at: None,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let got = store
+            .zavet_spec_get(repo, &live.slug)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.first_commit.as_deref(), Some("sA"));
+        assert_eq!(got.last_commit.as_deref(), Some("sB"));
+
+        let mut slugs = store.zavet_spec_slugs(repo).await.unwrap();
+        slugs.sort();
+        assert_eq!(
+            slugs,
+            vec![
+                ("auth-flow".to_string(), None),
+                (
+                    "openspec:add-csv-import".to_string(),
+                    Some("active".to_string())
+                ),
+                ("openspec:old".to_string(), Some("removed".to_string())),
+            ]
+        );
+        let mut counts = store.zavet_source_counts(repo).await.unwrap();
+        counts.sort_by(|a, b| a.state.cmp(&b.state));
+        let flat: Vec<_> = counts
+            .iter()
+            .map(|c| (c.kind.as_str(), c.root.as_str(), c.state.as_str(), c.units))
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("openspec", "openspec", "active", 1),
+                ("openspec", "openspec", "removed", 1)
+            ],
+            "native specs are not units"
+        );
+        assert!(store
+            .zavet_source_counts("other/repo")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_spec_has_no_source_and_event_spec_round_trips() {
+        let store = Store::open_in_memory().await.unwrap();
+        let repo = "github.com/o/r";
+        store
+            .zavet_upsert_spec(repo, &spec("auth-flow", &[], &[]), "sA", None, None)
+            .await
+            .unwrap();
+        assert!(store
+            .zavet_spec_get(repo, "auth-flow")
+            .await
+            .unwrap()
+            .unwrap()
+            .source
+            .is_none());
+
+        let mut e = ev("e1", EventKind::ManualStart);
+        e.spec = Some("openspec:add-csv-import".into());
+        store.append(&e).await.unwrap();
+        let back = store.events_since(None).await.unwrap();
+        assert_eq!(back[0].spec.as_deref(), Some("openspec:add-csv-import"));
     }
 
     #[tokio::test]

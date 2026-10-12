@@ -1,3 +1,15 @@
+## [0.7.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.6.0...v0.7.0) (2026-10-12)
+
+### ✨ Features
+
+* **cli:** cloud-agent wiring joins dira onboard and stays pinned across updates ([e776cab](https://github.com/dodi-smart/dirahq-cli/commit/e776cab3d117215c3bcb7a786289e15872b13353))
+
+### 🐛 Bug Fixes
+
+* **cli:** refresh model pricing from models.dev ([b0cdf0a](https://github.com/dodi-smart/dirahq-cli/commit/b0cdf0a076036a26d299119545587c5c9fbdb516))
+* **cli:** refresh model pricing from models.dev ([5b521b9](https://github.com/dodi-smart/dirahq-cli/commit/5b521b9f1a27aca3d78eef50ee12066c98416c44))
+* **cli:** refresh model pricing from models.dev ([20f9b8b](https://github.com/dodi-smart/dirahq-cli/commit/20f9b8b5b4081f983f7925d2df5e9807eb284753))
+
 ## [0.6.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.5.1...v0.6.0) (2026-09-03)
 
 ### ✨ Features

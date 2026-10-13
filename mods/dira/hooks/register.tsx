@@ -662,10 +662,15 @@ export const register: Register = on => {
       await refreshAll($)
       await refreshAudit($)
     })
-    // Every 20 s while a turn runs, every minute otherwise.
+    // Every 20 s while a turn runs, every minute otherwise. An open PR still
+    // waiting on CI or a review is re-read each minute too: those finish on
+    // GitHub, where no hook of ours sees them.
     $.clock.every(TICK_MS, async () => {
-      if (!isTurnRunning && (await $.clock.now()) - lastPollAt < IDLE_POLL_MS) return
       if (await read($, demoA)) return
+      const now = await $.clock.now()
+      const f = await read($, forecastA)
+      if (f?.pr && now - f.at >= IDLE_POLL_MS && (f.elements.ci === 'pending' || f.elements.review === 'pending')) void refreshForecast($, true)
+      if (!isTurnRunning && now - lastPollAt < IDLE_POLL_MS) return
       await loadStatus($, await read($, envA))
       await paint($)
     })

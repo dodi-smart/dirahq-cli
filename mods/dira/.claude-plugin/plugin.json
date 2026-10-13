@@ -1,0 +1,9 @@
+{
+  "name": "dira",
+  "version": "0.1.0",
+  "description": "dira, zavet and proba inside Claude Code: a status line, a knowledge-aware prompt box, knowledge in the transcript, a PR forecast band, /desk and /vouch",
+  "author": { "name": "dodi-smart" },
+  "license": "Apache-2.0",
+  "repository": "https://github.com/dodi-smart/dirahq-cli",
+  "types": "./types/index.d.ts"
+}

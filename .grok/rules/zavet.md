@@ -89,6 +89,8 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0036 — A pricing refresh appends and never drops a vendored id (active)
 - DIRASH-0037 — The portable hook yields to live user-scope wiring — no cache, no time window (active)
 - DIRASH-0038 — dira update refreshes the cwd repo's cloud pin through the new binary, never installs, never sweeps (active)
+- DIRASH-0039 — dira consumes source-backed specs only through the installed plugin's `zavet specs --json`, never the repo's vendored zavet (active)
+- DIRASH-0041 — Orchestration sessions keep repo-less time in their own bucket and take repos only from local tool evidence (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 
@@ -101,6 +103,7 @@ agent context at session start. Keep it short and non-negotiable.
 - harness-sources — Harness sources and hook ingestion (session, high)
 - knowledge-sync — Knowledge sync — the consent-gated second channel (session, medium)
 - onboarding — Onboarding — dira onboard and the installer handoff (session, high)
+- orchestration-sessions — Orchestration sessions and runs (session, high)
 
 Capture bar: record non-obvious choices a future reader could not reconstruct — micro-decisions as commit trailers (Why:/Rejected:/Constraint:/Refs:), structural ones via /zavet:decide.
 Spec maintenance (do this as part of normal work, no command needed): when implementing or changing a feature, update its covering spec in .zavet/specs/ — or create one from .zavet/.spec-template.md (origin: session) for substantial new features — reference the decisions involved, and add a `Spec: <slug>` trailer to the commit.

@@ -28,7 +28,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: dodi-smart/.github/.github/workflows/zavet-check.yml@v1
+    uses: dodi-smart/.github/.github/workflows/zavet-check.yml@next
     secrets: inherit
     with:
       # The decision checks are `cargo test`, so the Rust toolchain has to be

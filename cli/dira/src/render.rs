@@ -16,7 +16,6 @@ use dira_core::protocol::{
     ZavetStatusView, ZavetSyncView, ZavetUncapturedView, ZavetWhyView,
 };
 use dira_core::report::Report;
-use dira_core::runs;
 use time::OffsetDateTime;
 
 /// The width the layout was originally hand-tuned for. Used as the fallback when
@@ -2260,68 +2259,49 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout, flat: bool) {
         "HANDLE", "HARNESS", "KIND", "PROJECT", "HUMAN", "AGENT"
     );
     println!("{}", theme::paint(&header, Role::Muted));
-    let entries: Vec<runs::Entry<'_>> = if flat {
-        sessions.iter().map(runs::Entry::Session).collect()
-    } else {
-        dira_core::runs::group(sessions)
-    };
-    // Local-only titles name an unfolded run; never synced. Read only when one
-    // is on screen — it parses every `~/.claude/sessions/*.json`.
-    let titles = entries
-        .iter()
-        .any(|e| matches!(e, runs::Entry::Run(r) if !r.folded()))
-        .then(crate::session_titles::claude_titles)
-        .unwrap_or_default();
-    for entry in entries {
-        match entry {
-            runs::Entry::Session(s) => {
-                print_session_row(s, "  ", &s.handle, &session_project_label(s), pw);
-                print_session_meta(s);
+    if flat {
+        for s in sessions {
+            print_session_row(s, "  ", &s.handle, &session_project_label(s), pw);
+            print_session_meta(s);
+        }
+        return;
+    }
+    for row in crate::format::tree_rows(sessions, &titles_if_needed(sessions)) {
+        match row.session {
+            Some(s) => {
+                let (gutter, handle) = match row.glyph {
+                    "▾ " => ("▾ ", row.handle.clone()),
+                    "  " => ("  ", row.handle.clone()),
+                    branch => ("  ", format!("{branch}{}", row.handle)),
+                };
+                print_session_row(s, gutter, &handle, &row.project, pw);
+                if row.glyph == "  " {
+                    print_session_meta(s);
+                }
             }
-            runs::Entry::Run(run) => print_run(&run, &titles, pw),
+            None => {
+                let line = format!(
+                    "  {:<8} {:<10} {:<7} {}",
+                    format!("{}·", row.glyph),
+                    "",
+                    "direct",
+                    truncate_cols(&row.project, pw),
+                );
+                println!("{}", theme::paint(&line, Role::Faint));
+            }
         }
     }
 }
 
-/// One orchestration run: the orchestrator's row, then its members as a tree,
-/// then the repos only the orchestrator itself touched. A run over at most one
-/// repo is folded — its row names that repo, as ordinary work there would.
-fn print_run(run: &runs::Run<'_>, titles: &std::collections::HashMap<String, String>, pw: usize) {
-    let root = run.root;
-    let project = if run.folded() {
-        run.repos
-            .first()
-            .cloned()
-            .unwrap_or_else(|| crate::format::ORCHESTRATION_LABEL.to_string())
+/// Local session titles, read only when an orchestrator is on screen — it
+/// parses every `~/.claude/sessions/*.json`. Never synced.
+pub(crate) fn titles_if_needed(
+    sessions: &[SessionView],
+) -> std::collections::HashMap<String, String> {
+    if sessions.iter().any(|s| s.orchestrator) {
+        crate::session_titles::claude_titles()
     } else {
-        let name = titles
-            .get(&root.session_id)
-            .cloned()
-            .unwrap_or_else(|| crate::format::ORCHESTRATION_LABEL.to_string());
-        format!("{name} · {} repos", run.repos.len())
-    };
-    let gutter = if run.members.is_empty() && run.direct.is_empty() {
-        "  "
-    } else {
-        "▾ "
-    };
-    print_session_row(root, gutter, &root.handle, &project, pw);
-    let direct: &[String] = if run.folded() { &[] } else { &run.direct };
-    let total = run.members.len() + direct.len();
-    let branch = |i: usize| if i + 1 == total { "└ " } else { "├ " };
-    for (i, s) in run.members.iter().enumerate() {
-        let handle = format!("{}{}", branch(i), s.handle);
-        print_session_row(s, "  ", &handle, &session_project_label(s), pw);
-    }
-    for (k, repo) in direct.iter().enumerate() {
-        let line = format!(
-            "  {:<8} {:<10} {:<7} {}",
-            format!("{}·", branch(run.members.len() + k)),
-            "",
-            "direct",
-            truncate_cols(repo, pw),
-        );
-        println!("{}", theme::paint(&line, Role::Faint));
+        Default::default()
     }
 }
 
@@ -2431,13 +2411,23 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
     // the same shape/colour language as the cloud's "Right Now" view. Painting
     // only the glyph keeps the padded label column aligned.
     let agent_mark = theme::paint(theme::glyphs().diamond, Role::Agent);
-    for s in &agents {
+    // Lanes follow the run trees the sessions table shows: an orchestrator,
+    // then its members indented. Each lane is still one session's own time.
+    let kept: Vec<_> = crate::format::tree_rows(active, &titles_if_needed(active))
+        .into_iter()
+        .filter(|r| r.session.is_some_and(|s| s.accrues_agent_time()))
+        .collect();
+    let mut glyphs: Vec<&'static str> = kept.iter().map(|r| r.glyph).collect();
+    crate::format::retree(&mut glyphs);
+    for (row, glyph) in kept.iter().zip(glyphs) {
+        let s = row.session.expect("filtered to sessions");
+        let glyph = if glyph == "  " { "" } else { glyph };
         let label = truncate_cols(
             &format!(
-                "{} {} {}",
+                "{glyph}{} {} {}",
                 dira_sources::harness_id(s.harness),
                 dot_glyph(),
-                crate::format::session_repo_short(s)
+                row.short
             ),
             lw,
         );

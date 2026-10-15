@@ -1,10 +1,10 @@
 ---
 title: Onboarding — dira onboard and the installer handoff
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
-date: 2026-10-12
+date: 2026-10-15
 paths:
   - cli/dira/src/onboard/**
   - cli/dira/src/which.rs
@@ -12,7 +12,7 @@ paths:
   - install.sh
   - install.ps1
   - docs/getting-started.md
-decisions: [D-0001, D-0004, D-0007, D-0009, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0030, DIRASH-0038, DIRASH-0039]
+decisions: [D-0001, D-0004, D-0007, D-0009, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0030, DIRASH-0038, DIRASH-0039, DIRASH-0040]
 checks:
   - cloud:repo step decision logic :: cargo test -p dira --bin dira -- onboard::steps::tests::cloud_repo
   - end-to-end: wires the repo and a second run is a no-op :: cargo test -p dira --test onboard_e2e yes_wires_the_repo_for_cloud_agents_and_a_second_run_is_a_noop
@@ -156,15 +156,25 @@ calls only (`openspec/`, `.specify/` together with `specs/`, `_bmad/`,
 `docs/superpowers/`) plus one read of `.zavet/config` for the kinds already
 declared. It spawns nothing and writes nothing, so `--print` still leaves the
 filesystem byte-identical, and the plan prints "link OpenSpec, Spec Kit to
-zavet spec sources" for the undeclared ones.
+zavet spec sources" for the undeclared ones, followed by the rule files that
+come with the link ("brings the Spec Kit constitution into agent context"), a
+pure lookup by kind.
 
 The step runs right after `zavet:repo`, re-stats `.zavet/` (the scaffold may
 have just created it), and, when the plugin is installed and frameworks are
 missing from the config, asks and then runs the *plugin's*
 `<plugin_root>/bin/zavet spec-sources --detect --write` pinned to the repo
-toplevel (never the repo's vendored copy, DIRASH-0024/0039). It reports from
-the config afterwards ("Linked OpenSpec, Spec Kit → zavet spec sources"), so an
-old plugin that exits 0 without writing is a failure, not a false success. It
+toplevel (never the repo's vendored copy, DIRASH-0024/0039). The question
+names what linking brings: the spec-source lines it writes, and that the
+frameworks' rule files (the Spec Kit constitution, OpenSpec's `config.yaml`
+context and rules, the BMAD project context) then show in agent context,
+read-only. Rule sources follow the declarations, so the command and its
+arguments are unchanged. It reports from the config afterwards ("Linked
+OpenSpec, Spec Kit → zavet spec sources"), so an old plugin that exits 0
+without writing is a failure, not a false success. When the plugin advertises
+`spec_sources_json`, the report also lists the rule files now in context, read
+from `zavet spec-sources --json` (DIRASH-0040); an older plugin is never asked
+and the report just omits them. It
 is a `StepOutcome`: a missing plugin is a skip that names `/zavet:spec-adopt`,
 a failing plugin is `Failed`, and neither aborts the run.
 

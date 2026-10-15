@@ -1,10 +1,10 @@
 ---
 title: Zavet capture pipeline
-version: 8
+version: 9
 origin: session
 verified: false
 confidence: high
-date: 2026-10-12
+date: 2026-10-15
 paths:
   - cli/dirad/src/capture.rs
   - cli/dirad/src/zavet.rs
@@ -12,7 +12,7 @@ paths:
   - cli/core/src/project.rs
   - cli/core/src/zavet_specs.rs
   - cli/dirad/src/zavet_sources.rs
-decisions: [D-0001, DIRASH-0025, DIRASH-0026, DIRASH-0027, DIRASH-0028, DIRASH-0032, DIRASH-0039]
+decisions: [D-0001, DIRASH-0025, DIRASH-0026, DIRASH-0027, DIRASH-0028, DIRASH-0032, DIRASH-0039, DIRASH-0040]
 ---
 
 ## Overview
@@ -155,6 +155,22 @@ commit poll. No filesystem watcher, no extra daemon.
 - `dira zavet reindex` adds `.zavet/config` and each declared root to its
   scoped, unbounded pathspec, then resolves once and skips unchanged units
   (DIRASH-0028).
+- **Framework rule sources** (DIRASH-0040). A linked framework's rule files
+  (the Spec Kit constitution, OpenSpec `config.yaml` and legacy `project.md`,
+  BMAD's `AGENTS.md` block and legacy `project-context.md`) follow its
+  `spec-source:` line with no extra config. `zavet_sweep` sets `rule_trigger`
+  when a walked commit touches `.zavet/config`, `AGENTS.md`, a declared
+  framework's default rule path, or a rule path already stored (an override
+  path, once resolved). The capture then asks `refresh_sources` for its
+  rule-source half, which runs the plugin's `zavet spec-sources --json` (only
+  when `version --json` advertises `spec_sources_json`) under its own 12 s
+  budget, alongside the unit resolve when both trigger, and keeps the
+  `"type":"rule-source"` rows. The store writes only rows whose metadata
+  changed. A row a successful resolve on the default branch no longer lists
+  gets `removed_at`. An empty answer while a declared default rule file is on
+  disk removes nothing. A failed resolve changes nothing. `dira zavet reindex`
+  refreshes rule sources every run, and a repeat run writes nothing. Rule
+  sources never nudge the knowledge channel.
 - **Session attribution to a spec.** `dira start --spec <slug>` stamps
   `events.spec` on the manual start; the writer stamps every later event of a
   session that has a spec, and the live registry carries it into partial
@@ -191,6 +207,11 @@ commit poll. No filesystem watcher, no extra daemon.
   padding at the wrong width would key the event away from the record captured
   from that same repo. `dirad::zavet::ingest` canonicalizes once it can read
   the config.
+- Rule sources: `zavet_rule_sources` (0008), keyed `(repo, kind, path)`, holds
+  metadata only (oid, version, dates, rule count, state, reason,
+  overridden, first/updated/removed timestamps). `kind` and `state` are the
+  closed `RuleSourceKind` / `RuleSourceState` words, `other` for anything
+  unknown. `dira zavet status` lists the rows still listed.
 - Storage: `zavet_decisions`/`zavet_guards` (0002), `zavet_specs`/
   `zavet_spec_paths`/`zavet_spec_decisions` (0003), `zavet_checks` +
   `zavet_decisions.corrected_by` (0005), `zavet_trailers` keyed `(sha, seq)`.
@@ -229,8 +250,10 @@ commit poll. No filesystem watcher, no extra daemon.
 - First-sight fields (`first_commit`, `created_at`, `source_session`) survive
   every later upsert: provenance points at the commit that INTRODUCED the
   record.
-- The repo's vendored `.zavet/bin/zavet` is never executed; source units come
-  only from the installed plugin (DIRASH-0039).
+- The repo's vendored `.zavet/bin/zavet` is never executed; source units and
+  rule sources come only from the installed plugin (DIRASH-0039).
+- Rule-source text never lands locally and `zavet_rule_sources` rides no wire
+  until the contract carries it (DIRASH-0040).
 - The knowledge sweep shares the walk's blocking budget and never touches the
   accounting hot path. The reindex path is the one exception and earns it by
   being user-initiated and off the poll: it takes no capture timeout, and it

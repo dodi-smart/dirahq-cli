@@ -18,25 +18,10 @@
 //!   match, else nothing.
 
 use dira_contract::SpecSource;
-use dira_core::store::{Store, ZavetSpecCapture, ZavetSpecRow, ZavetSpecWrite};
+use dira_core::store::{SourcesWritten, Store, ZavetSpecCapture, ZavetSpecRow, ZavetSpecWrite};
 use dira_core::zavet_specs::ResolvedUnit;
 use std::collections::BTreeSet;
 use std::path::Path;
-
-/// What one [`persist_units`] pass changed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Persisted {
-    /// Units inserted or updated.
-    pub upserted: usize,
-    /// Previously seen units now marked `removed`.
-    pub removed: usize,
-}
-
-impl Persisted {
-    pub fn changed(&self) -> bool {
-        self.upserted + self.removed > 0
-    }
-}
 
 /// Cap on a source unit's composed `body_md` (characters), applied when the
 /// full-tier text is filled in. Native spec bodies have no local cap; this
@@ -52,6 +37,20 @@ pub fn resolve_blocking(root: &Path, with_text: bool) -> Option<Vec<ResolvedUnit
         Ok(units) => Some(units),
         Err(e) => {
             tracing::debug!(repo = %root.display(), "source specs skipped this sweep: {e}");
+            None
+        }
+    }
+}
+
+/// Resolve the repo's framework rule sources via the installed plugin, failing
+/// open exactly like [`resolve_blocking`]: `None` means "skip rule sources this
+/// sweep" (no plugin, a plugin without `spec_sources_json`, a timeout, a
+/// non-zero exit). Blocking — call from `spawn_blocking`.
+pub fn resolve_rules_blocking(root: &Path) -> Option<Vec<dira_core::zavet_specs::RuleSource>> {
+    match dira_core::zavet_specs::resolve_rule_sources_system(root) {
+        Ok(rules) => Some(rules),
+        Err(e) => {
+            tracing::debug!(repo = %root.display(), "rule sources skipped this sweep: {e}");
             None
         }
     }
@@ -141,14 +140,14 @@ pub async fn persist_units(
     units: &[ResolvedUnit],
     session: Option<&str>,
     allow_removals: bool,
-) -> Result<Persisted, dira_core::Error> {
+) -> Result<SourcesWritten, dira_core::Error> {
     let stored = store.zavet_specs_list(repo).await?;
     let by_slug: std::collections::HashMap<&str, &ZavetSpecRow> = stored
         .iter()
         .filter(|r| r.source.is_some())
         .map(|r| (r.slug.as_str(), r))
         .collect();
-    let mut out = Persisted::default();
+    let mut out = SourcesWritten::default();
 
     // Collected first, written in ONE transaction below: a sweep costs one
     // commit instead of one per unit, and lands whole or not at all.

@@ -1,15 +1,15 @@
 ---
 title: Knowledge sync — the consent-gated second channel
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: medium
-date: 2026-10-12
+date: 2026-10-15
 paths:
   - cli/core/src/sync/knowledge.rs
   - cli/dirad/src/knowledge_sync.rs
   - cli/dirad/src/zavet_sources.rs
-decisions: [D-0001, D-0020, DIRASH-0028, DIRASH-0030, DIRASH-0039]
+decisions: [D-0001, D-0020, DIRASH-0028, DIRASH-0030, DIRASH-0039, DIRASH-0040]
 ---
 
 ## Overview
@@ -136,6 +136,11 @@ code rather than recorded as it was built.
   documents) is full-tier content: never stored locally, never sent below
   `full`, and any new text-bearing field joins `strip_content` and
   `KNOWLEDGE_DISCLOSURE` in the same commit.
+- Framework rule sources (`zavet_rule_sources`) do not ride this channel at any
+  tier. They are local metadata with no `touched_seq`, and their text is never
+  stored. Sending them waits for a contract version that carries rule-source
+  metadata, and any text at `full` would join `strip_content` and
+  `KNOWLEDGE_DISCLOSURE` in the same commit (DIRASH-0040).
 - This channel never touches `AttestationBatch`, and no type under `/contract`
   used by it may carry a content-named field that the wire denylist would
   reject on the billing side.

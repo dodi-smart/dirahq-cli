@@ -221,6 +221,10 @@ fn print_plans_spec_framework_linking_and_still_changes_nothing() {
         "the undeclared framework is planned; got:\n{text}"
     );
     assert!(
+        text.contains("brings OpenSpec's config.yaml context and rules into agent context"),
+        "the plan names the rule files that come with the link; got:\n{text}"
+    );
+    assert!(
         !text.contains("Spec Kit to zavet"),
         "an already-declared kind is not offered again; got:\n{text}"
     );

@@ -724,9 +724,29 @@ pub async fn status(state: &AppState, cwd: Option<String>, repo: Option<String>)
         }
         spec_sources.push(line);
     }
+    // Framework rule sources still listed (removed rows stay in the store and
+    // out of the status). Metadata as last resolved; nothing is read here.
+    let rule_sources: Vec<dira_core::protocol::ZavetRuleSourceLine> = state
+        .store
+        .zavet_rule_sources_list(&repo)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.removed_at.is_none())
+        .map(|r| dira_core::protocol::ZavetRuleSourceLine {
+            kind: r.kind,
+            path: r.path,
+            state: r.state,
+            version: r.version,
+            last_amended: r.last_amended,
+            rule_count: r.rule_count,
+            reason: r.reason,
+        })
+        .collect();
     Response::ZavetStatus(Box::new(ZavetStatusView {
         frameworks_detected,
         spec_sources,
+        rule_sources,
         repo,
         active,
         knob: state.config.modules.zavet.as_str().to_string(),
@@ -1051,7 +1071,9 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
         let pathspecs: Vec<&str> = pathspecs.iter().map(String::as_str).collect();
         let records = dira_core::project::log_commit_refs(&top, &pathspecs, None);
         let trailer_commits = dira_core::project::log_commit_refs(&top, &[], trailer_limit);
-        let sweep = crate::capture::zavet_sweep(&top, &records);
+        // No stored rule paths: the reindex refreshes rule sources
+        // unconditionally below, so the sweep's rule trigger is not consulted.
+        let sweep = crate::capture::zavet_sweep(&top, &records, &[]);
         // Trailers only — the record parser costs a subprocess per commit and
         // this window is the wide one, so running it here would spawn one per
         // commit purely to discard the result.
@@ -1198,12 +1220,24 @@ pub async fn reindex(state: &AppState, cwd: Option<String>, all_trailers: bool) 
     // Source-backed units: one resolve through the installed plugin, after the
     // native records. `persist_units` skips every unit whose stored row already
     // matches, so a repeat run writes — and re-pushes — nothing.
-    if source_trigger {
-        let p =
-            crate::capture::refresh_sources(state, &repo, &top_for_sources, &cfg_for_sources, None)
-                .await;
-        view.specs_indexed += (p.upserted + p.removed) as u64;
-    }
+    // Framework rule sources: always re-resolved here — this is the explicit
+    // "bring the index up to date" command, and the store skips every row whose
+    // metadata already matches, so a repeat run writes nothing. Local metadata
+    // only: it is not knowledge-sync input and does not nudge that channel.
+    let (p, w) = crate::capture::refresh_sources(
+        state,
+        &repo,
+        &top_for_sources,
+        &cfg_for_sources,
+        None,
+        crate::capture::SourceRefresh {
+            units: source_trigger,
+            rules: true,
+        },
+    )
+    .await;
+    view.specs_indexed += (p.upserted + p.removed) as u64;
+    view.rule_sources_indexed = (w.upserted + w.removed) as u64;
     // Trailers are keyed `(sha, seq)` and inserted OR IGNORE, so re-recording a
     // sha already present is already a no-op — no hash check needed. The merged
     // window (see above), not the bounded-by-default `trailers` walk alone.
@@ -2432,7 +2466,7 @@ mod reindex_tests {
             1,
             "bounded to the newest commit only"
         );
-        let sweep = crate::capture::zavet_sweep(&top, &records);
+        let sweep = crate::capture::zavet_sweep(&top, &records, &[]);
         let trailers = crate::capture::zavet_trailers(&top, &trailer_commits, &cfg);
         assert!(
             trailers.is_empty(),

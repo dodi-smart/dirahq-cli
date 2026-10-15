@@ -488,6 +488,87 @@ pub(crate) fn kind_names(kinds: &[String]) -> String {
         .join(", ")
 }
 
+/// What linking `kinds` brings into agent context, joined — "the Spec Kit
+/// constitution and OpenSpec's config.yaml context and rules" — or `None` when
+/// none of them carries standing rules. Pure (the `--print` plan uses it).
+pub(crate) fn rule_names(kinds: &[String]) -> Option<String> {
+    let names: Vec<&str> = kinds
+        .iter()
+        .filter_map(|k| dira_core::zavet_specs::rule_files_of(k))
+        .collect();
+    match names.as_slice() {
+        [] => None,
+        [one] => Some((*one).to_string()),
+        [init @ .., last] => Some(format!("{} and {last}", init.join(", "))),
+    }
+}
+
+/// The confirm question of step 6b: what is linked, what it writes, and which
+/// framework rule files then show in agent context (read-only — zavet never
+/// imports or edits them).
+pub(crate) fn spec_link_question(missing: &[String]) -> String {
+    let rules = rule_names(missing)
+        .map(|r| format!("; {r} then show in agent context, read-only"))
+        .unwrap_or_default();
+    format!(
+        "Link {} to zavet spec sources (adds spec-source lines to .zavet/config{rules})?",
+        kind_names(missing)
+    )
+}
+
+/// The onboarding [`Runner`](crate::zavet_install::Runner) seen as the
+/// plugin runner [`dira_core::zavet_specs`] resolves through, so onboarding
+/// takes the same capability gate and parse as the daemon rather than a copy.
+/// The step's runner has no deadline of its own; `timeout` is not applied.
+struct PluginRunner<'a>(&'a dyn crate::zavet_install::Runner);
+
+impl dira_core::zavet_specs::SpecRunner for PluginRunner<'_> {
+    fn run(
+        &self,
+        bin: &Path,
+        cwd: &Path,
+        args: &[&str],
+        _timeout: std::time::Duration,
+    ) -> Result<String, dira_core::zavet_specs::RunError> {
+        use dira_core::zavet_specs::RunError;
+        let bin = bin.display().to_string();
+        let out = self
+            .0
+            .run_in(cwd, &bin, args)
+            .ok_or_else(|| RunError::Spawn(format!("could not run {bin}")))?;
+        if !out.status.success() {
+            return Err(RunError::Failed(out.status.code().unwrap_or(-1)));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+/// The framework rule files the plugin now reports as in context, as
+/// `path (label)` items — read through [`dira_core::zavet_specs::resolve_rule_sources`]
+/// (gated on the plugin advertising `spec_sources_json`). Best-effort: any
+/// failure is "nothing to report", never a failed step (the link itself
+/// already succeeded).
+fn linked_rule_files(
+    runner: &dyn crate::zavet_install::Runner,
+    root: &Path,
+    plugin_root: &Path,
+) -> Vec<String> {
+    use dira_core::zavet_specs::{resolve_rule_sources, RuleSourceState};
+    resolve_rule_sources(&PluginRunner(runner), plugin_root, root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.state != RuleSourceState::Off)
+        .map(|r| {
+            let mut item = format!("{} ({}", r.path, r.kind.label());
+            if r.state != RuleSourceState::Ok {
+                item.push_str(&format!(", {}", r.state.as_str()));
+            }
+            item.push(')');
+            item
+        })
+        .collect()
+}
+
 /// Step 6b — declare detected spec frameworks (OpenSpec, Spec Kit, BMAD,
 /// superpowers) as zavet spec sources, so their units become living specs.
 ///
@@ -534,13 +615,7 @@ pub(crate) fn zavet_spec_sources(
     if !bin.is_file() {
         return StepOutcome::Skipped(format!("no zavet binary at {}", bin.display()));
     }
-    if !ui.confirm(
-        &format!(
-            "Link {} to zavet spec sources (adds spec-source lines to .zavet/config)?",
-            kind_names(&missing)
-        ),
-        true,
-    ) {
+    if !ui.confirm(&spec_link_question(&missing), true) {
         return StepOutcome::Skipped("declined".into());
     }
     let bin_str = bin.display().to_string();
@@ -569,10 +644,14 @@ pub(crate) fn zavet_spec_sources(
                 .into(),
         );
     }
-    StepOutcome::Done(format!(
-        "Linked {} \u{2192} zavet spec sources",
-        kind_names(&linked)
-    ))
+    // Linking also switched on the frameworks' rule files (they follow the
+    // declarations, no extra line). Say which, as the plugin reports them.
+    let rules = linked_rule_files(runner, root, Path::new(&plugin_root));
+    let mut msg = format!("Linked {} \u{2192} zavet spec sources", kind_names(&linked));
+    if !rules.is_empty() {
+        msg.push_str(&format!("; rules in agent context: {}", rules.join(", ")));
+    }
+    StepOutcome::Done(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1716,6 +1795,23 @@ mod tests {
         calls: std::cell::RefCell<Vec<Vec<String>>>,
         write: Option<&'static str>,
         exit: i32,
+        /// stdout of `version --json` / `spec-sources --json` (empty = an
+        /// older plugin that advertises nothing).
+        version: &'static str,
+        rules: &'static str,
+    }
+
+    #[cfg(unix)]
+    impl LinkingPlugin {
+        fn new(write: Option<&'static str>, exit: i32) -> Self {
+            Self {
+                calls: Default::default(),
+                write,
+                exit,
+                version: "",
+                rules: "",
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1727,7 +1823,12 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(args.iter().map(|s| s.to_string()).collect());
-            if let Some(lines) = self.write {
+            let stdout = match args {
+                ["version", "--json"] => self.version.as_bytes().to_vec(),
+                ["spec-sources", "--json"] => self.rules.as_bytes().to_vec(),
+                _ => Vec::new(),
+            };
+            if let (Some(lines), true) = (self.write, args.contains(&"--write")) {
                 use std::io::Write;
                 let mut f = std::fs::OpenOptions::new()
                     .append(true)
@@ -1748,7 +1849,7 @@ mod tests {
                 .unwrap();
             Some(std::process::Output {
                 status,
-                stdout: Vec::new(),
+                stdout,
                 stderr: b"boom".to_vec(),
             })
         }
@@ -1776,11 +1877,7 @@ mod tests {
     fn spec_step_links_detected_frameworks_through_the_plugin_binary() {
         let (repo, plugin, st) = spec_fixture("prefix: D\n");
         let root = plugin.path().display().to_string();
-        let runner = LinkingPlugin {
-            calls: Default::default(),
-            write: Some("spec-source: openspec openspec\n"),
-            exit: 0,
-        };
+        let runner = LinkingPlugin::new(Some("spec-source: openspec openspec\n"), 0);
         let mut ui = ScriptedUi::new();
         let out = zavet_spec_sources(
             &runner,
@@ -1795,12 +1892,18 @@ mod tests {
             "got {out:?}"
         );
         assert_eq!(
-            runner.calls.borrow().as_slice(),
-            &[vec![
+            runner.calls.borrow()[0],
+            vec![
                 "spec-sources".to_string(),
                 "--detect".into(),
                 "--write".into()
-            ]]
+            ]
+        );
+        // An older plugin advertises no `spec_sources_json`: it is never asked
+        // for `spec-sources --json`, and the report just says "Linked".
+        assert_eq!(
+            runner.calls.borrow()[1..],
+            [vec!["version".to_string(), "--json".into()]]
         );
         // A second run finds the line and does nothing.
         let again = zavet_spec_sources(
@@ -1815,7 +1918,7 @@ mod tests {
             matches!(again, StepOutcome::AlreadyDone(_)),
             "got {again:?}"
         );
-        assert_eq!(runner.calls.borrow().len(), 1, "no second spawn");
+        assert_eq!(runner.calls.borrow().len(), 2, "no second spawn");
         drop(repo);
     }
 
@@ -1894,11 +1997,7 @@ mod tests {
     fn spec_step_reports_a_failing_plugin_without_aborting() {
         let (_r, plugin, st) = spec_fixture("prefix: D\n");
         let root = plugin.path().display().to_string();
-        let runner = LinkingPlugin {
-            calls: Default::default(),
-            write: None,
-            exit: 2,
-        };
+        let runner = LinkingPlugin::new(None, 2);
         let o = zavet_spec_sources(
             &runner,
             &|| Some(root.clone()),
@@ -1912,11 +2011,7 @@ mod tests {
             "got {o:?}"
         );
         // Exit 0 but nothing declared is also a failure, not a false "linked".
-        let runner = LinkingPlugin {
-            calls: Default::default(),
-            write: None,
-            exit: 0,
-        };
+        let runner = LinkingPlugin::new(None, 0);
         let o = zavet_spec_sources(
             &runner,
             &|| Some(root.clone()),
@@ -1926,5 +2021,88 @@ mod tests {
             &mut ScriptedUi::new(),
         );
         assert!(matches!(o, StepOutcome::Failed(_)), "got {o:?}");
+    }
+
+    #[test]
+    fn the_link_question_names_the_rule_files_that_come_with_it() {
+        let q = spec_link_question(&["openspec".into(), "speckit".into()]);
+        assert!(
+            q.starts_with("Link OpenSpec, Spec Kit to zavet spec sources"),
+            "{q}"
+        );
+        assert!(q.contains("adds spec-source lines to .zavet/config"), "{q}");
+        assert!(
+            q.contains("OpenSpec's config.yaml context and rules and the Spec Kit constitution"),
+            "{q}"
+        );
+        assert!(q.contains("agent context, read-only"), "{q}");
+        // A framework without standing rules adds no clause.
+        let q = spec_link_question(&["superpowers".into()]);
+        assert_eq!(
+            q,
+            "Link superpowers to zavet spec sources (adds spec-source lines to .zavet/config)?"
+        );
+        assert_eq!(
+            rule_names(&["bmad".into(), "openspec".into(), "speckit".into()]).as_deref(),
+            Some(
+                "the BMAD project context, OpenSpec's config.yaml context and rules and the \
+                 Spec Kit constitution"
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spec_step_reports_the_rule_files_linking_switched_on() {
+        let (_r, plugin, st) = spec_fixture("prefix: D\n");
+        let root = plugin.path().display().to_string();
+        let mut runner = LinkingPlugin::new(Some("spec-source: openspec openspec\n"), 0);
+        runner.version = r#"{"v":1,"version":"1.9.0","specs_json":1,"spec_sources_json":1}"#;
+        runner.rules = concat!(
+            r#"{"v":1,"type":"spec-source","kind":"openspec","root":"openspec","state":"ok"}"#,
+            "\n",
+            r#"{"v":1,"type":"rule-source","kind":"openspec-config","path":"openspec/config.yaml","enabled":true,"state":"ok"}"#,
+            "\n",
+            r#"{"v":1,"type":"rule-source","kind":"openspec-project-md","path":"openspec/project.md","enabled":true,"state":"legacy"}"#,
+            "\n",
+            r#"{"v":1,"type":"rule-source","kind":"bmad-agents-block","path":"AGENTS.md","enabled":false,"state":"off"}"#,
+            "\n",
+        );
+        let mut ui = ScriptedUi::new();
+        let out = zavet_spec_sources(
+            &runner,
+            &|| Some(root.clone()),
+            &st,
+            &Options::default(),
+            true,
+            &mut ui,
+        );
+        let StepOutcome::Done(msg) = &out else {
+            panic!("got {out:?}")
+        };
+        assert!(msg.starts_with("Linked OpenSpec"), "{msg}");
+        assert!(
+            msg.contains(
+                "rules in agent context: openspec/config.yaml (OpenSpec config), \
+                 openspec/project.md (OpenSpec project.md, legacy)"
+            ),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("AGENTS.md"),
+            "an `off` source is not in context: {msg}"
+        );
+        assert!(
+            ui.asked
+                .iter()
+                .any(|q| q.contains("OpenSpec's config.yaml context and rules")),
+            "{:?}",
+            ui.asked
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls.last().unwrap(),
+            &vec!["spec-sources".to_string(), "--json".into()]
+        );
     }
 }

@@ -1103,6 +1103,61 @@ fn print_zavet_status(v: &ZavetStatusView) {
     for line in spec_framework_lines(v) {
         println!("{line}");
     }
+    for line in rule_source_lines(v) {
+        println!("{line}");
+    }
+}
+
+/// The rule-source lines of `dira zavet status`: one per framework rule file
+/// the plugin reported (`kind  path  state  v<version>  amended <date>`), plus
+/// a hint under any that needs a human — still a template, or a file its
+/// framework has deprecated. Empty when there are none.
+fn rule_source_lines(v: &ZavetStatusView) -> Vec<String> {
+    use dira_core::zavet_specs::{RuleSourceKind, RuleSourceState};
+    let mut out = Vec::new();
+    if v.rule_sources.is_empty() {
+        return out;
+    }
+    out.push(String::new());
+    for r in &v.rule_sources {
+        let state = RuleSourceState::parse(&r.state);
+        let mut meta = vec![r.state.clone()];
+        if let Some(ver) = &r.version {
+            meta.push(format!("v{ver}"));
+        }
+        if let Some(d) = &r.last_amended {
+            meta.push(format!("amended {d}"));
+        }
+        let role = match state {
+            RuleSourceState::Ok => Role::Ink,
+            RuleSourceState::Off => Role::Faint,
+            _ => Role::Engaged,
+        };
+        out.push(format!(
+            "{} {}   {}   {}",
+            theme::paint(
+                &format!("{} {:<10}", theme::glyphs().square, "rules"),
+                Role::Knowledge
+            ),
+            theme::paint(RuleSourceKind::parse(&r.kind).label(), role),
+            theme::paint(&r.path, Role::Muted),
+            theme::paint(&meta.join("  "), Role::Muted),
+        ));
+        let hint =
+            match state {
+                RuleSourceState::Unratified => Some(r.reason.clone().unwrap_or_else(|| {
+                    "still a template — the framework has not ratified it".into()
+                })),
+                RuleSourceState::Legacy
+                | RuleSourceState::Unresolved
+                | RuleSourceState::FileMissing => r.reason.clone(),
+                _ => None,
+            };
+        if let Some(h) = hint {
+            out.push(format!("{:13}{}", "", theme::paint(&h, Role::Faint)));
+        }
+    }
+    out
 }
 
 /// The spec-framework lines of `dira zavet status`: what the working tree
@@ -1344,6 +1399,12 @@ fn zavet_reindex_lines(v: &ZavetReindexView) -> Vec<String> {
         notes.push(format!(
             "{} record(s) had their introducing commit corrected",
             v.provenance_repaired
+        ));
+    }
+    if v.rule_sources_indexed > 0 {
+        notes.push(format!(
+            "{} framework rule source(s) updated",
+            v.rule_sources_indexed
         ));
     }
     if v.trailers_bounded {
@@ -3271,6 +3332,50 @@ mod tests {
             !text.contains("detected   OpenSpec"),
             "a declared kind is not nagged: {text}"
         );
+    }
+
+    #[test]
+    fn status_lists_rule_sources_with_hints_for_the_ones_needing_a_human() {
+        let mut v = ZavetStatusView::default();
+        assert!(
+            rule_source_lines(&v).is_empty(),
+            "no rule sources, no lines"
+        );
+        let line = |kind: &str, path: &str, state: &str| dira_core::protocol::ZavetRuleSourceLine {
+            kind: kind.into(),
+            path: path.into(),
+            state: state.into(),
+            ..Default::default()
+        };
+        let mut ok = line(
+            "speckit-constitution",
+            ".specify/memory/constitution.md",
+            "ok",
+        );
+        ok.version = Some("1.2.0".into());
+        ok.last_amended = Some("2026-09-10".into());
+        let mut legacy = line("openspec-project-md", "openspec/project.md", "legacy");
+        legacy.reason =
+            Some("deprecated by OpenSpec: move it into openspec/config.yaml context".into());
+        v.rule_sources = vec![
+            ok,
+            legacy,
+            line("bmad-agents-block", "AGENTS.md", "unratified"),
+        ];
+        let text = rule_source_lines(&v)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Spec Kit constitution")
+                && text.contains(".specify/memory/constitution.md")
+                && text.contains("ok  v1.2.0  amended 2026-09-10"),
+            "{text}"
+        );
+        assert!(text.contains("deprecated by OpenSpec"), "{text}");
+        assert!(text.contains("not ratified"), "{text}");
+        assert_eq!(text.matches("rules").count(), 3, "{text}");
     }
 
     #[test]

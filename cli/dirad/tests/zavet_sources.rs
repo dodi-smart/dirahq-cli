@@ -1,7 +1,7 @@
 //! Source-backed specs, end to end: a real temp git repo with a declared
 //! `spec-source:`, a FAKE installed plugin (a shell script answering
-//! `version --json` / `specs --json`), walked by the production
-//! `capture_commits` path and asserted against the store.
+//! `version --json` / `specs --json` / `spec-sources --json`), walked by the
+//! production `capture_commits` path and asserted against the store.
 //!
 //! The fake plugin is reached through `DIRA_ZAVET_PLUGIN_ROOT`, the same seam a
 //! user with a non-standard install uses — never through the repo's vendored
@@ -39,7 +39,9 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
-/// A fake plugin root: `bin/zavet` serves whatever `rows.jsonl` holds.
+/// A fake plugin root: `bin/zavet` serves whatever `rows.jsonl` (units) and
+/// `sources.jsonl` (spec/rule sources) hold, and logs every argv to
+/// `calls.log`.
 struct FakePlugin {
     dir: tempfile::TempDir,
 }
@@ -53,9 +55,11 @@ impl FakePlugin {
             &bin,
             "#!/bin/sh\n\
              d=\"$(dirname \"$0\")/..\"\n\
+             echo \"$*\" >> \"$d/calls.log\"\n\
              case \"$1\" in\n\
                version) cat \"$d/version.json\" ;;\n\
                specs) cat \"$d/rows.jsonl\" ;;\n\
+               spec-sources) [ -f \"$d/sources.fail\" ] && exit 3; cat \"$d/sources.jsonl\" ;;\n\
                *) exit 2 ;;\n\
              esac\n",
         )
@@ -63,7 +67,34 @@ impl FakePlugin {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(dir.path().join("version.json"), r#"{"specs_json":1}"#).unwrap();
         std::fs::write(dir.path().join("rows.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("sources.jsonl"), "").unwrap();
         Self { dir }
+    }
+    /// A plugin that also advertises `spec_sources_json` and serves `jsonl`.
+    fn with_rules(jsonl: &str) -> Self {
+        let p = Self::new();
+        p.version(r#"{"specs_json":1,"spec_sources_json":1}"#);
+        p.sources(jsonl);
+        p
+    }
+    fn sources(&self, jsonl: &str) {
+        std::fs::write(self.dir.path().join("sources.jsonl"), jsonl).unwrap();
+    }
+    fn fail_sources(&self, fail: bool) {
+        let f = self.dir.path().join("sources.fail");
+        if fail {
+            std::fs::write(f, "").unwrap();
+        } else {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+    /// How many times `spec-sources --json` was asked.
+    fn rule_calls(&self) -> usize {
+        std::fs::read_to_string(self.dir.path().join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == "spec-sources --json")
+            .count()
     }
     fn rows(&self, jsonl: &str) {
         std::fs::write(self.dir.path().join("rows.jsonl"), jsonl).unwrap();
@@ -370,7 +401,8 @@ async fn a_failed_or_unsupported_resolve_changes_nothing() {
 #[tokio::test]
 async fn the_repos_vendored_zavet_is_never_executed() {
     let _g = PLUGIN_ENV.lock().await;
-    let plugin = FakePlugin::new();
+    // The rule-source resolve goes through the same binary: it is armed too.
+    let plugin = FakePlugin::with_rules(&config_rules("c1"));
     plugin.rows(&row("openspec", "add-csv-import", "active", ""));
     plugin.activate();
     let state = test_state().await;
@@ -396,6 +428,19 @@ async fn the_repos_vendored_zavet_is_never_executed() {
         .await
         .unwrap()
         .is_some());
+    // Rule sources came from the plugin, too — and still nothing ran the
+    // vendored copy, including through `dira zavet reindex`.
+    assert_eq!(rules_of(&state).await.len(), 1);
+    let _ = dirad::control::dispatch(
+        &state,
+        dira_core::protocol::Request::ZavetReindex {
+            cwd: Some(repo.path().display().to_string()),
+            all_trailers: false,
+        },
+    )
+    .await;
+    assert!(plugin.rule_calls() >= 2);
+    assert!(!marker.exists(), "the repo's vendored zavet must never run");
 }
 
 fn session_event(id: &str, kind: EventKind, spec: Option<&str>) -> RawEvent {
@@ -728,4 +773,324 @@ async fn an_ended_session_is_not_bound_late_and_a_removed_unit_is_not_a_target()
     );
     capture(&state, repo.path()).await;
     assert_eq!(session_spec(&state).await, (None, None));
+}
+
+// ---------------------------------------------------------------------------
+// Framework rule sources (`zavet spec-sources --json`, DIRASH-0040)
+// ---------------------------------------------------------------------------
+
+fn rule_row(kind: &str, path: &str, oid: &str, state: &str) -> String {
+    format!(
+        r#"{{"v":1,"type":"rule-source","kind":"{kind}","path":"{path}","source":"default","enabled":true,"oid":"{oid}","version":"1.2.0","ratified":"2026-06-01","lastAmended":"2026-09-10","ruleCount":2,"origin":"external","verified":false,"state":"{state}","reason":null}}"#
+    )
+}
+
+const SPEC_SOURCE_ROW: &str = r#"{"v":1,"type":"spec-source","kind":"openspec","root":"openspec","globs":[],"state":"ok","units":1,"unresolved":0}"#;
+
+fn config_rules(oid: &str) -> String {
+    format!(
+        "{SPEC_SOURCE_ROW}\n{}\n",
+        rule_row("openspec-config", "openspec/config.yaml", oid, "ok")
+    )
+}
+
+/// [`repo_with_source`] plus a committed `openspec/config.yaml`.
+fn repo_with_rules(branch: &str) -> tempfile::TempDir {
+    let dir = repo_with_source(branch);
+    std::fs::write(
+        dir.path().join("openspec/config.yaml"),
+        "context: |\n  Use TypeScript.\nrules:\n  proposal:\n    - Keep it short\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-q", "-m", "docs: openspec config"]);
+    dir
+}
+
+fn edit(repo: &Path, path: &str, msg: &str) {
+    let f = repo.join(path);
+    if let Some(parent) = f.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let prev = std::fs::read_to_string(&f).unwrap_or_default();
+    std::fs::write(&f, format!("{prev}# edit\n")).unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", msg]);
+}
+
+async fn rules_of(state: &AppState) -> Vec<dira_core::store::ZavetRuleSourceRow> {
+    state.store.zavet_rule_sources_list(REPO).await.unwrap()
+}
+
+async fn status_rules(state: &AppState) -> Vec<dira_core::protocol::ZavetRuleSourceLine> {
+    match dirad::control::dispatch(
+        state,
+        dira_core::protocol::Request::ZavetStatus {
+            cwd: None,
+            repo: Some(REPO.into()),
+        },
+    )
+    .await
+    {
+        dira_core::protocol::Response::ZavetStatus(v) => v.rule_sources,
+        other => panic!("expected a status view, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rule_sources_are_upserted_shown_in_status_and_marked_removed_never_deleted() {
+    let _g = PLUGIN_ENV.lock().await;
+    let plugin = FakePlugin::with_rules(&config_rules("c1"));
+    plugin.activate();
+    let state = test_state().await;
+    let repo = repo_with_rules("main");
+
+    capture(&state, repo.path()).await;
+    let rows = rules_of(&state).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!(
+        (r.kind.as_str(), r.path.as_str()),
+        ("openspec-config", "openspec/config.yaml")
+    );
+    assert_eq!(r.oid.as_deref(), Some("c1"));
+    assert_eq!(r.version.as_deref(), Some("1.2.0"));
+    assert_eq!(r.rule_count, Some(2));
+    assert_eq!(r.state, "ok");
+    assert!(r.removed_at.is_none());
+    // Over the control socket's dispatcher.
+    let lines = status_rules(&state).await;
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].path, "openspec/config.yaml");
+    assert_eq!(lines[0].last_amended.as_deref(), Some("2026-09-10"));
+
+    // Rule sources are local metadata: nothing about them enters the
+    // knowledge cursor.
+    let seq = state.store.zavet_specs_since(0, 100).await.unwrap();
+
+    // An edit to the rule file re-resolves; a new oid updates the row.
+    plugin.sources(&config_rules("c2"));
+    edit(
+        repo.path(),
+        "openspec/config.yaml",
+        "docs: tighten the rules",
+    );
+    capture(&state, repo.path()).await;
+    assert_eq!(rules_of(&state).await[0].oid.as_deref(), Some("c2"));
+    assert_eq!(
+        state.store.zavet_specs_since(0, 100).await.unwrap().len(),
+        seq.len(),
+        "a rule-source change pushes no knowledge"
+    );
+
+    // An EMPTY answer while the default rule file is still on disk is a failed
+    // resolve, not a deletion.
+    plugin.sources(SPEC_SOURCE_ROW);
+    edit(repo.path(), "openspec/config.yaml", "docs: plugin hiccup");
+    capture(&state, repo.path()).await;
+    assert!(rules_of(&state).await[0].removed_at.is_none());
+    assert_eq!(status_rules(&state).await.len(), 1);
+
+    // The file is really gone: marked removed, never deleted, out of status.
+    git(repo.path(), &["rm", "-q", "openspec/config.yaml"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "-m", "chore: drop the config"],
+    );
+    capture(&state, repo.path()).await;
+    let rows = rules_of(&state).await;
+    assert_eq!(rows.len(), 1, "never deleted");
+    assert!(rows[0].removed_at.is_some(), "{rows:?}");
+    assert!(status_rules(&state).await.is_empty());
+
+    // It comes back: listed again.
+    plugin.sources(&config_rules("c3"));
+    edit(
+        repo.path(),
+        "openspec/config.yaml",
+        "docs: restore the config",
+    );
+    capture(&state, repo.path()).await;
+    let rows = rules_of(&state).await;
+    assert!(rows[0].removed_at.is_none());
+    assert_eq!(rows[0].oid.as_deref(), Some("c3"));
+}
+
+#[tokio::test]
+async fn rule_source_removals_only_happen_from_the_default_branch_checkout() {
+    let _g = PLUGIN_ENV.lock().await;
+    let plugin = FakePlugin::with_rules(&config_rules("c1"));
+    plugin.activate();
+    let state = test_state().await;
+    let repo = repo_with_rules("main");
+    capture(&state, repo.path()).await;
+    assert_eq!(rules_of(&state).await.len(), 1);
+
+    git(repo.path(), &["checkout", "-q", "-b", "feat/no-config"]);
+    git(repo.path(), &["rm", "-q", "openspec/config.yaml"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "-m", "chore: branch without it"],
+    );
+    plugin.sources(SPEC_SOURCE_ROW);
+    capture(&state, repo.path()).await;
+    assert!(
+        rules_of(&state).await[0].removed_at.is_none(),
+        "off the default branch: no removals"
+    );
+
+    git(repo.path(), &["checkout", "-q", "main"]);
+    git(repo.path(), &["rm", "-q", "openspec/config.yaml"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "-m", "chore: drop it on main"],
+    );
+    capture(&state, repo.path()).await;
+    assert!(rules_of(&state).await[0].removed_at.is_some());
+}
+
+#[tokio::test]
+async fn a_failed_or_unsupported_rule_resolve_changes_nothing() {
+    let _g = PLUGIN_ENV.lock().await;
+    // A plugin without `spec_sources_json` is never asked.
+    let old = FakePlugin::new();
+    old.sources(&config_rules("c1"));
+    old.activate();
+    let state = test_state().await;
+    let repo = repo_with_rules("main");
+    capture(&state, repo.path()).await;
+    assert!(rules_of(&state).await.is_empty());
+    assert_eq!(old.rule_calls(), 0, "spec-sources --json must not run");
+
+    // A capable plugin that then fails: the stored rows stay as they were.
+    let plugin = FakePlugin::with_rules(&config_rules("c1"));
+    plugin.activate();
+    let state = test_state().await;
+    let repo = repo_with_rules("main");
+    capture(&state, repo.path()).await;
+    assert_eq!(rules_of(&state).await.len(), 1);
+    plugin.fail_sources(true);
+    git(repo.path(), &["rm", "-q", "openspec/config.yaml"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "-m", "chore: drop the config"],
+    );
+    capture(&state, repo.path()).await;
+    let rows = rules_of(&state).await;
+    assert!(
+        rows[0].removed_at.is_none(),
+        "a failed resolve removes nothing"
+    );
+    assert_eq!(rows[0].oid.as_deref(), Some("c1"));
+}
+
+#[tokio::test]
+async fn a_new_constitution_triggers_a_refresh_and_unrelated_commits_do_not() {
+    let _g = PLUGIN_ENV.lock().await;
+    let plugin = FakePlugin::with_rules("");
+    plugin.activate();
+    let state = test_state().await;
+    let repo = repo_with_source("main");
+    // Declare Spec Kit too (a config edit: itself a trigger).
+    std::fs::write(
+        repo.path().join(".zavet/config"),
+        "prefix: D\nspec-source: openspec openspec\nspec-source: speckit specs\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.path().join("specs")).unwrap();
+    std::fs::write(repo.path().join("specs/.keep"), "").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "chore: link spec kit"]);
+    capture(&state, repo.path()).await;
+    assert!(rules_of(&state).await.is_empty());
+    let calls = plugin.rule_calls();
+    assert!(calls >= 1, "the config edit re-resolved rule sources");
+
+    // A commit touching nothing rule-shaped does not ask the plugin.
+    std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "feat: code"]);
+    capture(&state, repo.path()).await;
+    assert_eq!(
+        plugin.rule_calls(),
+        calls,
+        "no rule resolve for unrelated code"
+    );
+
+    // The constitution lands — no config edit, no user action — and is seen.
+    plugin.sources(&rule_row(
+        "speckit-constitution",
+        ".specify/memory/constitution.md",
+        "k1",
+        "unratified",
+    ));
+    edit(
+        repo.path(),
+        ".specify/memory/constitution.md",
+        "docs: draft the constitution",
+    );
+    capture(&state, repo.path()).await;
+    let rows = rules_of(&state).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind, "speckit-constitution");
+    assert_eq!(rows[0].state, "unratified");
+    assert_eq!(plugin.rule_calls(), calls + 1);
+
+    // An override path, once stored, is watched too.
+    plugin.sources(&format!(
+        "{}\n{}\n",
+        rule_row(
+            "speckit-constitution",
+            ".specify/memory/constitution.md",
+            "k1",
+            "unratified"
+        ),
+        rule_row("openspec-config", "docs/openspec-rules.yaml", "o1", "ok"),
+    ));
+    edit(
+        repo.path(),
+        ".zavet/config",
+        "chore: point openspec rules elsewhere",
+    );
+    capture(&state, repo.path()).await;
+    assert_eq!(rules_of(&state).await.len(), 2);
+    let before = plugin.rule_calls();
+    edit(
+        repo.path(),
+        "docs/openspec-rules.yaml",
+        "docs: edit the override",
+    );
+    capture(&state, repo.path()).await;
+    assert_eq!(plugin.rule_calls(), before + 1, "a stored path triggers");
+}
+
+#[tokio::test]
+async fn reindex_refreshes_rule_sources_and_a_repeat_run_writes_nothing() {
+    let _g = PLUGIN_ENV.lock().await;
+    let plugin = FakePlugin::with_rules(&config_rules("c1"));
+    plugin.activate();
+    let state = test_state().await;
+    let repo = repo_with_rules("main");
+    let cwd = repo.path().display().to_string();
+    let reindex = || async {
+        match dirad::control::dispatch(
+            &state,
+            dira_core::protocol::Request::ZavetReindex {
+                cwd: Some(cwd.clone()),
+                all_trailers: false,
+            },
+        )
+        .await
+        {
+            dira_core::protocol::Response::ZavetReindex(v) => v,
+            other => panic!("expected a reindex view, got {other:?}"),
+        }
+    };
+    let first = reindex().await;
+    assert_eq!(first.rule_sources_indexed, 1, "{first:?}");
+    assert_eq!(rules_of(&state).await.len(), 1);
+    let updated = rules_of(&state).await[0].updated_at.clone();
+    let second = reindex().await;
+    assert_eq!(second.rule_sources_indexed, 0, "idempotent: {second:?}");
+    assert_eq!(rules_of(&state).await[0].updated_at, updated);
 }

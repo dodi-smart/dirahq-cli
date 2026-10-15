@@ -63,6 +63,105 @@ pub fn session_repo_short(s: &dira_core::protocol::SessionView) -> String {
     }
 }
 
+/// One line of a session list laid out as orchestration run trees: an
+/// ordinary session, a run's root, one of its members, or a repo only the
+/// orchestrator touched directly (`session: None`).
+#[derive(Debug, Clone)]
+pub struct TreeRow<'a> {
+    /// Two-column gutter: `▾ ` on a run root with rows under it, `├ `/`└ ` on
+    /// those rows, blank otherwise.
+    pub glyph: &'static str,
+    pub session: Option<&'a dira_core::protocol::SessionView>,
+    pub handle: String,
+    pub project: String,
+    /// A short project label for narrow places (the dashboard's lanes).
+    pub short: String,
+}
+
+/// Lay a session list out as run trees with [`dira_core::runs::group`] — the
+/// one grouping every view shares (`dira sessions`, `status`, `watch`). A run
+/// over at most one repo is folded and reads as that repo's work; a wider one
+/// is named by its local title (never synced) or `orchestration`.
+pub fn tree_rows<'a>(
+    sessions: &'a [dira_core::protocol::SessionView],
+    titles: &std::collections::HashMap<String, String>,
+) -> Vec<TreeRow<'a>> {
+    use dira_core::runs::{group, Entry};
+    let mut out = Vec::new();
+    for entry in group(sessions) {
+        match entry {
+            Entry::Session(s) => out.push(TreeRow {
+                glyph: "  ",
+                session: Some(s),
+                handle: s.handle.clone(),
+                project: session_project_label(s),
+                short: session_repo_short(s),
+            }),
+            Entry::Run(run) => {
+                let root = run.root;
+                let (project, short) = if run.folded() {
+                    let repo = run.repos.first().cloned();
+                    (
+                        repo.clone()
+                            .unwrap_or_else(|| ORCHESTRATION_LABEL.to_string()),
+                        repo_short(&repo.or_else(|| Some(ORCHESTRATION_LABEL.to_string()))),
+                    )
+                } else {
+                    let name = titles
+                        .get(&root.session_id)
+                        .cloned()
+                        .unwrap_or_else(|| ORCHESTRATION_LABEL.to_string());
+                    (format!("{name} · {} repos", run.repos.len()), name)
+                };
+                let direct: &[String] = if run.folded() { &[] } else { &run.direct };
+                let total = run.members.len() + direct.len();
+                out.push(TreeRow {
+                    glyph: if total == 0 { "  " } else { "▾ " },
+                    session: Some(root),
+                    handle: root.handle.clone(),
+                    project,
+                    short,
+                });
+                let branch = |i: usize| if i + 1 == total { "└ " } else { "├ " };
+                for (i, s) in run.members.iter().enumerate() {
+                    out.push(TreeRow {
+                        glyph: branch(i),
+                        session: Some(s),
+                        handle: s.handle.clone(),
+                        project: session_project_label(s),
+                        short: session_repo_short(s),
+                    });
+                }
+                for (k, repo) in direct.iter().enumerate() {
+                    out.push(TreeRow {
+                        glyph: branch(run.members.len() + k),
+                        session: None,
+                        handle: "·".to_string(),
+                        project: repo.clone(),
+                        short: repo_short(&Some(repo.clone())),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Re-close tree branches after rows were filtered out: a member glyph
+/// (`├ `/`└ `) becomes `└ ` when no member of the same run follows it, and
+/// `├ ` otherwise. A run root whose rows all dropped loses its `▾ `.
+pub fn retree(glyphs: &mut [&'static str]) {
+    let is_member = |g: &str| g == "├ " || g == "└ ";
+    for i in 0..glyphs.len() {
+        let next_is_member = glyphs.get(i + 1).is_some_and(|g| is_member(g));
+        if is_member(glyphs[i]) {
+            glyphs[i] = if next_is_member { "├ " } else { "└ " };
+        } else if glyphs[i] == "▾ " && !next_is_member {
+            glyphs[i] = "  ";
+        }
+    }
+}
+
 /// A short, last-segment label for a project path/slug — e.g. `acme/api` →
 /// `api`, `/Users/me/work/foo` → `foo`. Leaves bare names untouched. Used by the
 /// TUI where horizontal space is tight; the plain renderer keeps full labels.
@@ -301,6 +400,14 @@ mod tests {
     #[test]
     fn hms_clamps_negative() {
         assert_eq!(hms(-10), "0s");
+    }
+
+    #[test]
+    fn retree_recloses_branches_after_filtering() {
+        // A run whose last member (a direct-repo row) was filtered out.
+        let mut g = vec!["▾ ", "├ ", "├ ", "  ", "▾ ", "  "];
+        retree(&mut g);
+        assert_eq!(g, vec!["▾ ", "├ ", "└ ", "  ", "  ", "  "]);
     }
 
     #[test]

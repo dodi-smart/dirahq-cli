@@ -16,6 +16,25 @@ pub fn claude_titles() -> HashMap<String, String> {
     from_dir(&home.join(".claude").join("sessions"))
 }
 
+/// [`claude_titles`] memoized for 30 s, for views that redraw continuously
+/// (`dira watch`); a title renamed mid-session shows up on the next refresh.
+pub fn cached_claude_titles() -> HashMap<String, String> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Cached = Option<(Instant, HashMap<String, String>)>;
+    static CACHE: OnceLock<Mutex<Cached>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    match &*guard {
+        Some((at, titles)) if at.elapsed() < Duration::from_secs(30) => titles.clone(),
+        _ => {
+            let titles = claude_titles();
+            *guard = Some((Instant::now(), titles.clone()));
+            titles
+        }
+    }
+}
+
 fn from_dir(dir: &std::path::Path) -> HashMap<String, String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return HashMap::new();

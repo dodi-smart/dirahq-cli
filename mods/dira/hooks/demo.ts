@@ -70,7 +70,6 @@ export const DEMO_FORECAST: Forecast = {
   elements: { ci: 'ok', review: 'ok', authorship: 'ok', supervision: 'ok', intent: 'missing' },
   grade: 750,
   notes: ['2 commits touch dira-demo/src/** without Refs: DEMO-0008'],
-  at: 0,
 }
 
 export const DEMO_SOURCE = `//! Control socket for the daemon.

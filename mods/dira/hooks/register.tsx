@@ -23,12 +23,14 @@ import { DEMO_AUDIT, DEMO_DECISIONS, DEMO_FILE, DEMO_FORECAST, DEMO_OVERVIEWS, D
 import {
   C,
   ELEMENT_KEYS,
+  GLYPH,
   PROBA,
   affectedSpecs,
   analyzeDraft,
   bar,
   clip,
   commitTrailers,
+  decisionChips,
   directives,
   elementLine,
   extractPaths,
@@ -40,10 +42,11 @@ import {
   isGitCommit,
   isLivingSpec,
   isWorkItem,
+  knowledgeAt,
   knowledgeSvg,
   mentioned,
   mergeDecisionStats,
-  nextRung,
+  openTasks,
   overview,
   parseAudit,
   parseDecisions,
@@ -56,6 +59,7 @@ import {
   relationsSvg,
   statusAnsi,
   statusLine,
+  titleOf,
   toRelative,
   toSnapshot,
   vouchReasons,
@@ -70,7 +74,8 @@ const AUDIT_TTL_MS = 10 * 60_000
 const EDIT_TOOLS = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']
 const TRUNKS = ['main', 'master', 'develop', 'HEAD', 'trunk']
 const PARTS: Part[] = ['status', 'composer', 'transcript', 'band', 'steward']
-const ALL_ON: Parts = { status: true, composer: true, transcript: true, band: true, steward: true }
+const ALL_ON = Object.fromEntries(PARTS.map(p => [p, true])) as Parts
+const FORECAST_BACKOFF_MAX_MS = 15 * 60_000
 
 const envA = atom({ plugin: 'dira', key: 'env' } as const, null as Env | null)
 const snapA = atom({ plugin: 'dira', key: 'snap' } as const, null as Snapshot | null)
@@ -98,11 +103,17 @@ let sessionId = ''
 let demoRoot = ''
 let usesStatusLine = false
 // Status line: what was last drawn, so an unchanged line costs nothing.
-let lastAnsi = ''
+let lastAnsi: string | null = null
 let lastPlain: string | undefined
 let statusCacheNote = 'not written yet'
 let lastPollAt = 0
 let isTurnRunning = false
+// Forecast: one refresh at a time, when it last ran, and how long an open PR
+// that is still waiting on GitHub (CI, a review) goes between re-reads. The
+// wait doubles while nothing changes and resets when a turn starts.
+let forecastRun: Promise<void> | null = null
+let forecastAt = 0
+let pendingWaitMs = IDLE_POLL_MS
 // Composer: the latest draft and the edit it came from (the debounce).
 let draftText = ''
 let editSeq = 0
@@ -112,22 +123,20 @@ const footerMemo = new Map<string, { sig: string; ids: string[]; slugs: string[]
 
 // ---------------------------------------------------------------- plumbing
 
-async function sh($: any, argv: string[], init: Record<string, unknown> = {}): Promise<string | null> {
+/** Runs a host command; null when it could not start or was killed. */
+async function exec($: any, argv: string[], init: Record<string, unknown> = {}): Promise<{ code: number; stdout: string; stderr: string } | null> {
   try {
     const r = await $.process.run(argv, { timeoutMs: 15_000, ...init })
-    return r.exitCode === 0 ? r.stdout : null
+    return { code: r.exitCode, stdout: r.stdout, stderr: r.stderr }
   } catch {
     return null
   }
 }
 
-async function shAll($: any, argv: string[], init: Record<string, unknown> = {}): Promise<{ code: number; out: string } | null> {
-  try {
-    const r = await $.process.run(argv, { timeoutMs: 20_000, ...init })
-    return { code: r.exitCode, out: `${r.stdout}\n${r.stderr}` }
-  } catch {
-    return null
-  }
+/** A command's stdout when it succeeded, else null. */
+async function sh($: any, argv: string[], init: Record<string, unknown> = {}): Promise<string | null> {
+  const r = await exec($, argv, init)
+  return r && r.code === 0 ? r.stdout : null
 }
 
 async function probe(log: string[], label: string, fn: () => Promise<any>): Promise<any> {
@@ -175,8 +184,8 @@ function relPath(file: string, env: Env | null): string {
   return env ? toRelative(file, env.root) : file
 }
 
-function isPartOn(parts: Parts, part: Part): boolean {
-  return parts[part] !== false
+function describeParts(p: Parts, sep: string): string {
+  return PARTS.map(x => `${x} ${p[x] ? 'on' : 'off'}`).join(sep)
 }
 
 /** One-paragraph overviews of specs and decisions, read in parallel, cached once. */
@@ -205,7 +214,7 @@ async function blurbs($: any, keys: { key: string; isDecision: boolean }[]): Pro
 async function decisionNotes($: any, ids: string[], sep = '\n'): Promise<string[]> {
   const decisions = await read($, decisionsA)
   const text = await blurbs($, ids.map(key => ({ key, isDecision: true })))
-  return ids.map(id => `${id} — ${decisions.find(d => d.id === id)?.title ?? ''}${text[id] ? `${sep}${text[id]}` : ''}`)
+  return ids.map(id => `${id} — ${titleOf(decisions, id)}${text[id] ? `${sep}${text[id]}` : ''}`)
 }
 
 /**
@@ -245,7 +254,7 @@ async function markShown($: any, ids: string[]): Promise<void> {
 
 async function paint($: any): Promise<void> {
   const [snap, specs, guarded, touched, parts] = await Promise.all([read($, snapA), read($, specsA), read($, guardedA), read($, touchedA), read($, partsA)])
-  const isOn = isPartOn(parts, 'status')
+  const isOn = parts.status
   const stale = affectedSpecs(touched, specs).filter(a => !a.isSpecEdited).length
   const plain = isOn && !usesStatusLine ? statusLine(snap, guarded.length, stale) : undefined
   if (plain !== lastPlain) {
@@ -253,7 +262,7 @@ async function paint($: any): Promise<void> {
     $.ui.status(plain)
   }
   const ansi = isOn ? statusAnsi(snap, guarded.length, stale) : ''
-  if (ansi !== lastAnsi || statusCacheNote === 'not written yet') {
+  if (ansi !== lastAnsi) {
     lastAnsi = ansi
     await writeStatusCache($, ansi)
   }
@@ -264,25 +273,23 @@ async function writeStatusCache($: any, line: string): Promise<void> {
   const script =
     'for d in "${XDG_CACHE_HOME:-$HOME/.cache}/dira/mod" "/tmp/claude-$(id -u)/dira-mod"; do ' +
     'if mkdir -p "$d" 2>/dev/null && cat > "$d/status-$1.ansi.tmp" 2>/dev/null && mv "$d/status-$1.ansi.tmp" "$d/status-$1.ansi"; then echo "$d"; exit 0; fi; done; exit 1'
-  try {
-    const r = await $.process.run(['sh', '-c', script, 'dira-status', sessionId], { stdin: line, timeoutMs: 5_000 })
-    statusCacheNote = r.exitCode === 0 ? `written to ${r.stdout.trim()}` : `refused: ${r.stderr.trim() || 'no writable dir'}`
-  } catch (err: any) {
-    statusCacheNote = `threw: ${String(err?.message ?? err)}`
-  }
+  // bin/statusline.sh reads these same two directories; keep them in step.
+  const r = await exec($, ['sh', '-c', script, 'dira-status', sessionId], { stdin: line, timeoutMs: 5_000 })
+  statusCacheNote = !r ? 'could not run the writer' : r.code === 0 ? `written to ${r.stdout.trim()}` : `refused: ${r.stderr.trim() || 'no writable dir'}`
 }
 
 /** dira's numbers for this session; the cost is Claude Code's own count. */
 async function loadStatus($: any, env: Env | null): Promise<void> {
-  lastPollAt = await $.clock.now()
-  if (!env?.dira) return
+  const [now, isDemo] = await Promise.all([$.clock.now(), read($, demoA)])
+  lastPollAt = now
+  if (!env?.dira || isDemo) return
   const [out, usage] = await Promise.all([sh($, [env.dira, 'status', '--json'], { timeoutMs: 5_000 }), $.session.usage().catch(() => null)])
   const json = out && parseJson(out)
   if (json) await update($, snapA, () => toSnapshot(json, sessionId, usage?.cost?.usd ?? null))
 }
 
 async function loadKnowledge($: any, env: Env | null): Promise<void> {
-  if (!env?.zavet || !env.hasZavetDir) return
+  if (!env?.zavet || !env.hasZavetDir || (await read($, demoA))) return
   const [specs, list, guards, files, stats] = await Promise.all([
     runZavet($, env, ['specs', '--json']),
     runZavet($, env, ['list']),
@@ -310,7 +317,6 @@ async function recompute($: any): Promise<void> {
 
 /** Everything that feeds the surfaces, independent work in parallel, one paint. */
 async function refreshAll($: any, opts: { knowledge?: boolean; forecast?: 'await' | 'background' | 'skip'; isForced?: boolean } = {}): Promise<void> {
-  if (await read($, demoA)) return paint($)
   const env = await read($, envA)
   await Promise.all([loadStatus($, env), opts.knowledge === false ? null : loadKnowledge($, env)])
   await recompute($)
@@ -321,11 +327,9 @@ async function refreshAll($: any, opts: { knowledge?: boolean; forecast?: 'await
 
 /** `zavet audit` takes seconds: run it in the background, at most every 10 minutes. */
 async function refreshAudit($: any, isForced = false): Promise<void> {
-  if (await read($, demoA)) return
-  const now = await $.clock.now()
-  const have = await read($, auditA)
-  if (!isForced && have && now - have.at < AUDIT_TTL_MS) return
-  const out = await runZavet($, await read($, envA), ['audit'])
+  const [isDemo, now, have, env] = await Promise.all([read($, demoA), $.clock.now(), read($, auditA), read($, envA)])
+  if (isDemo || (!isForced && have && now - have.at < AUDIT_TTL_MS)) return
+  const out = await runZavet($, env, ['audit'])
   if (out !== null) await update($, auditA, () => parseAudit(out, now))
 }
 
@@ -341,32 +345,50 @@ async function setFocus($: any, focus: Focus | null): Promise<void> {
  * (dirahq-cloud cloud/src/lib/proba/checks/fold.ts is the real grader):
  * ci + review from the open PR via gh, authorship + supervision from dira's
  * capture of this session, intent from `zavet check <base>..HEAD`.
+ *
+ * Owns its own freshness: a settled forecast is re-read after two minutes, an
+ * open PR still waiting on CI or a review after `pendingWaitMs`, which backs
+ * off while nothing changes. One run at a time; a caller during a run shares it.
  */
 async function refreshForecast($: any, isForced = false): Promise<void> {
-  if (await read($, demoA)) return
-  const [env, have, snap] = await Promise.all([read($, envA), read($, forecastA), read($, snapA)])
-  if (!env) return
-  const now = await $.clock.now()
-  if (!isForced && have && now - have.at < FORECAST_TTL_MS) return
+  // Claim the slot before any await, so two callers can never both start a run.
+  forecastRun ??= (async () => {
+    const [isDemo, env, have, now] = await Promise.all([read($, demoA), read($, envA), read($, forecastA), $.clock.now()])
+    if (isDemo || !env) return
+    const isWaiting = !!have?.pr && (have.elements.ci === 'pending' || have.elements.review === 'pending')
+    if (!isForced && forecastAt && now - forecastAt < (isWaiting ? pendingWaitMs : FORECAST_TTL_MS)) return
+    await loadForecast($, env, have)
+  })().finally(() => {
+    forecastRun = null
+  })
+  return forecastRun
+}
+
+async function loadForecast($: any, env: Env, have: Forecast | null): Promise<void> {
   const cwd = env.root
-  const branch = (await sh($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd }))?.trim() ?? ''
-  if (!branch || TRUNKS.includes(branch)) {
-    await update($, forecastA, () => null)
-    return
-  }
-  const [prOut, hasDevelop] = await Promise.all([
+  const [branchOut, prOut, hasDevelop, snap] = await Promise.all([
+    sh($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd }),
     sh($, ['gh', 'pr', 'view', '--json', 'number,state,baseRefName,author,reviews,statusCheckRollup'], { cwd, timeoutMs: 10_000 }),
     sh($, ['git', 'rev-parse', '--verify', '--quiet', 'origin/develop'], { cwd }),
+    read($, snapA),
   ])
+  forecastAt = await $.clock.now()
+  const branch = branchOut?.trim() ?? ''
+  if (!branch || TRUNKS.includes(branch)) {
+    if (have) await update($, forecastA, () => null)
+    return
+  }
   const pr = parseJson(prOut ?? '')
   const isOpen = pr?.state === 'OPEN'
   const notes: string[] = []
   let ci: ElementState = 'pending'
   let review: ElementState = 'pending'
   if (pr && isOpen) {
-    const states = (pr.statusCheckRollup ?? []).map((r: any) => String(r.conclusion || r.state || r.status || '').toUpperCase())
-    if (states.some((s: string) => ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(s))) ci = 'missing'
-    else if (states.length && states.every((s: string) => ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(s))) ci = 'ok'
+    const states: string[] = (pr.statusCheckRollup ?? []).map((r: any) => String(r.conclusion || r.state || r.status || '').toUpperCase())
+    // A repo with no checks has nothing to wait for.
+    if (states.length === 0) ci = 'unknown'
+    else if (states.some(st => ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(st))) ci = 'missing'
+    else if (states.every(st => ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(st))) ci = 'ok'
     const approved = (pr.reviews ?? []).some((r: any) => r.state === 'APPROVED' && r.author?.login !== pr.author?.login)
     review = approved ? 'ok' : 'pending'
     if (ci === 'missing') notes.push('CI is failing')
@@ -378,14 +400,21 @@ async function refreshForecast($: any, isForced = false): Promise<void> {
   if (supervision === 'missing') notes.push('no engaged minutes captured on this branch yet')
   let intent: ElementState = 'unknown'
   if (env.zavet && env.hasZavetDir) {
-    const r = await shAll($, [env.zavet, 'check', `origin/${base}..HEAD`], { cwd })
+    const r = await exec($, [env.zavet, 'check', `origin/${base}..HEAD`], { cwd, timeoutMs: 20_000 })
     if (r) {
       intent = r.code === 0 ? 'ok' : 'missing'
-      if (intent === 'missing') notes.push(...r.out.split('\n').filter(l => l.trim() && !/^warn|warning only/.test(l)).slice(0, 3).map(l => clip(l.replace(/\t/g, ' '), 120)))
+      if (intent === 'missing')
+        notes.push(...`${r.stdout}\n${r.stderr}`.split('\n').filter(l => l.trim() && !/^warn|warning only/.test(l)).slice(0, 3).map(l => clip(l.replace(/\t/g, ' '), 120)))
     }
   }
   const elements = { ci, review, authorship, supervision, intent }
-  await update($, forecastA, () => ({ branch, pr: isOpen ? pr!.number : null, elements, grade: gradeFor(elements), notes, at: now }))
+  const next: Forecast = { branch, pr: isOpen ? pr!.number : null, elements, grade: gradeFor(elements), notes }
+  // Only a changed forecast redraws the band; an unchanged wait backs off.
+  if (JSON.stringify(next) === JSON.stringify(have)) pendingWaitMs = Math.min(pendingWaitMs * 2, FORECAST_BACKOFF_MAX_MS)
+  else {
+    pendingWaitMs = IDLE_POLL_MS
+    await update($, forecastA, () => next)
+  }
 }
 
 // ---------------------------------------------------------------- knowledge in the transcript
@@ -425,7 +454,7 @@ async function subagentBrief($: any, prompt: string): Promise<{ note: string; ch
     ...(decisions.length ? ['Cite decisions as `Refs:` trailers on any commit.'] : []),
   ]
   const chips: Chip[] = [
-    ...decisions.slice(0, 5).map(d => ({ kind: 'decision' as const, id: d.id, text: `briefed · ${d.title}` })),
+    ...decisionChips(decisions.slice(0, 5).map(d => d.id), decisions, 'briefed · '),
     ...specs.slice(0, 4).map(sp => ({ kind: 'spec' as const, id: sp.slug, text: 'briefed', isOk: true })),
   ]
   return { note: lines.join('\n'), chips }
@@ -468,9 +497,9 @@ async function checkPlan($: any, toolUseId: string, file: string): Promise<void>
   await update($, planChecksA, c => ({ ...c, [toolUseId]: { ...base, isChecking: false, conflicts } }))
 }
 
-/** One knowledge row per chip, as both tool rows and reply footers draw them. */
-function chipRows(Text: any, chips: Chip[]): any[] {
-  return chips.map(c =>
+/** A transcript row with its knowledge chips underneath, as tool rows and replies draw them. */
+function withChips(Box: any, Text: any, drawn: any, chips: Chip[]): any {
+  const rows = chips.map(c =>
     c.kind === 'trailer' ? (
       <Text key={`c-${c.id}`}>
         <Text color={C.engaged}>✓</Text> <Text color={C.muted}>{c.id}</Text>
@@ -478,12 +507,20 @@ function chipRows(Text: any, chips: Chip[]): any[] {
     ) : (
       <Text key={`c-${c.id}`} wrap="truncate-end">
         <Text color={c.kind === 'hallmark' ? PROBA : c.kind === 'spec' && c.isOk ? C.engaged : C.knowledge} bold={c.kind === 'hallmark'}>
-          {c.kind === 'decision' ? '◇ ' : c.kind === 'spec' ? '▪ ' : ''}
+          {c.kind === 'decision' || c.kind === 'spec' ? `${GLYPH[c.kind]} ` : ''}
           {c.id}
         </Text>{' '}
         <Text color={c.kind === 'hallmark' && c.isOk ? C.engaged : C.muted}>{c.text}</Text>
       </Text>
     ),
+  )
+  return (
+    <Box flexDirection="column">
+      {drawn}
+      <Box flexDirection="column" paddingLeft={2}>
+        {rows}
+      </Box>
+    </Box>
   )
 }
 
@@ -509,12 +546,12 @@ async function spellcheck($: any, text: string): Promise<void> {
     300,
   )
   const conflicts = found.filter(c => typeof c?.phrase === 'string' && text.includes(c.phrase) && typeof c?.id === 'string').slice(0, 3)
-  if (text === draftText) await update($, draftA, d => (d ? { ...d, text, conflicts } : d))
+  if (text === draftText) await update($, draftA, d => (d ? { ...d, conflicts } : d))
 }
 
 function composerTail(d: Draft): string | undefined {
   if (d.conflicts.length) return `⚠ ${d.conflicts[0]!.id}: ${d.conflicts[0]!.why}`
-  const parts = [d.ids.length ? `◇ ${d.ids.join(' ')}` : '', d.slugs.length ? `▪ ${d.slugs.join(' ')}` : ''].filter(Boolean)
+  const parts = [d.ids.length ? `${GLYPH.decision} ${d.ids.join(' ')}` : '', d.slugs.length ? `${GLYPH.spec} ${d.slugs.join(' ')}` : ''].filter(Boolean)
   return parts.length ? `${parts.join(' · ')} attached on Enter` : undefined
 }
 
@@ -528,8 +565,8 @@ async function scanVouch($: any): Promise<VouchItem[]> {
     ...decisions.filter(d => d.path).map(d => ({ key: d.id, kind: 'decision' as const, title: d.title, path: d.path! })),
     ...specs.filter(s => isLivingSpec(s) && s.primary).map(s => ({ key: s.slug, kind: 'spec' as const, title: s.title, path: s.primary! })),
   ]
-  const read2 = await Promise.all(records.map(r => $.fs.read(`${env.root}/${r.path}`).catch(() => '')))
-  const items: VouchItem[] = records.map((r, i) => ({ ...r, reasons: read2[i] ? vouchReasons(read2[i], r.kind) : [] })).filter(i => i.reasons.length)
+  const bodies = await Promise.all(records.map(r => $.fs.read(`${env.root}/${r.path}`).catch(() => '')))
+  const items: VouchItem[] = records.map((r, i) => ({ ...r, reasons: bodies[i] ? vouchReasons(bodies[i], r.kind) : [] })).filter(i => i.reasons.length)
   // Most-guarded first: those are the rules agents run into most.
   const weight = new Map(
     items.map(i => {
@@ -612,18 +649,17 @@ async function stopDemo($: any): Promise<void> {
     update($, forecastA, () => null),
     update($, narrationA, () => null),
   ])
-  await refreshAll($, { forecast: 'background', isForced: true })
+  forecastAt = 0
+  await refreshAll($, { isForced: true })
   void refreshAudit($, true)
 }
 
 // ---------------------------------------------------------------- register
 
 export const register: Register = on => {
-  let isInteractive = false
   let lastPlanFile: string | null = null
 
   on('session.start', async ($, e, next) => {
-    isInteractive = e.isInteractive
     // One refused name (a built-in took it) must not cost the rest.
     await $.command.register({ name: 'desk', description: 'dira: knowledge board — living specs by drift, decisions whose code moved' }).catch(() => {})
     await $.command.register({ name: 'vouch', description: 'zavet: interview to finish unverified specs and decisions', argumentHint: '[id|slug]' }).catch(() => {})
@@ -662,16 +698,14 @@ export const register: Register = on => {
       await refreshAll($)
       await refreshAudit($)
     })
-    // Every 20 s while a turn runs, every minute otherwise. An open PR still
-    // waiting on CI or a review is re-read each minute too: those finish on
-    // GitHub, where no hook of ours sees them.
+    // dira every 20 s while a turn runs, every minute otherwise. The band's
+    // forecast decides its own freshness: CI and reviews finish on GitHub,
+    // where no hook of ours sees them.
     $.clock.every(TICK_MS, async () => {
-      if (await read($, demoA)) return
-      const now = await $.clock.now()
-      const f = await read($, forecastA)
-      if (f?.pr && now - f.at >= IDLE_POLL_MS && (f.elements.ci === 'pending' || f.elements.review === 'pending')) void refreshForecast($, true)
+      const [now, env, parts] = await Promise.all([$.clock.now(), read($, envA), read($, partsA)])
+      if (parts.band) void refreshForecast($)
       if (!isTurnRunning && now - lastPollAt < IDLE_POLL_MS) return
-      await loadStatus($, await read($, envA))
+      await loadStatus($, env)
       await paint($)
     })
     return next(e)
@@ -690,15 +724,14 @@ export const register: Register = on => {
     if (!env) return ran
     const rel = relPath(file, env)
     const agentId = (e as any).agentId as string | undefined
-    const ids = guardIds(rel, decisions)
+    const { ids, covering } = knowledgeAt(rel, decisions, specs)
     const who = agentId ? '↳ ' : ''
     if (isEdit) {
-      if (!touched.includes(rel)) await update($, touchedA, t => [...t, rel])
-      await update($, turnTouchedA, t => (t.includes(rel) ? t : [...t, rel]))
-      const covering = specs.filter(s => isLivingSpec(s) && s.paths.includes(rel))
-      if (isPartOn(parts, 'transcript') && (ids.length || covering.length)) {
+      const addOnce = (t: string[]) => (t.includes(rel) ? t : [...t, rel])
+      await Promise.all([update($, touchedA, addOnce), update($, turnTouchedA, addOnce)])
+      if (ids.length || covering.length) {
         const chips: Chip[] = [
-          ...ids.map(id => ({ kind: 'decision' as const, id, text: decisions.find(d => d.id === id)?.title ?? '' })),
+          ...decisionChips(ids, decisions),
           ...covering.map(s => {
             const isOk = s.files.some(f => touched.includes(f) || f === rel)
             return { kind: 'spec' as const, id: s.slug, text: isOk ? 'spec updated this session' : 'spec may need an update', isOk }
@@ -708,17 +741,17 @@ export const register: Register = on => {
       }
       const ownSpec = specs.find(s => s.files.includes(rel))
       const narration = ownSpec
-        ? `${who}updating ▪ ${ownSpec.slug}`
+        ? `${who}updating ${GLYPH.spec} ${ownSpec.slug}`
         : ids.length
-          ? `${who}honouring ◇ ${ids.join(' ')} in ${rel.split('/').pop()}`
+          ? `${who}honouring ${GLYPH.decision} ${ids.join(' ')} in ${rel.split('/').pop()}`
           : covering.length
-            ? `${who}changing code under ▪ ${covering.map(s => s.slug).join(' ')}`
+            ? `${who}changing code under ${GLYPH.spec} ${covering.map(s => s.slug).join(' ')}`
             : null
       if (narration) await update($, narrationA, () => narration)
-    } else if (String(e.tool) === 'Read' && ids.length && isPartOn(parts, 'steward')) {
+    } else if (String(e.tool) === 'Read' && ids.length && parts.steward) {
       await announceGuard($, rel, ids, agentId)
       const gist = (await blurbs($, [{ key: ids[0]!, isDecision: true }]))[ids[0]!]
-      await update($, narrationA, () => `${who}consulting ◇ ${ids.join(' ')}${gist ? ` → ${clip(gist, 80)}` : ''}`)
+      await update($, narrationA, () => `${who}consulting ${GLYPH.decision} ${ids.join(' ')}${gist ? ` → ${clip(gist, 80)}` : ''}`)
     }
     return ran
   }).catch(($, e, next) => next(e))
@@ -727,7 +760,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const command = String((e as any).command ?? '')
     const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError || !isPartOn(await read($, partsA), 'transcript')) return ran
+    if (ran.deny !== undefined || ran.isError) return ran
     const id = e.tool_use_id
     if (isGitCommit(command)) {
       const chips: Chip[] = commitTrailers(command).map(t => ({ kind: 'trailer' as const, id: `${t.key}: ${t.value}` }))
@@ -735,12 +768,13 @@ export const register: Register = on => {
     }
     if (/\bgh\s+pr\s+(create|merge|ready)\b|\bgit\s+push\b/.test(command)) {
       // The push answers at once; the chip lands when gh and zavet have.
+      pendingWaitMs = IDLE_POLL_MS
       $.clock.after(0, async () => {
         await refreshForecast($, true)
         const f = await read($, forecastA)
         if (!f) return
         const t = forecastText(f.grade, f.elements)
-        const chip: Chip = { kind: 'hallmark', id: t.label, text: t.next ? `${t.next}${f.notes[0] ? ` · ${f.notes[0]}` : ''}` : 'every element evidenced', isOk: !t.next }
+        const chip: Chip = { kind: 'hallmark', id: t.label, text: !t.isComplete && f.notes[0] ? `${t.next} · ${f.notes[0]}` : t.next, isOk: t.isComplete }
         await update($, chipsA, c => ({ ...c, [id]: [...(c[id] ?? []), chip] }))
       })
     }
@@ -752,10 +786,9 @@ export const register: Register = on => {
     if (!slug) return { result: 'No slug given.' } as any
     const known = (await read($, specsA)).find(s => s.slug === slug)
     await setFocus($, { slug, source: 'declared' })
-    const open = known?.tasks.filter(t => !t.done).map(t => t.id) ?? []
     return {
       result: known
-        ? `Focus set to ${slug} (${known.state}). Open tasks: ${open.join(', ') || 'none'}. Primary: ${known.primary ?? 'n/a'}.`
+        ? `Focus set to ${slug} (${known.state}). Open tasks: ${openTasks(known)}. Primary: ${known.primary ?? 'n/a'}.`
         : `Focus set to ${slug}. (Not a unit zavet knows yet — check \`zavet specs\` for the exact slug.)`,
     } as any
   })
@@ -763,7 +796,7 @@ export const register: Register = on => {
   // Subagents carry the decisions and specs of the paths they touch.
   on('agent.spawn', async ($, e, next) => {
     const [env, isDemo, parts] = await Promise.all([read($, envA), read($, demoA), read($, partsA)])
-    if (!env?.hasZavetDir || isDemo || !isPartOn(parts, 'transcript')) return next(e)
+    if (!env?.hasZavetDir || isDemo || !parts.transcript) return next(e)
     const pack = await subagentBrief($, e.prompt)
     if (!pack) return next(e)
     await update($, chipsA, c => ({ ...c, [e.tool_use_id]: pack.chips }))
@@ -773,7 +806,7 @@ export const register: Register = on => {
   // A plan is checked against the knowledge before you approve it.
   on('tool.call', { tool: 'ExitPlanMode' }, async ($, e, next) => {
     const [env, parts] = await Promise.all([read($, envA), read($, partsA)])
-    if (env?.hasZavetDir && isPartOn(parts, 'transcript')) {
+    if (env?.hasZavetDir && parts.transcript) {
       const file = await planFile($, lastPlanFile)
       if (file) $.clock.after(0, () => checkPlan($, e.tool_use_id, file))
     }
@@ -794,7 +827,7 @@ export const register: Register = on => {
       read($, specsA),
       read($, draftA),
     ])
-    if ((!env?.hasZavetDir && !isDemo) || !isPartOn(parts, 'composer')) return r
+    if ((!env?.hasZavetDir && !isDemo) || !parts.composer) return r
     const text = r.text
     draftText = text
     if (!text.trim()) {
@@ -804,7 +837,7 @@ export const register: Register = on => {
     const found = analyzeDraft(text, decisions, specs.map(s => s.slug))
     const conflicts = (prev?.conflicts ?? []).filter(c => text.includes(c.phrase))
     const isSame = prev && prev.ids.join() === found.ids.join() && prev.slugs.join() === found.slugs.join() && prev.conflicts.length === conflicts.length
-    if (!isSame) await update($, draftA, () => ({ text, ids: found.ids, slugs: found.slugs, conflicts }))
+    if (!isSame) await update($, draftA, () => ({ ids: found.ids, slugs: found.slugs, conflicts }))
     const seq = ++editSeq
     $.clock.after(800, () => (seq === editSeq ? spellcheck($, text) : undefined))
     const marks = [
@@ -836,7 +869,7 @@ export const register: Register = on => {
     ])
     if (draft && (e.origin as any)?.kind !== 'plugin') {
       const text = await blurbs($, draft.slugs.map(key => ({ key, isDecision: false })))
-      const parts2 = [
+      const notes = [
         ...(await decisionNotes($, draft.ids.slice(0, 6))),
         ...draft.slugs.slice(0, 4).flatMap(slug => {
           const sp = specs.find(s => s.slug === slug)
@@ -844,15 +877,14 @@ export const register: Register = on => {
         }),
         ...draft.conflicts.map(c => `Note: "${c.phrase}" may contradict ${c.id} (${c.why}). Raise it with the user before acting on it.`),
       ]
-      if (parts2.length) extra.push(`[dira] Recorded knowledge the user's message names:\n\n${parts2.join('\n\n')}`)
+      if (notes.length) extra.push(`[dira] Recorded knowledge the user's message names:\n\n${notes.join('\n\n')}`)
       await update($, draftA, () => null)
     }
     const spec = specs.find(s => s.slug === focus?.slug)
-    if (focus && focus.source !== 'inferred' && !isDemo && isPartOn(parts, 'steward') && spec && isWorkItem(spec) && !seen.includes(`ctx:${focus.slug}`)) {
+    if (focus && focus.source !== 'inferred' && !isDemo && parts.steward && spec && isWorkItem(spec) && !seen.includes(`ctx:${focus.slug}`)) {
       await update($, announcedA, a => [...a, `ctx:${focus.slug}`])
-      const open = spec.tasks.filter(t => !t.done).map(t => t.id)
       extra.push(
-        `[dira] This session works on ${spec.slug} — "${spec.title}" (${spec.state}). Unit file: ${spec.primary}. Open tasks: ${open.join(', ') || 'none'}. Keep its task list current, and add a \`Spec: ${spec.slug}\` trailer to commits for it.`,
+        `[dira] This session works on ${spec.slug} — "${spec.title}" (${spec.state}). Unit file: ${spec.primary}. Open tasks: ${openTasks(spec)}. Keep its task list current, and add a \`Spec: ${spec.slug}\` trailer to commits for it.`,
       )
     }
     return extra.length ? next({ ...e, context: [...(e.context ?? []), ...extra] }) : next(e)
@@ -863,6 +895,7 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     if (!(e as any).agentId) {
       isTurnRunning = true
+      pendingWaitMs = IDLE_POLL_MS
       await Promise.all([update($, turnTouchedA, () => []), update($, narrationA, () => null)])
     }
     return next(e)
@@ -909,7 +942,7 @@ export const register: Register = on => {
         ...log,
         `specs loaded: ${specs.length}, decisions loaded: ${decisions.length}`,
         `forecast: ${f && t ? `${t.label}${t.next ? ` ${t.next}` : ''} (${f.branch}${f.pr ? ` #${f.pr}` : ', no open PR'})` : 'none (trunk branch or no repo)'}`,
-        `parts: ${PARTS.map(p => `${p} ${isPartOn(parts, p) ? 'on' : 'off'}`).join(', ')}`,
+        `parts: ${describeParts(parts, ', ')}`,
         `demo: ${isDemo}`,
         `status line cache: ${statusCacheNote}`,
       ].join('\n'),
@@ -919,19 +952,22 @@ export const register: Register = on => {
   on('command.run', { command: 'dira-mods' }, async ($, e) => {
     const [a = '', b = ''] = e.args.trim().toLowerCase().split(/\s+/)
     const parts = await read($, partsA)
-    const describe = (p: Parts) => PARTS.map(x => `  ${x.padEnd(11)} ${isPartOn(p, x) ? 'on' : 'off'}`).join('\n')
-    let nextParts: Parts | null = null
-    if (a === 'on' || a === 'off') nextParts = Object.fromEntries(PARTS.map(p => [p, a === 'on'])) as Parts
-    else if ((PARTS as string[]).includes(a) && (b === 'on' || b === 'off')) nextParts = { ...parts, [a]: b === 'on' }
-    else if (a) return { text: `Usage: /dira-mods [on|off], or /dira-mods <${PARTS.join('|')}> <on|off>\n\n${describe(parts)}` }
-    if (!nextParts) return { text: `dira mod parts (remembered across sessions):\n${describe(parts)}` }
-    const set = nextParts
-    await update($, partsA, () => set)
-    await $.store.set('parts', set)
-    if (!isPartOn(set, 'band')) await update($, bandOpenA, () => false)
-    if (!isPartOn(set, 'composer')) await update($, draftA, () => null)
+    const isSwitch = b === 'on' || b === 'off'
+    const set: Parts | null =
+      a === 'on' || a === 'off'
+        ? (Object.fromEntries(PARTS.map(p => [p, a === 'on'])) as Parts)
+        : (PARTS as string[]).includes(a) && isSwitch
+          ? { ...parts, [a]: b === 'on' }
+          : null
+    if (!set) {
+      const listing = `dira mod parts (remembered across sessions):\n  ${describeParts(parts, '\n  ')}`
+      return { text: a ? `Usage: /dira-mods [on|off], or /dira-mods <${PARTS.join('|')}> <on|off>\n\n${listing}` : listing }
+    }
+    await Promise.all([update($, partsA, () => set), $.store.set('parts', set)])
+    if (!set.band) await update($, bandOpenA, () => false)
+    if (!set.composer) await update($, draftA, () => null)
     await paint($)
-    return { text: `dira mod parts:\n${describe(set)}` }
+    return { text: `dira mod parts:\n  ${describeParts(set, '\n  ')}` }
   })
 
   on('command.run', { command: 'dira-demo' }, async ($, e) => {
@@ -982,7 +1018,7 @@ export const register: Register = on => {
     const drawn = await next(e)
     if (!drawn) return drawn
     const [plans, chipMap, parts] = await Promise.all([read($, planChecksA), read($, chipsA), read($, partsA)])
-    if (!isPartOn(parts, 'transcript')) return drawn
+    if (!parts.transcript) return drawn
     const { Box, Text } = $.ui.resolve(e)
     const plan = plans[e.props.tool_use_id]
     if (plan) {
@@ -1021,15 +1057,7 @@ export const register: Register = on => {
       )
     }
     const chips = chipMap[e.props.tool_use_id]
-    if (!chips?.length) return drawn
-    return (
-      <Box flexDirection="column">
-        {drawn}
-        <Box flexDirection="column" paddingLeft={2}>
-          {chipRows(Text, chips)}
-        </Box>
-      </Box>
-    )
+    return chips?.length ? withChips(Box, Text, drawn, chips) : drawn
   })
 
   // Decisions and specs Claude names in a reply get their titles underneath.
@@ -1038,7 +1066,7 @@ export const register: Register = on => {
     const raw = String(e.props.text ?? '')
     if (!drawn || !raw) return drawn
     const [decisions, specs, parts] = await Promise.all([read($, decisionsA), read($, specsA), read($, partsA)])
-    if (!isPartOn(parts, 'transcript')) return drawn
+    if (!parts.transcript) return drawn
     const living = specs.filter(isLivingSpec)
     const sig = `${decisions.length}:${living.length}`
     let hit = footerMemo.get(raw)
@@ -1050,18 +1078,11 @@ export const register: Register = on => {
     }
     if (hit.ids.length === 0 && hit.slugs.length === 0) return drawn
     const chips: Chip[] = [
-      ...hit.ids.slice(0, 5).map(id => ({ kind: 'decision' as const, id, text: decisions.find(d => d.id === id)?.title ?? '' })),
+      ...decisionChips(hit.ids.slice(0, 5), decisions),
       ...hit.slugs.slice(0, 3).map(slug => ({ kind: 'spec' as const, id: slug, text: living.find(s => s.slug === slug)?.title ?? '' })),
     ]
     const { Box, Text } = $.ui.resolve(e)
-    return (
-      <Box flexDirection="column">
-        {drawn}
-        <Box flexDirection="column" paddingLeft={2}>
-          {chipRows(Text, chips)}
-        </Box>
-      </Box>
-    )
+    return withChips(Box, Text, drawn, chips)
   })
 
   // ------------------------------------------------------------ the band
@@ -1074,24 +1095,23 @@ export const register: Register = on => {
     const below = await next(e)
     if (e.props.hasSurvey) return below
     const [forecast, parts, narration, isOpen] = await Promise.all([read($, forecastA), read($, partsA), read($, narrationA), read($, bandOpenA)])
-    if (!forecast?.pr || !isPartOn(parts, 'band')) return below
+    if (!forecast?.pr || !parts.band) return below
     const ui = $.ui.resolve(e) as any
     const { Box, Text, Button } = ui
     const isDesktop = e.surface === 'desktop' && 'Svg' in ui
     const width = e.props.bodyColumns ?? 80
     const t = forecastText(forecast.grade, forecast.elements)
-    const rung = nextRung(forecast.elements)
-    const summary = [`PR #${forecast.pr} · proba forecast ${forecast.grade ?? 'unassayed'}`, t.next ?? 'every element evidenced', ...ELEMENT_KEYS.map(k => elementLine(k, forecast.elements[k])), ...forecast.notes.slice(0, 2)].join('\n')
+    const summary = [`PR #${forecast.pr} · proba forecast ${t.label}`, t.next, ...ELEMENT_KEYS.map(k => elementLine(k, forecast.elements[k])), ...forecast.notes.slice(0, 2)].join('\n')
 
     const badge = isDesktop ? (
       <ui.Svg {...forecastBadgeSvg(forecast.grade, forecast.elements, summary)} alt={summary} isInteractive />
     ) : (
       <Text>
         <Text color={PROBA} bold>
-          ⬡ {forecast.grade ?? '—'}
+          {t.badge}
         </Text>{' '}
         <Text color={PROBA}>{ELEMENT_KEYS.map(k => (forecast.elements[k] === 'ok' ? '●' : '○')).join('')}</Text>
-        {rung ? <Text color={C.muted}> {rung.missing.join(', ')}</Text> : ''}
+        {t.missing.length ? <Text color={C.muted}> {t.missing.join(', ')}</Text> : ''}
       </Text>
     )
 
@@ -1118,9 +1138,10 @@ export const register: Register = on => {
       const edges: [number, number][] = []
       const linked = new Set<number>()
       touched.forEach((f, fi) => {
+        const { ids, covering } = knowledgeAt(f, decisions, living)
         const links = [
-          ...guardIds(f, decisions).map(id => ({ key: id, label: decisions.find(d => d.id === id)?.title ?? '', kind: 'decision' as const })),
-          ...living.filter(s => s.paths.includes(f)).map(s => ({ key: s.slug, label: s.title, kind: 'spec' as const })),
+          ...ids.map(id => ({ key: id, label: titleOf(decisions, id), kind: 'decision' as const })),
+          ...covering.map(s => ({ key: s.slug, label: s.title, kind: 'spec' as const })),
         ]
         for (const l of links) {
           let ni = nodes.findIndex(n => n.key === l.key)
@@ -1158,7 +1179,7 @@ export const register: Register = on => {
                   {ns.map(n => (
                     <Text key={`rel-${f}-${n.key}`} color={C.knowledge}>
                       {'  '}
-                      {n.kind === 'decision' ? '◇' : '▪'} {n.key}
+                      {GLYPH[n.kind]} {n.key}
                     </Text>
                   ))}
                 </Text>
@@ -1203,7 +1224,7 @@ export const register: Register = on => {
           {v.items.slice(0, 14).map(i => (
             <Button key={`v-${i.key}`} plain onPress={() => startVouch($, i.key)}>
               <Text color={i.key === v.current ? C.agent : C.knowledge}>
-                {i.key === v.current ? '▸' : i.kind === 'decision' ? '◇' : '▪'} {i.key}
+                {i.key === v.current ? '▸' : GLYPH[i.kind]} {i.key}
               </Text>{' '}
               <Text color={i.key === v.current ? C.ink : C.muted}>{clip(i.title, 48)}</Text>
               <Text color={C.faint}>  {i.reasons.join(' · ')}</Text>

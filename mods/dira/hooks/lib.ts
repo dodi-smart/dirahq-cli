@@ -1,7 +1,7 @@
 // Pure helpers: parsing dira/zavet output, matching, formatting and SVG.
 // No `$` in here, so every function is testable without the engine.
 
-import type { Audit, Decision, ElementKey, Elements, ElementState, GuardStats, Snapshot, Spec, Task } from '../types'
+import type { Audit, Chip, Decision, ElementKey, Elements, ElementState, GuardStats, Snapshot, Spec, Task } from '../types'
 
 type Json = Record<string, any>
 
@@ -18,6 +18,9 @@ export const C = {
 } as const
 
 export const PROBA = '#5ba3f5'
+
+/** The one glyph each kind of record wears, on every surface. */
+export const GLYPH = { decision: '◇', spec: '▪' } as const
 
 // ---------------------------------------------------------------- parsing
 
@@ -132,13 +135,15 @@ export function parseAudit(tsv: string, at: number): Audit {
 
 // ---------------------------------------------------------------- records
 
+/** The body of a `## heading` section, up to the next `##` heading. */
+function section(md: string, heading: string, flags = 'm'): string | null {
+  const m = md.match(new RegExp(`^##\\s+${heading}\\s*\\n([\\s\\S]*?)(?=^##\\s|$(?![\\s\\S]))`, flags))
+  return m ? m[1]!.trim() : null
+}
+
 /** The "Agent directives" (or "Decision") section of a decision record. */
 export function directives(markdown: string): string {
-  const pick = (h: string) => {
-    const m = markdown.match(new RegExp(`^##\\s+${h}\\s*\\n([\\s\\S]*?)(?=^##\\s|$(?![\\s\\S]))`, 'm'))
-    return m?.[1]?.trim() ?? ''
-  }
-  return (pick('Agent directives') || pick('Decision')).slice(0, 1200)
+  return (section(markdown, 'Agent directives') || section(markdown, 'Decision') || '').slice(0, 1200)
 }
 
 /** First paragraph of a spec's Overview (or its first prose paragraph). */
@@ -157,9 +162,7 @@ export function frontmatter(md: string, key: string): string | null {
 
 /** Unresolved bullets/paragraphs under `## Open questions` (none → 0). */
 export function openQuestions(md: string): number {
-  const m = md.match(/^##\s+Open questions\s*\n([\s\S]*?)(?=^##\s|$(?![\s\S]))/im)
-  if (!m) return 0
-  const body = m[1]!.trim()
+  const body = section(md, 'Open questions', 'im')
   if (!body || /^(none|n\/a|—|-)\.?$/i.test(body)) return 0
   const bullets = body.split('\n').filter(l => /^\s*[-*]\s+\S/.test(l)).length
   return bullets || 1
@@ -191,13 +194,23 @@ export function isWorkItem(s: Spec): boolean {
   return !isLivingSpec(s) && isActive(s)
 }
 
+/** Whether a living spec describes this file. */
+export function covers(s: Spec, path: string): boolean {
+  return isLivingSpec(s) && s.paths.includes(path)
+}
+
+/** Decision ids guarding a path and the living specs covering it. */
+export function knowledgeAt(path: string, decisions: Decision[], specs: Spec[]): { ids: string[]; covering: Spec[] } {
+  return { ids: guardIds(path, decisions), covering: specs.filter(s => covers(s, path)) }
+}
+
 type Affected = { spec: Spec; files: string[]; isSpecEdited: boolean }
 
 /** Living specs whose covered paths this session touched, most-touched first. */
 export function affectedSpecs(touched: string[], specs: Spec[]): Affected[] {
   const out: Affected[] = []
   for (const spec of specs.filter(isLivingSpec)) {
-    const files = touched.filter(p => spec.paths.includes(p))
+    const files = touched.filter(p => covers(spec, p))
     if (files.length === 0) continue
     out.push({ spec, files, isSpecEdited: touched.some(p => spec.files.includes(p)) })
   }
@@ -224,6 +237,20 @@ export function progress(tasks: Task[]): { done: number; total: number } {
   return { done: tasks.filter(t => t.done).length, total: tasks.length }
 }
 
+/** The ids of a work item's open tasks, as one line. */
+export function openTasks(s: Spec): string {
+  return s.tasks.filter(t => !t.done).map(t => t.id).join(', ') || 'none'
+}
+
+export function titleOf(decisions: Decision[], id: string): string {
+  return decisions.find(d => d.id === id)?.title ?? ''
+}
+
+/** A decision chip per id, titled. */
+export function decisionChips(ids: string[], decisions: Decision[], prefix = ''): Chip[] {
+  return ids.map(id => ({ kind: 'decision' as const, id, text: `${prefix}${titleOf(decisions, id)}` }))
+}
+
 // ---------------------------------------------------------------- text
 
 export function clip(s: string, n: number): string {
@@ -240,14 +267,14 @@ export function bar(done: number, total: number, width = 5): string {
   return '█'.repeat(n) + '░'.repeat(width - n)
 }
 
-export function dur(seconds: number): string {
+function dur(seconds: number): string {
   const m = Math.round(seconds / 60)
   if (m < 60) return `${m}m`
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}`
 }
 
 /** `€1.8k`, `$52`, `$4.10`: money squeezed for the status line. */
-export function moneyShort(amount: number, currency: string): string {
+function moneyShort(amount: number, currency: string): string {
   const n = amount >= 1000 ? `${(amount / 1000).toFixed(amount >= 10000 ? 0 : 1)}k` : amount >= 20 ? String(Math.round(amount)) : amount.toFixed(2)
   return currency.length <= 1 ? `${currency}${n}` : `${n} ${currency}`
 }
@@ -442,10 +469,20 @@ export function nextRung(el: Elements): { target: 585 | 750 | 999; missing: Elem
   return null
 }
 
-/** `⬡ 750` and what stands before the next grade, as every surface says it. */
-export function forecastText(grade: number | null, el: Elements): { label: string; next: string | null } {
+/**
+ * The forecast as every surface says it: `label` for text, `badge` where room
+ * is tight, `next` for what stands before the next grade (or that nothing
+ * does), and the `missing` elements themselves.
+ */
+export function forecastText(grade: number | null, el: Elements): { label: string; badge: string; next: string; missing: ElementKey[]; isComplete: boolean } {
   const rung = nextRung(el)
-  return { label: `⬡ ${grade ?? 'unassayed'}`, next: rung ? `→ ${rung.target} needs ${rung.missing.join(', ')}` : null }
+  return {
+    label: `⬡ ${grade ?? 'unassayed'}`,
+    badge: `⬡ ${grade ?? '—'}`,
+    next: rung ? `→ ${rung.target} needs ${rung.missing.join(', ')}` : 'every element evidenced',
+    missing: rung?.missing ?? [],
+    isComplete: !rung,
+  }
 }
 
 /** Plain-language line for one hallmark element, for tooltips. */
@@ -566,7 +603,7 @@ export function relationsSvg(
     const room = Math.floor((width - nodeX - 14) / 6.9) - n.key.length - 3
     body +=
       `<circle cx="${nodeX - 4}" cy="${y(i) - 4}" r="3.2" fill="none" stroke="${C.knowledge}" stroke-width="1.3"/>` +
-      `<text x="${nodeX + 4}" y="${y(i)}"><tspan fill="${C.knowledge}" font-weight="600">${n.kind === 'decision' ? '◇' : '▪'} ${esc(n.key)}</tspan><tspan class="m">  ${esc(clip(n.label, room))}</tspan></text>`
+      `<text x="${nodeX + 4}" y="${y(i)}"><tspan fill="${C.knowledge}" font-weight="600">${GLYPH[n.kind]} ${esc(n.key)}</tspan><tspan class="m">  ${esc(clip(n.label, room))}</tspan></text>`
   })
   return svg(width, top + Math.max(files.length, nodes.length, 1) * row + 4, body)
 }
@@ -578,7 +615,7 @@ export function relationsSvg(
  */
 export function forecastBadgeSvg(grade: number | null, el: Elements, summary: string): SvgDoc {
   const font = 'font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;font-size:13px;font-weight:650'
-  const label = `⬡ ${grade ?? '—'}`
+  const label = forecastText(grade, el).badge
   const x0 = 12 + label.length * 7.2
   let body = `<title>${esc(summary)}</title><text x="0" y="14" style="${font}" fill="${PROBA}">${esc(label)}</text>`
   ELEMENT_KEYS.forEach((k, i) => {

@@ -57,8 +57,9 @@ test('commit trailers are read from -m text and --trailer flags', async () => {
 
 test('forecast text names the next grade and what stands before it', async () => {
   const el = { ci: 'ok', review: 'ok', authorship: 'ok', supervision: 'ok', intent: 'missing' } as const
-  expect(forecastText(750, el)).toEqual({ label: '⬡ 750', next: '→ 999 needs intent' })
-  expect(forecastText(999, { ...el, intent: 'ok' })).toEqual({ label: '⬡ 999', next: null })
+  expect(forecastText(750, el)).toEqual({ label: '⬡ 750', badge: '⬡ 750', next: '→ 999 needs intent', missing: ['intent'], isComplete: false })
+  expect(forecastText(null, { ...el, review: 'pending' }).badge).toBe('⬡ —')
+  expect(forecastText(999, { ...el, intent: 'ok' }).next).toBe('every element evidenced')
 })
 
 test('decisions and zavet binary discovery', async () => {

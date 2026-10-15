@@ -60,12 +60,10 @@ export type Forecast = {
   elements: Elements
   grade: 585 | 750 | 999 | null
   notes: string[]
-  at: number
 }
 
 /** What the composer knows about the draft being typed. */
 export type Draft = {
-  text: string
   ids: string[]
   slugs: string[]
   conflicts: { phrase: string; id: string; why: string }[]

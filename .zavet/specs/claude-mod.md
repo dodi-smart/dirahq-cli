@@ -1,6 +1,6 @@
 ---
 title: The dira Claude Code mod
-version: 1
+version: 2
 origin: session
 verified: false
 confidence: medium
@@ -39,6 +39,12 @@ store or the cloud.
   750: + authorship + supervision; 999: + intent) from local evidence only. It
   is labelled a forecast; the cloud grade is authoritative. The band shows only
   for a branch with an open PR.
+- The forecast owns its freshness and runs one refresh at a time. A settled
+  forecast is re-read after two minutes. An open PR still waiting on CI or a
+  review is re-read every minute, backing off to 15 minutes while nothing
+  changes; a new turn or a push resets the wait. With the band switched off,
+  the background re-read stops. A repo with no CI checks counts as nothing to
+  wait for. An unchanged forecast is not rewritten, so the band does not redraw.
 - `/vouch` hands the model an interview prompt. `verified: true` is set only on
   the person's explicit confirmation, and decision records stay append-only
   for meaning (a changed claim becomes a correcting record).

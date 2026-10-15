@@ -2,7 +2,7 @@
 //! de-duplicated and idle-trimmed via [`crate::accounting`]; agent wall-clock is
 //! summed freely per session (it is evidence, never a billing base).
 
-use crate::accounting::{self, Signal};
+use crate::accounting;
 use crate::model::RawEvent;
 use crate::store::RollupLine;
 use std::collections::BTreeMap;
@@ -14,7 +14,16 @@ pub struct ProjectReport {
     pub project: Option<String>,
     pub human_seconds: i64,
     pub agent_wall_seconds: i64,
+    /// The repo-less work of orchestrating sessions — coordination that no
+    /// single repo describes, kept apart from genuinely unresolved work
+    /// (DIRASH-0041). Only ever set on a `project: None` line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orchestration: bool,
 }
+
+/// A report line's key: the project, and whether a repo-less line is the
+/// orchestration bucket.
+type LineKey = (Option<String>, bool);
 
 /// A computed report over a slice of events.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -31,16 +40,29 @@ pub struct Report {
 /// because a gap that means "the human walked away" means "the agent is running a
 /// build" — see [`accounting::AgentPolicy`].
 pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy) -> Report {
+    // Sessions any of whose events marks them as orchestrating. Their
+    // repo-less time is the orchestration bucket, not "unresolved".
+    let orchestrators: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|e| e.lineage.marks_orchestrator())
+        .map(|e| e.session_id.as_str())
+        .collect();
+    let key = |project: &Option<String>, session: &str| -> LineKey {
+        (
+            project.clone(),
+            project.is_none() && orchestrators.contains(session),
+        )
+    };
+
     // --- human time: dedup across the whole concurrent set ---
-    let signals: Vec<Signal> = events
+    // Keyed per opening signal exactly as `per_project_seconds` would, with
+    // the orchestration flag riding along on repo-less signals.
+    let signals: Vec<(time::OffsetDateTime, LineKey)> = events
         .iter()
         .filter(|e| e.kind.is_human_signal())
-        .map(|e| Signal {
-            at: e.at,
-            project: e.project.clone(),
-        })
+        .map(|e| (e.at, key(&e.project, &e.session_id)))
         .collect();
-    let human_by_project = accounting::per_project_seconds(&signals, idle);
+    let human_by_project = accounting::per_key_seconds(&signals, idle);
 
     // --- agent wall-clock: clamped active time per session, summed freely ---
     // The wall-clock is the clamped active span over each session's own event
@@ -75,16 +97,23 @@ pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy
         }
     }
 
-    let mut agent_by_project: BTreeMap<Option<String>, i64> = BTreeMap::new();
-    for (project, samples, had_activity) in sessions.values() {
+    let mut agent_by_project: BTreeMap<LineKey, i64> = BTreeMap::new();
+    for (session, (project, samples, had_activity)) in &sessions {
         if *had_activity {
-            *agent_by_project.entry(project.clone()).or_insert(0) +=
+            // An orchestrator's agent time is coordination as a whole: no
+            // single repo describes the session, whatever it touched first.
+            let k = if orchestrators.contains(session) {
+                (None, true)
+            } else {
+                (project.clone(), false)
+            };
+            *agent_by_project.entry(k).or_insert(0) +=
                 accounting::agent_active_seconds(samples, agent);
         }
     }
 
     // --- merge into per-project lines ---
-    let mut keys: Vec<Option<String>> = human_by_project
+    let mut keys: Vec<LineKey> = human_by_project
         .keys()
         .chain(agent_by_project.keys())
         .cloned()
@@ -97,7 +126,8 @@ pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy
         .map(|k| ProjectReport {
             human_seconds: human_by_project.get(&k).copied().unwrap_or(0),
             agent_wall_seconds: agent_by_project.get(&k).copied().unwrap_or(0),
-            project: k,
+            orchestration: k.1,
+            project: k.0,
         })
         .collect();
 
@@ -136,18 +166,21 @@ pub fn build_merged(
         return report;
     }
 
-    let mut by_project: BTreeMap<Option<String>, ProjectReport> = report
+    let mut by_project: BTreeMap<LineKey, ProjectReport> = report
         .projects
         .into_iter()
-        .map(|p| (p.project.clone(), p))
+        .map(|p| ((p.project.clone(), p.orchestration), p))
         .collect();
+    // Compacted rollups predate the orchestration split and carry none: their
+    // repo-less time stays on the unresolved line.
     for line in rollups {
         let entry = by_project
-            .entry(line.project.clone())
+            .entry((line.project.clone(), false))
             .or_insert_with(|| ProjectReport {
                 project: line.project.clone(),
                 human_seconds: 0,
                 agent_wall_seconds: 0,
+                orchestration: false,
             });
         entry.human_seconds += line.human_seconds;
         entry.agent_wall_seconds += line.agent_wall_seconds;
@@ -184,7 +217,49 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
+    }
+
+    #[test]
+    fn orchestrator_repo_less_time_is_its_own_line_not_unresolved() {
+        let orch = |secs: i64, kind: EventKind, project: Option<&str>| {
+            let mut e = ev("orch", secs, kind, "x");
+            e.project = project.map(str::to_string);
+            e.lineage.workspace = Some("0123456789abcdef".into());
+            e
+        };
+        let stray = |secs: i64| {
+            let mut e = ev("stray", secs, EventKind::UserPrompt, "x");
+            e.project = None;
+            e
+        };
+        let events = vec![
+            orch(0, EventKind::UserPrompt, None),
+            orch(60, EventKind::UserPrompt, Some("github.com/acme/api")),
+            orch(120, EventKind::UserPrompt, None),
+            stray(180),
+            stray(240),
+        ];
+        let r = build(&events, Duration::minutes(5), Default::default());
+        let line = |project: Option<&str>, orchestration: bool| {
+            r.projects
+                .iter()
+                .find(|p| p.project.as_deref() == project && p.orchestration == orchestration)
+                .map(|p| p.human_seconds)
+        };
+        // Gaps are attributed to their opening signal.
+        assert_eq!(line(None, true), Some(60 + 60), "orchestration bucket");
+        assert_eq!(line(Some("github.com/acme/api"), false), Some(60));
+        assert_eq!(
+            line(None, false),
+            Some(60),
+            "the stray session stays unresolved"
+        );
+        assert_eq!(
+            r.total_human_seconds, 240,
+            "the split never changes the total"
+        );
     }
 
     #[test]
@@ -285,6 +360,7 @@ mod tests {
                 activity: None,
                 note: None,
                 spec: None,
+                lineage: Default::default(),
             });
         }
         for i in 0..3 {
@@ -303,6 +379,7 @@ mod tests {
                 activity: None,
                 note: None,
                 spec: None,
+                lineage: Default::default(),
             });
         }
         for e in &all {

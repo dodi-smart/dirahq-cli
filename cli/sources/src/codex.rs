@@ -70,6 +70,7 @@ pub fn normalize(hook: &CodexHook) -> Option<Normalized> {
         transcript_path: hook.transcript_path.clone(),
         source: None,
         reason: None,
+        hints: Default::default(),
     })
 }
 
@@ -126,6 +127,7 @@ impl HarnessSource for CodexSource {
             transcript_path: None,
             source: None,
             reason: None,
+            hints: Default::default(),
         })
     }
 }

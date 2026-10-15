@@ -47,6 +47,7 @@ fn manual_tick_with_repo(session: &str, at: OffsetDateTime) -> RawEvent {
         activity: None,
         note: None,
         spec: None,
+        lineage: Default::default(),
     }
 }
 

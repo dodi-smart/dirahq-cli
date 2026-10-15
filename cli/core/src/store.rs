@@ -129,8 +129,9 @@ impl Store {
     pub async fn append(&self, ev: &RawEvent) -> Result<(), Error> {
         sqlx::query(
             "INSERT INTO events
-                (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity, note, spec)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity, note, spec,
+                 host_session, workspace, spawned, parent_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )
         .bind(&ev.id)
         .bind(ev.at.format(&Rfc3339).map_err(Error::time)?)
@@ -146,9 +147,27 @@ impl Store {
         .bind(&ev.activity)
         .bind(&ev.note)
         .bind(&ev.spec)
+        .bind(&ev.lineage.host_session)
+        .bind(&ev.lineage.workspace)
+        .bind(&ev.lineage.spawned)
+        .bind(&ev.lineage.parent_session)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The session whose event spawned the child host id `host` (an
+    /// orchestrator's `start_session` call), if one has been recorded.
+    pub async fn session_that_spawned(&self, host: &str) -> Result<Option<String>, Error> {
+        let row = sqlx::query(
+            "SELECT session_id FROM events WHERE spawned = ?1 AND session_id NOT LIKE ?2 \
+             ORDER BY at ASC LIMIT 1",
+        )
+        .bind(host)
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("session_id")))
     }
 
     /// Load events with `at >= since`, ordered by time. `None` loads all.
@@ -2926,6 +2945,12 @@ fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
         activity: row.get("activity"),
         note: row.get("note"),
         spec: row.get("spec"),
+        lineage: crate::model::Lineage {
+            host_session: row.get("host_session"),
+            workspace: row.get("workspace"),
+            spawned: row.get("spawned"),
+            parent_session: row.get("parent_session"),
+        },
     })
 }
 
@@ -2950,6 +2975,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
     }
 
@@ -3094,6 +3120,37 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].kind, EventKind::SessionStart);
         assert_eq!(all[1].project.as_deref(), Some("github.com/acme/api"));
+    }
+
+    #[tokio::test]
+    async fn lineage_roundtrips_and_resolves_the_spawning_session() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut spawn = ev("01A", EventKind::PostTool);
+        spawn.session_id = "orch".into();
+        spawn.lineage.workspace = Some("0123456789abcdef".into());
+        spawn.lineage.spawned = Some("local_child".into());
+        store.append(&spawn).await.unwrap();
+        let mut child = ev("01B", EventKind::SessionStart);
+        child.session_id = "kid".into();
+        child.lineage.host_session = Some("local_child".into());
+        child.lineage.parent_session = Some("orch".into());
+        store.append(&child).await.unwrap();
+
+        let all = store.events_since(None).await.unwrap();
+        assert_eq!(all[0].lineage, spawn.lineage);
+        assert_eq!(all[1].lineage, child.lineage);
+        assert_eq!(
+            store
+                .session_that_spawned("local_child")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("orch")
+        );
+        assert_eq!(
+            store.session_that_spawned("local_other").await.unwrap(),
+            None
+        );
     }
 
     /// The containment invariant for `dira doctor --probe`, asserted at the one
@@ -3245,6 +3302,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         };
         // id-order != at-order: 01C has a HIGHER id but an OLDER `at` than 01B.
         store
@@ -3315,6 +3373,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         };
         // Session s1 spans multiple ids; s2 is a different session entirely.
         store.append(&mk("01A", "s1", 0)).await.unwrap();
@@ -3550,6 +3609,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
     }
 

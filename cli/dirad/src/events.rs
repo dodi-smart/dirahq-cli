@@ -57,6 +57,7 @@ pub fn manual_event(
         note,
         // Threaded from `dira start --spec` by the control layer (W4).
         spec: None,
+        lineage: Default::default(),
     }
 }
 

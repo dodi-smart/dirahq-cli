@@ -26,6 +26,43 @@ pub fn project_label(p: &Option<String>) -> String {
     p.clone().unwrap_or_else(|| "(unresolved)".to_string())
 }
 
+/// What orchestration time is called wherever a repo name would go.
+pub const ORCHESTRATION_LABEL: &str = "orchestration";
+
+/// The PROJECT cell for a report line: the orchestration bucket is named as
+/// such, never folded into `(unresolved)`.
+pub fn report_line_label(p: &dira_core::report::ProjectReport) -> String {
+    if p.orchestration {
+        ORCHESTRATION_LABEL.to_string()
+    } else {
+        project_label(&p.project)
+    }
+}
+
+/// The PROJECT cell for a session. An orchestrator names no single repo, so
+/// it reads as `orchestration` (with how many repos it reached) rather than
+/// `(unresolved)`, which means "we could not tell".
+pub fn session_project_label(s: &dira_core::protocol::SessionView) -> String {
+    if !s.orchestrator {
+        return project_label(&s.project);
+    }
+    match s.repos.len() {
+        0 => ORCHESTRATION_LABEL.to_string(),
+        1 => format!("{ORCHESTRATION_LABEL} · {}", s.repos[0]),
+        n => format!("{ORCHESTRATION_LABEL} · {n} repos"),
+    }
+}
+
+/// [`repo_short`] for a session, orchestrator-aware like
+/// [`session_project_label`].
+pub fn session_repo_short(s: &dira_core::protocol::SessionView) -> String {
+    if s.orchestrator {
+        ORCHESTRATION_LABEL.to_string()
+    } else {
+        repo_short(&s.project)
+    }
+}
+
 /// A short, last-segment label for a project path/slug — e.g. `acme/api` →
 /// `api`, `/Users/me/work/foo` → `foo`. Leaves bare names untouched. Used by the
 /// TUI where horizontal space is tight; the plain renderer keeps full labels.

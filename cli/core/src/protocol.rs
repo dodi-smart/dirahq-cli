@@ -435,6 +435,17 @@ pub struct SessionView {
     /// phantom one.
     #[serde(default)]
     pub has_agent_activity: bool,
+    /// An orchestrating session (see `dira_core::orchestration`): its
+    /// `project` is deliberately `None` and its repos are in `repos`.
+    /// Defaulted so an older daemon degrades to the flat view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orchestrator: bool,
+    /// The orchestrator session that spawned this one, when linked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// Canonical repos an orchestrator's own tool calls touched, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
 }
 
 /// Lenient deserializers for the two typed enums above.
@@ -1178,6 +1189,9 @@ mod tests {
             last_activity_at: None,
             last_human_at: None,
             has_agent_activity: true,
+            orchestrator: false,
+            parent_session: None,
+            repos: Vec::new(),
         }
     }
 

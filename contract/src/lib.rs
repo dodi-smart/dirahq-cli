@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.5.0";
+pub const SCHEMA_VERSION: &str = "1.6.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -80,6 +80,17 @@ pub enum SessionKind {
     Agent,
     /// A manual `dira start` dira (meeting, manual testing, etc.).
     Manual,
+}
+
+/// What a session does relative to other sessions. Absent for an ordinary
+/// session; only roles that change how the cloud groups work are named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    /// A coordinating session (Claude Desktop's scratch-workspace sessions, or
+    /// any session that spawned others). Its repo-less time is the
+    /// "orchestration" bucket — never guessed onto a repo.
+    Orchestrator,
 }
 
 /// Which harness produced a session.
@@ -182,6 +193,26 @@ pub struct SessionRollup {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,
+    /// Set for an orchestrating session (see [`SessionRole`]).
+    /// Optional + omitted-when-absent so pre-1.6 payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<SessionRole>,
+    /// Harness session id of the orchestrator that spawned this session, when
+    /// the producer could link them. An id only — never a title.
+    /// Optional + omitted-when-absent so pre-1.6 payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// Canonical repo refs this session demonstrably touched, sorted and
+    /// capped. Set for orchestrators, whose `repoCanonical` stays absent
+    /// because no single repo describes them.
+    /// Optional + omitted-when-absent so pre-1.6 payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repos: Option<Vec<String>>,
+    /// Opaque 16-hex digest of the scratch workspace an orchestrator ran in,
+    /// so sibling runs from one workspace can be stacked. Never a path.
+    /// Optional + omitted-when-absent so pre-1.6 payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_ref: Option<String>,
 }
 
 /// Token usage for a session/turn. Cost is always an estimate, separate from time.
@@ -1526,6 +1557,11 @@ mod tests {
                     runtime_session_ref: Some("cse".into()),
                     // Populated so the content-token walk covers the 1.5 field.
                     spec: Some("openspec:add-csv-import".into()),
+                    // Populated so the content-token walk covers the 1.6 fields.
+                    role: Some(SessionRole::Orchestrator),
+                    parent_session: Some("ps".into()),
+                    repos: Some(vec!["r".into()]),
+                    workspace_ref: Some("0123456789abcdef".into()),
                 }],
                 token_usage: vec![TokenUsage {
                     id: "t".into(),
@@ -1796,6 +1832,10 @@ mod tests {
             runtime: None,
             runtime_session_ref: None,
             spec: Some("bmad:epic-1".into()),
+            role: None,
+            parent_session: None,
+            repos: None,
+            workspace_ref: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"spec\":\"bmad:epic-1\""));
@@ -1806,6 +1846,50 @@ mod tests {
         assert!(!json.contains("spec"));
         let old: SessionRollup = serde_json::from_str(&json).unwrap();
         assert_eq!(old.spec, None);
+    }
+
+    #[test]
+    fn session_orchestration_fields_roundtrip_and_are_omitted_when_none() {
+        let mut s = SessionRollup {
+            session_id: "s".into(),
+            harness: Harness::ClaudeCode,
+            kind: SessionKind::Agent,
+            repo_canonical: None,
+            identity_email: "e".into(),
+            started_at: "t".into(),
+            ended_at: None,
+            agent_wall_seconds: 1,
+            prompts: None,
+            branch: None,
+            note: None,
+            label: None,
+            runtime: None,
+            runtime_session_ref: None,
+            spec: None,
+            role: Some(SessionRole::Orchestrator),
+            parent_session: Some("parent".into()),
+            repos: Some(vec!["github.com/a/b".into(), "github.com/a/c".into()]),
+            workspace_ref: Some("0123456789abcdef".into()),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"role\":\"orchestrator\""));
+        assert!(json.contains("\"parentSession\":\"parent\""));
+        assert!(json.contains("\"repos\":[\"github.com/a/b\",\"github.com/a/c\"]"));
+        assert!(json.contains("\"workspaceRef\":\"0123456789abcdef\""));
+        let back: SessionRollup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.role, Some(SessionRole::Orchestrator));
+        assert_eq!(back.repos.as_ref().map(Vec::len), Some(2));
+
+        s.role = None;
+        s.parent_session = None;
+        s.repos = None;
+        s.workspace_ref = None;
+        let json = serde_json::to_string(&s).unwrap();
+        for absent in ["role", "parentSession", "repos", "workspaceRef"] {
+            assert!(!json.contains(absent), "`{absent}` should be omitted");
+        }
+        let old: SessionRollup = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.role, None);
     }
 
     #[test]
@@ -1933,6 +2017,10 @@ mod tests {
             runtime: Some("claude-web".into()),
             runtime_session_ref: Some("cse_01".into()),
             spec: None,
+            role: None,
+            parent_session: None,
+            repos: None,
+            workspace_ref: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"runtime\":\"claude-web\""));

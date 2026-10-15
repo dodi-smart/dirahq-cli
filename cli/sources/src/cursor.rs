@@ -90,6 +90,7 @@ pub fn normalize(hook: &CursorHook) -> Option<Normalized> {
         transcript_path: hook.transcript_path.clone(),
         source: None,
         reason: None,
+        hints: Default::default(),
     })
 }
 

@@ -57,6 +57,7 @@ pub fn normalize(hook: &OpenCodeHook) -> Option<Normalized> {
         transcript_path: hook.transcript_path.clone(),
         source: None,
         reason: None,
+        hints: Default::default(),
     })
 }
 

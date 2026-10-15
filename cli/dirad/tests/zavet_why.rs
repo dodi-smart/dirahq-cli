@@ -40,6 +40,7 @@ fn ev(session: &str, kind: EventKind, at: OffsetDateTime) -> RawEvent {
         activity: None,
         note: None,
         spec: None,
+        lineage: Default::default(),
     }
 }
 

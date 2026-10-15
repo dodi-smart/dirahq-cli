@@ -1,6 +1,6 @@
 ---
 title: Orchestration sessions and runs
-version: 1
+version: 2
 origin: session
 verified: false
 confidence: high
@@ -8,6 +8,7 @@ date: 2026-10-15
 paths:
   - cli/core/src/orchestration.rs
   - cli/core/src/runs.rs
+  - cli/core/src/report.rs
   - cli/core/migrations/0007_orchestration.sql
   - cli/sources/src/claude_code.rs
   - cli/dirad/src/writer.rs
@@ -25,9 +26,18 @@ links their children, and shows the whole thing as one run.
 
 ## Behavior
 
-- A session is an orchestrator when an event's cwd sits in a scratch workspace
-  and is not itself a repo, or when it spawned a child. A clone inside the
-  workspace is ordinary repo work.
+- A session is an orchestrator when it spawned a child, or when an event's cwd
+  sits in a scratch workspace and is not itself a repo, unless the session
+  also resolved a repo from a cwd outside every scratch workspace. A clone
+  inside the workspace (`scratch-…/repos/x`) does not cancel the role.
+- A spawned child often runs its first events in the parent's scratch dir, then
+  moves to its own worktree of a real repo. It is an ordinary session: it keeps
+  its sticky project and its rollup's `repoCanonical`. Its scratch events still
+  carry the `workspace` digest; only the session-level verdict changes.
+- `SessionLineage` folds the verdict from flags that only ever turn on, so the
+  rollup, the live registry and reports agree whatever the event order. While a
+  child's scratch preamble is all the registry has seen, it reads as an
+  orchestrator; the first event in its worktree flips it for good.
 - The writer resolves an event's repo from the cwd first. When the cwd names no
   repo, it uses the tool input's evidence: a `cd` chain, `git -C`, `gh -R`,
   `gh api repos/…`, or an `Edit`/`Write`/`Read` path. Evidence naming two

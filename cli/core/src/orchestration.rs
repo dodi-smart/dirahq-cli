@@ -105,17 +105,35 @@ pub fn inject_env_hints(payload: &mut serde_json::Value, var: impl Fn(&str) -> O
 /// can never disagree about what a session is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionLineage {
+    /// Derived on every [`Self::observe`]: the session spawned a child, or it
+    /// worked from a scratch workspace and never from a repo outside one.
     pub orchestrator: bool,
     pub parent_session: Option<String>,
     pub workspace: Option<String>,
     /// Every canonical repo an event of this session resolved to.
     pub repos: std::collections::BTreeSet<String>,
+    spawned: bool,
+    scratch: bool,
+    repo_outside_scratch: bool,
 }
 
 impl SessionLineage {
     pub fn observe(&mut self, ev: &crate::model::RawEvent) {
         let l = &ev.lineage;
-        self.orchestrator |= l.marks_orchestrator();
+        self.spawned |= l.spawned.is_some();
+        self.scratch |= l.workspace.is_some();
+        // A child spawned from an orchestrator often opens in the parent's
+        // scratch dir and then moves to its own worktree: once a session
+        // resolves a repo from a cwd outside every scratch workspace, its
+        // scratch events were a preamble, not orchestration. A clone under
+        // the scratch dir (`scratch-…/repos/x`) is still orchestrator work.
+        if !self.repo_outside_scratch && ev.project.is_some() {
+            self.repo_outside_scratch = ev
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| scratch_workspace(Path::new(cwd)).is_none());
+        }
+        self.orchestrator = self.spawned || (self.scratch && !self.repo_outside_scratch);
         if self.parent_session.is_none() {
             self.parent_session.clone_from(&l.parent_session);
         }
@@ -614,5 +632,97 @@ mod tests {
             )),
             None
         );
+    }
+
+    const SCRATCH: &str = "/Users/u/Library/Application Support/Claude/scratch-workspaces/acct/org/scratch-2026-10-15-bcf1a3";
+
+    /// One event as the writer's `enrich` stamps it: a scratch cwd that names
+    /// no repo carries the workspace digest.
+    fn event(cwd: &str, project: Option<&str>) -> crate::model::RawEvent {
+        let workspace = project
+            .is_none()
+            .then(|| scratch_workspace(Path::new(cwd)))
+            .flatten();
+        crate::model::RawEvent {
+            id: String::new(),
+            at: time::OffsetDateTime::UNIX_EPOCH,
+            session_id: "s".into(),
+            harness: dira_contract::Harness::ClaudeCode,
+            kind: crate::model::EventKind::PostTool,
+            cwd: Some(cwd.into()),
+            project: project.map(str::to_string),
+            identity_email: None,
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+            spec: None,
+            lineage: crate::model::Lineage {
+                workspace,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn fold<'a>(events: impl IntoIterator<Item = &'a crate::model::RawEvent>) -> SessionLineage {
+        let mut l = SessionLineage::default();
+        events.into_iter().for_each(|e| l.observe(e));
+        l
+    }
+
+    #[test]
+    fn a_scratch_only_session_is_an_orchestrator() {
+        let l = fold(&[event(SCRATCH, None), event(SCRATCH, None)]);
+        assert!(l.orchestrator);
+        assert!(l.workspace_ref().is_some());
+    }
+
+    #[test]
+    fn a_child_that_moves_to_its_own_worktree_is_not_an_orchestrator() {
+        // Seen live: a spawned child's first events run in the parent's
+        // scratch dir, the rest in a worktree of a real repo.
+        let wt = "/Users/u/Workspace/app/.claude/worktrees/x";
+        let mut events: Vec<_> = (0..11).map(|_| event(SCRATCH, None)).collect();
+        events.extend((0..3).map(|_| event(wt, Some("github.com/acme/app"))));
+        let l = fold(&events);
+        assert!(!l.orchestrator);
+        assert_eq!(l.role(), None);
+        assert_eq!(l.workspace_ref(), None);
+        assert_eq!(l.repos_touched(), None);
+        assert_eq!(
+            l.repo_canonical(Some("github.com/acme/app".into()))
+                .as_deref(),
+            Some("github.com/acme/app")
+        );
+        // The verdict holds while the scratch preamble is still all we saw.
+        assert!(fold(&events[..11]).orchestrator);
+        // And a return to the scratch dir does not flip it back.
+        events.push(event(SCRATCH, None));
+        assert!(!fold(&events).orchestrator);
+    }
+
+    #[test]
+    fn a_clone_under_the_scratch_dir_is_still_orchestrator_work() {
+        let clone = format!("{SCRATCH}/repos/api");
+        let l = fold(&[
+            event(SCRATCH, None),
+            event(&clone, Some("github.com/acme/api")),
+        ]);
+        assert!(l.orchestrator);
+        assert_eq!(l.repo_canonical(Some("github.com/acme/api".into())), None);
+        assert_eq!(l.repos_touched(), Some(vec!["github.com/acme/api".into()]));
+    }
+
+    #[test]
+    fn spawning_a_child_always_marks_an_orchestrator() {
+        let mut spawn = event("/Users/u/Workspace/app", Some("github.com/acme/app"));
+        spawn.lineage.spawned = Some("local_00000000-0000-0000-0000-000000000000".into());
+        let l = fold(&[
+            event(SCRATCH, None),
+            event("/Users/u/Workspace/app", Some("github.com/acme/app")),
+            spawn,
+        ]);
+        assert!(l.orchestrator);
     }
 }

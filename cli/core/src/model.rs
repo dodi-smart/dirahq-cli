@@ -78,13 +78,6 @@ pub struct Lineage {
     pub parent_session: Option<String>,
 }
 
-impl Lineage {
-    /// Whether this event marks its session as an orchestrator.
-    pub fn marks_orchestrator(&self) -> bool {
-        self.workspace.is_some() || self.spawned.is_some()
-    }
-}
-
 /// Session-id prefix reserved for `dira doctor --probe`'s end-to-end capture
 /// probe.
 ///

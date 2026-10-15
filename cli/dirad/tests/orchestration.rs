@@ -223,3 +223,110 @@ async fn an_orchestrator_attributes_per_tool_call_and_links_its_children() {
 
     writer.abort();
 }
+
+#[tokio::test]
+async fn a_child_that_starts_in_the_parent_scratch_dir_keeps_its_own_repo() {
+    let store = Store::open_in_memory().await.expect("store");
+    let (state, rx, _sync_rx, _knowledge_rx) = dirad::build_state(store, Config::default())
+        .await
+        .expect("build_state");
+    let writer_state = state.clone();
+    let writer = tokio::spawn(async move {
+        dirad::writer::writer_with(rx, writer_state, |_, _, _| {}).await;
+    });
+    let (tmp, scratch, _clone) = scratch_with_clone();
+    let cwd = scratch.display().to_string();
+    // The child's own worktree of a real repo, outside the scratch workspace.
+    let wt = tmp.path().join("Workspace/app/.claude/worktrees/x");
+    std::fs::create_dir_all(&wt).unwrap();
+    git(&wt, &["init", "-q", "-b", "main"]);
+    git(
+        &wt,
+        &["remote", "add", "origin", "git@github.com:acme/app.git"],
+    );
+    let wt_cwd = wt.display().to_string();
+
+    hook(
+        &state,
+        json!({ "hook_event_name": "PostToolUse", "session_id": "orch",
+        "cwd": cwd, "dira_env": env(ORCH_HOST),
+        "tool_name": "mcp__ccd_session__start_session",
+        "tool_input": { "title": "fix app" },
+        "tool_response": format!("Session started: {KID_HOST}") }),
+    )
+    .await;
+    // Its first events run in the parent's scratch dir…
+    for kind in ["SessionStart", "UserPromptSubmit"] {
+        hook(
+            &state,
+            json!({ "hook_event_name": kind, "session_id": "kid",
+            "cwd": cwd, "dira_env": env(KID_HOST) }),
+        )
+        .await;
+    }
+    // …then it moves to its own worktree.
+    for file in ["README.md", "src/lib.rs"] {
+        hook(
+            &state,
+            json!({ "hook_event_name": "PreToolUse", "session_id": "kid",
+            "cwd": wt_cwd, "dira_env": env(KID_HOST), "tool_name": "Read",
+            "tool_input": { "file_path": file } }),
+        )
+        .await;
+    }
+
+    let mut events = Vec::new();
+    for _ in 0..200 {
+        events = state.store.events_since(None).await.unwrap();
+        if events.len() >= 5 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+    }
+    assert_eq!(events.len(), 5, "every hook stored: {events:#?}");
+    let kid: Vec<_> = events.iter().filter(|e| e.session_id == "kid").collect();
+    // The per-event data is unchanged: the preamble still carries the digest.
+    assert!(kid[0].lineage.workspace.is_some());
+    assert_eq!(kid[3].project.as_deref(), Some("github.com/acme/app"));
+
+    {
+        let reg = dirad::control::lock_recover(&state.sessions);
+        let live = reg
+            .all()
+            .into_iter()
+            .find(|s| s.session_id == "kid")
+            .unwrap();
+        assert!(!live.lineage.orchestrator);
+        assert_eq!(live.project.as_deref(), Some("github.com/acme/app"));
+        assert_eq!(reg.parent_of("kid").as_deref(), Some("orch"));
+    }
+
+    let mut all = events.clone();
+    let end_at = all.last().unwrap().at + time::Duration::seconds(5);
+    let mut end = kid[0].clone();
+    end.id = "ZZZ".into();
+    end.kind = dira_core::model::EventKind::SessionEnd;
+    end.at = end_at;
+    all.push(end);
+    let batch = dira_core::sync::build_batch(
+        &all,
+        &[],
+        &[],
+        "dev",
+        time::Duration::minutes(5),
+        Default::default(),
+        end_at,
+    );
+    let k = batch
+        .sessions
+        .iter()
+        .find(|s| s.session_id == "kid")
+        .expect("child rollup");
+    assert_eq!(k.role, None);
+    assert_eq!(k.parent_session.as_deref(), Some("orch"));
+    assert_eq!(k.repo_canonical.as_deref(), Some("github.com/acme/app"));
+    assert_eq!(k.workspace_ref, None);
+    assert_eq!(k.repos, None);
+
+    writer.abort();
+}

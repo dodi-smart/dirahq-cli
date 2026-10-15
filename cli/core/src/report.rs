@@ -40,12 +40,20 @@ pub struct Report {
 /// because a gap that means "the human walked away" means "the agent is running a
 /// build" — see [`accounting::AgentPolicy`].
 pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy) -> Report {
-    // Sessions any of whose events marks them as orchestrating. Their
-    // repo-less time is the orchestration bucket, not "unresolved".
-    let orchestrators: std::collections::HashSet<&str> = events
-        .iter()
-        .filter(|e| e.lineage.marks_orchestrator())
-        .map(|e| e.session_id.as_str())
+    // Sessions whose lineage makes them orchestrators — the same rule the
+    // rollup and the live registry fold. Their repo-less time is the
+    // orchestration bucket, not "unresolved".
+    let mut lineages: std::collections::HashMap<&str, crate::orchestration::SessionLineage> =
+        std::collections::HashMap::new();
+    for e in events {
+        lineages
+            .entry(e.session_id.as_str())
+            .or_default()
+            .observe(e);
+    }
+    let orchestrators: std::collections::HashSet<&str> = lineages
+        .into_iter()
+        .filter_map(|(s, l)| l.orchestrator.then_some(s))
         .collect();
     let key = |project: &Option<String>, session: &str| -> LineKey {
         (

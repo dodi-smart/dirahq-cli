@@ -15,6 +15,7 @@
 use crate::state::AppState;
 use dira_core::model::EventKind;
 use dira_core::project::{self, CapturedCommit};
+use dira_core::store::SourcesWritten;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -106,6 +107,10 @@ struct GitWalk {
     /// A walked commit touched a declared spec-source root or `.zavet/config`,
     /// so the source units are worth re-resolving after the walk.
     source_trigger: bool,
+    /// A walked commit touched a framework rule file (a default path, a stored
+    /// one, `AGENTS.md` or `.zavet/config`), so the rule sources are worth
+    /// re-resolving — see [`refresh_sources`].
+    rule_trigger: bool,
     /// Repo toplevel and id/source config the sweep resolved, handed on to the
     /// post-walk source refresh so neither is read twice.
     top: PathBuf,
@@ -165,7 +170,12 @@ pub struct ZavetSpecAt {
 /// `zavet` gates the knowledge sweep. The `.zavet/` dir probe for `auto` mode
 /// happens here (inside the same blocking budget) — the caller passes the knob
 /// + per-repo override pre-resolved, since the store is async.
-fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWalk> {
+fn git_walk(
+    cwd: &str,
+    baseline: Option<&str>,
+    zavet: ZavetGate,
+    rule_paths: &[String],
+) -> Option<GitWalk> {
     let root = Path::new(cwd);
     let head = project::head_sha(root)?;
     if baseline == Some(head.as_str()) {
@@ -197,7 +207,7 @@ fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWa
                 authored_at: c.authored_at.clone(),
             })
             .collect();
-        zavet_sweep(root, &refs)
+        zavet_sweep(root, &refs, rule_paths)
     } else {
         ZavetSweep::default()
     };
@@ -212,6 +222,7 @@ fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWa
         specs: sweep.specs,
         zavet_active,
         source_trigger: sweep.source_trigger,
+        rule_trigger: sweep.rule_trigger,
         top,
         cfg: sweep.cfg,
     })
@@ -222,6 +233,14 @@ fn git_walk(cwd: &str, baseline: Option<&str>, zavet: ZavetGate) -> Option<GitWa
 struct ZavetGate {
     knob: dira_core::config::ZavetMode,
     override_: Option<bool>,
+}
+
+impl ZavetGate {
+    /// Whether the walk could find zavet active — false only when the knob or
+    /// the per-repo override rules it out before the `.zavet/` probe.
+    fn may_be_active(self) -> bool {
+        crate::zavet::effective_mode(self.knob, self.override_, true)
+    }
 }
 
 /// What one zavet sweep of a commit range yields.
@@ -235,6 +254,10 @@ pub struct ZavetSweep {
     /// The sweep only DETECTS this; resolving shells out to the plugin and is
     /// done by [`refresh_sources`] under its own budget.
     pub source_trigger: bool,
+    /// A commit in the walked range touched a framework rule file — one of
+    /// [`dira_core::zavet_specs::rule_trigger_paths`]. Detected here, resolved
+    /// by [`refresh_sources`].
+    pub rule_trigger: bool,
     /// The config this sweep resolved (id conventions + declared sources).
     pub cfg: ZavetConfig,
 }
@@ -250,16 +273,26 @@ pub struct ZavetSweep {
 /// pathspec-scoped history walk. There must only ever be one implementation of
 /// this parsing — two would drift, and a reindex that disagrees with the ambient
 /// poll is worse than the under-indexing it exists to fix.
-pub fn zavet_sweep(root: &Path, commits: &[project::CommitRef]) -> ZavetSweep {
+///
+/// `rule_paths` are the rule-source paths already on record for the repo (an
+/// override path is only known once resolved); with the declared defaults they
+/// decide [`ZavetSweep::rule_trigger`].
+pub fn zavet_sweep(
+    root: &Path,
+    commits: &[project::CommitRef],
+    rule_paths: &[String],
+) -> ZavetSweep {
     // One config read per sweep. Read from the WORKING TREE, not from each
     // historical blob: retired prefixes stay in `prefix-aliases`, so the
     // current config is what resolves an id minted under an older one.
     let cfg = crate::zavet::read_config(root);
     let trailers = zavet_trailers(root, commits, &cfg);
+    let rule_triggers = dira_core::zavet_specs::rule_trigger_paths(&cfg, rule_paths);
 
     let mut decisions = Vec::new();
     let mut specs = Vec::new();
     let mut source_trigger = false;
+    let mut rule_trigger = false;
     // Oldest first, so within one walk the INTRODUCING commit lands first and
     // the store's first-sight preservation keeps pointing at it. One
     // diff-tree per commit serves both the decision and the spec filter.
@@ -273,6 +306,9 @@ pub fn zavet_sweep(root: &Path, commits: &[project::CommitRef]) -> ZavetSweep {
                 .any(|p| dira_core::zavet_specs::path_triggers_resolve(&cfg, p))
         {
             source_trigger = true;
+        }
+        if !rule_trigger && touched.iter().any(|p| rule_triggers.contains(p)) {
+            rule_trigger = true;
         }
         for path in changed {
             let is_decision = dira_core::zavet::is_decision_path(&path);
@@ -312,87 +348,177 @@ pub fn zavet_sweep(root: &Path, commits: &[project::CommitRef]) -> ZavetSweep {
         decisions,
         specs,
         source_trigger,
+        rule_trigger,
         cfg,
     }
 }
 
-/// Re-resolve the repo's source-backed spec units through the installed plugin
-/// and write them (plus `removed` marks) into the store.
+/// Which halves of [`refresh_sources`] a sweep asks for.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRefresh {
+    /// Source-backed spec units (`zavet specs --json`).
+    pub units: bool,
+    /// Framework rule sources (`zavet spec-sources --json`, DIRASH-0040).
+    pub rules: bool,
+}
+
+/// Re-resolve the repo's source-backed spec units and/or framework rule
+/// sources through the installed plugin and write them (plus `removed` marks)
+/// into the store. The single owner of every plugin run a sweep makes
+/// (DIRASH-0039, DIRASH-0040).
 ///
-/// Runs OFF the writer task and OFF the commit walk's blocking budget, under
-/// [`SOURCES_TIMEOUT`]: a wedged or missing plugin costs this sweep its source
-/// specs — never its commits. Fail-open end to end: an unresolved run changes
-/// nothing, and in particular marks nothing `removed`.
+/// Runs OFF the writer task and OFF the commit walk's blocking budget, each
+/// resolve under its own [`SOURCES_TIMEOUT`]: a wedged or missing plugin costs
+/// this sweep its source specs or rule sources — never its commits. When both
+/// are asked for, the two plugin runs overlap; the store writes that follow
+/// stay sequential. Fail-open end to end: an unresolved run changes nothing,
+/// and in particular marks nothing `removed`.
 ///
 /// With no `spec-source:` lines declared the answer is known without asking the
-/// plugin (there are no units), but only when the config file really is there —
-/// a momentarily unreadable config must not read as "everything was deleted".
+/// plugin (there are no units, and rule sources follow the declarations), but
+/// only when the config file really is there — a momentarily unreadable config
+/// must not read as "everything was deleted".
 ///
-/// Returns what changed (all zero when nothing resolved).
+/// Removals are the dangerous half of a resolve. They need BOTH of:
+///  - the resolving checkout is on the repo's default branch (computed once,
+///    for both halves): the store is keyed by canonical repo but a resolve
+///    sees one checkout, so a feature branch or worktree that predates a unit
+///    would flap it removed/active;
+///  - an EMPTY answer for non-empty declarations is corroborated: every
+///    declared root is absent (units), and none of the declared frameworks'
+///    default rule files is on disk (rule sources). A plugin that emitted
+///    nothing for something still there is a failed resolve, not a deletion.
+///
+/// Without them, seen rows are still upserted but nothing is removed. Rule
+/// text is never read. Returns what changed, `(units, rules)` (all zero for a
+/// half not asked for or not resolved).
 pub async fn refresh_sources(
     state: &AppState,
     repo: &str,
     top: &Path,
     cfg: &ZavetConfig,
     session: Option<&str>,
-) -> crate::zavet_sources::Persisted {
-    use crate::zavet_sources::Persisted;
-    let units = if cfg.spec_sources.is_empty() {
-        if !top.join(crate::zavet::CONFIG_PATH).is_file() {
-            return Persisted::default();
-        }
-        Some(Vec::new())
-    } else {
-        let top = top.to_path_buf();
-        let join = tokio::task::spawn_blocking(move || {
-            crate::zavet_sources::resolve_blocking(&top, false)
-        });
-        match tokio::time::timeout(SOURCES_TIMEOUT, join).await {
-            Ok(Ok(units)) => units,
-            Ok(Err(e)) => {
-                tracing::debug!(repo, "source spec resolve task failed: {e}");
-                None
+    want: SourceRefresh,
+) -> (SourcesWritten, SourcesWritten) {
+    let (units, rules) = tokio::join!(
+        async {
+            if !want.units {
+                return None;
             }
-            Err(_) => {
-                tracing::debug!(repo, "source spec resolve timed out — skipped this sweep");
-                None
+            resolve_declared(repo, top, cfg, "source spec", |top| {
+                crate::zavet_sources::resolve_blocking(&top, false)
+            })
+            .await
+        },
+        async {
+            if !want.rules {
+                return None;
             }
-        }
-    };
-    let Some(units) = units else {
-        return Persisted::default();
-    };
-    // Removals are the dangerous half of a resolve (DIRASH-0039). They need
-    // BOTH of:
-    //  - the resolving checkout is on the repo's default branch: the store is
-    //    keyed by canonical repo but a resolve sees one checkout, so a feature
-    //    branch or worktree that predates a unit would flap it removed/active;
-    //  - an empty answer for non-empty declarations is corroborated by every
-    //    declared root really being absent from the checkout (a plugin that
-    //    emitted nothing for a root that is still there is a failed resolve).
-    // Without them, seen units are still upserted but nothing is removed.
-    let allow_removals = {
+            resolve_declared(repo, top, cfg, "rule source", |top| {
+                crate::zavet_sources::resolve_rules_blocking(&top)
+            })
+            .await
+        },
+    );
+    if units.is_none() && rules.is_none() {
+        return Default::default();
+    }
+    let on_default_branch = {
         let top = top.to_path_buf();
+        tokio::task::spawn_blocking(move || project::on_default_branch(&top))
+            .await
+            .unwrap_or(false)
+    };
+    let mut out = (SourcesWritten::default(), SourcesWritten::default());
+    if let Some(units) = units {
         let roots: Vec<String> = cfg.spec_sources.iter().map(|d| d.root.clone()).collect();
-        let empty_answer = units.is_empty();
-        tokio::task::spawn_blocking(move || {
-            if !project::on_default_branch(&top) {
-                return false;
-            }
-            !(empty_answer && roots.iter().any(|r| top.join(r).exists()))
-        })
-        .await
-        .unwrap_or(false)
-    };
+        let allow_removals = removal_allowed(
+            top,
+            on_default_branch,
+            units.is_empty(),
+            &roots,
+            Path::exists,
+        );
+        out.0 = persist_sources(state, repo, cfg, &units, session, allow_removals).await;
+    }
+    if let Some(rules) = rules {
+        let defaults = dira_core::zavet_specs::rule_default_paths(cfg);
+        let allow_removals = removal_allowed(
+            top,
+            on_default_branch,
+            rules.is_empty(),
+            &defaults,
+            Path::is_file,
+        );
+        out.1 = persist_rule_sources(state, repo, &rules, allow_removals).await;
+    }
+    out
+}
+
+/// One declared-source resolve, off the runtime under [`SOURCES_TIMEOUT`] and
+/// failing open (`None`: skip this sweep, logged at debug). With nothing
+/// declared the answer is `Some(empty)` without running the plugin, but only
+/// while `.zavet/config` is really there (see [`refresh_sources`]).
+async fn resolve_declared<T: Send + 'static>(
+    repo: &str,
+    top: &Path,
+    cfg: &ZavetConfig,
+    what: &str,
+    resolve: impl FnOnce(PathBuf) -> Option<Vec<T>> + Send + 'static,
+) -> Option<Vec<T>> {
+    if cfg.spec_sources.is_empty() {
+        return top.join(crate::zavet::CONFIG_PATH).is_file().then(Vec::new);
+    }
+    let top = top.to_path_buf();
+    match tokio::time::timeout(
+        SOURCES_TIMEOUT,
+        tokio::task::spawn_blocking(move || resolve(top)),
+    )
+    .await
+    {
+        Ok(Ok(found)) => found,
+        Ok(Err(e)) => {
+            tracing::debug!(repo, "{what} resolve task failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(repo, "{what} resolve timed out — skipped this sweep");
+            None
+        }
+    }
+}
+
+/// Whether a successful resolve may mark rows removed: the checkout is on the
+/// default branch, and an `empty_answer` is corroborated by none of the
+/// `corroborating` paths being `present` under `top` (see [`refresh_sources`]).
+fn removal_allowed(
+    top: &Path,
+    on_default_branch: bool,
+    empty_answer: bool,
+    corroborating: &[String],
+    present: fn(&Path) -> bool,
+) -> bool {
+    on_default_branch && !(empty_answer && corroborating.iter().any(|p| present(&top.join(p))))
+}
+
+/// Write a resolved unit set (the units half of [`refresh_sources`]).
+async fn persist_sources(
+    state: &AppState,
+    repo: &str,
+    cfg: &ZavetConfig,
+    units: &[dira_core::zavet_specs::ResolvedUnit],
+    session: Option<&str>,
+    allow_removals: bool,
+) -> SourcesWritten {
     if units.is_empty() && !cfg.spec_sources.is_empty() && !allow_removals {
         // Nothing to upsert and nothing we may remove: a no-op either way.
         tracing::debug!(
             repo,
             "empty source resolve not corroborated; changing nothing"
         );
-        return Persisted::default();
+        return SourcesWritten::default();
     }
-    match crate::zavet_sources::persist_units(&state.store, repo, &units, session, allow_removals)
+    match crate::zavet_sources::persist_units(&state.store, repo, units, session, allow_removals)
         .await
     {
         Ok(p) => {
@@ -408,7 +534,38 @@ pub async fn refresh_sources(
         }
         Err(e) => {
             tracing::warn!("source spec persist failed for {repo}: {e}");
-            Persisted::default()
+            SourcesWritten::default()
+        }
+    }
+}
+
+/// Write a resolved rule-source set (the rules half of [`refresh_sources`]).
+/// Local metadata only: nothing here nudges the knowledge sync.
+async fn persist_rule_sources(
+    state: &AppState,
+    repo: &str,
+    rules: &[dira_core::zavet_specs::RuleSource],
+    allow_removals: bool,
+) -> SourcesWritten {
+    match state
+        .store
+        .zavet_upsert_rule_sources(repo, rules, allow_removals)
+        .await
+    {
+        Ok(w) => {
+            if w.changed() {
+                tracing::info!(
+                    repo,
+                    upserted = w.upserted,
+                    removed = w.removed,
+                    "captured framework rule sources"
+                );
+            }
+            w
+        }
+        Err(e) => {
+            tracing::warn!("rule source persist failed for {repo}: {e}");
+            SourcesWritten::default()
         }
     }
 }
@@ -444,11 +601,27 @@ pub async fn capture_commits(state: &AppState, cwd: &str, canonical: &str) {
             .unwrap_or(None),
     };
 
+    // Rule-source paths already on record, so the sweep also notices an edit
+    // to an override path (the defaults it derives from the config itself).
+    // Only read when the sweep can run at all: a repo zavet is forced or
+    // knobbed off for never consults them.
+    let rule_paths = if zavet.may_be_active() {
+        state
+            .store
+            .zavet_rule_source_paths(canonical)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     // The blocking git work, off the runtime worker and time-boxed.
     let walk = {
         let cwd = cwd.to_string();
         let baseline = baseline.clone();
-        let join = tokio::task::spawn_blocking(move || git_walk(&cwd, baseline.as_deref(), zavet));
+        let join = tokio::task::spawn_blocking(move || {
+            git_walk(&cwd, baseline.as_deref(), zavet, &rule_paths)
+        });
         match tokio::time::timeout(CAPTURE_TIMEOUT, join).await {
             Ok(Ok(walk)) => walk,
             Ok(Err(e)) => {
@@ -540,19 +713,27 @@ pub async fn capture_commits(state: &AppState, cwd: &str, canonical: &str) {
         }
     }
 
-    // Source-backed spec units (OpenSpec / Spec Kit / BMAD / superpowers) — only
-    // when a walked commit touched a declared root or `.zavet/config`.
+    // Source-backed spec units (OpenSpec / Spec Kit / BMAD / superpowers) —
+    // only when a walked commit touched a declared root or `.zavet/config` —
+    // and framework rule files (constitution, OpenSpec config, BMAD context) —
+    // only when one, `AGENTS.md` or `.zavet/config` was touched. Rule sources
+    // are local metadata: only a unit change nudges the knowledge sync.
+    let want = SourceRefresh {
+        units: walk.zavet_active && walk.source_trigger,
+        rules: walk.zavet_active && walk.rule_trigger,
+    };
     let mut sources_changed = false;
-    if walk.zavet_active && walk.source_trigger {
-        sources_changed = refresh_sources(
+    if want.units || want.rules {
+        let (units, _rules) = refresh_sources(
             state,
             canonical,
             &walk.top,
             &walk.cfg,
             source_session.as_deref(),
+            want,
         )
-        .await
-        .changed();
+        .await;
+        sources_changed = units.changed();
     }
     // Bind the session to a spec from facts only (exact `Spec:` trailer, else
     // exact branch). After the source refresh so a unit introduced by these very

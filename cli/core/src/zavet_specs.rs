@@ -29,7 +29,7 @@ use dira_contract::{
     BodyRef, RequirementRef, SpecCounts, SpecDrift, SpecGroup, SpecSource, TaskRef, UnitFile,
 };
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -522,7 +522,8 @@ pub struct ResolvedUnit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     NoPlugin,
-    /// The plugin predates `zavet specs --json`.
+    /// The plugin predates the command asked for (`zavet specs --json`, or
+    /// `zavet spec-sources --json` for rule sources).
     Unsupported,
     Run(RunError),
 }
@@ -532,7 +533,10 @@ impl std::fmt::Display for ResolveError {
         match self {
             ResolveError::NoPlugin => write!(f, "zavet plugin is not installed"),
             ResolveError::Unsupported => {
-                write!(f, "installed zavet plugin has no `specs --json` support")
+                write!(
+                    f,
+                    "installed zavet plugin lacks the needed `--json` capability"
+                )
             }
             ResolveError::Run(e) => write!(f, "{e}"),
         }
@@ -573,8 +577,14 @@ pub const KNOWN_STORY_STATUSES: &[&str] = &["backlog", "ready", "in-progress", "
 /// Bucket every unknown word under this key.
 pub const OTHER_BUCKET: &str = "other";
 
+/// A vocabulary word as the closed lists spell it: trimmed, lower-cased, with
+/// spaces and underscores folded to `-` (`In Progress`, `file_missing`).
+fn fold_word(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace([' ', '_'], "-")
+}
+
 fn bucket(raw: &str, vocab: &'static [&'static str]) -> &'static str {
-    let k = raw.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    let k = fold_word(raw);
     vocab
         .iter()
         .find(|v| **v == k)
@@ -603,11 +613,13 @@ pub const MAX_NATIVE_STATE_CHARS: usize = 64;
 /// A framework's own state word, verbatim except that control characters are
 /// dropped and the length is capped. `None` when nothing printable remains.
 pub fn sanitize_native_state(raw: &str) -> Option<String> {
-    let s: String = raw
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NATIVE_STATE_CHARS)
-        .collect();
+    sanitize_scalar(Some(raw), MAX_NATIVE_STATE_CHARS)
+}
+
+/// Control characters dropped, trimmed, capped at `max` characters; `None`
+/// when nothing printable remains.
+fn sanitize_scalar(raw: Option<&str>, max: usize) -> Option<String> {
+    let s: String = raw?.chars().filter(|c| !c.is_control()).take(max).collect();
     let s = s.trim();
     (!s.is_empty()).then(|| s.to_string())
 }
@@ -811,39 +823,51 @@ pub fn parse_rows(stdout: &str, with_text: bool) -> Vec<ResolvedUnit> {
     out
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct VersionJson {
     #[serde(default)]
     specs_json: u64,
+    #[serde(default)]
+    spec_sources_json: u64,
 }
 
-/// Whether the plugin at `bin` advertises `specs_json` >= 1.
-fn supports_specs_json(runner: &dyn SpecRunner, bin: &Path, repo: &Path) -> Result<bool, RunError> {
+/// What the installed plugin says it can do (`zavet version --json`). One
+/// probe answers both flags; a field an older plugin does not emit is `false`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Caps {
+    /// `zavet specs --json` at [`SPECS_JSON_VERSION`].
+    specs_json: bool,
+    /// `zavet spec-sources --json` at [`SPEC_SOURCES_JSON_VERSION`].
+    spec_sources_json: bool,
+}
+
+/// The capabilities the plugin at `bin` advertises. Unparseable output is "no
+/// capabilities", not an error: the plugin answered, it just knows nothing.
+fn probe_caps(runner: &dyn SpecRunner, bin: &Path, repo: &Path) -> Result<Caps, RunError> {
     let out = runner.run(bin, repo, &["version", "--json"], RUN_TIMEOUT)?;
     Ok(serde_json::from_str::<VersionJson>(out.trim())
-        .map(|v| v.specs_json >= SPECS_JSON_VERSION)
-        .unwrap_or(false))
+        .map(|v| Caps {
+            specs_json: v.specs_json >= SPECS_JSON_VERSION,
+            spec_sources_json: v.spec_sources_json >= SPEC_SOURCES_JSON_VERSION,
+        })
+        .unwrap_or_default())
 }
 
-/// What the cached `specs_json` answer was read under.
+/// What the cached capability answer was read under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapStamp {
     bin: SystemTime,
     registry: Option<SystemTime>,
 }
 
-/// [`supports_specs_json`], remembered per binary. The capability is a property
-/// of the installed plugin, not of the repo, so one `version --json` per
-/// (binary path, binary mtime, `installed_plugins.json` mtime) answers every
-/// resolve until the plugin is upgraded or reinstalled. A failed probe is never
-/// cached (a timeout says nothing about the plugin), and neither is a binary
-/// whose mtime cannot be read.
-fn specs_json_capability(
-    runner: &dyn SpecRunner,
-    bin: &Path,
-    repo: &Path,
-) -> Result<bool, RunError> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (CapStamp, bool)>>> = OnceLock::new();
+/// [`probe_caps`], remembered per binary. The capabilities are a property of
+/// the installed plugin, not of the repo, so one `version --json` per (binary
+/// path, binary mtime, `installed_plugins.json` mtime) answers every resolve —
+/// units and rule sources alike — until the plugin is upgraded or reinstalled.
+/// A failed probe is never cached (a timeout says nothing about the plugin),
+/// and neither is a binary whose mtime cannot be read.
+fn plugin_caps(runner: &dyn SpecRunner, bin: &Path, repo: &Path) -> Result<Caps, RunError> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (CapStamp, Caps)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let stamp = runner.stamp(bin).map(|bin_mtime| CapStamp {
         bin: bin_mtime,
@@ -852,17 +876,17 @@ fn specs_json_capability(
             .and_then(|h| runner.stamp(&installed_plugins_path(&h))),
     });
     if let Some(stamp) = &stamp {
-        if let Some((seen, supported)) = lock_cache(cache).get(bin) {
+        if let Some((seen, caps)) = lock_cache(cache).get(bin) {
             if seen == stamp {
-                return Ok(*supported);
+                return Ok(*caps);
             }
         }
     }
-    let supported = supports_specs_json(runner, bin, repo)?;
+    let caps = probe_caps(runner, bin, repo)?;
     if let Some(stamp) = stamp {
-        lock_cache(cache).insert(bin.to_path_buf(), (stamp, supported));
+        lock_cache(cache).insert(bin.to_path_buf(), (stamp, caps));
     }
-    Ok(supported)
+    Ok(caps)
 }
 
 /// Resolve the repo's source-backed units through the plugin at `plugin_root`.
@@ -877,9 +901,9 @@ pub fn resolve_units(
     with_text: bool,
 ) -> Result<Vec<ResolvedUnit>, ResolveError> {
     let bin = plugin_bin(plugin_root);
-    match specs_json_capability(runner, &bin, repo) {
-        Ok(true) => {}
-        Ok(false) => return Err(ResolveError::Unsupported),
+    match plugin_caps(runner, &bin, repo) {
+        Ok(c) if c.specs_json => {}
+        Ok(_) => return Err(ResolveError::Unsupported),
         Err(e) => return Err(ResolveError::Run(e)),
     }
     let args: Vec<&str> = if with_text {
@@ -901,6 +925,345 @@ pub fn resolve_units_system(
 ) -> Result<Vec<ResolvedUnit>, ResolveError> {
     let root = plugin_root_cached().ok_or(ResolveError::NoPlugin)?;
     resolve_units(&SystemSpecRunner, &root, repo, with_text)
+}
+
+// ---------------------------------------------------------------------------
+// Rule sources — a linked framework's standing-rule files (metadata only)
+// ---------------------------------------------------------------------------
+//
+// A framework linked by a `spec-source:` line also brings its standing rules:
+// the Spec Kit constitution, OpenSpec's `config.yaml` context/rules (and the
+// legacy `project.md`), BMAD's `AGENTS.md` block (and the legacy
+// `project-context.md`). The plugin derives them from the declarations and
+// reports them as `"type":"rule-source"` rows of `zavet spec-sources --json`.
+// dira keeps their METADATA locally — kind, path, blob oid, version, dates,
+// rule count, state — and never their text: the rules reach an agent through
+// the plugin's own session context, and nothing here crosses any wire until
+// the contract carries it (DIRASH-0040, under DIRASH-0039).
+
+/// The `spec-sources --json` row schema this build understands (`"v"` on each
+/// row, `"spec_sources_json"` in `zavet version --json`).
+pub const SPEC_SOURCES_JSON_VERSION: u64 = 1;
+/// Longest `version`, `ratified` or `lastAmended` kept, in characters.
+pub const MAX_RULE_META_CHARS: usize = 64;
+/// Longest `reason` kept, in characters. Longer than the other scalars because
+/// it is the one human sentence (`deprecated by OpenSpec: move it into …`) and
+/// it is shown, never keyed on.
+pub const MAX_RULE_REASON_CHARS: usize = 200;
+/// Longest rule-source `path` accepted; a longer one drops the row.
+pub const MAX_RULE_PATH_CHARS: usize = 512;
+
+/// Which framework file a rule source is. Closed: anything the plugin grows
+/// later lands in [`RuleSourceKind::Other`] until dira learns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuleSourceKind {
+    /// `.specify/memory/constitution.md`.
+    SpeckitConstitution,
+    /// `openspec/config.yaml` `context:` / `rules:`.
+    OpenspecConfig,
+    /// `openspec/project.md` (legacy).
+    OpenspecProjectMd,
+    /// The `<!-- bmad:context -->` block of `AGENTS.md`.
+    BmadAgentsBlock,
+    /// `_bmad-output/project-context.md` (legacy).
+    BmadProjectContext,
+    Other,
+}
+
+impl RuleSourceKind {
+    pub const ALL: &'static [RuleSourceKind] = &[
+        RuleSourceKind::SpeckitConstitution,
+        RuleSourceKind::OpenspecConfig,
+        RuleSourceKind::OpenspecProjectMd,
+        RuleSourceKind::BmadAgentsBlock,
+        RuleSourceKind::BmadProjectContext,
+        RuleSourceKind::Other,
+    ];
+
+    /// The plugin's word for the kind (what the store keeps).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleSourceKind::SpeckitConstitution => "speckit-constitution",
+            RuleSourceKind::OpenspecConfig => "openspec-config",
+            RuleSourceKind::OpenspecProjectMd => "openspec-project-md",
+            RuleSourceKind::BmadAgentsBlock => "bmad-agents-block",
+            RuleSourceKind::BmadProjectContext => "bmad-project-context",
+            RuleSourceKind::Other => OTHER_BUCKET,
+        }
+    }
+
+    /// Parse the plugin's (or the store's) word, folded like every closed
+    /// vocabulary here; unknown words are `Other`.
+    pub fn parse(raw: &str) -> Self {
+        parse_closed(raw, Self::ALL, Self::as_str, RuleSourceKind::Other)
+    }
+
+    /// Short human name: `Spec Kit constitution`, `OpenSpec config`, ….
+    pub fn label(self) -> &'static str {
+        match self {
+            RuleSourceKind::SpeckitConstitution => "Spec Kit constitution",
+            RuleSourceKind::OpenspecConfig => "OpenSpec config",
+            RuleSourceKind::OpenspecProjectMd => "OpenSpec project.md",
+            RuleSourceKind::BmadAgentsBlock => "BMAD project context",
+            RuleSourceKind::BmadProjectContext => "BMAD project-context.md",
+            RuleSourceKind::Other => "framework rules",
+        }
+    }
+}
+
+/// A rule source's state as the plugin reports it. Closed, like the kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuleSourceState {
+    /// Parsed and in agent context.
+    Ok,
+    /// Still carries template placeholders or an unresolved Sync Impact Report.
+    Unratified,
+    /// A file its framework has deprecated in favour of another.
+    Legacy,
+    /// Present but unparseable (`reason` says why).
+    Unresolved,
+    /// An override path that does not exist.
+    FileMissing,
+    /// Turned off in `.zavet/config`.
+    Off,
+    Other,
+}
+
+impl RuleSourceState {
+    pub const ALL: &'static [RuleSourceState] = &[
+        RuleSourceState::Ok,
+        RuleSourceState::Unratified,
+        RuleSourceState::Legacy,
+        RuleSourceState::Unresolved,
+        RuleSourceState::FileMissing,
+        RuleSourceState::Off,
+        RuleSourceState::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleSourceState::Ok => "ok",
+            RuleSourceState::Unratified => "unratified",
+            RuleSourceState::Legacy => "legacy",
+            RuleSourceState::Unresolved => "unresolved",
+            RuleSourceState::FileMissing => "file-missing",
+            RuleSourceState::Off => "off",
+            RuleSourceState::Other => OTHER_BUCKET,
+        }
+    }
+
+    /// Parse the plugin's word (`file_missing`, ` OK ` fold in); unknown words
+    /// are `Other`.
+    pub fn parse(raw: &str) -> Self {
+        parse_closed(raw, Self::ALL, Self::as_str, RuleSourceState::Other)
+    }
+}
+
+/// The member of a closed vocabulary `raw` names after [`fold_word`], else
+/// `other`. `other` itself is never matched by its word, so it cannot be
+/// smuggled in as anything but the fallback it already is.
+fn parse_closed<T: Copy + PartialEq>(
+    raw: &str,
+    all: &[T],
+    word: fn(T) -> &'static str,
+    other: T,
+) -> T {
+    let k = fold_word(raw);
+    all.iter()
+        .copied()
+        .find(|v| *v != other && word(*v) == k)
+        .unwrap_or(other)
+}
+
+/// One `"type":"rule-source"` line of `zavet spec-sources --json`. As with
+/// [`Row`], every field is optional and unknown fields are ignored. There is
+/// deliberately no text field: the plugin emits none, and one it grew later
+/// would be dropped here.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RuleRow {
+    #[serde(deserialize_with = "null_default")]
+    v: u64,
+    #[serde(rename = "type", deserialize_with = "null_default")]
+    ty: String,
+    #[serde(deserialize_with = "null_default")]
+    kind: String,
+    #[serde(deserialize_with = "null_default")]
+    path: String,
+    #[serde(deserialize_with = "null_default")]
+    source: String,
+    oid: Option<String>,
+    version: Option<String>,
+    ratified: Option<String>,
+    last_amended: Option<String>,
+    rule_count: Option<u32>,
+    #[serde(deserialize_with = "null_default")]
+    state: String,
+    reason: Option<String>,
+}
+
+/// A framework rule file, as the installed plugin reports it. Metadata only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleSource {
+    pub kind: RuleSourceKind,
+    /// Repo-relative, `/`-separated.
+    pub path: String,
+    /// Set by a `rule-source: <kind> <path>` override rather than the default.
+    pub overridden: bool,
+    /// Working-tree blob oid (`git hash-object`); `None` when absent.
+    pub oid: Option<String>,
+    pub version: Option<String>,
+    pub ratified: Option<String>,
+    pub last_amended: Option<String>,
+    pub rule_count: Option<u32>,
+    pub state: RuleSourceState,
+    pub reason: Option<String>,
+}
+
+/// A rule-source path dira will store: repo-relative, `/`-separated, no `..`
+/// or `.` segments, no control characters, not too long. Anything else drops
+/// the row (the plugin already refuses such paths; this is the second lock).
+fn usable_rule_path(p: &str) -> bool {
+    !p.is_empty()
+        && p.chars().count() <= MAX_RULE_PATH_CHARS
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && !p.chars().any(char::is_control)
+        && !p
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+}
+
+fn map_rule_row(row: RuleRow) -> Option<RuleSource> {
+    if row.ty != "rule-source" || row.v != SPEC_SOURCES_JSON_VERSION {
+        return None;
+    }
+    if !usable_rule_path(&row.path) {
+        return None;
+    }
+    Some(RuleSource {
+        kind: RuleSourceKind::parse(&row.kind),
+        path: row.path,
+        overridden: row.source == "override",
+        oid: sanitize_scalar(row.oid.as_deref(), MAX_RULE_META_CHARS),
+        version: sanitize_scalar(row.version.as_deref(), MAX_RULE_META_CHARS),
+        ratified: sanitize_scalar(row.ratified.as_deref(), MAX_RULE_META_CHARS),
+        last_amended: sanitize_scalar(row.last_amended.as_deref(), MAX_RULE_META_CHARS),
+        rule_count: row.rule_count,
+        state: RuleSourceState::parse(&row.state),
+        reason: sanitize_scalar(row.reason.as_deref(), MAX_RULE_REASON_CHARS),
+    })
+}
+
+/// Parse `spec-sources --json` output into rule sources. Spec-source rows
+/// (`"type":"spec-source"`) are ignored — dira still reads its declarations
+/// from `.zavet/config` itself, and those rows could later replace that parse.
+/// A blank or malformed line is skipped; duplicates by `(kind, path)` keep the
+/// first. The result is sorted by `(kind, path)`.
+pub fn parse_rule_rows(stdout: &str) -> Vec<RuleSource> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<RuleRow>(line) else {
+            tracing::debug!("zavet spec-sources: skipped a malformed row");
+            continue;
+        };
+        if let Some(r) = map_rule_row(row) {
+            if seen.insert((r.kind, r.path.clone())) {
+                out.push(r);
+            }
+        }
+    }
+    out.sort_by(|a, b| (a.kind, &a.path).cmp(&(b.kind, &b.path)));
+    out
+}
+
+/// What standing rules linking a framework kind brings into agent context, in
+/// words — `None` for a framework that has none (superpowers). Pure, so the
+/// onboarding prompt and its `--print` plan can both say it without I/O.
+pub fn rule_files_of(kind: &str) -> Option<&'static str> {
+    match kind {
+        "speckit" => Some("the Spec Kit constitution"),
+        "openspec" => Some("OpenSpec's config.yaml context and rules"),
+        "bmad" => Some("the BMAD project context"),
+        _ => None,
+    }
+}
+
+/// Resolve the repo's framework rule sources through the plugin at
+/// `plugin_root`: `zavet spec-sources --json`, gated on `spec_sources_json`
+/// (an older plugin is [`ResolveError::Unsupported`] and is never asked).
+/// The same runner, timeout, output cap and capability cache as
+/// [`resolve_units`].
+pub fn resolve_rule_sources(
+    runner: &dyn SpecRunner,
+    plugin_root: &Path,
+    repo: &Path,
+) -> Result<Vec<RuleSource>, ResolveError> {
+    let bin = plugin_bin(plugin_root);
+    match plugin_caps(runner, &bin, repo) {
+        Ok(c) if c.spec_sources_json => {}
+        Ok(_) => return Err(ResolveError::Unsupported),
+        Err(e) => return Err(ResolveError::Run(e)),
+    }
+    let out = runner
+        .run(&bin, repo, &["spec-sources", "--json"], RUN_TIMEOUT)
+        .map_err(ResolveError::Run)?;
+    Ok(parse_rule_rows(&out))
+}
+
+/// [`resolve_rule_sources`] through the real plugin and the real runner, with
+/// the plugin located by [`plugin_root_cached`].
+pub fn resolve_rule_sources_system(repo: &Path) -> Result<Vec<RuleSource>, ResolveError> {
+    let root = plugin_root_cached().ok_or(ResolveError::NoPlugin)?;
+    resolve_rule_sources(&SystemSpecRunner, &root, repo)
+}
+
+/// Each declared framework's default rule-file paths (the plugin's map,
+/// mirrored): Spec Kit's constitution, OpenSpec's `config.yaml` and legacy
+/// `project.md` under its root, BMAD's legacy `project-context.md` under its
+/// root. `AGENTS.md` (BMAD's live block) is not listed: it exists in most
+/// repos whether or not it carries the block, so it says nothing on its own.
+pub fn rule_default_paths(cfg: &crate::zavet::ZavetConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: String| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for d in &cfg.spec_sources {
+        match d.kind.as_str() {
+            "speckit" => push(".specify/memory/constitution.md".into()),
+            "openspec" => {
+                push(format!("{}/config.yaml", d.root));
+                push(format!("{}/project.md", d.root));
+            }
+            "bmad" => push(format!("{}/project-context.md", d.root)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The repo-relative paths whose change makes the rule sources worth
+/// re-resolving: the config and `AGENTS.md` always, [`rule_default_paths`],
+/// and the `stored` rule paths already on record. Override paths are not
+/// derivable from the declarations (dira does not parse `rule-source:` lines)
+/// — the config edit that sets one is itself a trigger, and from then on the
+/// path is a stored one. Built once per sweep; a touched path triggers when it
+/// is a member.
+pub fn rule_trigger_paths(cfg: &crate::zavet::ZavetConfig, stored: &[String]) -> HashSet<String> {
+    let mut out: HashSet<String> = [".zavet/config", "AGENTS.md"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    out.extend(rule_default_paths(cfg));
+    out.extend(stored.iter().cloned());
+    out
 }
 
 /// The kinds a repo's `.zavet/config` declares, deduplicated, in file order.
@@ -1748,5 +2111,200 @@ mod tests {
             let root = detect_frameworks(d.path()).remove(0).root;
             assert_eq!(root, "_bmad-output");
         }
+    }
+
+    // -- rule sources -------------------------------------------------------
+
+    const RULE_OK: &str = r#"{"v":1,"type":"rule-source","kind":"speckit-constitution","path":".specify/memory/constitution.md","source":"default","enabled":true,"oid":"bda08d2a","version":"1.2.0","ratified":"2026-06-01","lastAmended":"2026-09-10","ruleCount":2,"origin":"external","verified":false,"state":"ok","reason":null,"text":"NEVER KEPT"}"#;
+    const RULE_LEGACY: &str = r#"{"v":1,"type":"rule-source","kind":"openspec-project-md","path":"openspec/project.md","source":"default","enabled":true,"oid":"1d4e","version":null,"ratified":null,"lastAmended":null,"ruleCount":null,"state":"legacy","reason":"deprecated by OpenSpec: move it into openspec/config.yaml context"}"#;
+    const SOURCE_ROW: &str = r#"{"v":1,"type":"spec-source","kind":"speckit","root":"specs","globs":[],"state":"ok","units":3,"unresolved":1}"#;
+
+    fn version_rules_ok() -> (&'static str, Result<String, RunError>) {
+        (
+            "version --json",
+            Ok(r#"{"version":"1.9.0","specs_json":1,"spec_sources_json":1}"#.into()),
+        )
+    }
+
+    #[test]
+    fn rule_rows_map_and_spec_source_rows_are_ignored() {
+        let out = format!("{SOURCE_ROW}\n{RULE_LEGACY}\n{RULE_OK}\n");
+        let rules = parse_rule_rows(&out);
+        assert_eq!(rules.len(), 2, "the spec-source row is not a rule source");
+        let c = &rules[0];
+        assert_eq!(
+            c.kind,
+            RuleSourceKind::SpeckitConstitution,
+            "sorted by kind"
+        );
+        assert_eq!(c.path, ".specify/memory/constitution.md");
+        assert_eq!(c.state, RuleSourceState::Ok);
+        assert!(!c.overridden);
+        assert_eq!(c.version.as_deref(), Some("1.2.0"));
+        assert_eq!(c.ratified.as_deref(), Some("2026-06-01"));
+        assert_eq!(c.last_amended.as_deref(), Some("2026-09-10"));
+        assert_eq!(c.rule_count, Some(2));
+        assert_eq!(c.oid.as_deref(), Some("bda08d2a"));
+        let l = &rules[1];
+        assert_eq!(l.kind, RuleSourceKind::OpenspecProjectMd);
+        assert_eq!(l.state, RuleSourceState::Legacy);
+        assert_eq!(l.rule_count, None);
+        assert!(l
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("deprecated by OpenSpec"));
+    }
+
+    #[test]
+    fn unknown_rule_kinds_and_states_land_in_other() {
+        let row = r#"{"v":1,"type":"rule-source","kind":"kiro-steering","path":".kiro/steering.md","state":"brand-new","enabled":true}"#;
+        let r = &parse_rule_rows(row)[0];
+        assert_eq!(r.kind, RuleSourceKind::Other);
+        assert_eq!(r.kind.as_str(), "other");
+        assert_eq!(r.state, RuleSourceState::Other);
+        assert_eq!(
+            RuleSourceState::parse("file_missing"),
+            RuleSourceState::FileMissing
+        );
+        assert_eq!(RuleSourceState::parse(" OK "), RuleSourceState::Ok);
+        assert_eq!(RuleSourceState::parse("__proto__"), RuleSourceState::Other);
+        assert_eq!(RuleSourceKind::parse("other"), RuleSourceKind::Other);
+        for k in RuleSourceKind::ALL {
+            assert_eq!(RuleSourceKind::parse(k.as_str()), *k, "round-trips");
+        }
+        for s in RuleSourceState::ALL {
+            assert_eq!(RuleSourceState::parse(s.as_str()), *s, "round-trips");
+        }
+    }
+
+    #[test]
+    fn foreign_versions_bad_paths_and_duplicates_are_dropped() {
+        let out = format!(
+            "garbage\n\
+             {{\"v\":2,\"type\":\"rule-source\",\"kind\":\"openspec-config\",\"path\":\"openspec/config.yaml\",\"state\":\"ok\"}}\n\
+             {{\"v\":1,\"type\":\"rule-source\",\"kind\":\"openspec-config\",\"path\":\"/etc/passwd\",\"state\":\"ok\"}}\n\
+             {{\"v\":1,\"type\":\"rule-source\",\"kind\":\"openspec-config\",\"path\":\"../x.yaml\",\"state\":\"ok\"}}\n\
+             {{\"v\":1,\"type\":\"rule-source\",\"kind\":\"openspec-config\",\"path\":\"\",\"state\":\"ok\"}}\n\
+             {{\"v\":1,\"kind\":\"openspec-config\",\"path\":\"openspec/config.yaml\",\"state\":\"ok\"}}\n\
+             {RULE_OK}\n{RULE_OK}\n"
+        );
+        let rules = parse_rule_rows(&out);
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0].kind, RuleSourceKind::SpeckitConstitution);
+    }
+
+    #[test]
+    fn rule_scalars_are_capped_and_stripped_and_off_is_disabled() {
+        let long = "v".repeat(300);
+        let row = format!(
+            r#"{{"v":1,"type":"rule-source","kind":"openspec-config","path":"openspec/config.yaml","state":"off","version":"{long}","reason":"{long}","lastAmended":"2026\u0007-01"}}"#
+        );
+        let r = &parse_rule_rows(&row)[0];
+        assert_eq!(
+            r.version.as_ref().unwrap().chars().count(),
+            MAX_RULE_META_CHARS
+        );
+        assert_eq!(
+            r.reason.as_ref().unwrap().chars().count(),
+            MAX_RULE_REASON_CHARS
+        );
+        assert_eq!(r.last_amended.as_deref(), Some("2026-01"));
+        assert_eq!(r.state, RuleSourceState::Off);
+    }
+
+    #[test]
+    fn rule_resolve_runs_spec_sources_json_on_the_plugin_binary() {
+        let fake = Fake::new(vec![
+            version_rules_ok(),
+            (
+                "spec-sources --json",
+                Ok(format!("{SOURCE_ROW}\n{RULE_OK}\n")),
+            ),
+        ]);
+        let rules = resolve_rule_sources(&fake, &root(), Path::new("/repo")).unwrap();
+        assert_eq!(rules.len(), 1);
+        let bin = root().join("bin").join("zavet").display().to_string();
+        let calls = fake.calls.borrow();
+        assert_eq!(calls[1], format!("{bin} spec-sources --json"));
+        assert!(calls.iter().all(|c| !c.contains(".zavet")), "{calls:?}");
+    }
+
+    #[test]
+    fn a_plugin_without_spec_sources_json_is_never_asked_for_rule_sources() {
+        for ver in [
+            r#"{"version":"1.8.0","specs_json":1}"#,
+            r#"{"spec_sources_json":0}"#,
+            "garbage",
+        ] {
+            let fake = Fake::new(vec![("version --json", Ok(ver.into()))]);
+            let err = resolve_rule_sources(&fake, &root(), Path::new("/repo")).unwrap_err();
+            assert_eq!(err, ResolveError::Unsupported, "{ver}");
+            assert_eq!(fake.calls.borrow().len(), 1, "spec-sources must not run");
+        }
+    }
+
+    #[test]
+    fn a_rule_resolve_timeout_cap_or_failure_fails_open() {
+        for e in [RunError::Timeout, RunError::OutputCap, RunError::Failed(1)] {
+            let fake = Fake::new(vec![
+                version_rules_ok(),
+                ("spec-sources --json", Err(e.clone())),
+            ]);
+            assert_eq!(
+                resolve_rule_sources(&fake, &root(), Path::new("/r")).unwrap_err(),
+                ResolveError::Run(e)
+            );
+        }
+        let fake = Fake::new(vec![("version --json", Err(RunError::Timeout))]);
+        assert_eq!(
+            resolve_rule_sources(&fake, &root(), Path::new("/r")).unwrap_err(),
+            ResolveError::Run(RunError::Timeout)
+        );
+    }
+
+    #[test]
+    fn one_cached_probe_serves_both_units_and_rule_sources() {
+        let fake = Fake::new(vec![
+            version_rules_ok(),
+            ("specs --json", Ok(String::new())),
+            ("spec-sources --json", Ok(String::new())),
+        ]);
+        fake.bin_stamp.set(Some(7));
+        let root = PathBuf::from("/cache-shared/plugin");
+        resolve_units(&fake, &root, Path::new("/repo"), false).unwrap();
+        resolve_rule_sources(&fake, &root, Path::new("/repo")).unwrap();
+        resolve_rule_sources(&fake, &root, Path::new("/repo")).unwrap();
+        assert_eq!(version_calls(&fake), 1);
+    }
+
+    #[test]
+    fn rule_triggers_cover_config_agents_md_defaults_and_stored_paths() {
+        let cfg = crate::zavet::parse_config(
+            "spec-source: openspec openspec\nspec-source: speckit specs\nspec-source: bmad _bmad-output\n",
+        );
+        let stored = vec!["docs/rules/constitution.md".to_string()];
+        let triggers = rule_trigger_paths(&cfg, &stored);
+        for p in [
+            ".zavet/config",
+            "AGENTS.md",
+            ".specify/memory/constitution.md",
+            "openspec/config.yaml",
+            "openspec/project.md",
+            "_bmad-output/project-context.md",
+            "docs/rules/constitution.md",
+        ] {
+            assert!(triggers.contains(p), "{p}");
+        }
+        for p in [
+            "src/main.rs",
+            "openspec/changes/x/proposal.md",
+            "sub/AGENTS.md",
+        ] {
+            assert!(!triggers.contains(p), "{p}");
+        }
+        // Undeclared frameworks contribute no default path.
+        let none = crate::zavet::parse_config("");
+        assert!(!rule_trigger_paths(&none, &[]).contains(".specify/memory/constitution.md"));
     }
 }

@@ -1982,6 +1982,152 @@ impl Store {
         Ok(())
     }
 
+    /// Write a fresh, successful rule-source resolve for `repo` in ONE
+    /// transaction (DIRASH-0040). A row whose metadata already matches — and
+    /// that is not marked removed — writes nothing. A row that comes back after
+    /// a removal has `removed_at` cleared. With `allow_removals`, every stored
+    /// row the resolve no longer lists gets `removed_at`; rows are never
+    /// deleted. Metadata only: [`RuleSource`](crate::zavet_specs::RuleSource)
+    /// carries no text, so none can land here.
+    pub async fn zavet_upsert_rule_sources(
+        &self,
+        repo: &str,
+        rules: &[crate::zavet_specs::RuleSource],
+        allow_removals: bool,
+    ) -> Result<SourcesWritten, Error> {
+        let now = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(Error::time)?;
+        let mut tx = self.pool.begin().await?;
+        let stored = Self::rule_sources_in(&mut tx, repo).await?;
+        let by_key: HashMap<(&str, &str), &ZavetRuleSourceRow> = stored
+            .iter()
+            .map(|r| ((r.kind.as_str(), r.path.as_str()), r))
+            .collect();
+        let mut out = SourcesWritten::default();
+        for r in rules {
+            let kind = r.kind.as_str();
+            if let Some(prev) = by_key.get(&(kind, r.path.as_str())) {
+                if prev.removed_at.is_none() && prev.same_metadata(r) {
+                    continue;
+                }
+            }
+            sqlx::query(
+                "INSERT INTO zavet_rule_sources
+                    (repo, kind, path, oid, version, ratified, last_amended, rule_count,
+                     state, reason, overridden, first_seen_at, updated_at, removed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, NULL)
+                 ON CONFLICT(repo, kind, path) DO UPDATE SET
+                    oid = excluded.oid,
+                    version = excluded.version,
+                    ratified = excluded.ratified,
+                    last_amended = excluded.last_amended,
+                    rule_count = excluded.rule_count,
+                    state = excluded.state,
+                    reason = excluded.reason,
+                    overridden = excluded.overridden,
+                    updated_at = excluded.updated_at,
+                    removed_at = NULL",
+            )
+            .bind(repo)
+            .bind(kind)
+            .bind(&r.path)
+            .bind(&r.oid)
+            .bind(&r.version)
+            .bind(&r.ratified)
+            .bind(&r.last_amended)
+            .bind(r.rule_count.map(i64::from))
+            .bind(r.state.as_str())
+            .bind(&r.reason)
+            .bind(r.overridden)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            out.upserted += 1;
+        }
+        if allow_removals {
+            let live: std::collections::HashSet<(&str, &str)> = rules
+                .iter()
+                .map(|r| (r.kind.as_str(), r.path.as_str()))
+                .collect();
+            for row in stored.iter().filter(|r| r.removed_at.is_none()) {
+                if live.contains(&(row.kind.as_str(), row.path.as_str())) {
+                    continue;
+                }
+                sqlx::query(
+                    "UPDATE zavet_rule_sources SET removed_at = ?4
+                      WHERE repo = ?1 AND kind = ?2 AND path = ?3",
+                )
+                .bind(repo)
+                .bind(&row.kind)
+                .bind(&row.path)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+                out.removed += 1;
+            }
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Every rule-source row stored for `repo`, removed ones included, ordered
+    /// by `(kind, path)`.
+    pub async fn zavet_rule_sources_list(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<ZavetRuleSourceRow>, Error> {
+        let mut conn = self.pool.acquire().await?;
+        Self::rule_sources_in(&mut conn, repo).await
+    }
+
+    /// The paths of `repo`'s rule sources that are still listed — what a sweep
+    /// watches beyond the default paths (an override path, once resolved).
+    pub async fn zavet_rule_source_paths(&self, repo: &str) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT path FROM zavet_rule_sources
+              WHERE repo = ?1 AND removed_at IS NULL ORDER BY path",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get("path")).collect())
+    }
+
+    async fn rule_sources_in(
+        conn: &mut sqlx::SqliteConnection,
+        repo: &str,
+    ) -> Result<Vec<ZavetRuleSourceRow>, Error> {
+        let rows = sqlx::query(
+            "SELECT kind, path, oid, version, ratified, last_amended, rule_count, state,
+                    reason, overridden, first_seen_at, updated_at, removed_at
+               FROM zavet_rule_sources WHERE repo = ?1 ORDER BY kind, path",
+        )
+        .bind(repo)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ZavetRuleSourceRow {
+                kind: r.get("kind"),
+                path: r.get("path"),
+                oid: r.get("oid"),
+                version: r.get("version"),
+                ratified: r.get("ratified"),
+                last_amended: r.get("last_amended"),
+                rule_count: r
+                    .get::<Option<i64>, _>("rule_count")
+                    .and_then(|n| u32::try_from(n).ok()),
+                state: r.get("state"),
+                reason: r.get("reason"),
+                overridden: r.get("overridden"),
+                first_seen_at: r.get("first_seen_at"),
+                updated_at: r.get("updated_at"),
+                removed_at: r.get("removed_at"),
+            })
+            .collect())
+    }
+
     /// [`Store::zavet_upsert_spec`] for many captures in ONE transaction: one
     /// commit (one fsync) for a whole source-unit sweep instead of one per
     /// unit, and a sweep that is all-or-nothing. Writes apply in order, so a
@@ -2699,6 +2845,57 @@ pub struct ZavetSpecWrite<'a> {
     pub cap: &'a ZavetSpecCapture,
     pub commit_sha: &'a str,
     pub authored_at: Option<&'a str>,
+}
+
+/// What one source-refresh pass changed — a [`Store::zavet_upsert_rule_sources`]
+/// call, or the daemon's source-unit persist (spec rows). Both follow the same
+/// "upsert what was seen, mark the rest removed, never delete" shape.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SourcesWritten {
+    /// Rows inserted, updated, or brought back from `removed`.
+    pub upserted: usize,
+    /// Previously listed rows newly marked removed.
+    pub removed: usize,
+}
+
+impl SourcesWritten {
+    pub fn changed(&self) -> bool {
+        self.upserted + self.removed > 0
+    }
+}
+
+/// A stored framework rule source (`zavet_rule_sources`). Metadata only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZavetRuleSourceRow {
+    /// A `RuleSourceKind` word (`other` for one dira does not know).
+    pub kind: String,
+    pub path: String,
+    pub oid: Option<String>,
+    pub version: Option<String>,
+    pub ratified: Option<String>,
+    pub last_amended: Option<String>,
+    pub rule_count: Option<u32>,
+    /// A `RuleSourceState` word.
+    pub state: String,
+    pub reason: Option<String>,
+    pub overridden: bool,
+    pub first_seen_at: String,
+    pub updated_at: String,
+    pub removed_at: Option<String>,
+}
+
+impl ZavetRuleSourceRow {
+    /// Whether the row already records everything `r` says.
+    fn same_metadata(&self, r: &crate::zavet_specs::RuleSource) -> bool {
+        self.oid == r.oid
+            && self.version == r.version
+            && self.ratified == r.ratified
+            && self.last_amended == r.last_amended
+            && self.rule_count == r.rule_count
+            && self.state == r.state.as_str()
+            && self.reason == r.reason
+            && self.overridden == r.overridden
+    }
 }
 
 /// A stored spec row plus its path globs and decision links.
@@ -4630,6 +4827,125 @@ mod tests {
             ],
             "only `spec` trailers split; blank items vanish"
         );
+    }
+
+    fn rule(kind: &str, path: &str, oid: &str, state: &str) -> crate::zavet_specs::RuleSource {
+        use crate::zavet_specs::{RuleSource, RuleSourceKind, RuleSourceState};
+        RuleSource {
+            kind: RuleSourceKind::parse(kind),
+            path: path.into(),
+            overridden: false,
+            oid: Some(oid.into()),
+            version: Some("1.2.0".into()),
+            ratified: Some("2026-06-01".into()),
+            last_amended: Some("2026-09-10".into()),
+            rule_count: Some(2),
+            state: RuleSourceState::parse(state),
+            reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rule_sources_upsert_skip_unchanged_and_are_marked_removed_never_deleted() {
+        let store = Store::open_in_memory().await.unwrap();
+        let c = rule(
+            "speckit-constitution",
+            ".specify/memory/constitution.md",
+            "a1",
+            "ok",
+        );
+        let o = rule("openspec-config", "openspec/config.yaml", "b1", "ok");
+        let w = store
+            .zavet_upsert_rule_sources("r", &[c.clone(), o.clone()], true)
+            .await
+            .unwrap();
+        assert_eq!((w.upserted, w.removed), (2, 0));
+        // Same answer again: nothing written.
+        let w = store
+            .zavet_upsert_rule_sources("r", &[c.clone(), o.clone()], true)
+            .await
+            .unwrap();
+        assert!(!w.changed(), "{w:?}");
+        // An edit (new oid) rewrites one row; first_seen_at is kept.
+        let first = store.zavet_rule_sources_list("r").await.unwrap()[1]
+            .first_seen_at
+            .clone();
+        let mut c2 = c.clone();
+        c2.oid = Some("a2".into());
+        let w = store
+            .zavet_upsert_rule_sources("r", &[c2.clone(), o.clone()], true)
+            .await
+            .unwrap();
+        assert_eq!((w.upserted, w.removed), (1, 0));
+        let rows = store.zavet_rule_sources_list("r").await.unwrap();
+        let sk = rows
+            .iter()
+            .find(|r| r.kind == "speckit-constitution")
+            .unwrap();
+        assert_eq!(sk.oid.as_deref(), Some("a2"));
+        assert_eq!(sk.first_seen_at, first);
+        // Without removal evidence a vanished row stays listed.
+        let w = store
+            .zavet_upsert_rule_sources("r", std::slice::from_ref(&c2), false)
+            .await
+            .unwrap();
+        assert!(!w.changed());
+        assert_eq!(store.zavet_rule_source_paths("r").await.unwrap().len(), 2);
+        // With it, the row is marked removed — and still there.
+        let w = store
+            .zavet_upsert_rule_sources("r", std::slice::from_ref(&c2), true)
+            .await
+            .unwrap();
+        assert_eq!((w.upserted, w.removed), (0, 1));
+        let rows = store.zavet_rule_sources_list("r").await.unwrap();
+        assert_eq!(rows.len(), 2, "never deleted");
+        assert!(rows
+            .iter()
+            .any(|r| r.kind == "openspec-config" && r.removed_at.is_some()));
+        assert_eq!(
+            store.zavet_rule_source_paths("r").await.unwrap(),
+            vec![".specify/memory/constitution.md".to_string()]
+        );
+        // A second removal pass changes nothing; a comeback clears removed_at.
+        let w = store
+            .zavet_upsert_rule_sources("r", std::slice::from_ref(&c2), true)
+            .await
+            .unwrap();
+        assert!(!w.changed());
+        let w = store
+            .zavet_upsert_rule_sources("r", &[c2, o], true)
+            .await
+            .unwrap();
+        assert_eq!((w.upserted, w.removed), (1, 0));
+        assert!(store
+            .zavet_rule_sources_list("r")
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.removed_at.is_none()));
+        // Other repos are untouched.
+        assert!(store
+            .zavet_rule_sources_list("other")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_0008_keeps_no_text_column() {
+        let store = Store::open_in_memory().await.unwrap();
+        let cols: Vec<String> =
+            sqlx::query("SELECT name FROM pragma_table_info('zavet_rule_sources')")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get("name"))
+                .collect();
+        assert!(cols.contains(&"oid".to_string()), "{cols:?}");
+        for banned in ["text", "body", "body_md", "md", "content", "rules"] {
+            assert!(!cols.iter().any(|c| c == banned), "{banned} in {cols:?}");
+        }
     }
 
     fn source_spec(state: &str) -> ZavetSpecCapture {

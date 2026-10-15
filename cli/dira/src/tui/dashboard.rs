@@ -2,10 +2,7 @@
 //! watch` dashboard. Everything that turns a [`StatusView`] into displayable
 //! numbers lives here (and is unit-tested) so the draw code stays dumb.
 
-use crate::format::{
-    bar, billing_line, hms, parse_ts, project_label, repo_short, tokens_compact, truncate_cols,
-    usd_approx,
-};
+use crate::format::{bar, billing_line, hms, parse_ts, tokens_compact, truncate_cols, usd_approx};
 use crate::theme::{self, Role};
 use dira_core::protocol::{any_engaged, BillingView, LiveState, SessionView, StatusView};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -84,7 +81,11 @@ pub fn lanes(s: &StatusView) -> Vec<Lane> {
             continue;
         }
         lanes.push(Lane {
-            label: format!("{} · {}", sess.handle, repo_short(&sess.project)),
+            label: format!(
+                "{} · {}",
+                sess.handle,
+                crate::format::session_repo_short(sess)
+            ),
             seconds: sess.agent_seconds,
             is_human: false,
         });
@@ -372,7 +373,10 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
         Row::new([
             Cell::from(truncate_cols(&sess.handle, 10)),
             Cell::from(truncate_cols(dira_sources::harness_id(sess.harness), 10)),
-            Cell::from(truncate_cols(&project_label(&sess.project), project_w)),
+            Cell::from(truncate_cols(
+                &crate::format::session_project_label(sess),
+                project_w,
+            )),
             Cell::from(hms(sess.human_seconds)),
             Cell::from(hms(sess.agent_seconds)),
             Cell::from(state),
@@ -461,7 +465,10 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
         .iter()
         .map(|p| {
             Row::new([
-                Cell::from(truncate_cols(&project_label(&p.project), project_w)),
+                Cell::from(truncate_cols(
+                    &crate::format::report_line_label(p),
+                    project_w,
+                )),
                 Cell::from(hms(p.human_seconds)),
                 Cell::from(hms(p.agent_wall_seconds)),
             ])
@@ -559,6 +566,9 @@ mod tests {
             // An agent fixture must carry agent evidence, or it would silently
             // stop growing a tail and these tests would assert nothing.
             has_agent_activity: true,
+            orchestrator: false,
+            parent_session: None,
+            repos: Vec::new(),
         }
     }
 
@@ -743,11 +753,13 @@ mod tests {
                         project: Some("acme/api".into()),
                         human_seconds: 10,
                         agent_wall_seconds: 100,
+                        orchestration: false,
                     },
                     ProjectReport {
                         project: Some("acme/web".into()),
                         human_seconds: 0,
                         agent_wall_seconds: 50,
+                        orchestration: false,
                     },
                 ],
             ),
@@ -801,6 +813,7 @@ mod tests {
                     project: Some("acme/api".into()),
                     human_seconds: 10,
                     agent_wall_seconds: 100,
+                    orchestration: false,
                 }],
             ),
             sync_pending: 0,

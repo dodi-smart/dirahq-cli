@@ -414,6 +414,7 @@ fn session_event(id: &str, kind: EventKind, spec: Option<&str>) -> RawEvent {
         activity: None,
         note: None,
         spec: spec.map(str::to_string),
+        lineage: Default::default(),
     }
 }
 

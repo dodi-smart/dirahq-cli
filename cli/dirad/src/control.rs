@@ -791,6 +791,9 @@ fn build_session_views(
                 last_activity_at: Some(fmt_ts(s.last_active_at.unwrap_or(s.last_event_at))),
                 last_human_at: s.last_human_signal_at.or(s.last_signal_at).map(fmt_ts),
                 has_agent_activity,
+                orchestrator: s.lineage.orchestrator,
+                parent_session: s.lineage.parent_session.clone(),
+                repos: s.lineage.repos_touched().unwrap_or_default(),
             }
         })
         .collect()
@@ -903,6 +906,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
     }
 

@@ -83,6 +83,16 @@ pub fn build_vector() -> serde_json::Value {
             // Populated so the 1.5 spec attribution is exercised by the
             // cross-language vector, not just tolerated.
             spec: Some("openspec:add-csv-import".to_string()),
+            // Populated so the 1.6 orchestration fields are exercised by the
+            // cross-language vector, not just tolerated. (A real orchestrator
+            // omits `repoCanonical`; the vector only cares about encoding.)
+            role: Some(dira_contract::SessionRole::Orchestrator),
+            parent_session: Some("01PARENT0000000000000000000".to_string()),
+            repos: Some(vec![
+                "github.com/dodi-smart/dira".to_string(),
+                "github.com/dodi-smart/dira-cloud".to_string(),
+            ]),
+            workspace_ref: Some("9f86d081884c7d65".to_string()),
         }],
         token_usage: vec![],
         artifacts: vec![],

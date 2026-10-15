@@ -465,6 +465,7 @@ async fn seed_event_cwd(db_path: &Path, cwd: &Path) {
         activity: None,
         note: None,
         spec: None,
+        lineage: Default::default(),
     };
     store.append(&event).await.expect("seed the event");
     // `stale_known_repos` reads through `Store::open_readonly`, which opens

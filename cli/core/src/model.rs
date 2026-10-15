@@ -51,6 +51,38 @@ pub struct RawEvent {
     /// prose (D-0001). Surfaced on the session rollup as `SessionRollup.spec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,
+    /// Orchestration lineage ids (see [`crate::orchestration`]). All absent for
+    /// an ordinary session.
+    #[serde(default, flatten)]
+    pub lineage: Lineage,
+}
+
+/// How an event relates to orchestration — ids only, never titles or tool
+/// arguments (D-0001, DIRASH-0041). Each column rolls up first-non-null per
+/// session, except `spawned`, which is per event (one child per spawn call).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    /// The harness host's id for this session (`local_<uuid>`), forwarded by
+    /// the hook shim from `CLAUDE_CODE_HOST_SESSION_ID`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session: Option<String>,
+    /// Opaque digest of the scratch workspace the event's cwd sits in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// Host id of a child session this event spawned (a `start_session` call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned: Option<String>,
+    /// Session id of the orchestrator that spawned this session, resolved by
+    /// the daemon from `host_session` against an earlier `spawned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+}
+
+impl Lineage {
+    /// Whether this event marks its session as an orchestrator.
+    pub fn marks_orchestrator(&self) -> bool {
+        self.workspace.is_some() || self.spawned.is_some()
+    }
 }
 
 /// Session-id prefix reserved for `dira doctor --probe`'s end-to-end capture

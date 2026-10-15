@@ -275,6 +275,16 @@
         }
       ]
     },
+    "SessionRole": {
+      "description": "What a session does relative to other sessions. Absent for an ordinary\nsession; only roles that change how the cloud groups work are named.",
+      "oneOf": [
+        {
+          "description": "A coordinating session (Claude Desktop's scratch-workspace sessions, or\nany session that spawned others). Its repo-less time is the\n\"orchestration\" bucket — never guessed onto a repo.",
+          "type": "string",
+          "const": "orchestrator"
+        }
+      ]
+    },
     "SessionRollup": {
       "description": "Per-session rollup. Agent wall-clock sums freely; it is evidence, never billed.",
       "type": "object",
@@ -321,6 +331,13 @@
             "null"
           ]
         },
+        "parentSession": {
+          "description": "Harness session id of the orchestrator that spawned this session, when\nthe producer could link them. An id only — never a title.\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "prompts": {
           "description": "Count of human prompts (user_prompt events) observed in this session.\nOptional + omitted-when-absent so older payloads stay byte-identical.",
           "type": [
@@ -334,6 +351,27 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "repos": {
+          "description": "Canonical repo refs this session demonstrably touched, sorted and\ncapped. Set for orchestrators, whose `repoCanonical` stays absent\nbecause no single repo describes them.\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "role": {
+          "description": "Set for an orchestrating session (see [`SessionRole`]).\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRole"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "runtime": {
@@ -363,6 +401,13 @@
         },
         "startedAt": {
           "type": "string"
+        },
+        "workspaceRef": {
+          "description": "Opaque 16-hex digest of the scratch workspace an orchestrator ran in,\nso sibling runs from one workspace can be stacked. Never a path.\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

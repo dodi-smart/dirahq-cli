@@ -45,6 +45,7 @@ fn event(session: &str, harness: Harness, kind: EventKind, at: OffsetDateTime) -
         activity: None,
         note: None,
         spec: None,
+        lineage: Default::default(),
     }
 }
 

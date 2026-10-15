@@ -4,7 +4,7 @@
 //! `session_id`, and `cwd`; tool events add `tool_name`. We map the event name to
 //! our internal [`EventKind`] and drop everything else.
 
-use crate::{HarnessSource, Normalized};
+use crate::{HarnessSource, Hints, Normalized};
 use dira_contract::Harness;
 use dira_core::model::EventKind;
 use serde::Deserialize;
@@ -19,7 +19,17 @@ impl HarnessSource for ClaudeCodeSource {
     fn id(&self) -> &'static str {
         "claude"
     }
-    fn normalize(&self, payload: serde_json::Value) -> Option<Normalized> {
+    fn normalize(&self, mut payload: serde_json::Value) -> Option<Normalized> {
+        // A tool's result can be megabytes (a Read, a Bash log) and only a
+        // `start_session` result is ever read, so drop every other one before
+        // it is rebuilt as a `Value` on this, the hottest ingest path.
+        if let Some(obj) = payload.as_object_mut() {
+            if obj.get("tool_name").and_then(|t| t.as_str())
+                != Some(dira_core::orchestration::START_SESSION_TOOL)
+            {
+                obj.remove("tool_response");
+            }
+        }
         let hook: ClaudeHook = serde_json::from_value(payload).ok()?;
         normalize(&hook)
     }
@@ -47,6 +57,24 @@ pub struct ClaudeHook {
     /// `bypass_permissions_disabled`, or `other`.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Tool arguments. Read only to derive repo evidence for a cwd that names
+    /// no repo (see [`dira_core::orchestration::repo_evidence`]); never kept.
+    #[serde(default)]
+    pub tool_input: Option<serde_json::Value>,
+    /// Tool result. Read only for a `start_session` call, to learn the child
+    /// session's host id; never kept.
+    #[serde(default)]
+    pub tool_response: Option<serde_json::Value>,
+    /// Env hints the `dira hook` shim forwarded (the harness never sets this).
+    #[serde(default, rename = "dira_env")]
+    pub dira_env: Option<DiraEnv>,
+}
+
+/// What the hook shim forwards from its own environment.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DiraEnv {
+    #[serde(default)]
+    pub host_session_id: Option<String>,
 }
 
 /// Map a Claude Code hook to a normalized event. Returns `None` for hook names we
@@ -75,7 +103,38 @@ pub fn normalize(hook: &ClaudeHook) -> Option<Normalized> {
         transcript_path: hook.transcript_path.clone(),
         source: hook.source.clone(),
         reason: hook.reason.clone(),
+        hints: Box::new(hints(hook, kind)),
     })
+}
+
+/// Orchestration hints for one hook. Evidence is only worth deriving for a
+/// tool event, and the child id only from a *finished* `start_session` call.
+fn hints(hook: &ClaudeHook, kind: EventKind) -> Hints {
+    use dira_core::orchestration as orch;
+    let host_session = hook
+        .dira_env
+        .as_ref()
+        .and_then(|e| e.host_session_id.as_deref())
+        .and_then(orch::host_session_id);
+    let tool = hook.tool_name.as_deref().unwrap_or_default();
+    let evidence = match (&hook.tool_input, kind) {
+        (Some(input), EventKind::PreTool | EventKind::PostTool) => {
+            let cwd = hook.cwd.as_deref().map(std::path::Path::new);
+            orch::repo_evidence(tool, input, cwd)
+        }
+        _ => Vec::new(),
+    };
+    let spawned = match (&hook.tool_response, kind) {
+        (Some(resp), EventKind::PostTool) if tool == orch::START_SESSION_TOOL => {
+            orch::spawned_child(resp)
+        }
+        _ => None,
+    };
+    Hints {
+        host_session,
+        evidence,
+        spawned,
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +232,68 @@ mod tests {
         let hook: ClaudeHook =
             serde_json::from_str(r#"{"hook_event_name":"PreCompact","session_id":"x"}"#).unwrap();
         assert!(normalize(&hook).is_none());
+    }
+
+    fn parse(json: &str) -> Normalized {
+        normalize(&serde_json::from_str::<ClaudeHook>(json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn tool_input_yields_evidence_but_never_survives_normalization() {
+        let n = parse(
+            r#"{"hook_event_name":"PostToolUse","session_id":"o","cwd":"/scratch",
+                "tool_name":"Bash","tool_input":{"command":"cd repos/a && git push"},
+                "tool_response":{"stdout":"secret output"}}"#,
+        );
+        use dira_core::orchestration::Evidence;
+        assert_eq!(
+            n.hints.evidence,
+            vec![Evidence::Path("/scratch/repos/a".into())]
+        );
+        // Only derived facts cross into `Normalized`: no field holds the command
+        // or its output.
+        let dbg = format!("{n:?}");
+        assert!(!dbg.contains("git push") && !dbg.contains("secret output"));
+    }
+
+    #[test]
+    fn start_session_response_names_the_spawned_child() {
+        let n = parse(
+            r#"{"hook_event_name":"PostToolUse","session_id":"o",
+                "tool_name":"mcp__ccd_session__start_session","tool_input":{"title":"t"},
+                "tool_response":"started local_f42e16b4-7364-4ba7-966e-6d2f2eaa2147"}"#,
+        );
+        assert_eq!(
+            n.hints.spawned.as_deref(),
+            Some("local_f42e16b4-7364-4ba7-966e-6d2f2eaa2147")
+        );
+        // The pre-call hook has no response yet, and must not invent a child.
+        let pre = parse(
+            r#"{"hook_event_name":"PreToolUse","session_id":"o",
+                "tool_name":"mcp__ccd_session__start_session","tool_input":{"title":"t"}}"#,
+        );
+        assert_eq!(pre.hints.spawned, None);
+    }
+
+    #[test]
+    fn forwarded_host_session_is_validated() {
+        let n = parse(
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"o",
+                "dira_env":{"host_session_id":"local_684b6117-0abc-44f3-9ce0-44f092702849"}}"#,
+        );
+        assert_eq!(
+            n.hints.host_session.as_deref(),
+            Some("local_684b6117-0abc-44f3-9ce0-44f092702849")
+        );
+        let junk = parse(
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"o",
+                "dira_env":{"host_session_id":"not-an-id"}}"#,
+        );
+        assert_eq!(junk.hints.host_session, None);
+        // A payload with no shim hints (old shim, HTTP hook) is still accepted.
+        assert_eq!(
+            *parse(r#"{"hook_event_name":"Stop","session_id":"o"}"#).hints,
+            Hints::default()
+        );
     }
 }

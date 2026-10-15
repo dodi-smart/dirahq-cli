@@ -1223,6 +1223,7 @@ fn partial_rollups(
             note: s.note,
             label: s.label,
             spec: s.spec,
+            lineage: s.lineage,
         })
         .collect()
 }
@@ -1386,6 +1387,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
     }
 
@@ -1413,6 +1415,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
     }
 

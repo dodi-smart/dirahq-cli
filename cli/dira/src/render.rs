@@ -7,7 +7,7 @@
 
 use crate::format::{
     bar as bar_cells, billing_line, display_width, hms, kind_label, pad_cols, pad_left_cols,
-    project_label, repo_short, tokens_compact, truncate_cols, usd_approx,
+    project_label, session_project_label, tokens_compact, truncate_cols, usd_approx,
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{
@@ -16,6 +16,7 @@ use dira_core::protocol::{
     ZavetStatusView, ZavetSyncView, ZavetUncapturedView, ZavetWhyView,
 };
 use dira_core::report::Report;
+use dira_core::runs;
 use time::OffsetDateTime;
 
 /// The width the layout was originally hand-tuned for. Used as the fallback when
@@ -216,7 +217,7 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
         Response::Sessions { sessions } => {
             let shown: Vec<SessionView> =
                 sessions.iter().filter(|s| has_time(s)).cloned().collect();
-            print_sessions(&shown, &Layout::for_width(terminal_cols()));
+            print_sessions(&shown, &Layout::for_width(terminal_cols()), opts.flat);
             true
         }
         Response::Report(r) => {
@@ -534,6 +535,8 @@ pub struct RowOpts {
     pub guards: bool,
     /// Hide records whose file is not on the checked-out branch (`--branch`).
     pub branch_only: bool,
+    /// List sessions one per row, without grouping runs (`dira sessions --flat`).
+    pub flat: bool,
 }
 
 /// `4d` / `3mo` since `created_at`, or `new` inside the first two days.
@@ -1986,7 +1989,7 @@ pub fn print_status(s: &StatusView, detailed: bool) {
         println!();
         if !active.is_empty() {
             println!("{}", theme::paint("ACTIVE SESSIONS", Role::Muted));
-            print_sessions(&active, &layout);
+            print_sessions(&active, &layout, false);
             println!();
             print_parallel(&active, &s.today, &layout);
         }
@@ -2246,7 +2249,7 @@ fn billing_age_suffix(fetched_at: &str, now: OffsetDateTime) -> Option<String> {
     Some(format!("(as of {label} ago)"))
 }
 
-fn print_sessions(sessions: &[SessionView], layout: &Layout) {
+fn print_sessions(sessions: &[SessionView], layout: &Layout, flat: bool) {
     if sessions.is_empty() {
         println!("  (none)");
         return;
@@ -2257,29 +2260,97 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout) {
         "HANDLE", "HARNESS", "KIND", "PROJECT", "HUMAN", "AGENT"
     );
     println!("{}", theme::paint(&header, Role::Muted));
-    for s in sessions {
-        // Paint only the trailing STATE word so the fixed-width columns stay
-        // aligned (the colour escapes have zero display width). "engaged" (you're
-        // driving it) is teal like the human lane; "active" (its agent is working
-        // on its own) is purple like the agent lane; "idle" is faint.
-        let (label, role) = match s.live_state() {
-            LiveState::Engaged => ("engaged", Role::Engaged),
-            LiveState::Active => ("active", Role::Agent),
-            LiveState::Idle => ("idle", Role::Faint),
-        };
-        let state = theme::paint(label, role);
-        println!(
-            "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
-            truncate_cols(&s.handle, 8),
-            truncate_cols(dira_sources::harness_id(s.harness), 10),
-            truncate_cols(kind_label(s.kind), 7),
-            truncate_cols(&project_label(&s.project), pw),
-            hms(s.human_seconds),
-            hms(s.agent_seconds),
-            state,
-        );
-        print_session_meta(s);
+    let entries: Vec<runs::Entry<'_>> = if flat {
+        sessions.iter().map(runs::Entry::Session).collect()
+    } else {
+        dira_core::runs::group(sessions)
+    };
+    // Local-only titles name an unfolded run; never synced. Read only when one
+    // is on screen — it parses every `~/.claude/sessions/*.json`.
+    let titles = entries
+        .iter()
+        .any(|e| matches!(e, runs::Entry::Run(r) if !r.folded()))
+        .then(crate::session_titles::claude_titles)
+        .unwrap_or_default();
+    for entry in entries {
+        match entry {
+            runs::Entry::Session(s) => {
+                print_session_row(s, "  ", &s.handle, &session_project_label(s), pw);
+                print_session_meta(s);
+            }
+            runs::Entry::Run(run) => print_run(&run, &titles, pw),
+        }
     }
+}
+
+/// One orchestration run: the orchestrator's row, then its members as a tree,
+/// then the repos only the orchestrator itself touched. A run over at most one
+/// repo is folded — its row names that repo, as ordinary work there would.
+fn print_run(run: &runs::Run<'_>, titles: &std::collections::HashMap<String, String>, pw: usize) {
+    let root = run.root;
+    let project = if run.folded() {
+        run.repos
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::format::ORCHESTRATION_LABEL.to_string())
+    } else {
+        let name = titles
+            .get(&root.session_id)
+            .cloned()
+            .unwrap_or_else(|| crate::format::ORCHESTRATION_LABEL.to_string());
+        format!("{name} · {} repos", run.repos.len())
+    };
+    let gutter = if run.members.is_empty() && run.direct.is_empty() {
+        "  "
+    } else {
+        "▾ "
+    };
+    print_session_row(root, gutter, &root.handle, &project, pw);
+    let direct: &[String] = if run.folded() { &[] } else { &run.direct };
+    let total = run.members.len() + direct.len();
+    let branch = |i: usize| if i + 1 == total { "└ " } else { "├ " };
+    for (i, s) in run.members.iter().enumerate() {
+        let handle = format!("{}{}", branch(i), s.handle);
+        print_session_row(s, "  ", &handle, &session_project_label(s), pw);
+    }
+    for (k, repo) in direct.iter().enumerate() {
+        let line = format!(
+            "  {:<8} {:<10} {:<7} {}",
+            format!("{}·", branch(run.members.len() + k)),
+            "",
+            "direct",
+            truncate_cols(repo, pw),
+        );
+        println!("{}", theme::paint(&line, Role::Faint));
+    }
+}
+
+fn print_session_row(s: &SessionView, gutter: &str, handle: &str, project: &str, pw: usize) {
+    // Paint only the trailing STATE word so the fixed-width columns stay
+    // aligned (the colour escapes have zero display width). "engaged" (you're
+    // driving it) is teal like the human lane; "active" (its agent is working
+    // on its own) is purple like the agent lane; "idle" is faint.
+    let (label, role) = match s.live_state() {
+        LiveState::Engaged => ("engaged", Role::Engaged),
+        LiveState::Active => ("active", Role::Agent),
+        LiveState::Idle => ("idle", Role::Faint),
+    };
+    let state = theme::paint(label, role);
+    let kind = if s.orchestrator {
+        "orch"
+    } else {
+        kind_label(s.kind)
+    };
+    println!(
+        "{gutter}{:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
+        truncate_cols(handle, 8),
+        truncate_cols(dira_sources::harness_id(s.harness), 10),
+        truncate_cols(kind, 7),
+        truncate_cols(project, pw),
+        hms(s.human_seconds),
+        hms(s.agent_seconds),
+        state,
+    );
 }
 
 /// An indented sub-line with a manual session's metadata: the `activity`
@@ -2366,7 +2437,7 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
                 "{} {} {}",
                 dira_sources::harness_id(s.harness),
                 dot_glyph(),
-                repo_short(&s.project)
+                crate::format::session_repo_short(s)
             ),
             lw,
         );
@@ -2397,7 +2468,7 @@ fn print_report(r: &Report, layout: &Layout) {
     for p in &r.projects {
         println!(
             "  {:<pw$} {:>10} {:>10}",
-            truncate_cols(&project_label(&p.project), pw),
+            truncate_cols(&crate::format::report_line_label(p), pw),
             hms(p.human_seconds),
             hms(p.agent_wall_seconds),
         );
@@ -2592,6 +2663,9 @@ mod tests {
             last_activity_at: None,
             last_human_at: None,
             has_agent_activity: true,
+            orchestrator: false,
+            parent_session: None,
+            repos: Vec::new(),
         }
     }
 
@@ -3307,6 +3381,7 @@ mod tests {
         let opts = RowOpts {
             guards: true,
             branch_only: false,
+            flat: false,
         };
         for cols in [60, 80, 100, 140, 200] {
             let lines = zavet_decisions_lines(&decisions, cols, opts, now())

@@ -121,6 +121,8 @@ pub struct PartialSession {
     pub label: Option<String>,
     /// Spec slug the session works under, if set (`dira start --spec`).
     pub spec: Option<String>,
+    /// Orchestration facts folded so far (role, parent, repos, workspace).
+    pub lineage: crate::orchestration::SessionLineage,
 }
 
 /// Build an attestation batch from a window of events, token rows, and artifacts.
@@ -240,7 +242,7 @@ fn assemble_batch(
             session_id: p.session_id.clone(),
             harness: p.harness,
             kind: p.kind,
-            repo_canonical: p.repo_canonical.clone(),
+            repo_canonical: p.lineage.repo_canonical(p.repo_canonical.clone()),
             identity_email: p.identity_email.clone().unwrap_or_default(),
             started_at: fmt(p.started_at),
             // The defining mark of a partial rollup: the session is still open.
@@ -255,6 +257,10 @@ fn assemble_batch(
             // environment, not of the stored events) — see dirad's sync loop.
             runtime: None,
             runtime_session_ref: None,
+            role: p.lineage.role(),
+            parent_session: p.lineage.parent_session.clone(),
+            repos: p.lineage.repos_touched(),
+            workspace_ref: p.lineage.workspace_ref(),
         });
     }
 
@@ -687,6 +693,7 @@ fn build_sessions(
         label: Option<String>,
         /// First non-null spec slug across the session's events.
         spec: Option<String>,
+        lineage: crate::orchestration::SessionLineage,
     }
 
     // Sessions that END in THIS window's slice ONLY — never from `history` (see the
@@ -738,7 +745,9 @@ fn build_sessions(
                 note: e.note.clone(),
                 label: e.label.clone(),
                 spec: e.spec.clone(),
+                lineage: Default::default(),
             });
+        entry.lineage.observe(e);
         entry.event_times.push(crate::accounting::AgentSample {
             at: e.at,
             opens_span: e.kind.opens_agent_span(),
@@ -806,7 +815,7 @@ fn build_sessions(
                 session_id: id.to_string(),
                 harness: a.harness,
                 kind: a.kind,
-                repo_canonical: a.project,
+                repo_canonical: a.lineage.repo_canonical(a.project),
                 identity_email: a.email.unwrap_or_default(),
                 started_at: fmt(a.first),
                 ended_at: a.ended_at.map(fmt),
@@ -820,6 +829,10 @@ fn build_sessions(
                 // environment, not of the stored events) — see dirad's sync loop.
                 runtime: None,
                 runtime_session_ref: None,
+                role: a.lineage.role(),
+                parent_session: a.lineage.parent_session.clone(),
+                repos: a.lineage.repos_touched(),
+                workspace_ref: a.lineage.workspace_ref(),
             }
         })
         .collect()
@@ -1018,6 +1031,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
     }
 
@@ -1740,6 +1754,7 @@ mod tests {
             note: None,
             label: None,
             spec: None,
+            lineage: Default::default(),
         }];
         let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, AGENT, NOW);
         let s = batch
@@ -1802,6 +1817,7 @@ mod tests {
             note: None,
             label: None,
             spec: Some("capture-pipeline".into()),
+            lineage: Default::default(),
         }];
         let b = build_batch_with_partials(&[], &[], &[], &partials, "d", IDLE, AGENT, NOW);
         assert_eq!(b.sessions[0].spec.as_deref(), Some("capture-pipeline"));
@@ -1829,6 +1845,7 @@ mod tests {
             note: None,
             label: None,
             spec: None,
+            lineage: Default::default(),
         }];
         let batch = build_batch_with_partials(&window, &[], &[], &partials, "d", IDLE, AGENT, NOW);
         let rollups: Vec<_> = batch
@@ -1858,6 +1875,7 @@ mod tests {
             note: None,
             label: None,
             spec: None,
+            lineage: Default::default(),
         }];
         let batch = build_batch_with_partials(&[], &[], &[], &partials, "d", IDLE, AGENT, NOW);
         assert!(

@@ -8,9 +8,10 @@
 //! Rules:
 //! 1. **Flatten.** A run is rooted at the topmost orchestrator present in the
 //!    list; nested orchestrators and their children all join that root's run.
-//! 2. **Repos.** A run's repos are the union of its members' repos — a child's
-//!    `project`, an orchestrator's own `repos`. A repo only an orchestrator
-//!    touched (no child worked there) is **direct**.
+//! 2. **Repos.** A run's repos are the union of its members' repos — a
+//!    session's `project` plus its `repos` (an orchestrator's, or a spawner's
+//!    that keeps its own repo but reached into others). A repo that only an
+//!    orchestrator touched, and no other member worked in, is **direct**.
 //! 3. **Fold.** A run touching at most one repo is *folded*: renderers show it
 //!    as that repo's work rather than as a new group.
 //! 4. **Orphans.** A child whose parent is not in the list stands alone; it
@@ -124,8 +125,8 @@ fn build_run<'a>(root: &'a SessionView, members: Vec<&'a SessionView>) -> Run<'a
     for s in std::iter::once(root).chain(members.iter().copied()) {
         if s.orchestrator {
             via_orchestrators.extend(s.repos.iter().cloned());
-        } else if let Some(p) = &s.project {
-            via_children.insert(p.clone());
+        } else {
+            via_children.extend(s.project.iter().chain(&s.repos).cloned());
         }
     }
     Run {
@@ -255,6 +256,24 @@ mod tests {
         let g = group(&list);
         assert_eq!(g.len(), 1);
         assert_eq!(ids(&g[0]), vec!["p", "k"]);
+    }
+
+    #[test]
+    fn a_spawner_heads_its_run_with_its_own_repo_and_reach() {
+        // A repo-rooted session that spawned a child keeps its repo, carries
+        // the other repos it touched, and heads the run as the child's parent.
+        let spawner = SessionView {
+            project: Some("app".into()),
+            repos: vec!["api".into(), "app".into()],
+            ..view("p")
+        };
+        let list = vec![spawner, child("k", "p", "web")];
+        let g = group(&list);
+        assert_eq!(g.len(), 1);
+        let Entry::Run(r) = &g[0] else { panic!() };
+        assert_eq!(r.root.session_id, "p");
+        assert_eq!(r.repos, vec!["api", "app", "web"]);
+        assert!(r.direct.is_empty(), "only orchestrators have direct repos");
     }
 
     #[test]

@@ -12,7 +12,7 @@ paths:
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042]
 ---
 
 ## Overview
@@ -137,6 +137,10 @@ single flush window (issue #40).
   the live registry use for partials. An orchestrator's `repoCanonical` is
   always absent. An ordinary session omits all four, so its rollup stays
   byte-identical to 1.5 (DIRASH-0041).
+- Contract 1.7 changes no shape. A spawner (a session that spawned from its
+  own repo) keeps `repoCanonical` and also sends `repos`. `role`, `repos` and
+  `workspaceRef` become authoritative: a 1.7 rollup that omits one tells the
+  cloud to clear it (DIRASH-0042).
 
 ## Invariants
 

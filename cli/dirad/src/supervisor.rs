@@ -162,6 +162,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }))
     }
 

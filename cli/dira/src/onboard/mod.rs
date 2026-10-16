@@ -257,14 +257,19 @@ fn print_plan(state: &detect::State, opts: &Options) {
             .cloned()
             .collect();
         if !missing.is_empty() {
+            // Rule files come with the link; the plan names them (a pure
+            // lookup by kind — still no I/O).
+            let rules = steps::rule_names(&missing)
+                .map(|r| format!("; brings {r} into agent context"))
+                .unwrap_or_default();
             if state.has_zavet_dir {
                 println!(
-                    "  · link {} to zavet spec sources",
+                    "  · link {} to zavet spec sources{rules}",
                     steps::kind_names(&missing)
                 );
             } else {
                 println!(
-                    "  · link {} to zavet spec sources (with the new .zavet/)",
+                    "  · link {} to zavet spec sources (with the new .zavet/){rules}",
                     steps::kind_names(&missing)
                 );
             }

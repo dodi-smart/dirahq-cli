@@ -7,7 +7,7 @@
 
 use crate::format::{
     bar as bar_cells, billing_line, display_width, hms, kind_label, pad_cols, pad_left_cols,
-    project_label, repo_short, tokens_compact, truncate_cols, usd_approx,
+    project_label, session_project_label, tokens_compact, truncate_cols, usd_approx,
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{
@@ -216,7 +216,7 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
         Response::Sessions { sessions } => {
             let shown: Vec<SessionView> =
                 sessions.iter().filter(|s| has_time(s)).cloned().collect();
-            print_sessions(&shown, &Layout::for_width(terminal_cols()));
+            print_sessions(&shown, &Layout::for_width(terminal_cols()), opts.flat);
             true
         }
         Response::Report(r) => {
@@ -534,6 +534,8 @@ pub struct RowOpts {
     pub guards: bool,
     /// Hide records whose file is not on the checked-out branch (`--branch`).
     pub branch_only: bool,
+    /// List sessions one per row, without grouping runs (`dira sessions --flat`).
+    pub flat: bool,
 }
 
 /// `4d` / `3mo` since `created_at`, or `new` inside the first two days.
@@ -1100,6 +1102,61 @@ fn print_zavet_status(v: &ZavetStatusView) {
     for line in spec_framework_lines(v) {
         println!("{line}");
     }
+    for line in rule_source_lines(v) {
+        println!("{line}");
+    }
+}
+
+/// The rule-source lines of `dira zavet status`: one per framework rule file
+/// the plugin reported (`kind  path  state  v<version>  amended <date>`), plus
+/// a hint under any that needs a human — still a template, or a file its
+/// framework has deprecated. Empty when there are none.
+fn rule_source_lines(v: &ZavetStatusView) -> Vec<String> {
+    use dira_core::zavet_specs::{RuleSourceKind, RuleSourceState};
+    let mut out = Vec::new();
+    if v.rule_sources.is_empty() {
+        return out;
+    }
+    out.push(String::new());
+    for r in &v.rule_sources {
+        let state = RuleSourceState::parse(&r.state);
+        let mut meta = vec![r.state.clone()];
+        if let Some(ver) = &r.version {
+            meta.push(format!("v{ver}"));
+        }
+        if let Some(d) = &r.last_amended {
+            meta.push(format!("amended {d}"));
+        }
+        let role = match state {
+            RuleSourceState::Ok => Role::Ink,
+            RuleSourceState::Off => Role::Faint,
+            _ => Role::Engaged,
+        };
+        out.push(format!(
+            "{} {}   {}   {}",
+            theme::paint(
+                &format!("{} {:<10}", theme::glyphs().square, "rules"),
+                Role::Knowledge
+            ),
+            theme::paint(RuleSourceKind::parse(&r.kind).label(), role),
+            theme::paint(&r.path, Role::Muted),
+            theme::paint(&meta.join("  "), Role::Muted),
+        ));
+        let hint =
+            match state {
+                RuleSourceState::Unratified => Some(r.reason.clone().unwrap_or_else(|| {
+                    "still a template — the framework has not ratified it".into()
+                })),
+                RuleSourceState::Legacy
+                | RuleSourceState::Unresolved
+                | RuleSourceState::FileMissing => r.reason.clone(),
+                _ => None,
+            };
+        if let Some(h) = hint {
+            out.push(format!("{:13}{}", "", theme::paint(&h, Role::Faint)));
+        }
+    }
+    out
 }
 
 /// The spec-framework lines of `dira zavet status`: what the working tree
@@ -1341,6 +1398,12 @@ fn zavet_reindex_lines(v: &ZavetReindexView) -> Vec<String> {
         notes.push(format!(
             "{} record(s) had their introducing commit corrected",
             v.provenance_repaired
+        ));
+    }
+    if v.rule_sources_indexed > 0 {
+        notes.push(format!(
+            "{} framework rule source(s) updated",
+            v.rule_sources_indexed
         ));
     }
     if v.trailers_bounded {
@@ -1986,7 +2049,7 @@ pub fn print_status(s: &StatusView, detailed: bool) {
         println!();
         if !active.is_empty() {
             println!("{}", theme::paint("ACTIVE SESSIONS", Role::Muted));
-            print_sessions(&active, &layout);
+            print_sessions(&active, &layout, false);
             println!();
             print_parallel(&active, &s.today, &layout);
         }
@@ -2246,7 +2309,7 @@ fn billing_age_suffix(fetched_at: &str, now: OffsetDateTime) -> Option<String> {
     Some(format!("(as of {label} ago)"))
 }
 
-fn print_sessions(sessions: &[SessionView], layout: &Layout) {
+fn print_sessions(sessions: &[SessionView], layout: &Layout, flat: bool) {
     if sessions.is_empty() {
         println!("  (none)");
         return;
@@ -2257,29 +2320,78 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout) {
         "HANDLE", "HARNESS", "KIND", "PROJECT", "HUMAN", "AGENT"
     );
     println!("{}", theme::paint(&header, Role::Muted));
-    for s in sessions {
-        // Paint only the trailing STATE word so the fixed-width columns stay
-        // aligned (the colour escapes have zero display width). "engaged" (you're
-        // driving it) is teal like the human lane; "active" (its agent is working
-        // on its own) is purple like the agent lane; "idle" is faint.
-        let (label, role) = match s.live_state() {
-            LiveState::Engaged => ("engaged", Role::Engaged),
-            LiveState::Active => ("active", Role::Agent),
-            LiveState::Idle => ("idle", Role::Faint),
-        };
-        let state = theme::paint(label, role);
-        println!(
-            "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
-            truncate_cols(&s.handle, 8),
-            truncate_cols(dira_sources::harness_id(s.harness), 10),
-            truncate_cols(kind_label(s.kind), 7),
-            truncate_cols(&project_label(&s.project), pw),
-            hms(s.human_seconds),
-            hms(s.agent_seconds),
-            state,
-        );
-        print_session_meta(s);
+    if flat {
+        for s in sessions {
+            print_session_row(s, "  ", &s.handle, &session_project_label(s), pw);
+            print_session_meta(s);
+        }
+        return;
     }
+    for row in crate::format::tree_rows(sessions, &titles_if_needed(sessions)) {
+        match row.session {
+            Some(s) => {
+                let (gutter, handle) = match row.glyph {
+                    "▾ " => ("▾ ", row.handle.clone()),
+                    "  " => ("  ", row.handle.clone()),
+                    branch => ("  ", format!("{branch}{}", row.handle)),
+                };
+                print_session_row(s, gutter, &handle, &row.project, pw);
+                if row.glyph == "  " {
+                    print_session_meta(s);
+                }
+            }
+            None => {
+                let line = format!(
+                    "  {:<8} {:<10} {:<7} {}",
+                    format!("{}·", row.glyph),
+                    "",
+                    "direct",
+                    truncate_cols(&row.project, pw),
+                );
+                println!("{}", theme::paint(&line, Role::Faint));
+            }
+        }
+    }
+}
+
+/// Local session titles, read only when an orchestrator is on screen — it
+/// parses every `~/.claude/sessions/*.json`. Never synced.
+pub(crate) fn titles_if_needed(
+    sessions: &[SessionView],
+) -> std::collections::HashMap<String, String> {
+    if sessions.iter().any(|s| s.orchestrator) {
+        crate::session_titles::claude_titles()
+    } else {
+        Default::default()
+    }
+}
+
+fn print_session_row(s: &SessionView, gutter: &str, handle: &str, project: &str, pw: usize) {
+    // Paint only the trailing STATE word so the fixed-width columns stay
+    // aligned (the colour escapes have zero display width). "engaged" (you're
+    // driving it) is teal like the human lane; "active" (its agent is working
+    // on its own) is purple like the agent lane; "idle" is faint.
+    let (label, role) = match s.live_state() {
+        LiveState::Engaged => ("engaged", Role::Engaged),
+        LiveState::Active => ("active", Role::Agent),
+        LiveState::Idle => ("idle", Role::Faint),
+    };
+    let state = theme::paint(label, role);
+    let kind = if s.orchestrator {
+        "orch"
+    } else {
+        kind_label(s.kind)
+    };
+    println!(
+        "{gutter}{:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
+        truncate_cols(handle, 8),
+        truncate_cols(dira_sources::harness_id(s.harness), 10),
+        truncate_cols(kind, 7),
+        truncate_cols(project, pw),
+        hms(s.human_seconds),
+        hms(s.agent_seconds),
+        state,
+    );
 }
 
 /// An indented sub-line with a manual session's metadata: the `activity`
@@ -2360,13 +2472,23 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
     // the same shape/colour language as the cloud's "Right Now" view. Painting
     // only the glyph keeps the padded label column aligned.
     let agent_mark = theme::paint(theme::glyphs().diamond, Role::Agent);
-    for s in &agents {
+    // Lanes follow the run trees the sessions table shows: an orchestrator,
+    // then its members indented. Each lane is still one session's own time.
+    let kept: Vec<_> = crate::format::tree_rows(active, &titles_if_needed(active))
+        .into_iter()
+        .filter(|r| r.session.is_some_and(|s| s.accrues_agent_time()))
+        .collect();
+    let mut glyphs: Vec<&'static str> = kept.iter().map(|r| r.glyph).collect();
+    crate::format::retree(&mut glyphs);
+    for (row, glyph) in kept.iter().zip(glyphs) {
+        let s = row.session.expect("filtered to sessions");
+        let glyph = if glyph == "  " { "" } else { glyph };
         let label = truncate_cols(
             &format!(
-                "{} {} {}",
+                "{glyph}{} {} {}",
                 dira_sources::harness_id(s.harness),
                 dot_glyph(),
-                repo_short(&s.project)
+                row.short
             ),
             lw,
         );
@@ -2397,7 +2519,7 @@ fn print_report(r: &Report, layout: &Layout) {
     for p in &r.projects {
         println!(
             "  {:<pw$} {:>10} {:>10}",
-            truncate_cols(&project_label(&p.project), pw),
+            truncate_cols(&crate::format::report_line_label(p), pw),
             hms(p.human_seconds),
             hms(p.agent_wall_seconds),
         );
@@ -2592,6 +2714,9 @@ mod tests {
             last_activity_at: None,
             last_human_at: None,
             has_agent_activity: true,
+            orchestrator: false,
+            parent_session: None,
+            repos: Vec::new(),
         }
     }
 
@@ -3200,6 +3325,50 @@ mod tests {
     }
 
     #[test]
+    fn status_lists_rule_sources_with_hints_for_the_ones_needing_a_human() {
+        let mut v = ZavetStatusView::default();
+        assert!(
+            rule_source_lines(&v).is_empty(),
+            "no rule sources, no lines"
+        );
+        let line = |kind: &str, path: &str, state: &str| dira_core::protocol::ZavetRuleSourceLine {
+            kind: kind.into(),
+            path: path.into(),
+            state: state.into(),
+            ..Default::default()
+        };
+        let mut ok = line(
+            "speckit-constitution",
+            ".specify/memory/constitution.md",
+            "ok",
+        );
+        ok.version = Some("1.2.0".into());
+        ok.last_amended = Some("2026-09-10".into());
+        let mut legacy = line("openspec-project-md", "openspec/project.md", "legacy");
+        legacy.reason =
+            Some("deprecated by OpenSpec: move it into openspec/config.yaml context".into());
+        v.rule_sources = vec![
+            ok,
+            legacy,
+            line("bmad-agents-block", "AGENTS.md", "unratified"),
+        ];
+        let text = rule_source_lines(&v)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Spec Kit constitution")
+                && text.contains(".specify/memory/constitution.md")
+                && text.contains("ok  v1.2.0  amended 2026-09-10"),
+            "{text}"
+        );
+        assert!(text.contains("deprecated by OpenSpec"), "{text}");
+        assert!(text.contains("not ratified"), "{text}");
+        assert_eq!(text.matches("rules").count(), 3, "{text}");
+    }
+
+    #[test]
     fn truncate_cols_counts_display_cells() {
         assert_eq!(display_width("日本語"), 6);
         assert!(display_width(&crate::format::truncate_cols("日本語テスト", 6)) <= 6);
@@ -3307,6 +3476,7 @@ mod tests {
         let opts = RowOpts {
             guards: true,
             branch_only: false,
+            flat: false,
         };
         for cols in [60, 80, 100, 140, 200] {
             let lines = zavet_decisions_lines(&decisions, cols, opts, now())

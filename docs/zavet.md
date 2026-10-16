@@ -228,6 +228,20 @@ capture. The shellout runs in the repo directory the daemon last observed
 (falling back to the caller's cwd); with neither, staleness reads *unknown*,
 never guessed.
 
+**Framework rule sources** follow linked spec frameworks with no extra step.
+A `spec-source:` line for Spec Kit, OpenSpec or BMAD also brings that
+framework's standing rules into agent context through the plugin: the Spec Kit
+constitution, OpenSpec's `config.yaml` `context:`/`rules:` (and the legacy
+`project.md`), BMAD's `AGENTS.md` block (and the legacy `project-context.md`).
+The plugin owns them, marks them unverified and never edits them; one
+`rule-source: <kind> off` line in `.zavet/config` turns one off. dira tracks
+their metadata only (kind, path, blob oid, version, dates, rule count, state)
+by reading `zavet spec-sources --json` from the installed plugin. It refreshes
+when a commit touches `.zavet/config`, `AGENTS.md` or a rule file, and on
+`dira zavet reindex`. `dira zavet status` lists them with a hint for any still
+unratified or deprecated. The text is never stored and nothing about them is
+synced (DIRASH-0040).
+
 **Attribution rule (everywhere):** the unique active session for the repo
 (`SessionRegistry::session_for_repo`) or NULL — never guessed. Unattributed
 evidence still counts and is reported, so costs read as honest lower bounds.

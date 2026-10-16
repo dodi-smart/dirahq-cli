@@ -438,6 +438,9 @@ pub struct LiveSession {
     /// fallback policy for ended rollups, whose terminal write overwrites this
     /// anyway (issue #40).
     pub branch: Option<String>,
+    /// Orchestration facts folded from this session's events (role, parent,
+    /// repos touched, workspace) — the same accumulator the synced rollup uses.
+    pub lineage: dira_core::orchestration::SessionLineage,
     /// Has this session ever shown a *real* signal — a human signal or agent
     /// activity — as opposed to nothing but lifecycle noise (issue #74)?
     ///
@@ -566,8 +569,10 @@ impl SessionRegistry {
                 last_partial_active_seconds: None,
                 prompts: 0,
                 branch: ev.branch.clone(),
+                lineage: Default::default(),
                 had_signal: false,
             });
+        entry.lineage.observe(ev);
 
         // Sticky, and set before anything else can early-return: the first real
         // signal promotes the session out of "lifecycle noise" for good (issue #74).
@@ -593,6 +598,10 @@ impl SessionRegistry {
         if entry.project.is_none() && ev.project.is_some() {
             entry.project = ev.project.clone();
         }
+        // The lineage owns the rule (no single repo for an orchestrator), the
+        // same one the synced rollup applies; it clears a project seen before
+        // the role was learned (a later `start_session`).
+        entry.project = entry.lineage.repo_canonical(entry.project.take());
         if entry.label.is_none() && ev.label.is_some() {
             entry.label = ev.label.clone();
         }
@@ -828,6 +837,16 @@ impl SessionRegistry {
         self.sessions.get(session_id)?.project.clone()
     }
 
+    /// The orchestrator this session was linked to, if the registry has seen
+    /// the link (first non-null `parent_session` across its events).
+    pub fn parent_of(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .get(session_id)?
+            .lineage
+            .parent_session
+            .clone()
+    }
+
     /// Resolve a stop selector to the session ids to close.
     pub fn select_manual(
         &self,
@@ -936,6 +955,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
     }
 

@@ -11,7 +11,8 @@
 use crate::capture::{self, Throttle};
 use crate::state::{AppState, EventMsg};
 use dira_contract::Harness;
-use dira_core::model::{EventKind, RawEvent};
+use dira_core::model::{EventKind, Lineage, RawEvent};
+use dira_core::orchestration;
 use dira_core::project::{self, Resolved};
 use futures::FutureExt as _;
 use std::collections::HashMap;
@@ -43,12 +44,16 @@ const NEGATIVE_TTL: StdDuration = StdDuration::from_secs(60);
 /// unbounded before this change; out of scope here.
 pub(crate) struct ProjectCache {
     entries: HashMap<String, (Resolved, Instant)>,
+    /// Host id → parent session memo for orchestration links, kept beside the
+    /// project memo because both live exactly as long as the writer loop.
+    parents: ParentCache,
 }
 
 impl ProjectCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            parents: ParentCache::default(),
         }
     }
 
@@ -225,10 +230,18 @@ async fn process_message(
         }
         _ => None,
     };
-    let mut ev = match msg {
-        EventMsg::Raw(ev) => *ev,
+    let (mut ev, repo_dir) = match msg {
+        EventMsg::Raw(ev) => {
+            // Unchanged from before evidence existed: a raw event's own
+            // cwd/project pair is the registration it always was.
+            let dir = ev.project.as_ref().and(ev.cwd.clone());
+            (*ev, dir)
+        }
         EventMsg::Hook { norm, harness, at } => enrich(norm, harness, at, cache),
     };
+    if ev.lineage.host_session.is_some() && ev.lineage.parent_session.is_none() {
+        ev.lineage.parent_session = resolve_parent(state, &ev, &mut cache.parents).await;
+    }
     // A session already bound to a spec (an explicit `dira start --spec`, or a
     // capture-time resolution) stamps every later event, so any window of the
     // log carries it — a rollup built from a slice that misses the first event
@@ -390,10 +403,16 @@ async fn process_message(
     // a git spawn on the hot path for no new information. Manual events — the
     // one place a caller-supplied name reaches this loop — carry no `cwd` at
     // all, and so never enter this branch.
-    if let (Some(cwd), Some(proj)) = (ev.cwd.as_deref(), ev.project.as_deref()) {
-        crate::control::register_repo_dir(state, proj, cwd);
+    //
+    // `repo_dir` is the directory the project was actually resolved from:
+    // the cwd, or — for an orchestrator whose cwd names no repo — the
+    // directory its tool call pointed at. Never the scratch cwd paired with
+    // an evidence repo (DIRASH-0027). A repo named outright (`gh -R`) has no
+    // local directory, so it registers nothing.
+    if let (Some(dir), Some(proj)) = (repo_dir.as_deref(), ev.project.as_deref()) {
+        crate::control::register_repo_dir(state, proj, dir);
         if capture::captures_commits(ev.kind) && throttle.ready(proj) {
-            capture_fn(state, cwd, proj);
+            capture_fn(state, dir, proj);
         }
     }
     if let Some((path, harness)) = transcript {
@@ -463,8 +482,11 @@ fn coalesce_decision(
     coalesce: Duration,
 ) -> Watermark {
     if coalesces(ev.kind) && coalesce > Duration::ZERO {
+        // A spawn record is the only place a parent/child link is ever
+        // observed — dropping it would orphan the child for good.
+        let carries_link = ev.lineage.spawned.is_some();
         if let Some(prev) = last.get(&ev.session_id) {
-            if ev.at - *prev < coalesce {
+            if ev.at - *prev < coalesce && !carries_link {
                 return Watermark::Drop;
             }
         }
@@ -556,14 +578,38 @@ fn triggers_sync(kind: EventKind) -> bool {
     )
 }
 
-/// Turn a normalized hook into a full event, resolving its project off the hot path.
+/// Turn a normalized hook into a full event, resolving its project off the hot
+/// path. Also returns the directory the project was resolved from, when there
+/// is one, for `repo_dirs` and commit capture.
+///
+/// The cwd decides first. Only when it names no repo does the tool call's own
+/// evidence get a say (an orchestrator's `cd repos/x && …`), and then only if
+/// every piece of it agrees on one repo — see [`orchestration::single_repo`].
 fn enrich(
     norm: dira_sources::Normalized,
     harness: Harness,
     at: OffsetDateTime,
     cache: &mut ProjectCache,
-) -> RawEvent {
-    let resolved = norm.cwd.as_ref().map(|cwd| cache.resolve(cwd));
+) -> (RawEvent, Option<String>) {
+    let mut resolved = norm.cwd.as_ref().map(|cwd| cache.resolve(cwd));
+    let mut repo_dir = resolved
+        .as_ref()
+        .filter(|r| r.project.is_some())
+        .and(norm.cwd.clone());
+    // A scratch workspace marks an orchestrator only from a cwd that is not
+    // itself a repo: a session working inside a clone under the workspace is
+    // ordinary repo work, whoever spawned it.
+    let workspace = norm
+        .cwd
+        .as_deref()
+        .filter(|_| repo_dir.is_none())
+        .and_then(|cwd| orchestration::scratch_workspace(std::path::Path::new(cwd)));
+    if repo_dir.is_none() && !norm.hints.evidence.is_empty() {
+        if let Some((r, dir)) = resolve_evidence(&norm.hints.evidence, cache) {
+            resolved = Some(r);
+            repo_dir = dir;
+        }
+    }
 
     // The session branch is volatile (a checkout can change it within a session),
     // so resolve it live per event rather than caching it with the project.
@@ -572,7 +618,7 @@ fn enrich(
         .as_ref()
         .and_then(|cwd| project::current_branch(std::path::Path::new(cwd)));
 
-    RawEvent {
+    let ev = RawEvent {
         id: Ulid::generate().to_string(),
         at,
         session_id: norm.session_id,
@@ -587,7 +633,100 @@ fn enrich(
         activity: None,
         note: None,
         spec: None,
+        lineage: Lineage {
+            host_session: norm.hints.host_session,
+            workspace,
+            spawned: norm.hints.spawned,
+            parent_session: None,
+        },
+    };
+    (ev, repo_dir)
+}
+
+/// Resolve tool-call evidence to one repo, or nothing. Path evidence is first
+/// lifted to the repo root that contains it (a few `stat`s, no spawn), so an
+/// orchestrator touching many folders of one repo costs one `git` resolve via
+/// [`ProjectCache`], and a path outside any repo costs none; a repo named
+/// outright is taken as-is. The returned directory is the repo root that
+/// resolved, if the winning evidence was a path — the only kind that may enter
+/// `repo_dirs`.
+fn resolve_evidence(
+    evidence: &[orchestration::Evidence],
+    cache: &mut ProjectCache,
+) -> Option<(project::Resolved, Option<String>)> {
+    let mut hits: Vec<(project::Resolved, Option<String>)> = Vec::new();
+    for e in evidence {
+        match e {
+            orchestration::Evidence::Path(p) => {
+                let Some(root) = repo_root(p) else { continue };
+                let dir = root.to_string_lossy().into_owned();
+                let r = cache.resolve(&dir);
+                if r.project.is_some() {
+                    hits.push((r, Some(dir)));
+                }
+            }
+            orchestration::Evidence::Repo(proj) => hits.push((
+                project::Resolved {
+                    project: Some(proj.clone()),
+                    identity_email: None,
+                    identity_name: None,
+                },
+                None,
+            )),
+        }
     }
+    orchestration::single_repo(hits.iter().filter_map(|(r, _)| r.project.clone()))?;
+    // Prefer a hit with a local directory: it carries a real identity and may
+    // register the repo for commit capture.
+    hits.into_iter().max_by_key(|(_, dir)| dir.is_some())
+}
+
+/// The nearest ancestor of `path` (itself included) holding a `.git` entry —
+/// a directory, or the file a linked worktree or submodule uses.
+fn repo_root(path: &std::path::Path) -> Option<&std::path::Path> {
+    path.ancestors().find(|a| a.join(".git").exists())
+}
+
+/// How long a "no parent recorded yet" answer is trusted before the store is
+/// asked again. A child's first events routinely arrive before the
+/// orchestrator's `start_session` call returns and records the spawn.
+const PARENT_NEGATIVE_TTL: StdDuration = StdDuration::from_secs(30);
+
+/// Memoized host id → parent session lookups.
+#[derive(Default)]
+pub(crate) struct ParentCache {
+    entries: HashMap<String, (Option<String>, Instant)>,
+}
+
+/// The orchestrator that spawned this event's session, if known: first from
+/// the live registry (the session already linked), then from the store (an
+/// event whose `spawned` names this session's host id).
+async fn resolve_parent(
+    state: &AppState,
+    ev: &RawEvent,
+    cache: &mut ParentCache,
+) -> Option<String> {
+    let known = crate::control::lock_recover(&state.sessions).parent_of(&ev.session_id);
+    if known.is_some() {
+        return known;
+    }
+    let host = ev.lineage.host_session.as_deref()?;
+    if let Some((hit, at)) = cache.entries.get(host) {
+        if hit.is_some() || at.elapsed() < PARENT_NEGATIVE_TTL {
+            return hit.clone();
+        }
+    }
+    let found = match state.store.session_that_spawned(host).await {
+        Ok(found) => found.filter(|p| p != &ev.session_id),
+        Err(e) => {
+            tracing::debug!("parent lookup failed: {e}");
+            None
+        }
+    };
+    cache
+        .entries
+        .insert(host.to_string(), (found.clone(), Instant::now()));
+    found
 }
 
 /// Tail-read whichever per-session file the harness's hook reported —
@@ -929,6 +1068,7 @@ mod tests {
             activity: None,
             note: None,
             spec: None,
+            lineage: Default::default(),
         }
     }
 

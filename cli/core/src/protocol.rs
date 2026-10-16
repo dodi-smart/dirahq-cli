@@ -435,6 +435,17 @@ pub struct SessionView {
     /// phantom one.
     #[serde(default)]
     pub has_agent_activity: bool,
+    /// An orchestrating session (see `dira_core::orchestration`): its
+    /// `project` is deliberately `None` and its repos are in `repos`.
+    /// Defaulted so an older daemon degrades to the flat view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orchestrator: bool,
+    /// The orchestrator session that spawned this one, when linked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// Canonical repos an orchestrator's own tool calls touched, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
 }
 
 /// Lenient deserializers for the two typed enums above.
@@ -701,6 +712,29 @@ pub struct ZavetStatusView {
     /// units the daemon has captured under each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spec_sources: Vec<ZavetSpecSourceLine>,
+    /// Framework rule files (constitution, OpenSpec config, BMAD context) the
+    /// installed plugin reported for the linked frameworks, still listed.
+    /// Metadata only (DIRASH-0040).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_sources: Vec<ZavetRuleSourceLine>,
+}
+
+/// One framework rule source as `dira zavet status` shows it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZavetRuleSourceLine {
+    /// `speckit-constitution`, `openspec-config`, … (`other` when unknown).
+    pub kind: String,
+    pub path: String,
+    /// `ok`, `unratified`, `legacy`, `unresolved`, `file-missing`, `off`, `other`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_amended: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One declared spec-framework source and its captured census
@@ -769,6 +803,10 @@ pub struct ZavetReindexView {
     /// is the whole case this repair exists for (DIRASH-0032).
     #[serde(default)]
     pub provenance_repaired: u64,
+    /// Framework rule-source rows written (inserted, updated or marked
+    /// removed). Zero on a repeat run over an unchanged repo.
+    #[serde(default)]
+    pub rule_sources_indexed: u64,
 }
 
 /// Per-kind guard-event tallies with the honest unattributed count.
@@ -1178,6 +1216,9 @@ mod tests {
             last_activity_at: None,
             last_human_at: None,
             has_agent_activity: true,
+            orchestrator: false,
+            parent_session: None,
+            repos: Vec::new(),
         }
     }
 

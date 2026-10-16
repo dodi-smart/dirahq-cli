@@ -1,15 +1,15 @@
 ---
 title: Harness sources and hook ingestion
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
-date: 2026-08-09
+date: 2026-10-15
 paths:
   - cli/sources/src/
   - cli/dira/src/init.rs
   - contract/src/lib.rs
-decisions: [D-0001]
+decisions: [D-0001, DIRASH-0041]
 ---
 
 ## Overview
@@ -54,8 +54,13 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
   `normalize(payload) -> Option<Normalized>`. Registered in `registry()`.
 - `Normalized` carries only metadata: session_id, kind, cwd, tool name,
   optional transcript path, and the optional lifecycle reasons `source` /
-  `reason`. Prompt text, tool arguments, and outputs are never read (D-0001
-  posture extends to ingestion).
+  `reason`, plus boxed orchestration `hints`. Prompt text is never read.
+  Tool arguments and outputs are read only by the Claude source, only to
+  derive `hints` (repo evidence, a spawned child's host id), and never leave
+  `normalize` (D-0001, DIRASH-0041).
+- `hints.host_session` comes from the `dira_env` object the `dira hook` shim
+  injects from `CLAUDE_CODE_HOST_SESSION_ID`. The harness never sets
+  `dira_env`, and a payload without it (old shim, HTTP hook) is accepted.
 - `source` / `reason` are Claude Code's `SessionStart.source` (`startup`,
   `resume`, `clear`, `compact`, `fork`) and `SessionEnd.reason` (`clear`,
   `resume`, `logout`, `prompt_input_exit`, `bypass_permissions_disabled`,

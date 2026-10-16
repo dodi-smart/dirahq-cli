@@ -1222,6 +1222,7 @@ mod tests {
             last_partial_active_seconds: None,
             prompts: 0,
             branch: None,
+            lineage: Default::default(),
         }
     }
 

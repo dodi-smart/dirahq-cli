@@ -43,6 +43,25 @@ pub struct Normalized {
     /// `SessionEnd.reason`: `clear` / `resume` / `logout` / `prompt_input_exit` /
     /// `bypass_permissions_disabled` / `other`). Diagnostics only, as above.
     pub reason: Option<String>,
+    /// Orchestration hints derived from this hook — ids and locations only.
+    /// Empty for every harness but Claude Code. Boxed: every hook rides the
+    /// writer queue, and most carry no hints at all.
+    pub hints: Box<Hints>,
+}
+
+/// What a hook says about orchestration, derived at normalization so the raw
+/// tool input/response never travels further than this crate (D-0001,
+/// DIRASH-0041). Nothing here is stored as-is: the daemon resolves `evidence`
+/// to a canonical repo ref and drops the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hints {
+    /// The harness host's id for this session (`local_<uuid>`), forwarded by
+    /// the hook shim under [`dira_core::orchestration::PAYLOAD_ENV_KEY`].
+    pub host_session: Option<String>,
+    /// Where the tool call says it worked, when its cwd names no repo.
+    pub evidence: Vec<dira_core::orchestration::Evidence>,
+    /// The child host id a `start_session` call started.
+    pub spawned: Option<String>,
 }
 
 /// A pluggable harness ingress. Each source knows how to turn one harness's raw

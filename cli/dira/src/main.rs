@@ -14,6 +14,7 @@ mod hook_yield;
 mod init;
 mod onboard;
 mod render;
+mod session_titles;
 #[cfg(test)]
 mod test_support;
 mod theme;
@@ -265,13 +266,18 @@ Examples:
     #[command(after_help = "\
 Examples:
   dira sessions              handles, projects, human/agent time, state
-  dira sessions --json       the same rows as one JSON object, for scripts")]
+  dira sessions --json       the same rows as one JSON object, for scripts
+  dira sessions --flat       one row per session, without grouping orchestration runs")]
     Sessions {
         /// Emit the session list as JSON instead of a table. Scriptable proof
         /// of what was captured (`jq '.sessions | length'`), and what CI
         /// asserts on.
         #[arg(long)]
         json: bool,
+        /// List every session on its own row instead of grouping an
+        /// orchestrator with the sessions it spawned.
+        #[arg(long)]
+        flat: bool,
     },
     /// Retroactive manual entry, e.g. `dira invoice 1h Meeting with Fol` (bare = minutes).
     #[command(
@@ -1366,7 +1372,7 @@ async fn main() -> Result<()> {
             action: ZavetAction::Decisions { json: true, .. }
                 | ZavetAction::Wiki { json: true, .. }
                 | ZavetAction::Specs { json: true, .. }
-        } | Command::Sessions { json: true }
+        } | Command::Sessions { json: true, .. }
     );
     let row_opts = match &cli.command {
         Command::Zavet {
@@ -1374,6 +1380,11 @@ async fn main() -> Result<()> {
         } => render::RowOpts {
             guards: *guards,
             branch_only: *branch,
+            ..Default::default()
+        },
+        Command::Sessions { flat, .. } => render::RowOpts {
+            flat: *flat,
+            ..Default::default()
         },
         _ => render::RowOpts::default(),
     };
@@ -1719,6 +1730,13 @@ async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcom
                 return HookOutcome::Yielded;
             }
         }
+    }
+    let mut payload = payload;
+    // Claude Desktop names each session's host id only in the environment of
+    // its process tree, which only this shim can see — forward it so the
+    // daemon can link an orchestrator to the sessions it spawned.
+    if dira_sources::canonical_harness_id(harness) == Some("claude") {
+        dira_core::orchestration::inject_env_hints(&mut payload, dira_core::env::non_blank);
     }
     let owned = harness.to_string();
     deliver_hook_payload(config, harness, probe, payload, move |payload| {

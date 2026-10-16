@@ -1,10 +1,10 @@
 ---
 title: Attestation sync and session rollups
-version: 5
+version: 6
 origin: session
 verified: false
 confidence: high
-date: 2026-08-09
+date: 2026-10-15
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
@@ -12,7 +12,7 @@ paths:
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041]
 ---
 
 ## Overview
@@ -131,6 +131,12 @@ single flush window (issue #40).
   `unwrap_or_default()`, so an unreadable ack dropped `dataEpoch`. A cloud
   that had reset its durable log was indistinguishable from one that never
   mentioned an epoch, and the re-send never fired.
+- Contract 1.6 adds four optional `SessionRollup` fields: `role`
+  (`orchestrator`), `parentSession`, `repos` and `workspaceRef`. They come
+  from `orchestration::SessionLineage`, the one fold both `build_sessions` and
+  the live registry use for partials. An orchestrator's `repoCanonical` is
+  always absent. An ordinary session omits all four, so its rollup stays
+  byte-identical to 1.5 (DIRASH-0041).
 
 ## Invariants
 

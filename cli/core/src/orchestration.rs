@@ -105,8 +105,11 @@ pub fn inject_env_hints(payload: &mut serde_json::Value, var: impl Fn(&str) -> O
 /// can never disagree about what a session is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionLineage {
-    /// Derived on every [`Self::observe`]: the session spawned a child, or it
-    /// worked from a scratch workspace and never from a repo outside one.
+    /// Derived on every [`Self::observe`]: the session worked from a scratch
+    /// workspace or spawned a child, and never resolved a repo from a cwd
+    /// outside every scratch workspace. A session that spawns from its own
+    /// repo is a *spawner* instead: it keeps its repo and heads a run only by
+    /// being its children's parent.
     pub orchestrator: bool,
     pub parent_session: Option<String>,
     pub workspace: Option<String>,
@@ -133,7 +136,7 @@ impl SessionLineage {
                 .as_deref()
                 .is_some_and(|cwd| scratch_workspace(Path::new(cwd)).is_none());
         }
-        self.orchestrator = self.spawned || (self.scratch && !self.repo_outside_scratch);
+        self.orchestrator = (self.spawned || self.scratch) && !self.repo_outside_scratch;
         if self.parent_session.is_none() {
             self.parent_session.clone_from(&l.parent_session);
         }
@@ -163,10 +166,13 @@ impl SessionLineage {
             .then_some(dira_contract::SessionRole::Orchestrator)
     }
 
-    /// Sorted repos, only for an orchestrator — an ordinary session's rollup
-    /// stays byte-identical to a pre-1.6 one.
+    /// Sorted repos, for an orchestrator and for a spawner (a run head that
+    /// keeps its own repo but may reach into others). A session that spawned
+    /// nothing leaves it absent, so its rollup stays byte-identical to a
+    /// pre-1.6 one.
     pub fn repos_touched(&self) -> Option<Vec<String>> {
-        (self.orchestrator && !self.repos.is_empty()).then(|| self.repos.iter().cloned().collect())
+        ((self.orchestrator || self.spawned) && !self.repos.is_empty())
+            .then(|| self.repos.iter().cloned().collect())
     }
 
     pub fn workspace_ref(&self) -> Option<String> {
@@ -714,15 +720,53 @@ mod tests {
         assert_eq!(l.repos_touched(), Some(vec!["github.com/acme/api".into()]));
     }
 
+    fn spawn(cwd: &str, project: Option<&str>) -> crate::model::RawEvent {
+        let mut e = event(cwd, project);
+        e.lineage.spawned = Some("local_00000000-0000-0000-0000-000000000000".into());
+        e
+    }
+
     #[test]
-    fn spawning_a_child_always_marks_an_orchestrator() {
-        let mut spawn = event("/Users/u/Workspace/app", Some("github.com/acme/app"));
-        spawn.lineage.spawned = Some("local_00000000-0000-0000-0000-000000000000".into());
-        let l = fold(&[
-            event(SCRATCH, None),
-            event("/Users/u/Workspace/app", Some("github.com/acme/app")),
-            spawn,
-        ]);
+    fn a_session_that_spawns_from_its_repo_keeps_the_repo() {
+        // Seen in prod: a worktree session that calls `start_session` was
+        // demoted to a repo-less orchestrator and lost its project.
+        let wt = "/Users/u/Workspace/app/.claude/worktrees/x";
+        let app = Some("github.com/acme/app");
+        let mut events = vec![event(wt, app), spawn(wt, app), event(wt, app)];
+        // It also reached into another repo by `gh -R` from its own cwd.
+        events.push(event(wt, Some("github.com/acme/api")));
+        let l = fold(&events);
+        assert!(!l.orchestrator);
+        assert_eq!(l.role(), None);
+        assert_eq!(l.workspace_ref(), None);
+        assert_eq!(
+            l.repo_canonical(Some("github.com/acme/app".into()))
+                .as_deref(),
+            Some("github.com/acme/app")
+        );
+        assert_eq!(
+            l.repos_touched(),
+            Some(vec![
+                "github.com/acme/api".into(),
+                "github.com/acme/app".into()
+            ])
+        );
+        // The spawn record arriving first does not change the verdict either.
+        assert!(!fold(&[spawn(wt, app), event(wt, app)]).orchestrator);
+    }
+
+    #[test]
+    fn spawning_from_scratch_or_from_no_repo_marks_an_orchestrator() {
+        assert!(fold(&[event(SCRATCH, None), spawn(SCRATCH, None)]).orchestrator);
+        let l = fold(&[spawn("/Users/u", None), event("/Users/u", None)]);
         assert!(l.orchestrator);
+        assert_eq!(l.repo_canonical(None), None);
+    }
+
+    #[test]
+    fn a_session_that_spawned_nothing_lists_no_repos() {
+        let app = Some("github.com/acme/app");
+        let l = fold(&[event("/Users/u/Workspace/app", app)]);
+        assert_eq!(l.repos_touched(), None);
     }
 }

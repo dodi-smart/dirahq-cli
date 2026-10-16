@@ -12,6 +12,7 @@ paths:
   - cli/core/src/runtime.rs
   - cli/core/src/httpclient.rs
   - cli/dira/src/device.rs
+  - cli/dira/src/json_splice.rs
 decisions: [D-0001, D-0009, D-0011, DIRASH-0029, DIRASH-0033, DIRASH-0037, DIRASH-0038]
 checks:
   - status: freshness/pin/per-harness judgment matches what apply would do :: cargo test -p dira --bin dira -- cloud_init::tests::status_
@@ -19,6 +20,7 @@ checks:
   - generated scripts substituted + POSIX + contracts :: cargo test -p dira --bin dira -- cloud_init::tests::generated_scripts_are_substituted_and_shell_sane
   - portable commands read as wired by the shared matcher :: cargo test -p dira --bin dira -- init::reader_tests::portable_wrapper_commands_read_as_wired
   - injection replaces absolute-path entries, converges :: cargo test -p dira --bin dira -- cloud_init::tests::nested_injection_replaces_absolute_path_entries_and_is_idempotent
+  - the merge keeps key order and untouched formatting, a re-run is byte-identical :: cargo test -p dira --bin dira -- json_splice:: cloud_init::tests::apply_keeps_a_biome_formatted_settings_file_as_written
   - end-to-end artifacts + idempotency + dry run + git-toplevel refusal + malformed-config refusal + gitignore warning :: cargo test -p dira --test cloud_init_e2e
   - digest pinning: no-pin skips the fetch, a good pin survives a failed re-fetch, a pin is never reused for a different version :: cargo test -p dira --bin dira -- cloud_init::tests::resolve_digests_no_pin_never_fetches_and_is_empty cloud_init::tests::resolve_digests_keeps_a_good_pin_on_a_failed_refetch cloud_init::tests::resolve_digests_does_not_reuse_a_pin_for_a_different_version cloud_init::tests::fetch_release_digests_embeds_both_targets_from_a_scripted_server
   - dira init over a cloud-wired project adds nothing at project scope, --global still writes :: cargo test -p dira --test cloud_init_e2e -- dira_init_over_a_cloud_init_repo_adds_nothing_and_global_still_writes
@@ -85,7 +87,14 @@ live wiring instead (DIRASH-0037).
   `.claude/settings.json` and `.cursor/hooks.json`. Machine-specific
   `dira init` entries for the same harness are REPLACED, not duplicated —
   a repo never carries both a broken and a portable form of the same hook.
-  Non-dira hook entries are never touched. Re-running is a fixpoint. Every
+  Non-dira hook entries are never touched. The merge splices the existing
+  file rather than re-serialising it (`json_splice`): keys keep their order,
+  everything outside a changed value keeps its bytes (a biome-inline
+  `"deny": ["…"]` stays inline), new keys are appended after an object's last
+  entry, and a re-rendered value keeps the original's key order and indent
+  unit. A minified or duplicate-key file falls back to a full render, still
+  in the original key order. Re-running is a fixpoint and leaves an
+  already-wired file byte-identical (nothing is written). Every
   write resolves the git work tree's toplevel first and writes there, never at
   `cwd`, so the command works the same run from any subdirectory; a
   non-`--print` invocation outside a git work tree refuses with an actionable
@@ -366,6 +375,8 @@ The CLI ships this claim variant dark until the cloud implements it:
   cargo test -p dira --bin dira -- init::reader_tests::portable_wrapper_commands_read_as_wired
 - injection replaces absolute-path entries, converges ::
   cargo test -p dira --bin dira -- cloud_init::tests::nested_injection_replaces_absolute_path_entries_and_is_idempotent
+- the merge keeps key order and untouched formatting, a re-run is byte-identical ::
+  cargo test -p dira --bin dira -- json_splice:: cloud_init::tests::apply_keeps_a_biome_formatted_settings_file_as_written
 - end-to-end artifacts + idempotency + dry run + git-toplevel refusal + malformed-config refusal + gitignore warning ::
   cargo test -p dira --test cloud_init_e2e
 - digest pinning: no-pin skips the fetch, a good pin survives a failed re-fetch, a pin is never reused for a different version ::

@@ -12,6 +12,7 @@ mod format;
 mod hook_health;
 mod hook_yield;
 mod init;
+mod json_splice;
 mod onboard;
 mod render;
 mod session_titles;

@@ -1,0 +1,5 @@
+{
+  "name": "dirahq",
+  "owner": { "name": "dodi-smart" },
+  "plugins": [{ "name": "dira", "source": "./mods/dira", "description": "dira, zavet and proba inside Claude Code" }]
+}

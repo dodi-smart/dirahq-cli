@@ -22,6 +22,7 @@ pub mod runs;
 pub mod runtime;
 pub mod signing;
 pub mod store;
+pub mod stored_at;
 pub mod sync;
 pub mod tokens;
 pub mod zavet;
@@ -76,8 +77,5 @@ impl From<sqlx::migrate::MigrateError> for Error {
 impl Error {
     pub(crate) fn time(e: time::error::Format) -> Self {
         Error::Time(e.to_string())
-    }
-    pub(crate) fn parse(e: time::error::Parse) -> Self {
-        Error::Parse(e.to_string())
     }
 }

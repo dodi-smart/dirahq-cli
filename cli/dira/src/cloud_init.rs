@@ -1631,6 +1631,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_keeps_a_biome_formatted_settings_file_as_written() {
+        // Non-alphabetical keys, a single-item array biome keeps inline, and
+        // a user hook whose entry lists `type` before `command`.
+        const USER: &str = r#"{
+  "permissions": {
+    "deny": ["Bash(supabase config push:*)"]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "./scripts/lint.sh" }]
+      }
+    ]
+  },
+  "env": { "Z_LAST": "1", "A_FIRST": "2" }
+}
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        std::fs::write(&claude, USER).unwrap();
+
+        apply_unpinned(dir.path()).await;
+        let text = std::fs::read_to_string(&claude).unwrap();
+        assert!(
+            text.starts_with(
+                "{\n  \"permissions\": {\n    \"deny\": [\"Bash(supabase config push:*)\"]\n  },\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"./scripts/lint.sh\"\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("  },\n  \"env\": { \"Z_LAST\": \"1\", \"A_FIRST\": \"2\" }\n}\n"),
+            "{text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2, "{text}");
+        assert!(status(dir.path(), all())
+            .harnesses
+            .iter()
+            .all(|h| h.current()));
+
+        // A re-run is a byte-identical no-op.
+        let before = snapshot(dir.path());
+        let again = apply_unpinned(dir.path()).await;
+        assert!(again.wired.iter().all(|w| w.events_added == 0));
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[tokio::test]
     async fn status_reports_a_partially_wired_harness_config() {
         let dir = tempfile::tempdir().unwrap();
         apply_unpinned(dir.path()).await;

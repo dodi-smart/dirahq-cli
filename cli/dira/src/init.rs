@@ -768,7 +768,9 @@ fn claude_user_settings_path_from(config_dir: Option<&str>, home: &Path) -> Path
 }
 
 /// Load a JSON settings file (or start empty), let `inject` merge our hooks in,
-/// then either print or write it back — preserving existing keys. Shared by the
+/// then either print or write it back — preserving existing keys, their order
+/// and the formatting of everything the merge left untouched (see
+/// [`crate::json_splice`]); an unchanged file is not rewritten. Shared by the
 /// harnesses whose config is JSON (Claude, Gemini, Cursor).
 ///
 /// `inject` returns how many events it newly added, which is what lets a
@@ -782,10 +784,16 @@ pub(crate) fn apply_json_settings(
     command: &str,
     inject: impl FnOnce(&mut Value) -> usize,
 ) -> Result<Wired> {
+    // The original text and its parse, kept so an unchanged file is left
+    // byte-identical and a changed one is spliced rather than re-serialised.
+    let mut original: Option<(String, Value)> = None;
     let mut settings: Value = if path.exists() {
         let text = std::fs::read_to_string(&path)?;
-        match serde_json::from_str(&text) {
-            Ok(v) => v,
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) => {
+                original = Some((text, v.clone()));
+                v
+            }
             Err(e) => match on_unparseable {
                 OnUnparseable::Overwrite => json!({}),
                 OnUnparseable::Refuse => bail!(
@@ -801,8 +809,19 @@ pub(crate) fn apply_json_settings(
 
     let events_added = inject(&mut settings);
 
+    // `None` = nothing changed, so nothing is written.
+    let rendered = match &original {
+        Some((_, old)) if *old == settings => None,
+        Some((text, old)) => Some(crate::json_splice::merge(text, old, &settings)),
+        None => Some(serde_json::to_string_pretty(&settings)? + "\n"),
+    };
+
     if print_only {
-        println!("{}", serde_json::to_string_pretty(&settings)?);
+        let shown = rendered
+            .as_deref()
+            .or(original.as_ref().map(|(text, _)| text.as_str()))
+            .unwrap_or_default();
+        println!("{}", shown.trim_end());
         return Ok(Wired {
             label,
             kind: Kind::Hooks,
@@ -813,10 +832,12 @@ pub(crate) fn apply_json_settings(
         });
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(rendered) = rendered {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, rendered)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
     Ok(Wired {
         label,
         kind: Kind::Hooks,

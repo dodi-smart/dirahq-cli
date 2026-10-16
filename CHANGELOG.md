@@ -1,3 +1,20 @@
+## [0.9.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.8.0...v0.9.0) (2026-10-16)
+
+### ✨ Features
+
+* **cli:** attribute and group Claude Desktop orchestration sessions ([fc1bdbd](https://github.com/dodi-smart/dirahq-cli/commit/fc1bdbdde4679eff09cb33d81a87abc0db1b6ac0))
+* **cli:** track framework rule sources from the zavet plugin (local metadata) ([30dd5fe](https://github.com/dodi-smart/dirahq-cli/commit/30dd5fead669bf330a8c2c6a657019756c80c78e))
+
+### 🐛 Bug Fixes
+
+* **cli:** group orchestration runs in dira watch and status lanes ([1366ccc](https://github.com/dodi-smart/dirahq-cli/commit/1366ccc96da0d37f953f06f7fe7d9db5af8efb95))
+* **cli:** keep a spawned child that leaves the scratch dir an ordinary session ([2073646](https://github.com/dodi-smart/dirahq-cli/commit/20736461dc14c4423786c1aac958dc1145544927))
+* **cli:** refresh model pricing from models.dev ([8aebd34](https://github.com/dodi-smart/dirahq-cli/commit/8aebd34fccf1ed1e531bb5493862e280145f5e14))
+
+### 📚 Documentation
+
+* **cli:** record the orchestration sessions decision and spec ([93495fc](https://github.com/dodi-smart/dirahq-cli/commit/93495fc5268f7b35333e107ba94691ae15ecc932))
+
 ## [0.8.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.7.0...v0.8.0) (2026-10-12)
 
 ### ✨ Features

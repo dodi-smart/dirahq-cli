@@ -1,3 +1,18 @@
+## [0.10.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.9.0...v0.10.0) (2026-10-16)
+
+### ✨ Features
+
+* **contract:** make session role, repos and workspaceRef authoritative from 1.7 ([bd497a6](https://github.com/dodi-smart/dirahq-cli/commit/bd497a68a9ca17a3682a9e7d671822f2b5da7228)), references [dodi-smart/dirahq-cloud#251](https://github.com/dodi-smart/dirahq-cloud/issues/251)
+
+### 🐛 Bug Fixes
+
+* **cli:** keep key order and formatting when merging hooks into existing settings ([f18cce1](https://github.com/dodi-smart/dirahq-cli/commit/f18cce1b7a53784c2a9402381b0b34ec063670aa))
+* **cli:** keep the repo of a session that spawns children from it ([3306e5e](https://github.com/dodi-smart/dirahq-cli/commit/3306e5e59ceb0ed490221ee29742330caf6deb80)), closes [#178](https://github.com/dodi-smart/dirahq-cli/issues/178)
+
+### ✅ Tests
+
+* **daemon:** order orchestration test events by instant, not store text order ([#188](https://github.com/dodi-smart/dirahq-cli/issues/188)) ([e3b19cc](https://github.com/dodi-smart/dirahq-cli/commit/e3b19cc29a37236d484ec0bc7b3f407954b4d03e))
+
 ## [0.9.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.8.0...v0.9.0) (2026-10-16)
 
 ### ✨ Features

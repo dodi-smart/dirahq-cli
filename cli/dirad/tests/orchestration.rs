@@ -77,11 +77,15 @@ async fn start() -> (AppState, tokio::task::JoinHandle<()>) {
     (state, writer)
 }
 
-/// Every stored event, once the async writer has stored all `n` of them.
+/// Every stored event in timestamp order, once the async writer has stored all
+/// `n` of them. `events_since` orders by `at` as RFC3339 text, whose trimmed
+/// fractions mis-sort events within one second, so sort by the parsed time
+/// before a test indexes into it.
 async fn wait_events(state: &AppState, n: usize) -> Vec<RawEvent> {
     let mut events = Vec::new();
     for _ in 0..200 {
         events = state.store.events_since(None).await.unwrap();
+        events.sort_by_key(|e| e.at);
         if events.len() >= n {
             break;
         }

@@ -99,6 +99,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0039 — dira consumes source-backed specs only through the installed plugin's `zavet specs --json`, never the repo's vendored zavet (active)
 - DIRASH-0040 — Framework rule sources are local metadata read through the plugin's `spec-sources --json`, never text, never synced (active)
 - DIRASH-0041 — Orchestration sessions keep repo-less time in their own bucket and take repos only from local tool evidence (active)
+- DIRASH-0042 — A session that spawns from its own repo keeps the repo, and 1.7 rollups can retract a verdict (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

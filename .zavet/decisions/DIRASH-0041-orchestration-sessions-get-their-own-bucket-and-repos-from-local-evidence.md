@@ -13,6 +13,7 @@ checks:
   - several repos in one command yield no evidence :: cargo test -p dira-core --lib orchestration::tests::several_distinct_repos_in_one_command_are_ambiguous
   - orchestrator attribution and links end to end :: cargo test -p dirad --test orchestration
   - repo-less orchestrator time is its own report line :: cargo test -p dira-core --lib report::tests::orchestrator_repo_less_time_is_its_own_line_not_unresolved
+corrected-by: DIRASH-0042
 origin: recorded
 verified: true
 ---

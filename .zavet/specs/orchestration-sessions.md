@@ -1,10 +1,10 @@
 ---
 title: Orchestration sessions and runs
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: high
-date: 2026-10-15
+date: 2026-10-16
 paths:
   - cli/core/src/orchestration.rs
   - cli/core/src/runs.rs
@@ -13,7 +13,7 @@ paths:
   - cli/sources/src/claude_code.rs
   - cli/dirad/src/writer.rs
   - cli/dira/src/session_titles.rs
-decisions: [D-0001, DIRASH-0027, DIRASH-0041]
+decisions: [D-0001, DIRASH-0027, DIRASH-0041, DIRASH-0042]
 ---
 
 ## Overview
@@ -26,10 +26,13 @@ links their children, and shows the whole thing as one run.
 
 ## Behavior
 
-- A session is an orchestrator when it spawned a child, or when an event's cwd
-  sits in a scratch workspace and is not itself a repo, unless the session
-  also resolved a repo from a cwd outside every scratch workspace. A clone
-  inside the workspace (`scratch-…/repos/x`) does not cancel the role.
+- A session is an orchestrator when it spawned a child or an event's cwd sits
+  in a scratch workspace and is not itself a repo, unless the session also
+  resolved a repo from a cwd outside every scratch workspace. A clone inside
+  the workspace (`scratch-…/repos/x`) does not cancel the role.
+- A session that spawns from its own repo is a spawner (DIRASH-0042). It keeps
+  its sticky project and `repoCanonical`, has no role, and lists the repos it
+  touched in `repos`. It heads a run because its children name it as parent.
 - A spawned child often runs its first events in the parent's scratch dir, then
   moves to its own worktree of a real repo. It is an ordinary session: it keeps
   its sticky project and its rollup's `repoCanonical`. Its scratch events still
@@ -48,6 +51,7 @@ links their children, and shows the whole thing as one run.
   from the event whose `spawned` holds its host id. Spawn records are exempt
   from coalescing, since they carry the only copy of the link.
 - An orchestrator never gets a sticky project. Its repos are listed instead.
+  A spawner keeps its project and also lists its repos.
 - Reports show an `orchestration` line for an orchestrator's repo-less time,
   separate from `(unresolved)`. The split never changes a total.
 - `dira sessions` groups runs into a tree. A run over at most one repo is
@@ -62,6 +66,11 @@ links their children, and shows the whole thing as one run.
   defaulted so an older daemon degrades to the flat view.
 - Contract 1.6 `SessionRollup` gains `role`, `parentSession`, `repos` and
   `workspaceRef`. See attestation-sync.
+- From contract 1.7, `role`, `repos` and `workspaceRef` are authoritative on
+  every rollup. An absent field retracts what an earlier rollup sent, so a
+  child whose scratch preamble read as an orchestrator heals in the cloud.
+- A run's repos are every member's `project` plus `repos`. Only an
+  orchestrator's repos can be `direct`.
 - `runs::group` is the CLI lens. The cloud's `assembleRuns` follows the same
   rules and heads a run with the one cloud project covering all its repos.
 

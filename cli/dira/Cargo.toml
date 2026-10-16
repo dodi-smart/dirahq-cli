@@ -46,7 +46,7 @@ dunce.workspace = true
 # not something `dira update` can assume. Deflate-only keeps the compile cost
 # bounded; the updater only reads archives our own release workflow produced.
 [target.'cfg(windows)'.dependencies]
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # `client::classify` matches ERROR_PIPE_BUSY by raw code so a busy pipe is never
 # reported as a dead daemon. Feature flag only; already a workspace dependency.
 # `Win32_System_Console` is what enables ANSI escapes on legacy conhost and

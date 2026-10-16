@@ -140,6 +140,12 @@ async fn an_orchestrator_attributes_per_tool_call_and_links_its_children() {
         tokio::time::sleep(StdDuration::from_millis(20)).await;
     }
     assert_eq!(events.len(), 8, "every hook stored: {events:#?}");
+    // Hook order, from the parsed instants. The store's `ORDER BY at` compares
+    // RFC3339 text, which `time` writes with trailing zeros trimmed, so
+    // `…25.56781Z` sorts after `…25.567816Z`. Hooks microseconds apart come
+    // back swapped about one run in five, and the ULID ids are random within a
+    // millisecond, so neither can stand in for ingest order here.
+    events.sort_by_key(|e| e.at);
 
     // Per-event attribution: the prompt stays repo-less (the orchestration
     // bucket); each tool call lands on the repo it named.

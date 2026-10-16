@@ -88,6 +88,12 @@ async fn wait_events(state: &AppState, n: usize) -> Vec<RawEvent> {
         tokio::time::sleep(StdDuration::from_millis(20)).await;
     }
     assert_eq!(events.len(), n, "every hook stored: {events:#?}");
+    // Hook order, from the parsed instants. The store's `ORDER BY at` compares
+    // RFC3339 text, which `time` writes with trailing zeros trimmed, so
+    // `…25.56781Z` sorts after `…25.567816Z`. Hooks microseconds apart come
+    // back swapped about one run in five, and the ULID ids are random within a
+    // millisecond, so neither can stand in for ingest order here.
+    events.sort_by_key(|e| e.at);
     events
 }
 

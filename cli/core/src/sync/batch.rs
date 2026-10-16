@@ -238,11 +238,12 @@ fn assemble_batch(
         if p.active_seconds == 0 || ended_ids.contains(&p.session_id) {
             continue;
         }
+        let wire = p.lineage.wire(p.repo_canonical.clone());
         sessions.push(SessionRollup {
             session_id: p.session_id.clone(),
             harness: p.harness,
             kind: p.kind,
-            repo_canonical: p.lineage.repo_canonical(p.repo_canonical.clone()),
+            repo_canonical: wire.repo_canonical,
             identity_email: p.identity_email.clone().unwrap_or_default(),
             started_at: fmt(p.started_at),
             // The defining mark of a partial rollup: the session is still open.
@@ -257,10 +258,10 @@ fn assemble_batch(
             // environment, not of the stored events) — see dirad's sync loop.
             runtime: None,
             runtime_session_ref: None,
-            role: p.lineage.role(),
-            parent_session: p.lineage.parent_session.clone(),
-            repos: p.lineage.repos_touched(),
-            workspace_ref: p.lineage.workspace_ref(),
+            role: wire.role,
+            parent_session: wire.parent_session,
+            repos: wire.repos,
+            workspace_ref: wire.workspace_ref,
         });
     }
 
@@ -811,11 +812,12 @@ fn build_sessions(
                     .max_by(|(an, ac), (bn, bc)| ac.cmp(bc).then(bn.cmp(an)))
                     .map(|(name, _)| name.clone())
             });
+            let wire = a.lineage.wire(a.project);
             SessionRollup {
                 session_id: id.to_string(),
                 harness: a.harness,
                 kind: a.kind,
-                repo_canonical: a.lineage.repo_canonical(a.project),
+                repo_canonical: wire.repo_canonical,
                 identity_email: a.email.unwrap_or_default(),
                 started_at: fmt(a.first),
                 ended_at: a.ended_at.map(fmt),
@@ -829,10 +831,10 @@ fn build_sessions(
                 // environment, not of the stored events) — see dirad's sync loop.
                 runtime: None,
                 runtime_session_ref: None,
-                role: a.lineage.role(),
-                parent_session: a.lineage.parent_session.clone(),
-                repos: a.lineage.repos_touched(),
-                workspace_ref: a.lineage.workspace_ref(),
+                role: wire.role,
+                parent_session: wire.parent_session,
+                repos: wire.repos,
+                workspace_ref: wire.workspace_ref,
             }
         })
         .collect()

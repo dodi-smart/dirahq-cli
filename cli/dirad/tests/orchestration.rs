@@ -399,3 +399,105 @@ async fn a_worktree_session_that_spawns_a_child_keeps_its_repo() {
     assert_eq!(p.workspace_ref, None);
     writer.abort();
 }
+
+/// One acked flush's worth of partial rollups: what the next sync would ship,
+/// rolled onto the wire, with its watermarks pinned as an ack pins them.
+fn flush_partials(state: &AppState) -> Vec<SessionRollup> {
+    let now = time::OffsetDateTime::now_utc();
+    let partials = dirad::sync::partial_rollups(state, now);
+    dirad::control::lock_recover(&state.sessions).mark_partials_sent(&partials);
+    dira_core::sync::build_batch_with_partials(
+        &[],
+        &[],
+        &[],
+        &partials,
+        "dev",
+        time::Duration::minutes(5),
+        Default::default(),
+        now,
+    )
+    .sessions
+}
+
+/// Issue #179: a session gets its sessions row on first sight, not an hour in,
+/// and a lineage change re-ships it at once. Here a child's scratch preamble
+/// first reads as an orchestrator; moving to its own worktree flips the verdict
+/// and the very next flush retracts it (the cloud honours that from 1.7).
+#[tokio::test]
+async fn a_young_session_ships_a_partial_on_first_sight_and_on_a_verdict_flip() {
+    let (state, writer) = start().await;
+    assert!(
+        state.config.partial_rollup_after() > time::Duration::seconds(60),
+        "the age threshold must not be what ships these partials"
+    );
+    let (tmp, scratch, _clone) = scratch_with_clone();
+    let cwd = scratch.display().to_string();
+    let wt_cwd = git_repo(
+        &tmp.path().join("Workspace/app/.claude/worktrees/x"),
+        "acme/app",
+    );
+
+    hook(
+        &state,
+        json!({ "hook_event_name": "PostToolUse", "session_id": "orch",
+        "cwd": cwd, "dira_env": env(ORCH_HOST),
+        "tool_name": "mcp__ccd_session__start_session",
+        "tool_input": { "title": "fix app" },
+        "tool_response": format!("Session started: {KID_HOST}") }),
+    )
+    .await;
+    hook(
+        &state,
+        json!({ "hook_event_name": "UserPromptSubmit", "session_id": "kid",
+        "cwd": cwd, "dira_env": env(KID_HOST) }),
+    )
+    .await;
+    // Ingress stamps events with the wall clock: wait so the preamble has
+    // whole seconds of activity (a partial with none is never shipped).
+    tokio::time::sleep(StdDuration::from_millis(1100)).await;
+    hook(
+        &state,
+        json!({ "hook_event_name": "PreToolUse", "session_id": "kid",
+        "cwd": cwd, "dira_env": env(KID_HOST), "tool_name": "Read",
+        "tool_input": { "file_path": "notes.md" } }),
+    )
+    .await;
+    wait_events(&state, 3).await;
+
+    // First sight: a partial, seconds old, carrying the preamble's verdict.
+    let first = flush_partials(&state);
+    let kid: Vec<_> = first.iter().filter(|s| s.session_id == "kid").collect();
+    assert_eq!(kid.len(), 1, "first sight ships one partial: {first:#?}");
+    assert_eq!(kid[0].ended_at, None);
+    assert_eq!(kid[0].role, Some(SessionRole::Orchestrator));
+    assert_eq!(kid[0].parent_session.as_deref(), Some("orch"));
+    assert!(
+        flush_partials(&state).is_empty(),
+        "nothing re-ships while the lineage holds still"
+    );
+
+    // The child moves to its own worktree: the verdict flips.
+    hook(
+        &state,
+        json!({ "hook_event_name": "PreToolUse", "session_id": "kid",
+        "cwd": wt_cwd, "dira_env": env(KID_HOST), "tool_name": "Read",
+        "tool_input": { "file_path": "README.md" } }),
+    )
+    .await;
+    wait_events(&state, 4).await;
+    let flip = flush_partials(&state);
+    assert_eq!(flip.len(), 1, "the flip ships one partial: {flip:#?}");
+    assert_eq!(flip[0].session_id, "kid");
+    assert_eq!(
+        flip[0].role, None,
+        "the stale orchestrator verdict is retracted"
+    );
+    assert_eq!(
+        flip[0].repo_canonical.as_deref(),
+        Some("github.com/acme/app")
+    );
+    assert_eq!(flip[0].parent_session.as_deref(), Some("orch"));
+    assert!(flush_partials(&state).is_empty(), "the flip ships once");
+
+    writer.abort();
+}

@@ -1219,10 +1219,11 @@ mod tests {
             last_human_signal_at: None,
             last_active_at: None,
             last_opens_span: false,
-            last_partial_active_seconds: None,
+            last_partial: None,
             prompts: 0,
             branch: None,
             lineage: Default::default(),
+            wire: Default::default(),
         }
     }
 

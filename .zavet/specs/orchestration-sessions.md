@@ -1,6 +1,6 @@
 ---
 title: Orchestration sessions and runs
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
@@ -13,6 +13,7 @@ paths:
   - cli/sources/src/claude_code.rs
   - cli/dirad/src/writer.rs
   - cli/dira/src/session_titles.rs
+  - cli/dirad/src/state.rs
 decisions: [D-0001, DIRASH-0027, DIRASH-0041, DIRASH-0042]
 ---
 
@@ -40,7 +41,11 @@ links their children, and shows the whole thing as one run.
 - `SessionLineage` folds the verdict from flags that only ever turn on, so the
   rollup, the live registry and reports agree whatever the event order. While a
   child's scratch preamble is all the registry has seen, it reads as an
-  orchestrator; the first event in its worktree flips it for good.
+  orchestrator; the first event in its worktree flips it for good. Any change
+  to what the rollup would carry (role, parent, repos, workspace, repo) ships
+  a partial rollup on the next flush (see attestation-sync), so the cloud's live view follows
+  the flip. That early partial is only safe from contract 1.7, where the
+  later rollup's absent `role` retracts the preamble's.
 - The writer resolves an event's repo from the cwd first. When the cwd names no
   repo, it uses the tool input's evidence: a `cd` chain, `git -C`, `gh -R`,
   `gh api repos/…`, or an `Edit`/`Write`/`Read` path. Evidence naming two

@@ -279,7 +279,7 @@
       "description": "What a session does relative to other sessions. Absent for an ordinary\nsession; only roles that change how the cloud groups work are named.",
       "oneOf": [
         {
-          "description": "A coordinating session (Claude Desktop's scratch-workspace sessions, or\nany session that spawned others). Its repo-less time is the\n\"orchestration\" bucket — never guessed onto a repo.",
+          "description": "A coordinating session with no repo of its own: Claude Desktop's\nscratch-workspace sessions, or a session that spawned others without\never working from a repo. Its repo-less time is the \"orchestration\"\nbucket — never guessed onto a repo. A session that spawns others from\nits own repo is not one: it keeps its `repoCanonical` and heads a run\nonly because its children name it as their parent.",
           "type": "string",
           "const": "orchestrator"
         }
@@ -354,7 +354,7 @@
           ]
         },
         "repos": {
-          "description": "Canonical repo refs this session demonstrably touched, sorted and\ncapped. Set for orchestrators, whose `repoCanonical` stays absent\nbecause no single repo describes them.\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.",
+          "description": "Canonical repo refs this session demonstrably touched, sorted and\ncapped. Set for orchestrators, whose `repoCanonical` stays absent\nbecause no single repo describes them, and (from 1.7) for a session\nthat spawned others from its own repo, which also keeps its\n`repoCanonical`.\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.",
           "type": [
             "array",
             "null"
@@ -364,7 +364,7 @@
           }
         },
         "role": {
-          "description": "Set for an orchestrating session (see [`SessionRole`]).\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.",
+          "description": "Set for an orchestrating session (see [`SessionRole`]).\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.\n\nFrom 1.7, `role`, `repos` and `workspaceRef` are authoritative on every\nrollup: absent means \"not set\", so a newer rollup that omits one\nretracts the value an earlier one sent (a child whose scratch-dir\npreamble read as an orchestrator). Before 1.7, absent meant \"unknown\".",
           "anyOf": [
             {
               "$ref": "#/$defs/SessionRole"

@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.6.0";
+pub const SCHEMA_VERSION: &str = "1.7.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -87,9 +87,12 @@ pub enum SessionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRole {
-    /// A coordinating session (Claude Desktop's scratch-workspace sessions, or
-    /// any session that spawned others). Its repo-less time is the
-    /// "orchestration" bucket — never guessed onto a repo.
+    /// A coordinating session with no repo of its own: Claude Desktop's
+    /// scratch-workspace sessions, or a session that spawned others without
+    /// ever working from a repo. Its repo-less time is the "orchestration"
+    /// bucket — never guessed onto a repo. A session that spawns others from
+    /// its own repo is not one: it keeps its `repoCanonical` and heads a run
+    /// only because its children name it as their parent.
     Orchestrator,
 }
 
@@ -195,6 +198,11 @@ pub struct SessionRollup {
     pub spec: Option<String>,
     /// Set for an orchestrating session (see [`SessionRole`]).
     /// Optional + omitted-when-absent so pre-1.6 payloads stay byte-identical.
+    ///
+    /// From 1.7, `role`, `repos` and `workspaceRef` are authoritative on every
+    /// rollup: absent means "not set", so a newer rollup that omits one
+    /// retracts the value an earlier one sent (a child whose scratch-dir
+    /// preamble read as an orchestrator). Before 1.7, absent meant "unknown".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<SessionRole>,
     /// Harness session id of the orchestrator that spawned this session, when
@@ -204,7 +212,9 @@ pub struct SessionRollup {
     pub parent_session: Option<String>,
     /// Canonical repo refs this session demonstrably touched, sorted and
     /// capped. Set for orchestrators, whose `repoCanonical` stays absent
-    /// because no single repo describes them.
+    /// because no single repo describes them, and (from 1.7) for a session
+    /// that spawned others from its own repo, which also keeps its
+    /// `repoCanonical`.
     /// Optional + omitted-when-absent so pre-1.6 payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repos: Option<Vec<String>>,

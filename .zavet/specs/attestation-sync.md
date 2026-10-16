@@ -1,10 +1,10 @@
 ---
 title: Attestation sync and session rollups
-version: 6
+version: 7
 origin: session
 verified: false
 confidence: high
-date: 2026-10-15
+date: 2026-10-16
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
@@ -103,6 +103,16 @@ single flush window (issue #40).
   whose write supersedes the partial anyway). The registry is a pure
   reduction over events, so daemon-restart hydration replays it back for
   free.
+- A non-ended session with active time ships a partial whenever its lineage
+  fingerprint differs from the last one sent, whatever its age (issue #179).
+  The fingerprint is the orchestrator verdict, spawned-a-child, the parent
+  link, the `repos` set and the project. First sight counts as a change, so
+  the cloud has a sessions row within a flush instead of an hour later.
+  Re-sends for growth alone still wait for `partial_rollup_after` and need
+  new `active_seconds`. `partial_rollup_after = 0` still disables partials.
+- An acked partial pins the watermarks from the snapshot it was built from
+  (`PartialMark`), not from the registry at ack time, so a change that lands
+  mid-flush ships on the next one.
 
 ## Interfaces & data
 

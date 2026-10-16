@@ -771,8 +771,7 @@ async fn flush(
     //    Phase 6c: partial rollups for long-running un-ended sessions come from the
     //    live registry; their watermark is advanced only after the final chunk acks.
     let now = time::OffsetDateTime::now_utc();
-    let partials = partial_rollups(state, now);
-    let partial_ids: Vec<String> = partials.iter().map(|p| p.session_id.clone()).collect();
+    let (partials, partial_marks) = partial_rollups(state, now);
     let idle = state.config.idle();
     let agent_policy = state.config.agent_policy();
     // Seed the first chunk's interval build with the already-synced human signals that
@@ -987,9 +986,9 @@ async fn flush(
                 }
                 // Partial rollups are a live-registry snapshot, not a cursor over
                 // stored rows, so they stay on the final chunk. See D-0020.
-                if is_last && !partial_ids.is_empty() {
+                if is_last && !partial_marks.is_empty() {
                     if let Ok(mut reg) = state.sessions.lock() {
-                        reg.mark_partials_sent(&partial_ids);
+                        reg.mark_partials_sent(&partial_marks);
                     }
                 }
             }
@@ -1058,7 +1057,7 @@ async fn flush(
         // one shipping a thousand, which is why a 97% compute loss produced no
         // warning, no counter and no log line for weeks.
         tokens = token_rows.len(),
-        partial_rollups = partial_ids.len(),
+        partial_rollups = partial_marks.len(),
         chunks = chunk_count,
         intervals = total_intervals,
         sessions = total_sessions,
@@ -1188,23 +1187,29 @@ pub(crate) async fn note_data_epoch(state: &AppState, epoch: &str) -> Result<boo
     }
 }
 
-/// Gather partial-rollup descriptors for long-running un-ended sessions from the
-/// live registry (Phase 6c). Holds the registry lock only to snapshot — no await
-/// inside. Returns empty when partial rollups are disabled (`partial_rollup_after
-/// = 0`) or the lock is poisoned.
-fn partial_rollups(
+/// Gather partial-rollup descriptors for un-ended sessions from the live
+/// registry (Phase 6c): new or lineage-changed ones at once, long-running ones
+/// as they grow (issue #179). Returns the marks to pin once the batch is acked
+/// alongside. Holds the registry lock only to snapshot — no await inside.
+/// Returns empty when partial rollups are disabled (`partial_rollup_after = 0`)
+/// or the lock is poisoned.
+pub fn partial_rollups(
     state: &AppState,
     now: time::OffsetDateTime,
-) -> Vec<dira_core::sync::PartialSession> {
+) -> (
+    Vec<dira_core::sync::PartialSession>,
+    Vec<crate::state::PartialMark>,
+) {
     let older_than = state.config.partial_rollup_after();
     if older_than <= time::Duration::ZERO {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let candidates = match state.sessions.lock() {
         Ok(reg) => reg.partial_rollup_candidates(now, older_than),
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), Vec::new()),
     };
-    candidates
+    let marks = candidates.iter().map(|s| s.partial_mark()).collect();
+    let partials = candidates
         .into_iter()
         .map(|s| dira_core::sync::PartialSession {
             session_id: s.session_id,
@@ -1225,7 +1230,8 @@ fn partial_rollups(
             spec: s.spec,
             lineage: s.lineage,
         })
-        .collect()
+        .collect();
+    (partials, marks)
 }
 
 /// Render an optional cloud-reported count for a log line: the number when the

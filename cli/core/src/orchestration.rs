@@ -161,6 +161,11 @@ impl SessionLineage {
         }
     }
 
+    /// Did any event of this session spawn a child session?
+    pub fn spawned(&self) -> bool {
+        self.spawned
+    }
+
     pub fn role(&self) -> Option<dira_contract::SessionRole> {
         self.orchestrator
             .then_some(dira_contract::SessionRole::Orchestrator)

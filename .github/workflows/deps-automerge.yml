@@ -1,0 +1,45 @@
+# Thin caller, copy to <repo>/.github/workflows/deps-automerge.yml
+#
+# Part of the standard once a repo has deps-verify and extends the shared Renovate
+# preset; fleet sync adds it then.
+# Merges a Renovate or Dependabot minor, patch or lock file maintenance PR once
+# deps-verify labelled it `deps:verified` (or `deps:fixed` and pr-review
+# approved), and the required check is green. Majors always wait for a person.
+# The rules live in the shared merge gate, not here. The org variable
+# DEPS_AUTOMERGE='false' stops every merge.
+#
+# Each event below can complete the evidence. A run decides once and exits, so
+# nothing holds a runner while it waits:
+#   pull_request labeled   deps-verify set its verdict label
+#   status                 pr-review posted `review / verdict`
+#   workflow_run           PR Checks finished
+# The shared workflow's own `if:` drops every other case before a runner is
+# booked, so there is no pre-filter here. The repo must extend the shared
+# Renovate preset, which adds the deps:minor / deps:patch / deps:lockfile
+# labels the gate reads.
+name: Dependency Automerge
+on:
+  pull_request:
+    types: [labeled]
+  status:
+  # `workflows:` must match the PR Checks caller's `name:`; `branches:` keeps
+  # human PRs from creating runs at all.
+  workflow_run:
+    workflows: [PR Checks]
+    types: [completed]
+    branches: ['renovate/**', 'dependabot/**']
+jobs:
+  merge:
+    uses: dodi-smart/.github/.github/workflows/deps-automerge.yml@v1
+    secrets: inherit
+    # The union of what the called workflow's jobs request. A caller has to grant
+    # every one of them or the run fails at startup; add to this block when the
+    # shared workflow adds a permission. The merge itself uses the org App token.
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    # Set only when the required check is not the pr-checks summary job.
+    # with:
+    #   required-check: "checks / PR Checks"

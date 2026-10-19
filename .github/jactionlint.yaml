@@ -1,0 +1,139 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/jdx/jactionlint/main/schema/jactionlint-config.json
+#
+# Config for jactionlint, the workflow linter that hk runs for correctness and
+# security in one pass. Copy to <repo>/.github/jactionlint.yaml, where
+# jactionlint finds it on its own.
+profile: default
+
+rules:
+  # Actions are pinned by a readable tag (`@v7`, and `@v1` for the shared
+  # workflows), not a commit SHA, on purpose. The shared Renovate preset sets
+  # `pinDigests: false` and holds a bump back for a release-age delay instead, so
+  # a SHA pin would only make every update unreadable. Allow a ref pin everywhere,
+  # or the linter reports every `uses:` in the repo. A bare `uses: owner/repo`
+  # with no ref still fails.
+  unpinned-uses:
+    policies:
+      "*": ref-pin
+
+# Capability labels the shared runner picker hands out. A job that gets its
+# runner through `fromJson(...)` is not checked, but a literal `runs-on:` must
+# use one of these or the hosted labels.
+self-hosted-runner:
+  labels: [light, large, gpu]
+
+# The org's caller templates pass `secrets: inherit` to the shared workflows,
+# which this org owns and reviews. Each entry matches one caller file and only
+# its calls into the shared workflows, so a new workflow that inherits, or a
+# caller that inherits into anything else, still fails.
+#
+# Ignores for this repo's own workflows go at the end of this list. Fleet sync
+# keeps them and re-renders everything else, so `ignores` stays the last key.
+ignores:
+  - rule: secrets-inherit
+    file: .github/workflows/agents.yml
+    uses: dodi-smart/.github/*
+    reason: the agent callers pass the org App and Claude secrets to the shared agent workflows
+  - rule: secrets-inherit
+    file: .github/workflows/deps-automerge.yml
+    uses: dodi-smart/.github/*
+    reason: the shared merge gate needs the org App secrets to merge
+  - rule: secrets-inherit
+    file: .github/workflows/deps-verify.yml
+    uses: dodi-smart/.github/*
+    reason: the shared dependency verifier needs the secrets the repo's own build needs
+  - rule: secrets-inherit
+    file: .github/workflows/pr-checks.yml
+    uses: dodi-smart/.github/*
+    reason: the shared checks run the repo's own build, which needs the repo's own secrets
+  - rule: secrets-inherit
+    file: .github/workflows/pr-iterate.yml
+    uses: dodi-smart/.github/*
+    reason: the shared fix loop needs the Claude token and the org App secrets
+  - rule: secrets-inherit
+    file: .github/workflows/pr-review.yml
+    uses: dodi-smart/.github/*
+    reason: the shared review workflow needs the org App and Claude secrets
+  - rule: secrets-inherit
+    file: .github/workflows/release.yml
+    uses: dodi-smart/.github/*
+    reason: the shared release workflow needs the org App secrets to push past the rulesets
+  # The standalone zavet caller, for a repo that has no pr-checks.yml.
+  - rule: secrets-inherit
+    file: .github/workflows/zavet-check.yml
+    uses: dodi-smart/.github/*
+    reason: the standalone zavet caller passes the repo's secrets to the shared zavet check
+
+  # Each shared agent, review and verification workflow sets its own top-level
+  # `concurrency:`, because only it knows whether a run is safe to cancel (an
+  # implement run may already have pushed a branch). The linter cannot see that
+  # offline, and a second group in the caller would cancel runs the called
+  # workflow means to queue. pr-checks.yml and release.yml set theirs here.
+  - rule: concurrency-limits
+    file: .github/workflows/{agents,deps-automerge,deps-verify,pr-iterate,pr-review,zavet-check}.yml
+    reason: the called shared workflow sets its own concurrency
+  # Comments are how people ask the agents for something, so `issue_comment` is
+  # the point of this caller. The shared workflows check `agent:no-touch` before
+  # anything else, never check out a pull request's code on a comment, and the
+  # agent step runs only for a commenter with write access.
+  - rule: dangerous-triggers
+    file: .github/workflows/agents.yml
+    reason: comments are how agents are asked; the shared workflows gate the commenter
+  # deps-verify.yml resumes on PR Checks completing. The trigger is filtered to
+  # dependency branches, its `if:` keeps only pull_request runs, and the shared
+  # workflow gates again on the resolved pull request.
+  - rule: dangerous-triggers
+    file: .github/workflows/deps-verify.yml
+    reason: workflow_run on PR Checks, filtered by the caller and the shared gate
+  # deps-automerge.yml decides on PR Checks completing. The trigger is filtered
+  # to dependency branches, and the shared workflow's `if:` and merge gate
+  # check the pull request again; it never checks out the pull request's code.
+  - rule: dangerous-triggers
+    file: .github/workflows/deps-automerge.yml
+    reason: workflow_run on PR Checks, filtered by the caller and the shared merge gate
+  # pr-iterate.yml moves its loop on PR Checks completing. The shared workflow's
+  # `if:` keeps only runs a bot started on a pull request, and its gate ties the
+  # event to an `agent:iterate` PR on its current head before any agent step.
+  - rule: dangerous-triggers
+    file: .github/workflows/pr-iterate.yml
+    reason: workflow_run on PR Checks, gated by the shared workflow before any agent step
+
+  # --- this repo's own workflows -------------------------------------------
+  # Findings in workflows that predate jactionlint, carried over from the
+  # zizmor.yml and actionlint.yaml it replaced. Each is a decision about the
+  # release pipeline or token scopes, not a lint fix, so it is ignored per rule
+  # and per file: a new occurrence in another file still fails.
+  #
+  # build-release.yml is guarded by D-0002/D-0005/D-0010/D-0013/D-0014/D-0015 and
+  # runs on `workflow_run` of the release workflow by design (D-0013). Its
+  # checkouts feed signing and upload steps, its Linux legs install rustup inside
+  # an alpine container, and the SC2129 redirect style is left untouched.
+  - rule: dangerous-triggers
+    file: .github/workflows/build-release.yml
+    reason: workflow_run of the release workflow is how tagged builds start (D-0013)
+  - rule: excessive-permissions
+    file: .github/workflows/{build-release,release,pricing-sync}.yml
+    reason: the release, build and pricing-sync workflows push commits, tags or a PR branch
+  - rule: artipacked
+    file: .github/workflows/{build-release,cloud-capture,release}.yml
+    reason: these checkouts push or feed a signing/upload step; needs a per-job look
+  - rule: shellcheck
+    file: .github/workflows/build-release.yml
+    reason: SC2129 style only, in a guarded release file
+  - rule: unpinned-images
+    file: .github/workflows/build-release.yml
+    reason: the musl leg's alpine container follows a readable tag, like every action here
+  - rule: unverified-download
+    file: .github/workflows/build-release.yml
+    reason: rustup's installer inside the alpine container; tracked with the release pipeline
+  - rule: cache-poisoning
+    file: .github/workflows/release.yml
+    reason: semantic-release's bun and mise caches; tracked as a release-pipeline follow-up
+  # The cloud-capture job installs a pinned Claude Code CLI version globally.
+  - rule: adhoc-packages
+    file: .github/workflows/cloud-capture.yml
+    reason: a pinned global CLI install, not a project dependency
+  # The installer sync mints an App token to open a PR in the landing repo.
+  - rule: github-app
+    file: .github/workflows/sync-install-script.yml
+    reason: the cross-repo installer sync PR; token scoping tracked as a follow-up

@@ -1,3 +1,8 @@
+# Repo-specific checks the shared PR Checks workflow (pr-checks.yml) cannot run:
+# the native Windows lane, the install-script linters and the license gate.
+# Linux Rust (fmt, clippy, tests, contract drift), hk lint, commitlint and the
+# zavet checks live in pr-checks.yml, whose `checks / PR Checks` summary is the
+# required status check. Every job here is GitHub-hosted (D-0012).
 name: CI
 
 on:
@@ -6,8 +11,8 @@ on:
     branches: [develop, main]
   # Compiles on develop so the Swatinem/rust-cache entry PRs restore from is
   # ever warm — a PR run can only read a base-branch cache, never write one
-  # another PR can use. Rust/Rust (windows) below are the only jobs that run
-  # here; the rest stay PR-only.
+  # another PR can use. Rust (windows) below is the only job that runs here;
+  # the rest stay PR-only.
   push:
     branches: [develop]
   workflow_dispatch:
@@ -17,64 +22,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Enforce Conventional Commits on every PR. Lightweight — stays on
-  # GitHub-hosted runners (no self-hosted fallback needed).
-  commit-lint:
-    name: Commit Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    if: github.event.pull_request.draft == false
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v6
-        with:
-          configFile: commitlint.config.mjs
-
-  # The same lint the optional git hooks run, defined once in hk.pkl, with the
-  # tools pinned in mise.toml. `install_args` limits mise to the lint tools: a bare
-  # mise-action would also install everything else in mise.toml (rust, node, bun,
-  # just), none of which this job uses. rustfmt comes from the runner's rustup.
-  # Lightweight — stays on GitHub-hosted runners, same as commit-lint (D-0012).
-  lint:
-    name: Lint (hk)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event.pull_request.draft == false
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: >-
-            aqua:jdx/hk
-            aqua:rhysd/actionlint
-            aqua:koalaman/shellcheck
-            aqua:crate-ci/typos
-            aqua:zizmorcore/zizmor
-            aqua:gitleaks/gitleaks
-      - name: hk check --all
-        run: hk check --all
-
   # Lint the shell that puts a binary on someone's PATH: POSIX-only shellcheck
   # plus canonical shfmt formatting. Both scripts here are install-path logic
   # guarded by D-0004 — install.sh places a released binary, dev-install.sh
   # symlinks a build-tree one — which is why they are held to a standard the
   # rest of the repo's shell is not.
-  # Lightweight — stays on GitHub-hosted runners, same as commit-lint.
+  # Lightweight — stays on GitHub-hosted runners (D-0012).
   shell-lint:
     name: Shell Lint (install scripts)
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: github.event.pull_request.draft == false
+    # A dispatch has no pull_request, so a bare draft gate would skip it.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     permissions:
       contents: read
     steps:
@@ -99,7 +58,7 @@ jobs:
     name: PowerShell Lint (install.ps1)
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: github.event.pull_request.draft == false
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     permissions:
       contents: read
     steps:
@@ -120,7 +79,7 @@ jobs:
     name: Dependency licenses
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event.pull_request.draft == false
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     permissions:
       contents: read
     steps:
@@ -134,77 +93,15 @@ jobs:
       - name: cargo deny check licenses
         run: cargo deny check licenses
 
-  # GitHub-hosted, never self-hosted. This job builds and runs a contributor's
-  # code (`cargo test`, `build.rs`, proc-macro expansion) straight off a
-  # `pull_request` trigger, so on a public repo it is arbitrary code execution
-  # by anyone who can get a PR approved. The org's `self-hosted,build` pool is
-  # persistent and lives inside our network — one poisoned PR there buys
-  # lateral access and a foothold that survives into later legitimate runs.
-  # Ephemeral GitHub-hosted runners bound that blast radius to a throwaway VM.
-  # `build-release.yml` still uses the self-hosted pool: it triggers only on
-  # `workflow_run`/`workflow_dispatch`, which a fork PR cannot reach.
-  rust:
-    name: Rust (capture layer)
-    runs-on: ubuntu-latest
-    # Also runs on push to develop (trusted, post-merge code) to compile and
-    # save the rust-cache entry PRs then restore from — see the `on:` comment.
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
-    env:
-      RUST_BACKTRACE: "1"
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      # Set up the Rust toolchain directly instead of via mise — mise's
-      # `rust = "stable"` is a silent no-op on runners without rustup. The
-      # GitHub-hosted images ship rustup, so this just pins stable and adds
-      # the components fmt/clippy need.
-      - name: Set up Rust toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup component add rustfmt clippy
-      # shared-key pins one entry both events read: PRs restore it (save-if is
-      # false there) instead of each writing a near-duplicate off the same base.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-linux
-          save-if: ${{ github.ref == 'refs/heads/develop' }}
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: test
-        run: cargo test --workspace
-      # Diff EVERY schema emit-schema writes, not just attestation. The cloud
-      # generates its Zod/TS from these files, so a stale one ships a wrong
-      # boundary downstream while this job stays green — which is exactly the
-      # hole knowledge.schema.json sat in: a KnowledgeDecision/KnowledgeSpec
-      # field addition leaves attestation.schema.json byte-identical.
-      - name: contract schemas are up to date
-        run: |
-          cargo run -q -p dira-contract --bin emit-schema
-          git diff --exit-code contract/*.schema.json \
-            || (echo "a contract schema is stale — run 'just contract-schema'"; exit 1)
-      - name: signing vector fixture is up to date
-        run: |
-          cargo run -q -p dira-core --bin sign_vector > contract/testdata/signing-vector.json
-          git diff --exit-code contract/testdata/signing-vector.json \
-            || (echo "signing-vector fixture is stale — run 'just vector'"; exit 1)
-
   # Windows build/test lane (native, not WSL): validates the named-pipe IPC transport
   # (`cli/ipc`) and everything else in the workspace on the actual target platform.
-  # Independent of `rust` above — fmt/contract-schema stay Linux-only intentionally
+  # Independent of PR Checks' Linux lane — fmt/contract-schema stay Linux-only intentionally
   # (see module doc), so this job only runs clippy + tests.
   rust-windows:
     name: Rust (windows)
     runs-on: windows-latest
-    # Also runs on push to develop — see the `rust` job and the `on:` comment.
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    # Also runs on push to develop to keep its rust-cache warm — see the `on:` comment.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     timeout-minutes: 30
     env:
       RUST_BACKTRACE: "1"

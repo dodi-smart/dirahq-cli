@@ -1,0 +1,37 @@
+# Thin caller, copy to <repo>/.github/workflows/pr-review.yml
+#
+# Note what is NOT here: `synchronize`. Reviewing on every push is what gets a
+# review bot muted. A PR is reviewed when it becomes ready, and again only when
+# someone asks by applying `agent:review`.
+name: PR Review
+on:
+  pull_request:
+    types: [ready_for_review, reopened, labeled]
+    branches: [develop, main]
+    paths-ignore: ['**.md', 'docs/**']
+jobs:
+  review:
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'agent:review'
+    uses: dodi-smart/.github/.github/workflows/pr-review.yml@v1
+    secrets: inherit
+    # The union of what the called workflow's jobs request. A caller has to grant
+    # every one of them or the run fails at startup; add to this block when the
+    # shared workflow adds a permission.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      checks: read
+      actions: read
+      id-token: write
+    # The default `sensitive-paths` names concepts (credentials, money,
+    # permissions, crypto, request boundaries, schema, CI/deploy) rather than one
+    # stack's vocabulary. Override it when this repo has its own sensitive
+    # surfaces, and check the pattern actually matches something here, because a
+    # pattern that matches nothing silently reviews everything at the base level.
+    # with:
+    #   sensitive-paths: "(auth|payment|rls|migrations?/|<repo-specific>)"
+    #   level: medium
+    #   elevated-level: high

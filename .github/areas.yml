@@ -1,0 +1,104 @@
+# Areas for dodi-smart/dirahq-cli
+#
+# `area:` is the ONE repo-specific label namespace. Each area lists the paths
+# that DEFINE it, so a triage agent maps a changed file to an area
+# deterministically instead of guessing. Names and descriptions must stay in
+# sync with `gh label list` (scripts/sync-labels.sh --areas .github/areas.yml).
+#
+# The areas follow the living specs in .zavet/specs/ where one exists, so an
+# issue's area and the spec an agent should read line up.
+#
+# The `rules` block matters more than the list: it resolves the overlaps where
+# the obvious guess is wrong.
+
+areas:
+  - name: contract
+    description: "Wire schema crate and its generated, drift-gated artifacts"
+    paths: [contract/, cli/core/src/bin/sign_vector.rs]
+
+  - name: capture
+    description: "Harness sources, hook ingestion and the daemon event writer"
+    paths: [cli/sources/, cli/dirad/src/capture.rs, cli/dirad/src/writer.rs, cli/dirad/src/events.rs, cli/dira/src/hook_health.rs, cli/dira/src/hook_yield.rs, .dira/, mods/]
+
+  - name: accounting
+    description: "Human/agent time, tokens, pricing and orchestration rollups"
+    paths: [cli/core/src/accounting.rs, cli/core/src/report.rs, cli/core/src/tokens.rs, cli/core/src/pricing.rs, cli/core/pricing/, cli/core/src/bin/pricing_sync.rs, cli/core/src/orchestration.rs, cli/core/src/runs.rs]
+
+  - name: store
+    description: "Local SQLite store, its schema and stored time columns"
+    paths: [cli/core/src/store.rs, cli/core/src/stored_at.rs, cli/core/src/model.rs, cli/core/src/project.rs]
+
+  - name: sync
+    description: "Attestation sync to the cloud: batching, backoff, heartbeat"
+    paths: [cli/core/src/sync/, cli/dirad/src/sync.rs, cli/dirad/src/heartbeat.rs, cli/dirad/src/billing.rs, cli/core/src/httpclient.rs]
+
+  - name: identity
+    description: "Device keys, signing, linking and keychain storage"
+    paths: [cli/core/src/identity.rs, cli/core/src/signing.rs, cli/dira/src/device.rs]
+
+  - name: knowledge
+    description: "Zavet integration: decisions, specs and knowledge sync"
+    paths: [cli/core/src/zavet.rs, cli/core/src/zavet_specs.rs, cli/core/src/sync/knowledge.rs, cli/dirad/src/knowledge_sync.rs, cli/dirad/src/zavet.rs, cli/dirad/src/zavet_sources.rs, cli/dira/src/zavet_adapters.rs, cli/dira/src/zavet_install.rs]
+
+  - name: daemon
+    description: "dirad lifecycle, control socket/pipe and IPC transport"
+    paths: [cli/dirad/src/lib.rs, cli/dirad/src/main.rs, cli/dirad/src/control.rs, cli/dirad/src/supervisor.rs, cli/dirad/src/state.rs, cli/dirad/src/http.rs, cli/dirad/src/logfile.rs, cli/dirad/src/jitter.rs, cli/ipc/, cli/dira/src/daemon.rs, cli/dira/src/client.rs]
+
+  - name: commands
+    description: "dira command surface, config, rendering and the TUI"
+    paths: [cli/dira/src/main.rs, cli/dira/src/render.rs, cli/dira/src/format.rs, cli/dira/src/theme.rs, cli/dira/src/tui/, cli/dira/src/config_cmd.rs, cli/core/src/config.rs, cli/dira/src/session_titles.rs]
+
+  - name: onboarding
+    description: "dira onboard, init and cloud init, incl. cloud runtimes"
+    paths: [cli/dira/src/onboard/, cli/dira/src/init.rs, cli/dira/src/cloud_init.rs, cli/core/src/runtime.rs]
+
+  - name: doctor
+    description: "dira doctor checks and the capture probe"
+    paths: [cli/dira/src/doctor/, cli/dirad/src/probe.rs]
+
+  - name: distribution
+    description: "Installers, self-update and the release build matrix"
+    paths: [install.sh, install.ps1, dev-install.sh, cli/dira/src/update/, cli/dira/src/which.rs, .cargo/, .github/workflows/build-release.yml, .github/workflows/sync-install-script.yml]
+
+  - name: infra
+    description: "CI, hooks, release tooling and repo chrome"
+    paths: [.github/, justfile, mise.toml, hk.pkl, release.config.mjs, commitlint.config.mjs, package.json, deny.toml, typos.toml, .gitleaks.toml]
+
+rules:
+  - "Label by WHERE THE FIX GOES, not where the symptom appears. A wrong total in
+     `dira report` fixed in cli/core/src/accounting.rs is area:accounting, not
+     area:commands."
+
+  - "cli/core/src/sync/knowledge.rs sits under sync/ but is the consent-gated
+     knowledge channel (D-0001, DIRASH-0030): it is area:knowledge, not area:sync.
+     Everything else under cli/core/src/sync/ is area:sync."
+
+  - "cli/dirad/src/billing.rs and cli/core/src/sync/billing.rs report usage
+     upstream; they are area:sync. Pricing a token (pricing.rs, cli/core/pricing/)
+     is area:accounting."
+
+  - "The capture probe is split on the doctor/capture seam: the probe ITSELF
+     (cli/dirad/src/probe.rs, cli/dira/src/doctor/capture.rs) is area:doctor; a
+     fix to how a real hook event is parsed or written is area:capture
+     (DIRASH-0023)."
+
+  - "Changing a type under contract/ almost always touches its producer too. Label
+     area:contract plus the area of the producing code (usually area:sync or
+     area:capture); the regenerated contract/*.schema.json and signing vector
+     are never an area on their own."
+
+  - "Workflows are area:infra EXCEPT build-release.yml and
+     sync-install-script.yml, which ship binaries and installers and are
+     area:distribution (D-0013, D-0015)."
+
+  - "cli/dira/src/main.rs is the argument parser for every command. Wiring a new
+     flag for an existing feature takes that feature's area (a new `dira doctor`
+     flag is area:doctor); only cross-cutting command plumbing is area:commands."
+
+  - "cli/dirad/src/state.rs and control.rs carry daemon state for every
+     feature. A change to what a feature stores is that feature's area plus
+     area:daemon only when the control protocol or lifecycle changes."
+
+  - "Multiple area: labels on one issue are normal. A schema migration that
+     changes a stored time column and the sync batch that reads it carries
+     area:store and area:sync."

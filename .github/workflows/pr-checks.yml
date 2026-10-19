@@ -1,0 +1,70 @@
+# Thin caller, copy to <repo>/.github/workflows/pr-checks.yml
+#
+# Replaces a hand-written ci.yml / pr-checks.yml. Lint and typecheck run on the
+# small pool, tests and build on the large one.
+#
+# `concurrency` is set HERE, in the caller, because it depends on this repo's
+# branches. Do not drop it: without it every push runs a full build to
+# completion instead of cancelling the superseded one.
+#
+# Do NOT add `paths-ignore` here. The shared workflow already skips the real
+# jobs on a docs-only change itself (`docs-only-paths` input, default Markdown
+# and `docs/**`) but still runs its summary job, so the required status check
+# is created either way. A caller-side `paths-ignore` would skip that summary
+# job too, on a docs-only PR — leaving a required check waiting forever.
+name: PR Checks
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [develop, main]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    # workflow_dispatch has no pull_request, so a bare draft gate evaluates
+    # null == false -> FALSE and every dispatch silently runs nothing. The
+    # trigger was decorative in every repo that copied this file until the
+    # event-name arm was added. Keep both arms together.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    uses: dodi-smart/.github/.github/workflows/pr-checks.yml@v1
+    secrets: inherit
+    # A called job can only ask for what the calling job grants. The opt-in
+    # `zavet` and `react-doctor` jobs comment on the pull request, and
+    # react-doctor also writes a commit status; without these grants they fail
+    # at startup. Keep the block even while both stay commented out below.
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    with:
+      stack: rust
+      # The workspace, not just the root crate, and fmt alongside clippy. clippy
+      # already compiles every target, so there is no separate typecheck.
+      lint: cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+      typecheck: ""
+      # Tests, then the contract drift gate: re-emit every schema and the
+      # signing vector and fail if any differs from what is committed. The cloud
+      # generates its Zod/TS from these files, so a stale one ships a wrong
+      # boundary downstream while the tests stay green.
+      test: >-
+        cargo test --workspace
+        && cargo run -q -p dira-contract --bin emit-schema
+        && cargo run -q -p dira-core --bin sign_vector > contract/testdata/signing-vector.json
+        && { git diff --exit-code -- contract/ || { echo "::error::contract artifacts are stale, run 'just contract'"; false; }; }
+      # Release binaries are build-release.yml's job (D-0015); a PR release build
+      # would only repeat the test compile at a higher opt level.
+      build: ""
+      #
+      # Git-hook checks from hk.pkl, with tools installed from mise.toml.
+      hk: true
+      # commitlint.config.mjs holds this repo's scope enum (the release map).
+      commitlint: ${{ github.event_name == 'pull_request' }}   # a dispatch has no PR to lint
+      commitlint-config: commitlint.config.mjs
+      #
+      # Knowledge layer: the decision checks are mostly `cargo test`.
+      zavet: true
+      zavet-stack: rust

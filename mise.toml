@@ -10,7 +10,7 @@ bun = "latest"
 # Lint tools for the git hooks (hk.pkl) and the `hk` input of pr-checks.yml.
 # Pinned here so Renovate bumps them; keep hk in step with the version named in
 # the `amends` and `import` lines of hk.pkl.
-"aqua:jdx/hk" = "2.6.0"
+"aqua:jdx/hk" = "2.7.0"
 "aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:crate-ci/typos" = "1.51.1"
 "aqua:gitleaks/gitleaks" = "8.30.1"

@@ -4,10 +4,10 @@
   "files": {
     ".commitlintrc.json": {
       "kind": "rendered",
+      "mode": "local",
       "sha256": null,
       "template": "commitlintrc.json",
-      "version": null,
-      "mode": "local"
+      "version": null
     },
     ".github/jactionlint.yaml": {
       "kind": "rendered",
@@ -53,10 +53,10 @@
     },
     ".github/workflows/release.yml": {
       "kind": "rendered",
+      "mode": "local",
       "sha256": null,
       "template": "workflows/release.yml",
-      "version": null,
-      "mode": "local"
+      "version": null
     },
     ".gitleaks.toml": {
       "kind": "seeded",
@@ -72,9 +72,9 @@
     },
     "mise.toml": {
       "kind": "seeded",
-      "sha256": "16cea7f5bfb891c9c9f0fe8c7d8f11c8e3623bd64852c861a613bf0f196962ed",
+      "sha256": "d8782eff4b0cb8c680eb225228e4e77c34950a90c83845b691ae94dd4abfb6a0",
       "template": "mise.toml",
-      "version": "1.25.3"
+      "version": "1.28.0"
     },
     "typos.toml": {
       "kind": "seeded",
@@ -94,5 +94,5 @@
   },
   "schema": 1,
   "stack": "rust",
-  "version": "1.25.3"
+  "version": "1.28.0"
 }

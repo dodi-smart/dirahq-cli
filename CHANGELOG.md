@@ -1,3 +1,14 @@
+## [0.11.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.10.1...v0.11.0) (2026-10-20)
+
+### ✨ Features
+
+* **contract:** name Claude Desktop scheduled-task sessions with a content-free trigger ([#202](https://github.com/dodi-smart/dirahq-cli/issues/202)) ([5951587](https://github.com/dodi-smart/dirahq-cli/commit/5951587ba1531d8de430bf30776d4da1b6fbee7f)), closes [#180](https://github.com/dodi-smart/dirahq-cli/issues/180) [#201](https://github.com/dodi-smart/dirahq-cli/issues/201), references [cli#181](https://github.com/cli/issues/181) [#180](https://github.com/dodi-smart/dirahq-cli/issues/180) [#178](https://github.com/dodi-smart/dirahq-cli/issues/178) [dirahq-cloud#251](https://github.com/dirahq-cloud/issues/251) [dirahq-cloud#253](https://github.com/dirahq-cloud/issues/253) [#201](https://github.com/dodi-smart/dirahq-cli/issues/201)
+
+### 🐛 Bug Fixes
+
+* **cli:** make orchestration sessions traceable to their repo and working branch ([#197](https://github.com/dodi-smart/dirahq-cli/issues/197)) ([ed4177f](https://github.com/dodi-smart/dirahq-cli/commit/ed4177faf064a890f74471e80f6ee7b311ad3c81)), references [cli#181](https://github.com/cli/issues/181) [#180](https://github.com/dodi-smart/dirahq-cli/issues/180)
+* **daemon:** re-send ended session rollups once when the lineage rules change ([#200](https://github.com/dodi-smart/dirahq-cli/issues/200)) ([f2c397f](https://github.com/dodi-smart/dirahq-cli/commit/f2c397ff738538823bd92d800f24c51269f92bf8)), closes [#180](https://github.com/dodi-smart/dirahq-cli/issues/180), references [cli#181](https://github.com/cli/issues/181) [#180](https://github.com/dodi-smart/dirahq-cli/issues/180) [#178](https://github.com/dodi-smart/dirahq-cli/issues/178) [dirahq-cloud#251](https://github.com/dirahq-cloud/issues/251) [dirahq-cloud#253](https://github.com/dirahq-cloud/issues/253)
+
 ## [0.10.1](https://github.com/dodi-smart/dirahq-cli/compare/v0.10.0...v0.10.1) (2026-10-20)
 
 ### 🐛 Bug Fixes

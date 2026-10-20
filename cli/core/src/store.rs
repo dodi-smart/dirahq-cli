@@ -360,6 +360,29 @@ impl Store {
         Ok(out)
     }
 
+    /// Ids of sessions whose LATEST event is a `session_end` at or after
+    /// `since`, i.e. sessions that are definitely over. Feeds the one-shot
+    /// lineage re-send (DIRASH-0045): a session with any event after its end
+    /// (a compaction `SessionEnd` on a live session) is excluded, because a
+    /// partial for it would reopen the cloud row (cloud#253). Sorted by id.
+    /// Reserved probe sessions are filtered like every other read (DIRASH-0023).
+    pub async fn ended_sessions_since(&self, since: OffsetDateTime) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT e.session_id AS session_id FROM events e \
+             WHERE e.kind = 'session_end' AND e.at >= ?1 AND e.session_id NOT LIKE ?2 \
+             AND NOT EXISTS (SELECT 1 FROM events n WHERE n.session_id = e.session_id \
+                 AND (n.at > e.at OR (n.at = e.at AND n.id > e.id))) \
+             ORDER BY e.session_id ASC",
+        )
+        .bind(StoredAt(since))
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut ids: Vec<String> = rows.iter().map(|r| r.get("session_id")).collect();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// Human-signal "seed" for a sync flush: the already-synced human signals (id ≤
     /// `cursor`) whose `at` falls in `[at_lo, at_hi]`, ordered by `at` ascending.
     ///
@@ -3897,6 +3920,38 @@ mod tests {
             spec: None,
             lineage: Default::default(),
         }
+    }
+
+    /// The lineage re-send (DIRASH-0045) may only touch sessions that are
+    /// definitely over: latest event a `session_end`, inside the window, and
+    /// never a reserved probe session.
+    #[tokio::test]
+    async fn ended_sessions_since_lists_only_sessions_whose_last_event_is_an_end() {
+        let store = Store::open_in_memory().await.unwrap();
+        let t = |secs: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs);
+        let probe = format!("{}01PROBE", crate::model::PROBE_SESSION_PREFIX);
+        for e in [
+            // ended
+            ev_at("01", "done", t(100), EventKind::UserPrompt),
+            ev_at("02", "done", t(200), EventKind::SessionEnd),
+            // a compaction end followed by more work: live
+            ev_at("03", "live", t(100), EventKind::SessionEnd),
+            ev_at("04", "live", t(300), EventKind::PreTool),
+            // ended before the window
+            ev_at("05", "old", t(10), EventKind::SessionEnd),
+            // probe
+            ev_at("06", &probe, t(200), EventKind::SessionEnd),
+        ] {
+            store.append(&e).await.unwrap();
+        }
+        assert_eq!(
+            store.ended_sessions_since(t(50)).await.unwrap(),
+            vec!["done".to_string()]
+        );
+        assert_eq!(
+            store.ended_sessions_since(t(0)).await.unwrap(),
+            vec!["done".to_string(), "old".to_string()]
+        );
     }
 
     /// `distinct_event_cwds` returns the most-recently-active cwd first

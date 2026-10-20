@@ -1,6 +1,6 @@
 ---
 title: Attestation sync and session rollups
-version: 8
+version: 9
 origin: session
 verified: false
 confidence: high
@@ -13,7 +13,7 @@ paths:
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045]
 ---
 
 ## Overview
@@ -120,6 +120,17 @@ single flush window (issue #40).
   nothing. Re-sends for growth alone still wait for `partial_rollup_after`
   and need new `active_seconds`. `partial_rollup_after = 0` still disables
   partials.
+- Lineage rule changes re-send ended rollups once (DIRASH-0045).
+  `orchestration::LINEAGE_RULES_VERSION` (2) is compared with the `meta` key
+  `lineage_rules_version` (missing = 0). When the build is newer, the sync task
+  rebuilds the final rollup of every session that ended in the last 30 days
+  (`Store::ended_sessions_since`: latest event is a `session_end`) through
+  `build_lineage_resend_rollups`, and POSTs sessions-only batches
+  (`build_lineage_resend_batches`: empty intervals, tokens and artifacts, no
+  cursor moved). Never a partial: the cloud reopens an ended row on one
+  (cloud#253). The marker is written only after every chunk was acked; an
+  unlinked device or missing cloud URL is a silent no-op. It runs after a healthy
+  flush, paced and backed off like a drain, and never blocks normal sync.
 - An acked partial pins `last_partial = (active_seconds, wire)` from the
   `PartialSession` that was sent, not from the registry at ack time, so a
   change that lands mid-flush ships on the next one.

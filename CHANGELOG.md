@@ -1,3 +1,11 @@
+## [0.10.1](https://github.com/dodi-smart/dirahq-cli/compare/v0.10.0...v0.10.1) (2026-10-20)
+
+### 🐛 Bug Fixes
+
+* **cli:** refresh model pricing from models.dev ([d02b9ef](https://github.com/dodi-smart/dirahq-cli/commit/d02b9ef20d21a29347fcfa1447781f8437a994ce))
+* **cli:** ship a partial rollup on first sight and on every lineage change ([889f1a1](https://github.com/dodi-smart/dirahq-cli/commit/889f1a148fd6f2dcd220829457c45cabef584fd1)), closes [dodi-smart/dirahq-cli#179](https://github.com/dodi-smart/dirahq-cli/issues/179), references [cli#184](https://github.com/cli/issues/184) [cloud#256](https://github.com/cloud/issues/256)
+* **cli:** store time columns fixed-width UTC so text order is time order ([e950635](https://github.com/dodi-smart/dirahq-cli/commit/e95063551a77f5d3ef24cf7a76cf49667364aefa))
+
 ## [0.10.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.9.0...v0.10.0) (2026-10-16)
 
 ### ✨ Features

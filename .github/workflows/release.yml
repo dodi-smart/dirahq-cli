@@ -1,14 +1,23 @@
+# Thin caller of the shared dev-standards release workflow.
+#
+# WHY the shared workflow and not an inline job: the org `develop-checks`
+# ruleset requires "checks / PR Checks" on every push to develop, and its only
+# bypass actor is the org GitHub App. GITHUB_TOKEN can't be added as a bypass
+# actor, so a push made with it is rejected (GH013). That's how v0.10.1 shipped
+# without binaries: the inline backmerge job was rejected, the Release run
+# failed, and build-release.yml (gated on `conclusion == 'success'`) skipped.
+# The shared workflow mints the App token (GH_APP_CLIENT_ID /
+# GH_APP_PRIVATE_KEY, via `secrets: inherit`) and pushes the release commit,
+# the tags and the backmerge with it, the same way dirahq-cloud releases.
+#
+# The workflow name must stay "Release": build-release.yml listens for it with
+# `workflow_run`.
 name: Release
 
 on:
   push:
     branches: [main, develop]
   workflow_dispatch:
-
-permissions:
-  contents: write
-  issues: write
-  pull-requests: write
 
 # Never cancel an in-flight release — a half-pushed tag/version commit is worse
 # than waiting. Releases for different refs are still isolated.
@@ -18,63 +27,21 @@ concurrency:
 
 jobs:
   release:
-    name: Release CLI
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]') }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: jdx/mise-action@v5
-      # The JS release tooling (semantic-release + plugins) runs under bun/node.
-      # mise here only provides the Rust toolchain (cargo set-version), so install
-      # bun + node explicitly rather than pinning them in the Rust repo's mise.toml.
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-      - name: Install cargo-edit (provides `cargo set-version`)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-edit
-      - name: Install release tooling
-        run: bun install --frozen-lockfile
-      # Link the org's shared semantic-release config into node_modules.
-      - uses: dodi-smart/.github/actions/semantic-release-config@v1
-      - name: Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bunx semantic-release --extends ./release.config.mjs
-
-  # After stable releases on main, fast-forward the prerelease channel by merging
-  # main back into develop so develop never lags behind production.
-  backmerge:
-    name: Backmerge main → develop
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: [release]
-    if: |
-      always() &&
-      (needs.release.result == 'success' || needs.release.result == 'skipped') &&
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]'))
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-      - name: Merge main into develop
-        run: |
-          git fetch origin develop:develop
-          git checkout develop
-          git merge main --no-ff -m "chore(release): merge main into develop [skip ci]"
-          git push origin develop
+    uses: dodi-smart/.github/.github/workflows/release.yml@v1
+    secrets: inherit
+    # The union of what the called workflow requests; a caller has to grant it
+    # or the run fails at startup.
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    with:
+      # bun runs the JS release tooling (semantic-release + plugins, pinned in
+      # package.json). The Rust toolchain on ubuntu-latest is enough for
+      # `cargo set-version`, which the exec step in release.config.mjs runs, so
+      # only cargo-edit has to be added.
+      stack: bun
+      install: bun install --frozen-lockfile && cargo install cargo-edit --locked
+      release-command: bun run release
+      node-version: "24"
+      backmerge: true

@@ -1738,7 +1738,10 @@ mod tests {
             "tree",
             &format!("sleep 60 &\necho $! > {}\nwait", pidfile.display()),
         );
-        let r = SystemSpecRunner.run(&bin, dir.path(), &[], Duration::from_millis(400));
+        // The script sleeps 60s, so any timeout proves the kill; it only has to
+        // outlast the shell writing the pidfile, which a loaded test run can
+        // delay well past a few hundred milliseconds.
+        let r = SystemSpecRunner.run(&bin, dir.path(), &[], Duration::from_secs(3));
         assert_eq!(r, Err(RunError::Timeout));
         let pid: i32 = std::fs::read_to_string(&pidfile)
             .unwrap()

@@ -249,6 +249,13 @@ async fn process_message(
     if ev.spec.is_none() {
         ev.spec = crate::control::lock_recover(&state.sessions).spec_of(&ev.session_id);
     }
+    // Likewise a session already known to be trigger-started stamps every later
+    // event, so a rollup built from a slice that misses the finding still names it.
+    if ev.lineage.trigger.is_none() {
+        let (t, n) = crate::control::lock_recover(&state.sessions).trigger_of(&ev.session_id);
+        ev.lineage.trigger = t;
+        ev.lineage.trigger_name = n;
+    }
 
     // A `dira doctor --probe` row is a transport test, not a session. It takes
     // the store append and nothing else: no coalescing watermark, no
@@ -422,15 +429,23 @@ async fn process_message(
         // `ProjectCache`'s doc comment). `capture_tokens` marks the progress
         // counter and warns internally per transcript, so main + every sidecar
         // each contribute their own count to the running total (issue #93).
-        capture_tokens(
+        let mut found = None;
+        capture_tokens_into(
             state,
             &path,
             harness,
             &ev.session_id,
             ev.project.as_deref(),
             cache,
+            Some(&mut found),
         )
         .await;
+        if let Some(found) = found {
+            let root = dira_core::config::home_dir()
+                .ok()
+                .map(|h| dira_core::tokens::scheduled_tasks_root(&h));
+            apply_trigger(state, &ev, &found, root.as_deref()).await;
+        }
         // Claude Code writes `Task`-tool subagent turns to sibling
         // `agent-*.jsonl` files that no hook ever names, so the main transcript
         // alone misses them entirely. Attributed to the parent session — the id
@@ -453,6 +468,37 @@ async fn process_message(
             }
         }
     }
+}
+
+/// Record a trigger the transcript pass found (DIRASH-0046): verify the task
+/// slug against the real task directory, stamp the event whose hook prompted the
+/// read, and fold it into the live registry so a partial ships it. The slug
+/// candidate came from prompt text and survives only if `tasks_root/<slug>/`
+/// exists; nothing from the prompt is stored or logged.
+async fn apply_trigger(
+    state: &AppState,
+    ev: &RawEvent,
+    found: &dira_core::tokens::TranscriptTrigger,
+    tasks_root: Option<&std::path::Path>,
+) {
+    let name = found
+        .slug_candidate
+        .as_deref()
+        .zip(tasks_root)
+        .and_then(|(slug, root)| dira_core::tokens::verified_task_slug(root, slug));
+    if let Err(e) = state
+        .store
+        .set_event_trigger(&ev.id, found.trigger, name.as_deref())
+        .await
+    {
+        tracing::warn!("session trigger write failed ({}): {e}", ev.session_id);
+        return;
+    }
+    crate::control::lock_recover(&state.sessions).observe_trigger(
+        &ev.session_id,
+        Some(found.trigger),
+        name.as_deref(),
+    );
 }
 
 /// What (if anything) the coalescing watermark map needs once an event's fate
@@ -646,6 +692,8 @@ fn enrich(
             workspace,
             spawned: norm.hints.spawned,
             parent_session: None,
+            trigger: None,
+            trigger_name: None,
         },
     };
     (ev, repo_dir)
@@ -871,6 +919,31 @@ async fn capture_tokens(
     event_project: Option<&str>,
     cache: &mut ProjectCache,
 ) -> u64 {
+    capture_tokens_into(
+        state,
+        transcript_path,
+        harness,
+        session_id,
+        event_project,
+        cache,
+        None,
+    )
+    .await
+}
+
+/// [`capture_tokens`], which in the SAME pass over the appended tail also asks
+/// whether the session was started by a trigger (DIRASH-0046). The finding goes
+/// to `trigger_out` when given; it is read from the session's own transcript
+/// only, never a subagent sidecar, and the tail text is dropped with the pass.
+async fn capture_tokens_into(
+    state: &AppState,
+    transcript_path: &str,
+    harness: Harness,
+    session_id: &str,
+    event_project: Option<&str>,
+    cache: &mut ProjectCache,
+    trigger_out: Option<&mut Option<dira_core::tokens::TranscriptTrigger>>,
+) -> u64 {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
     let offset_key = offset_key_for(session_id, transcript_path);
@@ -959,6 +1032,13 @@ async fn capture_tokens(
         Harness::Grok => dira_core::tokens::parse_grok_updates_usage(&tail),
         _ => dira_core::tokens::parse_transcript_usage(&tail),
     };
+    if let Some(out) = trigger_out {
+        if harness == Harness::ClaudeCode
+            && !is_subagent_transcript(std::path::Path::new(transcript_path))
+        {
+            *out = dira_core::tokens::parse_transcript_trigger(&tail);
+        }
+    }
     // Read once, not per turn: the registry's sticky first-non-null project for
     // this session (`SessionRegistry::observe` already ran for every event that
     // led here — see `writer.rs`'s ordering invariant). The last-known-good
@@ -1412,6 +1492,139 @@ mod tests {
                 "each turn's OWN cwd must resolve it, independent of the trigger"
             );
         }
+    }
+
+    const SCHEDULED_LINE: &str = r#"{"type":"user","turnOrigin":"scheduled","origin":{"kind":"task-notification","subkind":"scheduled-trigger","fireReason":"scheduled"},"message":{"role":"user","content":"Run ~/.claude/scheduled-tasks/triage-refresh/SKILL.md SECRET-PROMPT"}}"#;
+
+    /// The Stop-hook path for one session: store the event, fold it, then run the
+    /// transcript pass with the trigger scan and apply what it found against
+    /// `tasks_root` (the injectable `~/.claude/scheduled-tasks`).
+    async fn stop_with_transcript(
+        state: &AppState,
+        transcript: &std::path::Path,
+        tasks_root: &std::path::Path,
+        session: &str,
+    ) -> RawEvent {
+        let ev = RawEvent {
+            id: Ulid::generate().to_string(),
+            at: OffsetDateTime::now_utc(),
+            session_id: session.to_string(),
+            harness: Harness::ClaudeCode,
+            kind: EventKind::Stop,
+            cwd: None,
+            project: None,
+            identity_email: None,
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+            spec: None,
+            lineage: Default::default(),
+        };
+        state.store.append(&ev).await.unwrap();
+        crate::control::lock_recover(&state.sessions).observe(&ev, Duration::minutes(5));
+        let mut found = None;
+        let mut cache = ProjectCache::new();
+        capture_tokens_into(
+            state,
+            transcript.to_str().unwrap(),
+            Harness::ClaudeCode,
+            session,
+            None,
+            &mut cache,
+            Some(&mut found),
+        )
+        .await;
+        if let Some(found) = found {
+            apply_trigger(state, &ev, &found, Some(tasks_root)).await;
+        }
+        ev
+    }
+
+    /// DIRASH-0046: a scheduled run is marked on the stored event and the live
+    /// registry, and the slug survives only because its directory exists.
+    #[tokio::test]
+    async fn a_scheduled_transcript_stamps_the_trigger_and_the_verified_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().join("scheduled-tasks");
+        std::fs::create_dir_all(tasks.join("triage-refresh")).unwrap();
+        let path = dir.path().join("sess-t.jsonl");
+        std::fs::write(&path, format!("{SCHEDULED_LINE}\n")).unwrap();
+
+        let state = state_in_memory().await;
+        let ev = stop_with_transcript(&state, &path, &tasks, "sess-t").await;
+
+        let stored = state.store.events_since(None).await.unwrap();
+        let row = stored.iter().find(|e| e.id == ev.id).unwrap();
+        assert_eq!(
+            row.lineage.trigger,
+            Some(dira_contract::SessionTrigger::Scheduled)
+        );
+        assert_eq!(row.lineage.trigger_name.as_deref(), Some("triage-refresh"));
+        let live = crate::control::lock_recover(&state.sessions).trigger_of("sess-t");
+        assert_eq!(
+            live,
+            (
+                Some(dira_contract::SessionTrigger::Scheduled),
+                Some("triage-refresh".to_string())
+            )
+        );
+        // Nothing of the prompt is anywhere in what was stored.
+        let dump = format!("{stored:?}");
+        assert!(!dump.contains("SECRET-PROMPT"), "{dump}");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_transcript_whose_task_dir_is_missing_keeps_only_the_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().join("scheduled-tasks"); // not created
+        let path = dir.path().join("sess-m.jsonl");
+        std::fs::write(&path, format!("{SCHEDULED_LINE}\n")).unwrap();
+
+        let state = state_in_memory().await;
+        stop_with_transcript(&state, &path, &tasks, "sess-m").await;
+
+        let live = crate::control::lock_recover(&state.sessions).trigger_of("sess-m");
+        assert_eq!(live, (Some(dira_contract::SessionTrigger::Scheduled), None));
+        let stored = state.store.events_since(None).await.unwrap();
+        assert_eq!(stored[0].lineage.trigger_name, None);
+    }
+
+    #[tokio::test]
+    async fn an_interactive_transcript_and_a_sidecar_never_set_a_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().join("scheduled-tasks");
+        std::fs::create_dir_all(tasks.join("triage-refresh")).unwrap();
+        let human = dir.path().join("sess-h.jsonl");
+        std::fs::write(
+            &human,
+            r#"{"type":"user","turnOrigin":"human","message":{"content":"scheduled-tasks/triage-refresh"}}
+"#,
+        )
+        .unwrap();
+        let state = state_in_memory().await;
+        stop_with_transcript(&state, &human, &tasks, "sess-h").await;
+        assert_eq!(
+            crate::control::lock_recover(&state.sessions).trigger_of("sess-h"),
+            (None, None)
+        );
+
+        // A subagent sidecar is never scanned, even if it looks scheduled.
+        let sidecar = dir.path().join("agent-1.jsonl");
+        std::fs::write(&sidecar, format!("{SCHEDULED_LINE}\n")).unwrap();
+        let mut found = None;
+        capture_tokens_into(
+            &state,
+            sidecar.to_str().unwrap(),
+            Harness::ClaudeCode,
+            "sess-h",
+            None,
+            &mut ProjectCache::new(),
+            Some(&mut found),
+        )
+        .await;
+        assert!(found.is_none());
     }
 
     async fn state_in_memory() -> AppState {

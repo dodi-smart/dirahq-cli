@@ -96,6 +96,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0043 — Store time columns hold one fixed-width UTC form, bound only through StoredAt or RawAt (active)
 - DIRASH-0044 — A scratch session is an orchestrator only when it coordinates (active)
 - DIRASH-0045 — A lineage rule change re-sends the ended rollups once, sessions only (active)
+- DIRASH-0046 — A scheduled-task slug may cross the wire as triggerName, only when its directory exists (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

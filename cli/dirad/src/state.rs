@@ -780,6 +780,33 @@ impl SessionRegistry {
         self.sessions.get(session_id).and_then(|s| s.spec.clone())
     }
 
+    /// The trigger (and verified task slug) a live session is known to have been
+    /// started by (DIRASH-0046).
+    pub fn trigger_of(
+        &self,
+        session_id: &str,
+    ) -> (Option<dira_contract::SessionTrigger>, Option<String>) {
+        self.sessions.get(session_id).map_or((None, None), |s| {
+            (s.lineage.trigger, s.lineage.trigger_name.clone())
+        })
+    }
+
+    /// Fold a trigger found by the transcript pass (after the hook's event was
+    /// already observed). Refreshes the cached wire so the next partial-rollup
+    /// scan sees the change. An unknown session is ignored.
+    pub fn observe_trigger(
+        &mut self,
+        session_id: &str,
+        trigger: Option<dira_contract::SessionTrigger>,
+        name: Option<&str>,
+    ) {
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            if s.lineage.observe_trigger(trigger, name) {
+                s.wire = s.lineage.wire(s.project.clone());
+            }
+        }
+    }
+
     /// Whether the registry has seen this session end (`SessionEnd` /
     /// `ManualStop`). Absence is "no opinion", not "ended".
     pub fn is_ended(&self, session_id: &str) -> bool {
@@ -1447,6 +1474,37 @@ mod tests {
         assert_eq!(live.wire.workspace_ref, None);
         assert_eq!(live.wire.repos, None);
         assert_eq!(send(&mut reg, t(10)), ["cron"], "first sight still ships");
+    }
+
+    /// A trigger the transcript pass finds after the hook's event was folded
+    /// changes the wire, so a live scheduled session ships it on the next flush
+    /// even with no new active time (DIRASH-0046); and a repeat is not a change.
+    #[test]
+    fn a_newly_seen_trigger_is_offered_as_a_partial_once() {
+        use dira_contract::SessionTrigger;
+        let t = |secs| OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs);
+        let mut reg = SessionRegistry::default();
+        reg.observe(&scratch_ev("cron", EventKind::UserPrompt, 0), IDLE);
+        reg.observe(&scratch_ev("cron", EventKind::PreTool, 10), IDLE);
+        assert_eq!(send(&mut reg, t(10)), ["cron"]);
+        assert!(send(&mut reg, t(10)).is_empty(), "nothing changed");
+
+        reg.observe_trigger("cron", Some(SessionTrigger::Scheduled), None);
+        assert_eq!(send(&mut reg, t(10)), ["cron"], "the trigger ships");
+        // The slug arriving later is a second change, then it is quiet.
+        reg.observe_trigger("cron", Some(SessionTrigger::Scheduled), Some("nightly"));
+        assert_eq!(send(&mut reg, t(10)), ["cron"]);
+        reg.observe_trigger("cron", Some(SessionTrigger::Scheduled), Some("other"));
+        assert!(send(&mut reg, t(10)).is_empty(), "first non-null wins");
+        let live = &reg.sessions["cron"];
+        assert_eq!(live.wire.trigger_name.as_deref(), Some("nightly"));
+        assert_eq!(
+            reg.trigger_of("cron"),
+            (Some(SessionTrigger::Scheduled), Some("nightly".into()))
+        );
+        // An unknown session is ignored, never created.
+        reg.observe_trigger("ghost", Some(SessionTrigger::Scheduled), None);
+        assert_eq!(reg.trigger_of("ghost"), (None, None));
     }
 
     /// The marks pin what was *sent*: a lineage change landing between the

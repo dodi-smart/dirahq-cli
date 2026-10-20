@@ -1,6 +1,6 @@
 ---
 title: Attestation sync and session rollups
-version: 9
+version: 10
 origin: session
 verified: false
 confidence: high
@@ -13,7 +13,7 @@ paths:
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046]
 ---
 
 ## Overview
@@ -113,8 +113,8 @@ single flush window (issue #40).
 - A non-ended session with active time ships a partial whenever its
   rollup's lineage would differ from the last partial sent, whatever its age
   (issue #179). "Lineage" is `SessionLineage::wire`'s `LineageWire`:
-  `repoCanonical`, `role`, `parentSession`, `repos` and `workspaceRef`, the
-  one projection both batch builders use. First sight counts as a change, so
+  `repoCanonical`, `role`, `parentSession`, `repos`, `workspaceRef`,
+  `trigger` and `triggerName`, the one projection both batch builders use. First sight counts as a change, so
   the cloud has a sessions row within a flush instead of an hour later. A
   plain session reaching a second repo changes nothing on its wire and ships
   nothing. Re-sends for growth alone still wait for `partial_rollup_after`
@@ -172,6 +172,17 @@ single flush window (issue #40).
   own repo) keeps `repoCanonical` and also sends `repos`. `role`, `repos` and
   `workspaceRef` become authoritative: a 1.7 rollup that omits one tells the
   cloud to clear it (DIRASH-0042).
+- Contract 1.8 adds two optional `SessionRollup` fields: `trigger`
+  (`scheduled`) and `triggerName`, the slug of the Claude Desktop scheduled task
+  (`[a-z0-9][a-z0-9_-]*`, at most 64 chars). The slug is sent only when it
+  names an existing `~/.claude/scheduled-tasks/<slug>/` directory, never prompt
+  text (DIRASH-0046, an exception to D-0001 for that identifier). Both fold
+  first-non-null per session through `SessionLineage`, are stamped on events
+  (`events.trigger`, `events.trigger_name`, migration 0009) and are never
+  retracted: absent means "not triggered or unknown" and a later rollup that
+  omits them clears nothing. A trigger seen by the live registry counts as a
+  lineage change, so a partial ships it. `LINEAGE_RULES_VERSION` is unchanged:
+  past events carry no trigger, so there is nothing to re-send.
 
 ## Invariants
 

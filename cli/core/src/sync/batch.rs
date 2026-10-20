@@ -262,6 +262,8 @@ fn assemble_batch(
             parent_session: wire.parent_session,
             repos: wire.repos,
             workspace_ref: wire.workspace_ref,
+            trigger: wire.trigger,
+            trigger_name: wire.trigger_name,
         });
     }
 
@@ -897,6 +899,8 @@ fn build_sessions(
                 parent_session: wire.parent_session,
                 repos: wire.repos,
                 workspace_ref: wire.workspace_ref,
+                trigger: wire.trigger,
+                trigger_name: wire.trigger_name,
             }
         })
         .collect()
@@ -2444,6 +2448,44 @@ mod tests {
             "ended_at must be the temporally-latest end, not the stale history one"
         );
     }
+    // --- DIRASH-0046: session trigger rolls up first-non-null ----------------------
+
+    #[test]
+    fn a_trigger_found_on_any_event_rolls_up_and_is_never_retracted() {
+        use dira_contract::SessionTrigger;
+        let mut history = ended_history("s1");
+        // The transcript pass stamped the Stop-like event mid-session, and a
+        // later event (stamped from the registry) repeats it.
+        history[2].lineage.trigger = Some(SessionTrigger::Scheduled);
+        history[2].lineage.trigger_name = Some("dodi-smart-triage-refresh".into());
+        history[4].lineage.trigger = Some(SessionTrigger::Scheduled);
+        history[4].lineage.trigger_name = Some("a-different-name".into());
+        let out = build_sessions(&history, &history, AGENT);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].trigger, Some(SessionTrigger::Scheduled));
+        assert_eq!(
+            out[0].trigger_name.as_deref(),
+            Some("dodi-smart-triage-refresh"),
+            "first non-null wins"
+        );
+        // A session no event of which carries one omits both fields on the wire.
+        let plain = build_sessions(&ended_history("s2"), &ended_history("s2"), AGENT);
+        assert_eq!(plain[0].trigger, None);
+        let json = serde_json::to_string(&plain[0]).unwrap();
+        assert!(!json.contains("trigger"), "{json}");
+    }
+
+    #[test]
+    fn a_partial_carries_the_live_sessions_trigger() {
+        use dira_contract::SessionTrigger;
+        let mut lineage = crate::orchestration::SessionLineage::default();
+        assert!(lineage.observe_trigger(Some(SessionTrigger::Scheduled), Some("nightly")));
+        assert!(!lineage.observe_trigger(Some(SessionTrigger::Scheduled), Some("nightly")));
+        let wire = lineage.wire(None);
+        assert_eq!(wire.trigger, Some(SessionTrigger::Scheduled));
+        assert_eq!(wire.trigger_name.as_deref(), Some("nightly"));
+    }
+
     // --- DIRASH-0045: one-shot lineage re-send ------------------------------------
 
     fn ended_history(session: &str) -> Vec<RawEvent> {

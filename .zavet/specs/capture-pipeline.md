@@ -1,6 +1,6 @@
 ---
 title: Zavet capture pipeline
-version: 9
+version: 10
 origin: session
 verified: false
 confidence: high
@@ -12,7 +12,7 @@ paths:
   - cli/core/src/project.rs
   - cli/core/src/zavet_specs.rs
   - cli/dirad/src/zavet_sources.rs
-decisions: [D-0001, DIRASH-0025, DIRASH-0026, DIRASH-0027, DIRASH-0028, DIRASH-0032, DIRASH-0039, DIRASH-0040]
+decisions: [D-0001, DIRASH-0025, DIRASH-0026, DIRASH-0027, DIRASH-0028, DIRASH-0032, DIRASH-0039, DIRASH-0040, DIRASH-0046]
 ---
 
 ## Overview
@@ -182,6 +182,15 @@ commit poll. No filesystem watcher, no extra daemon.
   already requires. Binding is best-effort: a session already ended in the
   registry is skipped (its rollup is out, so a late binding could not reach the
   cloud), and `removed`/`unresolved` units are not binding targets.
+
+- **Session trigger from the transcript.** The token pass that tail-reads a
+  Claude session's own transcript (never a subagent sidecar) also looks at
+  `user` records for `turnOrigin: "scheduled"` or `origin.subkind:
+  "scheduled-trigger"`. A hit marks the session `scheduled` and, from that
+  record's text only, takes a `scheduled-tasks/<slug>` candidate that is kept
+  only if `~/.claude/scheduled-tasks/<slug>/` exists. The text is dropped. The
+  writer stamps the result on the event that prompted the read and folds it into
+  the live registry (DIRASH-0046).
 
 ## Interfaces & data
 

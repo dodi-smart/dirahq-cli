@@ -402,6 +402,24 @@
         "startedAt": {
           "type": "string"
         },
+        "trigger": {
+          "description": "What started this session when it was a trigger rather than a person\n(see [`SessionTrigger`]). Absent means \"not started by a trigger, or\nunknown\". A trigger is never retracted: a newer rollup that omits it\ndoes not clear one an earlier rollup sent.\nOptional + omitted-when-absent so pre-1.8 payloads stay byte-identical.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionTrigger"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "triggerName": {
+          "description": "The slug of the Claude Desktop scheduled task that started this session\n(`dodi-smart-triage-refresh`), only ever set alongside\n`trigger = scheduled`. The producer sends it only when it names an\nexisting directory under `~/.claude/scheduled-tasks/`, so it matches\n`[a-z0-9][a-z0-9_-]*` and is at most 64 chars. It is a user-chosen\nidentifier like a branch name, never prompt text, a task description,\na schedule or SKILL.md content (DIRASH-0046, an exception to D-0001\nscoped to this verified identifier).\nOptional + omitted-when-absent so pre-1.8 payloads stay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "workspaceRef": {
           "description": "Opaque 16-hex digest of the scratch workspace an orchestrator ran in,\nso sibling runs from one workspace can be stacked. Never a path.\nOptional + omitted-when-absent so pre-1.6 payloads stay byte-identical.",
           "type": [
@@ -417,6 +435,16 @@
         "identityEmail",
         "startedAt",
         "agentWallSeconds"
+      ]
+    },
+    "SessionTrigger": {
+      "description": "What started a session when it was not a person. Absent for an interactive\nsession, and for one whose origin is unknown.",
+      "oneOf": [
+        {
+          "description": "A Claude Desktop scheduled task fired the session. The producer reads\nthe transcript's first-turn origin metadata (never its content) to\nknow.",
+          "type": "string",
+          "const": "scheduled"
+        }
       ]
     },
     "TokenUsage": {

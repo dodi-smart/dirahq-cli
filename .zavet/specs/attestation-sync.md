@@ -1,6 +1,6 @@
 ---
 title: Attestation sync and session rollups
-version: 7
+version: 10
 origin: session
 verified: false
 confidence: high
@@ -13,7 +13,7 @@ paths:
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046]
 ---
 
 ## Overview
@@ -97,23 +97,40 @@ single flush window (issue #40).
   compaction), and a history-derived end would fabricate a false terminal
   rollup. When both a stale and a real end exist, `(at, id)`-sorted merging
   makes the latest end win.
+- A rollup's `branch` is the one the work landed on, by one rule shared by
+  the partial and the ended rollup (`sync::SessionBranch`): among events in
+  the session's own (first-seen) repo, or all events when it has none, the
+  latest branch that is not trunk (`main`/`master`/`develop`/`trunk`) or
+  `HEAD`, else the latest branch at all. Code-tab worktrees start on a
+  throwaway `claude/*` branch and push from another, so the start branch
+  never matched a commit ref or a PR head. An event whose repo came from
+  tool evidence takes its branch from that repo's root, not the cwd.
 - Partial rollups describe still-live sessions from the daemon's in-memory
   registry: rolling clamped `active_seconds`, a live `prompts` counter,
-  and the last-resolved branch (last-wins is the honest answer for a live
-  session, deliberately unlike the terminal rollup's start-branch policy,
-  whose write supersedes the partial anyway). The registry is a pure
+  and the session branch. The registry is a pure
   reduction over events, so daemon-restart hydration replays it back for
   free.
 - A non-ended session with active time ships a partial whenever its
   rollup's lineage would differ from the last partial sent, whatever its age
   (issue #179). "Lineage" is `SessionLineage::wire`'s `LineageWire`:
-  `repoCanonical`, `role`, `parentSession`, `repos` and `workspaceRef`, the
-  one projection both batch builders use. First sight counts as a change, so
+  `repoCanonical`, `role`, `parentSession`, `repos`, `workspaceRef`,
+  `trigger` and `triggerName`, the one projection both batch builders use. First sight counts as a change, so
   the cloud has a sessions row within a flush instead of an hour later. A
   plain session reaching a second repo changes nothing on its wire and ships
   nothing. Re-sends for growth alone still wait for `partial_rollup_after`
   and need new `active_seconds`. `partial_rollup_after = 0` still disables
   partials.
+- Lineage rule changes re-send ended rollups once (DIRASH-0045).
+  `orchestration::LINEAGE_RULES_VERSION` (2) is compared with the `meta` key
+  `lineage_rules_version` (missing = 0). When the build is newer, the sync task
+  rebuilds the final rollup of every session that ended in the last 30 days
+  (`Store::ended_sessions_since`: latest event is a `session_end`) through
+  `build_lineage_resend_rollups`, and POSTs sessions-only batches
+  (`build_lineage_resend_batches`: empty intervals, tokens and artifacts, no
+  cursor moved). Never a partial: the cloud reopens an ended row on one
+  (cloud#253). The marker is written only after every chunk was acked; an
+  unlinked device or missing cloud URL is a silent no-op. It runs after a healthy
+  flush, paced and backed off like a drain, and never blocks normal sync.
 - An acked partial pins `last_partial = (active_seconds, wire)` from the
   `PartialSession` that was sent, not from the registry at ack time, so a
   change that lands mid-flush ships on the next one.
@@ -155,6 +172,17 @@ single flush window (issue #40).
   own repo) keeps `repoCanonical` and also sends `repos`. `role`, `repos` and
   `workspaceRef` become authoritative: a 1.7 rollup that omits one tells the
   cloud to clear it (DIRASH-0042).
+- Contract 1.8 adds two optional `SessionRollup` fields: `trigger`
+  (`scheduled`) and `triggerName`, the slug of the Claude Desktop scheduled task
+  (`[a-z0-9][a-z0-9_-]*`, at most 64 chars). The slug is sent only when it
+  names an existing `~/.claude/scheduled-tasks/<slug>/` directory, never prompt
+  text (DIRASH-0046, an exception to D-0001 for that identifier). Both fold
+  first-non-null per session through `SessionLineage`, are stamped on events
+  (`events.trigger`, `events.trigger_name`, migration 0009) and are never
+  retracted: absent means "not triggered or unknown" and a later rollup that
+  omits them clears nothing. A trigger seen by the live registry counts as a
+  lineage change, so a partial ships it. `LINEAGE_RULES_VERSION` is unchanged:
+  past events carry no trigger, so there is nothing to re-send.
 
 ## Invariants
 

@@ -262,6 +262,8 @@ fn assemble_batch(
             parent_session: wire.parent_session,
             repos: wire.repos,
             workspace_ref: wire.workspace_ref,
+            trigger: wire.trigger,
+            trigger_name: wire.trigger_name,
         });
     }
 
@@ -631,6 +633,81 @@ fn interval_id(
     Ulid::from(value).to_string()
 }
 
+/// Branches that never name the work a session did: the integration trunks and
+/// a detached `HEAD`.
+fn is_trunk_branch(b: &str) -> bool {
+    matches!(b, "main" | "master" | "develop" | "trunk" | "HEAD")
+}
+
+/// Picks the branch a session reports on the wire, shared by the final rollup
+/// (`build_sessions`) and the live registry's partial rollup so both agree.
+///
+/// A harness may start a session on a throwaway placeholder branch
+/// (`claude/<name>-<hex>`) and push the work from a renamed one, and a
+/// multi-repo session has events in other repos on other branches. So:
+/// - only events of the session's own repo count (the first-seen project; every
+///   event counts when the session never has a project);
+/// - the LATEST such event on a non-trunk branch wins;
+/// - failing that, the latest branch of those events, trunk included.
+///
+/// Incremental and order-independent (compares `at`, ties go to the later call).
+#[derive(Debug, Clone, Default)]
+pub struct SessionBranch {
+    own_project: Option<String>,
+    all: BranchPick,
+    own: BranchPick,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BranchPick {
+    /// Latest event on a non-trunk branch.
+    work: Option<(OffsetDateTime, String)>,
+    /// Latest event on any branch.
+    any: Option<(OffsetDateTime, String)>,
+}
+
+impl BranchPick {
+    fn observe(&mut self, at: OffsetDateTime, branch: &str) {
+        let newer =
+            |slot: &Option<(OffsetDateTime, String)>| slot.as_ref().is_none_or(|(t, _)| at >= *t);
+        if newer(&self.any) {
+            self.any = Some((at, branch.to_string()));
+        }
+        if !is_trunk_branch(branch) && newer(&self.work) {
+            self.work = Some((at, branch.to_string()));
+        }
+    }
+
+    fn resolve(&self) -> Option<String> {
+        self.work
+            .as_ref()
+            .or(self.any.as_ref())
+            .map(|(_, b)| b.clone())
+    }
+}
+
+impl SessionBranch {
+    pub fn observe(&mut self, e: &RawEvent) {
+        if self.own_project.is_none() {
+            self.own_project = e.project.clone();
+        }
+        let Some(b) = e.branch.as_deref() else { return };
+        self.all.observe(e.at, b);
+        if self.own_project.is_some() && e.project == self.own_project {
+            self.own.observe(e.at, b);
+        }
+    }
+
+    /// The session's branch, or `None` when no qualifying event carried one.
+    pub fn resolve(&self) -> Option<String> {
+        if self.own_project.is_some() {
+            self.own.resolve()
+        } else {
+            self.all.resolve()
+        }
+    }
+}
+
 /// Per-session rollups, emitted only for sessions that have ended in this window.
 ///
 /// `idle` trims the session's `agent_wall_seconds`: rather than the raw `last -
@@ -682,10 +759,8 @@ fn build_sessions(
         prompts: u64,
         ended: bool,
         ended_at: Option<OffsetDateTime>,
-        /// Branch on the session's *earliest* observed event (session start).
-        start_branch: Option<String>,
-        /// Frequency of each branch across the session's events (fallback).
-        branch_counts: BTreeMap<String, u64>,
+        /// The branch the session's work landed on (see [`SessionBranch`]).
+        branch: SessionBranch,
         /// Every event timestamp in the session, for idle-trimmed wall-clock.
         event_times: Vec<crate::accounting::AgentSample>,
         /// First non-null free-text note / operational label across the session's
@@ -719,7 +794,7 @@ fn build_sessions(
         ended_ids.contains(e.session_id.as_str()) && !slice_ids.contains(e.id.as_str())
     }));
     // Sort by (at, id): the accumulator below is order-dependent (first-non-null
-    // project/email/note/label, `start_branch` via `e.at < entry.first`), and a
+    // project/email/note/label, `first` via `e.at < entry.first`), and a
     // history-carried stale end (e.g. a compaction `SessionEnd`) must lose to a
     // later real end on `ended_at` — sorting by `at` (ties broken by id) makes the
     // last-processed end win, which is always the temporally-latest one.
@@ -740,8 +815,7 @@ fn build_sessions(
                 prompts: 0,
                 ended: false,
                 ended_at: None,
-                start_branch: e.branch.clone(),
-                branch_counts: BTreeMap::new(),
+                branch: SessionBranch::default(),
                 event_times: Vec::new(),
                 note: e.note.clone(),
                 label: e.label.clone(),
@@ -753,13 +827,9 @@ fn build_sessions(
             at: e.at,
             opens_span: e.kind.opens_agent_span(),
         });
-        if let Some(b) = &e.branch {
-            *entry.branch_counts.entry(b.clone()).or_insert(0) += 1;
-        }
-        // Track the branch at the session's earliest event (its start).
+        entry.branch.observe(e);
         if e.at < entry.first {
             entry.first = e.at;
-            entry.start_branch = e.branch.clone();
         }
         if e.at > entry.last {
             entry.last = e.at;
@@ -803,15 +873,9 @@ fn build_sessions(
             } else {
                 0
             };
-            // Branch at session start, falling back to the most frequent branch
-            // among the session's events (ties broken by branch name for
-            // determinism). `None` when no event carried a branch.
-            let branch = a.start_branch.clone().or_else(|| {
-                a.branch_counts
-                    .iter()
-                    .max_by(|(an, ac), (bn, bc)| ac.cmp(bc).then(bn.cmp(an)))
-                    .map(|(name, _)| name.clone())
-            });
+            // The branch the work landed on, not the start branch (see
+            // [`SessionBranch`]); `None` when no qualifying event carried one.
+            let branch = a.branch.resolve();
             let wire = a.lineage.wire(a.project);
             SessionRollup {
                 session_id: id.to_string(),
@@ -835,6 +899,112 @@ fn build_sessions(
                 parent_session: wire.parent_session,
                 repos: wire.repos,
                 workspace_ref: wire.workspace_ref,
+                trigger: wire.trigger,
+                trigger_name: wire.trigger_name,
+            }
+        })
+        .collect()
+}
+
+/// Most sessions one lineage re-send batch carries. A rollup is a few hundred
+/// bytes (the repo list is capped), so this stays far under the request-body
+/// ceiling while keeping a 30-day backlog to a handful of POSTs.
+pub const CHUNK_RESEND_SESSIONS: usize = 100;
+
+/// Rebuild the FINAL rollups of sessions that are definitely over, from their
+/// full retained event history, for the one-shot lineage re-send
+/// ([`crate::orchestration::LINEAGE_RULES_VERSION`], DIRASH-0045).
+///
+/// `history` holds every retained event of the sessions to rebuild. A session
+/// is rolled up only when its LATEST event, by `(at, id)`, is a `SessionEnd`:
+/// a session that kept going after an end (Claude Code emits one on
+/// compaction) is live, and a partial for it must never be sent from here,
+/// because the cloud reopens an ended row when a partial arrives (cloud#253).
+/// Live sessions ship their corrected lineage through the registry's
+/// partial-on-lineage-change path instead.
+///
+/// The rollup comes from the same accumulator as the normal path
+/// ([`build_sessions`], with the whole history as the window), so its time
+/// fields (`started_at`, `ended_at`, `agent_wall_seconds`, `prompts`) are what
+/// the first send carried and the cloud's `agentWallSeconds >= stored` guard
+/// accepts it. A session with no agent time is skipped: it has no lineage to
+/// correct and was only ever shipped for its human intervals.
+pub fn build_lineage_resend_rollups(
+    history: &[RawEvent],
+    agent: crate::accounting::AgentPolicy,
+) -> Vec<SessionRollup> {
+    let mut latest: BTreeMap<&str, &RawEvent> = BTreeMap::new();
+    for e in history {
+        let slot = latest.entry(e.session_id.as_str()).or_insert(e);
+        if (e.at, e.id.as_str()) > (slot.at, slot.id.as_str()) {
+            *slot = e;
+        }
+    }
+    let over: std::collections::HashSet<&str> = latest
+        .into_iter()
+        .filter(|(_, e)| matches!(e.kind, EventKind::SessionEnd))
+        .map(|(id, _)| id)
+        .collect();
+    let events: Vec<RawEvent> = history
+        .iter()
+        .filter(|e| over.contains(e.session_id.as_str()))
+        .cloned()
+        .collect();
+    build_sessions(&events, &[], agent)
+        .into_iter()
+        .filter(|s| s.agent_wall_seconds > 0)
+        .collect()
+}
+
+/// Package re-sent rollups as sessions-only batches of at most
+/// [`CHUNK_RESEND_SESSIONS`]. `intervals`, `token_usage` and `artifacts` are
+/// always empty, so the re-send can never count a second of time twice, and
+/// the batches carry no cursor: the caller moves none.
+///
+/// The batch id hashes the rules version and the rollup content, so a retry
+/// of the same chunk dedups at the cloud while a corrected rollup (or a later
+/// rules version) gets a fresh id. Its ULID timestamp is the newest covered
+/// event's, like [`batch_id_for_chunk`], so the cloud's `max(batchId)`
+/// watermark never runs ahead of the event cursor.
+pub fn build_lineage_resend_batches(
+    rollups: Vec<SessionRollup>,
+    history: &[RawEvent],
+    rules_version: u32,
+    device_id: &str,
+    now: OffsetDateTime,
+) -> Vec<AttestationBatch> {
+    rollups
+        .chunks(CHUNK_RESEND_SESSIONS)
+        .map(|chunk| {
+            let body = serde_json::to_vec(chunk).unwrap_or_default();
+            let mut seed_bytes = rules_version.to_be_bytes().to_vec();
+            seed_bytes.extend_from_slice(&body);
+            let lo = fnv1a_bytes(&seed_bytes, 0xcbf29ce484222325);
+            let hi = fnv1a_bytes(&seed_bytes, 0x100000001b3);
+            let content = ((hi as u128) << 64) | lo as u128;
+            let ids: std::collections::HashSet<&str> =
+                chunk.iter().map(|s| s.session_id.as_str()).collect();
+            let max_ts_ms = history
+                .iter()
+                .filter(|e| ids.contains(e.session_id.as_str()))
+                .map(|e| e.id.as_str())
+                .max()
+                .and_then(|id| Ulid::from_string(id).ok())
+                .map(|u| u.timestamp_ms());
+            let batch_id = match max_ts_ms {
+                Some(ts) => {
+                    Ulid::from(((ts as u128) << 80) | (content & ((1u128 << 80) - 1))).to_string()
+                }
+                None => Ulid::from(content).to_string(),
+            };
+            AttestationBatch {
+                batch_id,
+                device_id: device_id.to_string(),
+                generated_at: fmt(now),
+                intervals: Vec::new(),
+                sessions: chunk.to_vec(),
+                token_usage: Vec::new(),
+                artifacts: Vec::new(),
             }
         })
         .collect()
@@ -1678,23 +1848,108 @@ mod tests {
         assert_eq!(a.blobs.as_ref().unwrap()[0].blob, "blob-a");
     }
 
-    #[test]
-    fn session_branch_propagates_from_events() {
-        // Branch on the start event wins over later branches.
-        let mut start = ev("s1", 0, EventKind::SessionStart, "p");
-        start.branch = Some("feat/x".into());
-        let mut work = ev("s1", 10, EventKind::PreTool, "p");
-        work.branch = Some("feat/y".into());
-        let mut end = ev("s1", 20, EventKind::SessionEnd, "p");
-        end.branch = Some("feat/y".into());
-        let batch = build_batch(&[start, work, end], &[], &[], "d", IDLE, AGENT, NOW);
+    fn ev_pb(session: &str, secs: i64, kind: EventKind, project: &str, branch: &str) -> RawEvent {
+        ev_b(session, secs, kind, project, branch)
+    }
+
+    fn rolled_branch(events: &[RawEvent]) -> Option<String> {
+        let batch = build_batch(events, &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.sessions.len(), 1);
-        assert_eq!(batch.sessions[0].branch.as_deref(), Some("feat/x"));
+        batch.sessions[0].branch.clone()
     }
 
     #[test]
-    fn session_branch_falls_back_to_most_frequent() {
-        // No branch on the start event ⇒ fall back to the most frequent branch.
+    fn session_branch_propagates_from_events() {
+        // The latest non-trunk branch wins over the start branch.
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "feat/x");
+        let work = ev_pb("s1", 10, EventKind::PreTool, "p", "feat/y");
+        let end = ev_pb("s1", 20, EventKind::SessionEnd, "p", "feat/y");
+        assert_eq!(
+            rolled_branch(&[start, work, end]).as_deref(),
+            Some("feat/y")
+        );
+    }
+
+    #[test]
+    fn session_branch_placeholder_start_then_renamed_work_branch() {
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "claude/zen-ab12cd");
+        let work = ev_pb("s1", 10, EventKind::PreTool, "p", "feat/x");
+        let end = ev_pb("s1", 20, EventKind::SessionEnd, "p", "feat/x");
+        assert_eq!(
+            rolled_branch(&[start, work, end]).as_deref(),
+            Some("feat/x")
+        );
+    }
+
+    #[test]
+    fn session_branch_ignores_trailing_trunk() {
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "feat/x");
+        let work = ev_pb("s1", 10, EventKind::PreTool, "p", "feat/x");
+        let end = ev_pb("s1", 20, EventKind::SessionEnd, "p", "main");
+        assert_eq!(
+            rolled_branch(&[start, work, end]).as_deref(),
+            Some("feat/x")
+        );
+    }
+
+    #[test]
+    fn session_branch_trunk_only_falls_back_to_trunk() {
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "main");
+        let work = ev("s1", 10, EventKind::PreTool, "p");
+        let end = ev("s1", 20, EventKind::SessionEnd, "p");
+        assert_eq!(rolled_branch(&[start, work, end]).as_deref(), Some("main"));
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "main");
+        let work = ev_pb("s1", 10, EventKind::PreTool, "p", "HEAD");
+        let end = ev("s1", 20, EventKind::SessionEnd, "p");
+        assert_eq!(rolled_branch(&[start, work, end]).as_deref(), Some("HEAD"));
+    }
+
+    #[test]
+    fn session_branch_ignores_other_repos_events() {
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "own", "feat/own");
+        let other = ev_pb("s1", 10, EventKind::PreTool, "other", "fix/elsewhere");
+        let end = ev_pb("s1", 20, EventKind::SessionEnd, "own", "main");
+        assert_eq!(
+            rolled_branch(&[start, other, end]).as_deref(),
+            Some("feat/own")
+        );
+    }
+
+    #[test]
+    fn session_branch_without_project_considers_all_events() {
+        let mut start = ev_pb("s1", 0, EventKind::SessionStart, "p", "claude/x-1");
+        start.project = None;
+        let mut work = ev_pb("s1", 10, EventKind::PreTool, "p", "feat/x");
+        work.project = None;
+        let mut end = ev("s1", 20, EventKind::SessionEnd, "p");
+        end.project = None;
+        assert_eq!(
+            rolled_branch(&[start, work, end]).as_deref(),
+            Some("feat/x")
+        );
+    }
+
+    #[test]
+    fn partial_and_final_rollups_share_the_branch_rule() {
+        let events = [
+            ev_pb("s1", 0, EventKind::SessionStart, "own", "claude/x-1"),
+            ev_pb("s1", 5, EventKind::PreTool, "other", "fix/elsewhere"),
+            ev_pb("s1", 10, EventKind::PreTool, "own", "feat/x"),
+            ev_pb("s1", 20, EventKind::PostTool, "own", "main"),
+        ];
+        let mut tracker = SessionBranch::default();
+        for e in &events {
+            tracker.observe(e);
+        }
+        let mut ended = events.to_vec();
+        ended.push(ev("s1", 30, EventKind::SessionEnd, "own"));
+        assert_eq!(tracker.resolve().as_deref(), Some("feat/x"));
+        assert_eq!(rolled_branch(&ended), tracker.resolve());
+    }
+
+    #[test]
+    fn session_branch_latest_non_trunk_wins_over_frequency() {
+        // Frequency is irrelevant: the latest non-trunk branch wins.
         let start = ev("s1", 0, EventKind::SessionStart, "p"); // branch None
         let mut w1 = ev("s1", 10, EventKind::PreTool, "p");
         w1.branch = Some("feat/x".into());
@@ -1702,9 +1957,10 @@ mod tests {
         w2.branch = Some("feat/x".into());
         let mut end = ev("s1", 30, EventKind::SessionEnd, "p");
         end.branch = Some("feat/y".into());
-        let batch = build_batch(&[start, w1, w2, end], &[], &[], "d", IDLE, AGENT, NOW);
-        assert_eq!(batch.sessions.len(), 1);
-        assert_eq!(batch.sessions[0].branch.as_deref(), Some("feat/x"));
+        assert_eq!(
+            rolled_branch(&[start, w1, w2, end]).as_deref(),
+            Some("feat/y")
+        );
     }
 
     #[test]
@@ -2191,5 +2447,122 @@ mod tests {
             Some(fmt(OffsetDateTime::UNIX_EPOCH + Duration::seconds(500))),
             "ended_at must be the temporally-latest end, not the stale history one"
         );
+    }
+    // --- DIRASH-0046: session trigger rolls up first-non-null ----------------------
+
+    #[test]
+    fn a_trigger_found_on_any_event_rolls_up_and_is_never_retracted() {
+        use dira_contract::SessionTrigger;
+        let mut history = ended_history("s1");
+        // The transcript pass stamped the Stop-like event mid-session, and a
+        // later event (stamped from the registry) repeats it.
+        history[2].lineage.trigger = Some(SessionTrigger::Scheduled);
+        history[2].lineage.trigger_name = Some("dodi-smart-triage-refresh".into());
+        history[4].lineage.trigger = Some(SessionTrigger::Scheduled);
+        history[4].lineage.trigger_name = Some("a-different-name".into());
+        let out = build_sessions(&history, &history, AGENT);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].trigger, Some(SessionTrigger::Scheduled));
+        assert_eq!(
+            out[0].trigger_name.as_deref(),
+            Some("dodi-smart-triage-refresh"),
+            "first non-null wins"
+        );
+        // A session no event of which carries one omits both fields on the wire.
+        let plain = build_sessions(&ended_history("s2"), &ended_history("s2"), AGENT);
+        assert_eq!(plain[0].trigger, None);
+        let json = serde_json::to_string(&plain[0]).unwrap();
+        assert!(!json.contains("trigger"), "{json}");
+    }
+
+    #[test]
+    fn a_partial_carries_the_live_sessions_trigger() {
+        use dira_contract::SessionTrigger;
+        let mut lineage = crate::orchestration::SessionLineage::default();
+        assert!(lineage.observe_trigger(Some(SessionTrigger::Scheduled), Some("nightly")));
+        assert!(!lineage.observe_trigger(Some(SessionTrigger::Scheduled), Some("nightly")));
+        let wire = lineage.wire(None);
+        assert_eq!(wire.trigger, Some(SessionTrigger::Scheduled));
+        assert_eq!(wire.trigger_name.as_deref(), Some("nightly"));
+    }
+
+    // --- DIRASH-0045: one-shot lineage re-send ------------------------------------
+
+    fn ended_history(session: &str) -> Vec<RawEvent> {
+        vec![
+            ev_b(session, 0, EventKind::SessionStart, "p", "feat/x"),
+            ev_b(session, 10, EventKind::UserPrompt, "p", "feat/x"),
+            ev_b(session, 30, EventKind::PreTool, "p", "feat/x"),
+            ev_b(session, 60, EventKind::PostTool, "p", "feat/x"),
+            ev_b(session, 90, EventKind::UserPrompt, "p", "feat/x"),
+            ev_b(session, 120, EventKind::SessionEnd, "p", "feat/x"),
+        ]
+    }
+
+    #[test]
+    fn a_lineage_resend_rollup_equals_the_normal_ended_rollup_over_the_same_history() {
+        let history = ended_history("s1");
+        // What the first send produced: the bare end in the window, the rest as history.
+        let window = vec![history[5].clone()];
+        let normal =
+            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &history);
+        let first = &normal[0].batch.sessions;
+        assert_eq!(first.len(), 1);
+
+        let resent = build_lineage_resend_rollups(&history, AGENT);
+        assert_eq!(resent.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&resent[0]).unwrap(),
+            serde_json::to_value(&first[0]).unwrap(),
+            "time fields and lineage must match what the first send carried"
+        );
+        assert!(resent[0].agent_wall_seconds > 0);
+        assert_eq!(resent[0].prompts, Some(2));
+    }
+
+    #[test]
+    fn a_session_whose_last_event_is_not_an_end_is_not_resent() {
+        // A compaction-style end followed by more work: live, so no final
+        // rollup and, above all, no partial that would reopen an ended row.
+        let mut live = ended_history("live");
+        live.push(ev("live", 300, EventKind::PreTool, "p"));
+        let mut all = ended_history("done");
+        all.extend(live);
+        let out = build_lineage_resend_rollups(&all, AGENT);
+        let ids: Vec<&str> = out.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["done"]);
+        assert!(out.iter().all(|s| s.ended_at.is_some()));
+    }
+
+    #[test]
+    fn lineage_resend_batches_carry_only_sessions() {
+        let mut history = ended_history("s1");
+        history.extend(ended_history("s2"));
+        let rollups = build_lineage_resend_rollups(&history, AGENT);
+        assert_eq!(rollups.len(), 2);
+        let batches = build_lineage_resend_batches(rollups.clone(), &history, 2, "d", NOW);
+        assert_eq!(batches.len(), 1);
+        let b = &batches[0];
+        assert_eq!(b.sessions.len(), 2);
+        assert!(b.intervals.is_empty() && b.token_usage.is_empty() && b.artifacts.is_empty());
+
+        // Same content, same id (retry dedup); another rules version, another id.
+        let again = build_lineage_resend_batches(rollups.clone(), &history, 2, "d", NOW);
+        assert_eq!(again[0].batch_id, b.batch_id);
+        let bumped = build_lineage_resend_batches(rollups, &history, 3, "d", NOW);
+        assert_ne!(bumped[0].batch_id, b.batch_id);
+    }
+
+    #[test]
+    fn lineage_resend_batches_are_capped_per_chunk() {
+        let mut history = Vec::new();
+        for i in 0..(CHUNK_RESEND_SESSIONS + 1) {
+            history.extend(ended_history(&format!("s{i:04}")));
+        }
+        let rollups = build_lineage_resend_rollups(&history, AGENT);
+        let batches = build_lineage_resend_batches(rollups, &history, 2, "d", NOW);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].sessions.len(), CHUNK_RESEND_SESSIONS);
+        assert_eq!(batches[1].sessions.len(), 1);
     }
 }

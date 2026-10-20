@@ -220,8 +220,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO events
                 (id, at, session_id, harness, kind, cwd, project, identity_email, branch, tool, label, activity, note, spec,
-                 host_session, workspace, spawned, parent_session)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                 host_session, workspace, spawned, parent_session, trigger, trigger_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         )
         .bind(&ev.id)
         .bind(StoredAt(ev.at))
@@ -241,6 +241,29 @@ impl Store {
         .bind(&ev.lineage.workspace)
         .bind(&ev.lineage.spawned)
         .bind(&ev.lineage.parent_session)
+        .bind(ev.lineage.trigger.map(crate::orchestration::trigger_str))
+        .bind(&ev.lineage.trigger_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Stamp a session trigger on an already-stored event. The transcript pass
+    /// that finds it runs after the hook's event was appended (DIRASH-0046).
+    /// Only fills empty columns, so a trigger is never rewritten.
+    pub async fn set_event_trigger(
+        &self,
+        event_id: &str,
+        trigger: dira_contract::SessionTrigger,
+        trigger_name: Option<&str>,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE events SET trigger = COALESCE(trigger, ?2), \
+             trigger_name = COALESCE(trigger_name, ?3) WHERE id = ?1",
+        )
+        .bind(event_id)
+        .bind(crate::orchestration::trigger_str(trigger))
+        .bind(trigger_name)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -358,6 +381,29 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Ids of sessions whose LATEST event is a `session_end` at or after
+    /// `since`, i.e. sessions that are definitely over. Feeds the one-shot
+    /// lineage re-send (DIRASH-0045): a session with any event after its end
+    /// (a compaction `SessionEnd` on a live session) is excluded, because a
+    /// partial for it would reopen the cloud row (cloud#253). Sorted by id.
+    /// Reserved probe sessions are filtered like every other read (DIRASH-0023).
+    pub async fn ended_sessions_since(&self, since: OffsetDateTime) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT e.session_id AS session_id FROM events e \
+             WHERE e.kind = 'session_end' AND e.at >= ?1 AND e.session_id NOT LIKE ?2 \
+             AND NOT EXISTS (SELECT 1 FROM events n WHERE n.session_id = e.session_id \
+                 AND (n.at > e.at OR (n.at = e.at AND n.id > e.id))) \
+             ORDER BY e.session_id ASC",
+        )
+        .bind(StoredAt(since))
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut ids: Vec<String> = rows.iter().map(|r| r.get("session_id")).collect();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Human-signal "seed" for a sync flush: the already-synced human signals (id ≤
@@ -3236,6 +3282,11 @@ fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
             workspace: row.get("workspace"),
             spawned: row.get("spawned"),
             parent_session: row.get("parent_session"),
+            trigger: row
+                .get::<Option<String>, _>("trigger")
+                .as_deref()
+                .and_then(crate::orchestration::parse_trigger),
+            trigger_name: row.get("trigger_name"),
         },
     })
 }
@@ -3406,6 +3457,34 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].kind, EventKind::SessionStart);
         assert_eq!(all[1].project.as_deref(), Some("github.com/acme/api"));
+    }
+
+    #[tokio::test]
+    async fn a_trigger_roundtrips_and_is_stamped_on_a_stored_event_once() {
+        use dira_contract::SessionTrigger;
+        let store = Store::open_in_memory().await.unwrap();
+        let plain = ev("e1", EventKind::Stop);
+        let mut born = ev("e2", EventKind::SessionStart);
+        born.lineage.trigger = Some(SessionTrigger::Scheduled);
+        born.lineage.trigger_name = Some("nightly".into());
+        store.append(&plain).await.unwrap();
+        store.append(&born).await.unwrap();
+
+        // The transcript pass runs after the append: stamp the stored row.
+        store
+            .set_event_trigger("e1", SessionTrigger::Scheduled, Some("first"))
+            .await
+            .unwrap();
+        // Never rewritten once set.
+        store
+            .set_event_trigger("e1", SessionTrigger::Scheduled, Some("second"))
+            .await
+            .unwrap();
+
+        let all = store.events_since(None).await.unwrap();
+        assert_eq!(all[0].lineage.trigger, Some(SessionTrigger::Scheduled));
+        assert_eq!(all[0].lineage.trigger_name.as_deref(), Some("first"));
+        assert_eq!(all[1].lineage, born.lineage);
     }
 
     #[tokio::test]
@@ -3897,6 +3976,38 @@ mod tests {
             spec: None,
             lineage: Default::default(),
         }
+    }
+
+    /// The lineage re-send (DIRASH-0045) may only touch sessions that are
+    /// definitely over: latest event a `session_end`, inside the window, and
+    /// never a reserved probe session.
+    #[tokio::test]
+    async fn ended_sessions_since_lists_only_sessions_whose_last_event_is_an_end() {
+        let store = Store::open_in_memory().await.unwrap();
+        let t = |secs: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs);
+        let probe = format!("{}01PROBE", crate::model::PROBE_SESSION_PREFIX);
+        for e in [
+            // ended
+            ev_at("01", "done", t(100), EventKind::UserPrompt),
+            ev_at("02", "done", t(200), EventKind::SessionEnd),
+            // a compaction end followed by more work: live
+            ev_at("03", "live", t(100), EventKind::SessionEnd),
+            ev_at("04", "live", t(300), EventKind::PreTool),
+            // ended before the window
+            ev_at("05", "old", t(10), EventKind::SessionEnd),
+            // probe
+            ev_at("06", &probe, t(200), EventKind::SessionEnd),
+        ] {
+            store.append(&e).await.unwrap();
+        }
+        assert_eq!(
+            store.ended_sessions_since(t(50)).await.unwrap(),
+            vec!["done".to_string()]
+        );
+        assert_eq!(
+            store.ended_sessions_since(t(0)).await.unwrap(),
+            vec!["done".to_string(), "old".to_string()]
+        );
     }
 
     /// `distinct_event_cwds` returns the most-recently-active cwd first

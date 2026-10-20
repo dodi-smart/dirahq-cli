@@ -11,8 +11,9 @@ pub mod knowledge;
 pub mod ratelimit;
 
 pub use batch::{
-    build_batch, build_batch_with_partials, build_chunked_batches, est_cost, fnv1a_bytes,
-    ArtifactRow, ChunkBatch, PartialSession, TokenRow, CHUNK_ARTIFACTS, CHUNK_EVENTS, CHUNK_TOKENS,
+    build_batch, build_batch_with_partials, build_chunked_batches, build_lineage_resend_batches,
+    build_lineage_resend_rollups, est_cost, fnv1a_bytes, ArtifactRow, ChunkBatch, PartialSession,
+    SessionBranch, TokenRow, CHUNK_ARTIFACTS, CHUNK_EVENTS, CHUNK_RESEND_SESSIONS, CHUNK_TOKENS,
 };
 pub use billing::{
     parse_billing_summary_response, BillingSummary, CachedBillingSummary, META_BILLING_SUMMARY,
@@ -55,3 +56,8 @@ pub const META_LAST_EPOCH: &str = "sync_last_data_epoch";
 /// cached so `dira device status` can show "in sync / cloud behind" without a round
 /// trip. Advisory/display only — never drives an automatic rewind.
 pub const META_CLOUD_WATERMARK: &str = "sync_cloud_watermark";
+
+/// `meta` key: the [`crate::orchestration::LINEAGE_RULES_VERSION`] whose
+/// corrected rollups were last re-sent to the cloud in full. Missing reads as
+/// 0. Written only after every re-send chunk was acked (DIRASH-0045).
+pub const META_LINEAGE_RULES_VERSION: &str = "lineage_rules_version";

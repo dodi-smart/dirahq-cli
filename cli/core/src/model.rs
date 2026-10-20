@@ -76,6 +76,14 @@ pub struct Lineage {
     /// the daemon from `host_session` against an earlier `spawned`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session: Option<String>,
+    /// What started the session when it was a trigger, not a person. Derived
+    /// from the transcript's origin metadata, never its content (DIRASH-0046).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<dira_contract::SessionTrigger>,
+    /// Slug of the Claude Desktop scheduled task, kept only when it names an
+    /// existing `~/.claude/scheduled-tasks/<slug>/` directory (DIRASH-0046).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_name: Option<String>,
 }
 
 /// Session-id prefix reserved for `dira doctor --probe`'s end-to-end capture

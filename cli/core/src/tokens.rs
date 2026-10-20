@@ -175,6 +175,101 @@ pub fn parse_transcript_usage(jsonl: &str) -> Vec<TokenTurn> {
     out
 }
 
+/// What a Claude transcript says started its session (DIRASH-0046).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptTrigger {
+    pub trigger: dira_contract::SessionTrigger,
+    /// A syntactically valid `scheduled-tasks/<slug>` slug found in the first
+    /// triggered turn. NOT yet trustworthy: it is only ever kept after
+    /// [`verified_task_slug`] confirms the directory exists.
+    pub slug_candidate: Option<String>,
+}
+
+/// Is `s` a scheduled-task slug: `[a-z0-9][a-z0-9_-]{0,63}`?
+pub fn is_task_slug(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 64
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+}
+
+/// The first `scheduled-tasks/<slug>` in `text` whose slug is valid. The run
+/// after the marker is taken through `[A-Za-z0-9._-]` and validated whole, so
+/// `../x`, `Upper` or `a.b` yield nothing rather than a trimmed lookalike.
+fn first_task_slug(text: &str) -> Option<String> {
+    const MARKER: &str = "scheduled-tasks/";
+    let mut rest = text;
+    while let Some(i) = rest.find(MARKER) {
+        rest = &rest[i + MARKER.len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
+            .unwrap_or(rest.len());
+        if is_task_slug(&rest[..end]) {
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
+}
+
+/// Does this `user` record say a schedule fired the turn? Reads two metadata
+/// fields only.
+fn is_scheduled_record(v: &serde_json::Value) -> bool {
+    v.get("turnOrigin").and_then(|t| t.as_str()) == Some("scheduled")
+        || v.get("origin")
+            .and_then(|o| o.get("subkind"))
+            .and_then(|k| k.as_str())
+            == Some("scheduled-trigger")
+}
+
+/// Derive-then-drop (DIRASH-0041, DIRASH-0046): find out whether a Claude
+/// transcript tail starts with a scheduled run and, if so, which task slug its
+/// first triggered turn names. Reads the origin metadata of `user` records, and
+/// that one record's message text only to match the slug. The text is never
+/// returned, stored or logged.
+pub fn parse_transcript_trigger(jsonl: &str) -> Option<TranscriptTrigger> {
+    for line in jsonl.lines() {
+        // Cheap prefilter: the transcript is large and almost none of it is
+        // scheduled. Both signals contain this word.
+        if !line.contains("scheduled") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") || !is_scheduled_record(&v) {
+            continue;
+        }
+        let content = v.get("message").and_then(|m| m.get("content"));
+        let slug_candidate = match content {
+            Some(serde_json::Value::String(s)) => first_task_slug(s),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .find_map(first_task_slug),
+            _ => None,
+        };
+        return Some(TranscriptTrigger {
+            trigger: dira_contract::SessionTrigger::Scheduled,
+            slug_candidate,
+        });
+    }
+    None
+}
+
+/// Where Claude Desktop keeps its scheduled tasks, under `home`.
+pub fn scheduled_tasks_root(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".claude").join("scheduled-tasks")
+}
+
+/// Keep `candidate` only if it is a valid slug AND names an existing directory
+/// under `tasks_root`. This is what stops prompt text from becoming a name.
+pub fn verified_task_slug(tasks_root: &std::path::Path, candidate: &str) -> Option<String> {
+    (is_task_slug(candidate) && tasks_root.join(candidate).is_dir()).then(|| candidate.to_string())
+}
+
 /// Parse a grok-build session transcript (`~/.grok/sessions/<encoded-cwd>/<id>/updates.jsonl`,
 /// JSONL) into per-turn token usage.
 ///
@@ -572,5 +667,117 @@ not-json
         };
         // 1M cache_read @ $0.75 = $0.75.
         assert!((t.est_cost_usd() - 0.75).abs() < 1e-9);
+    }
+
+    // --- DIRASH-0046: session trigger from the transcript ---------------------
+
+    const SCHEDULED_USER: &str = r#"{"type":"user","turnOrigin":"scheduled","promptSource":"system","origin":{"kind":"task-notification","subkind":"scheduled-trigger","fireReason":"scheduled"},"message":{"role":"user","content":"Run the task described in ~/.claude/scheduled-tasks/dodi-smart-triage-refresh/SKILL.md now."}}"#;
+
+    #[test]
+    fn an_interactive_transcript_has_no_trigger() {
+        let jsonl = [
+            r#"{"type":"user","turnOrigin":"human","message":{"role":"user","content":"see scheduled-tasks/x/SKILL.md"}}"#,
+            r#"{"type":"user","turnOrigin":"sdk","message":{"content":"scheduled run"}}"#,
+            r#"{"type":"user","turnOrigin":"task_notification","message":{"content":"x"}}"#,
+        ]
+        .join("\n");
+        assert_eq!(parse_transcript_trigger(&jsonl), None);
+    }
+
+    #[test]
+    fn a_scheduled_turn_yields_the_trigger_and_a_slug_candidate() {
+        let jsonl = format!("{{\"type\":\"summary\"}}\nnot json\n{SCHEDULED_USER}\n");
+        assert_eq!(
+            parse_transcript_trigger(&jsonl),
+            Some(TranscriptTrigger {
+                trigger: dira_contract::SessionTrigger::Scheduled,
+                slug_candidate: Some("dodi-smart-triage-refresh".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn either_origin_signal_marks_it_and_array_content_is_read_for_the_slug() {
+        let by_subkind = r#"{"type":"user","origin":{"subkind":"scheduled-trigger"},"message":{"content":[{"type":"tool_result","content":"scheduled-tasks/ignored"},{"type":"text","text":"open scheduled-tasks/nightly_9/SKILL.md"}]}}"#;
+        let t = parse_transcript_trigger(by_subkind).unwrap();
+        assert_eq!(t.slug_candidate.as_deref(), Some("nightly_9"));
+        // A non-user record that merely carries the field is not a turn.
+        let assistant = r#"{"type":"assistant","turnOrigin":"scheduled","message":{"content":"scheduled-tasks/a"}}"#;
+        assert_eq!(parse_transcript_trigger(assistant), None);
+    }
+
+    #[test]
+    fn a_scheduled_turn_without_a_slug_is_still_a_trigger() {
+        let line =
+            r#"{"type":"user","turnOrigin":"scheduled","message":{"content":"do the thing"}}"#;
+        let t = parse_transcript_trigger(line).unwrap();
+        assert_eq!(t.trigger, dira_contract::SessionTrigger::Scheduled);
+        assert_eq!(t.slug_candidate, None);
+    }
+
+    #[test]
+    fn a_slug_that_is_not_exactly_a_slug_is_rejected() {
+        for bad in [
+            "",
+            "../x",
+            "a/b",
+            "Upper",
+            "-lead",
+            "_lead",
+            "a.b",
+            "a b",
+            "ünï",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_task_slug(bad), "{bad:?} must be rejected");
+        }
+        assert!(is_task_slug("a"));
+        assert!(is_task_slug("9-x_y"));
+        assert!(is_task_slug(&"a".repeat(64)));
+        // In prompt text: no trimmed lookalike is ever extracted.
+        for text in [
+            "scheduled-tasks/../x/SKILL.md",
+            "scheduled-tasks/Upper/SKILL.md",
+            "scheduled-tasks/a.b/SKILL.md",
+            "scheduled-tasks//etc",
+            "scheduled-tasks/",
+        ] {
+            assert_eq!(first_task_slug(text), None, "{text:?}");
+        }
+        // `a/b` is the slug `a` followed by a path, never the slug `a/b`.
+        assert_eq!(first_task_slug("scheduled-tasks/a/b").as_deref(), Some("a"));
+        // The first VALID occurrence wins.
+        assert_eq!(
+            first_task_slug("scheduled-tasks/Bad then scheduled-tasks/ok-1/x").as_deref(),
+            Some("ok-1")
+        );
+    }
+
+    #[test]
+    fn a_slug_survives_only_when_its_directory_exists() {
+        let home = tempfile::tempdir().unwrap();
+        let root = scheduled_tasks_root(home.path());
+        std::fs::create_dir_all(root.join("real-task")).unwrap();
+        std::fs::write(root.join("a-file"), "x").unwrap();
+        assert_eq!(
+            verified_task_slug(&root, "real-task").as_deref(),
+            Some("real-task")
+        );
+        assert_eq!(verified_task_slug(&root, "missing"), None);
+        assert_eq!(
+            verified_task_slug(&root, "a-file"),
+            None,
+            "a file is not a task dir"
+        );
+        assert_eq!(verified_task_slug(&root, "../real-task"), None);
+        assert_eq!(verified_task_slug(&root.join("nope"), "real-task"), None);
+    }
+
+    #[test]
+    fn the_prompt_text_never_surfaces_in_the_parsed_trigger() {
+        let line = r#"{"type":"user","turnOrigin":"scheduled","message":{"content":"SECRET-PROMPT scheduled-tasks/ok/SKILL.md more SECRET text"}}"#;
+        let t = parse_transcript_trigger(line).unwrap();
+        let dump = format!("{t:?}");
+        assert!(!dump.contains("SECRET"), "{dump}");
     }
 }

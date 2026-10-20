@@ -249,6 +249,13 @@ async fn process_message(
     if ev.spec.is_none() {
         ev.spec = crate::control::lock_recover(&state.sessions).spec_of(&ev.session_id);
     }
+    // Likewise a session already known to be trigger-started stamps every later
+    // event, so a rollup built from a slice that misses the finding still names it.
+    if ev.lineage.trigger.is_none() {
+        let (t, n) = crate::control::lock_recover(&state.sessions).trigger_of(&ev.session_id);
+        ev.lineage.trigger = t;
+        ev.lineage.trigger_name = n;
+    }
 
     // A `dira doctor --probe` row is a transport test, not a session. It takes
     // the store append and nothing else: no coalescing watermark, no
@@ -422,15 +429,23 @@ async fn process_message(
         // `ProjectCache`'s doc comment). `capture_tokens` marks the progress
         // counter and warns internally per transcript, so main + every sidecar
         // each contribute their own count to the running total (issue #93).
-        capture_tokens(
+        let mut found = None;
+        capture_tokens_into(
             state,
             &path,
             harness,
             &ev.session_id,
             ev.project.as_deref(),
             cache,
+            Some(&mut found),
         )
         .await;
+        if let Some(found) = found {
+            let root = dira_core::config::home_dir()
+                .ok()
+                .map(|h| dira_core::tokens::scheduled_tasks_root(&h));
+            apply_trigger(state, &ev, &found, root.as_deref()).await;
+        }
         // Claude Code writes `Task`-tool subagent turns to sibling
         // `agent-*.jsonl` files that no hook ever names, so the main transcript
         // alone misses them entirely. Attributed to the parent session — the id
@@ -453,6 +468,37 @@ async fn process_message(
             }
         }
     }
+}
+
+/// Record a trigger the transcript pass found (DIRASH-0046): verify the task
+/// slug against the real task directory, stamp the event whose hook prompted the
+/// read, and fold it into the live registry so a partial ships it. The slug
+/// candidate came from prompt text and survives only if `tasks_root/<slug>/`
+/// exists; nothing from the prompt is stored or logged.
+async fn apply_trigger(
+    state: &AppState,
+    ev: &RawEvent,
+    found: &dira_core::tokens::TranscriptTrigger,
+    tasks_root: Option<&std::path::Path>,
+) {
+    let name = found
+        .slug_candidate
+        .as_deref()
+        .zip(tasks_root)
+        .and_then(|(slug, root)| dira_core::tokens::verified_task_slug(root, slug));
+    if let Err(e) = state
+        .store
+        .set_event_trigger(&ev.id, found.trigger, name.as_deref())
+        .await
+    {
+        tracing::warn!("session trigger write failed ({}): {e}", ev.session_id);
+        return;
+    }
+    crate::control::lock_recover(&state.sessions).observe_trigger(
+        &ev.session_id,
+        Some(found.trigger),
+        name.as_deref(),
+    );
 }
 
 /// What (if anything) the coalescing watermark map needs once an event's fate
@@ -604,19 +650,27 @@ fn enrich(
         .as_deref()
         .filter(|_| repo_dir.is_none())
         .and_then(|cwd| orchestration::scratch_workspace(std::path::Path::new(cwd)));
+    let mut from_evidence = false;
     if repo_dir.is_none() && !norm.hints.evidence.is_empty() {
         if let Some((r, dir)) = resolve_evidence(&norm.hints.evidence, cache) {
             resolved = Some(r);
             repo_dir = dir;
+            from_evidence = true;
         }
     }
 
     // The session branch is volatile (a checkout can change it within a session),
     // so resolve it live per event rather than caching it with the project.
-    let branch = norm
-        .cwd
-        .as_ref()
-        .and_then(|cwd| project::current_branch(std::path::Path::new(cwd)));
+    // When tool evidence named the repo, only that repo's root can say its
+    // branch: a repo named outright (`gh -R`) has no directory, so no branch,
+    // and the cwd — a scratch dir, or a repo with no usable remote — belongs to
+    // some other checkout whose branch would be a lie. Otherwise the cwd decides.
+    let branch_dir = if from_evidence {
+        repo_dir.as_ref()
+    } else {
+        norm.cwd.as_ref()
+    };
+    let branch = branch_dir.and_then(|dir| project::current_branch(std::path::Path::new(dir)));
 
     let ev = RawEvent {
         id: Ulid::generate().to_string(),
@@ -638,6 +692,8 @@ fn enrich(
             workspace,
             spawned: norm.hints.spawned,
             parent_session: None,
+            trigger: None,
+            trigger_name: None,
         },
     };
     (ev, repo_dir)
@@ -863,6 +919,31 @@ async fn capture_tokens(
     event_project: Option<&str>,
     cache: &mut ProjectCache,
 ) -> u64 {
+    capture_tokens_into(
+        state,
+        transcript_path,
+        harness,
+        session_id,
+        event_project,
+        cache,
+        None,
+    )
+    .await
+}
+
+/// [`capture_tokens`], which in the SAME pass over the appended tail also asks
+/// whether the session was started by a trigger (DIRASH-0046). The finding goes
+/// to `trigger_out` when given; it is read from the session's own transcript
+/// only, never a subagent sidecar, and the tail text is dropped with the pass.
+async fn capture_tokens_into(
+    state: &AppState,
+    transcript_path: &str,
+    harness: Harness,
+    session_id: &str,
+    event_project: Option<&str>,
+    cache: &mut ProjectCache,
+    trigger_out: Option<&mut Option<dira_core::tokens::TranscriptTrigger>>,
+) -> u64 {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
     let offset_key = offset_key_for(session_id, transcript_path);
@@ -951,6 +1032,13 @@ async fn capture_tokens(
         Harness::Grok => dira_core::tokens::parse_grok_updates_usage(&tail),
         _ => dira_core::tokens::parse_transcript_usage(&tail),
     };
+    if let Some(out) = trigger_out {
+        if harness == Harness::ClaudeCode
+            && !is_subagent_transcript(std::path::Path::new(transcript_path))
+        {
+            *out = dira_core::tokens::parse_transcript_trigger(&tail);
+        }
+    }
     // Read once, not per turn: the registry's sticky first-non-null project for
     // this session (`SessionRegistry::observe` already ran for every event that
     // led here — see `writer.rs`'s ordering invariant). The last-known-good
@@ -1254,6 +1342,118 @@ mod tests {
         git(&["remote", "add", "origin", origin]);
     }
 
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    fn hook_in(
+        cwd: &std::path::Path,
+        evidence: Vec<orchestration::Evidence>,
+    ) -> dira_sources::Normalized {
+        dira_sources::Normalized {
+            session_id: "s1".into(),
+            kind: EventKind::PreTool,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            tool: Some("Edit".into()),
+            transcript_path: None,
+            source: None,
+            reason: None,
+            hints: Box::new(dira_sources::Hints {
+                evidence,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// An event whose repo came from tool evidence (cwd is a scratch dir) takes
+    /// its branch from the evidence repo root, not the branchless scratch cwd.
+    /// A repo named outright (no directory) keeps no branch.
+    #[test]
+    fn evidence_resolved_event_takes_the_branch_of_the_evidence_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        git_repo(&repo, "https://github.com/acme/api");
+        git_in(&repo, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        git_in(&repo, &["checkout", "-q", "-b", "feat/x"]);
+
+        let mut cache = ProjectCache::new();
+        let file = repo.join("src").join("a.rs");
+        let (ev, repo_dir) = enrich(
+            hook_in(&scratch, vec![orchestration::Evidence::Path(file)]),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.project.as_deref(), Some("github.com/acme/api"));
+        assert!(repo_dir.is_some());
+        assert_eq!(ev.branch.as_deref(), Some("feat/x"));
+
+        // An ordinary cwd-resolved event still reads its own cwd's branch.
+        let (ev, _) = enrich(
+            hook_in(&repo, vec![]),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.branch.as_deref(), Some("feat/x"));
+
+        // A repo named outright has no directory to ask.
+        let (ev, repo_dir) = enrich(
+            hook_in(
+                &scratch,
+                vec![orchestration::Evidence::Repo("github.com/acme/api".into())],
+            ),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert!(repo_dir.is_none());
+        assert_eq!(ev.branch, None);
+    }
+
+    /// A cwd that is a git checkout with no usable remote resolves no project,
+    /// so `gh -R` evidence names the repo — and the cwd's own branch belongs to
+    /// another checkout entirely. It must never be stamped on the event.
+    #[test]
+    fn repo_named_by_evidence_never_takes_a_remote_less_cwds_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        git_in(dir.path(), &["init", "-q", notes.to_str().unwrap()]);
+        git_in(&notes, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        git_in(&notes, &["checkout", "-q", "-b", "wip/notes"]);
+
+        let mut cache = ProjectCache::new();
+        let (ev, repo_dir) = enrich(
+            hook_in(
+                &notes,
+                vec![orchestration::Evidence::Repo("github.com/acme/api".into())],
+            ),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.project.as_deref(), Some("github.com/acme/api"));
+        assert!(repo_dir.is_none());
+        assert_eq!(
+            ev.branch, None,
+            "the remote-less cwd's wip/notes must not leak"
+        );
+    }
+
     /// Issue #93: a `Stop` whose OWN cwd fails to resolve used to strip
     /// attribution from every turn parsed in that pass, even when each turn's own
     /// cwd — recorded on the transcript line itself — resolves fine. Per D-0026,
@@ -1292,6 +1492,139 @@ mod tests {
                 "each turn's OWN cwd must resolve it, independent of the trigger"
             );
         }
+    }
+
+    const SCHEDULED_LINE: &str = r#"{"type":"user","turnOrigin":"scheduled","origin":{"kind":"task-notification","subkind":"scheduled-trigger","fireReason":"scheduled"},"message":{"role":"user","content":"Run ~/.claude/scheduled-tasks/triage-refresh/SKILL.md SECRET-PROMPT"}}"#;
+
+    /// The Stop-hook path for one session: store the event, fold it, then run the
+    /// transcript pass with the trigger scan and apply what it found against
+    /// `tasks_root` (the injectable `~/.claude/scheduled-tasks`).
+    async fn stop_with_transcript(
+        state: &AppState,
+        transcript: &std::path::Path,
+        tasks_root: &std::path::Path,
+        session: &str,
+    ) -> RawEvent {
+        let ev = RawEvent {
+            id: Ulid::generate().to_string(),
+            at: OffsetDateTime::now_utc(),
+            session_id: session.to_string(),
+            harness: Harness::ClaudeCode,
+            kind: EventKind::Stop,
+            cwd: None,
+            project: None,
+            identity_email: None,
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+            spec: None,
+            lineage: Default::default(),
+        };
+        state.store.append(&ev).await.unwrap();
+        crate::control::lock_recover(&state.sessions).observe(&ev, Duration::minutes(5));
+        let mut found = None;
+        let mut cache = ProjectCache::new();
+        capture_tokens_into(
+            state,
+            transcript.to_str().unwrap(),
+            Harness::ClaudeCode,
+            session,
+            None,
+            &mut cache,
+            Some(&mut found),
+        )
+        .await;
+        if let Some(found) = found {
+            apply_trigger(state, &ev, &found, Some(tasks_root)).await;
+        }
+        ev
+    }
+
+    /// DIRASH-0046: a scheduled run is marked on the stored event and the live
+    /// registry, and the slug survives only because its directory exists.
+    #[tokio::test]
+    async fn a_scheduled_transcript_stamps_the_trigger_and_the_verified_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().join("scheduled-tasks");
+        std::fs::create_dir_all(tasks.join("triage-refresh")).unwrap();
+        let path = dir.path().join("sess-t.jsonl");
+        std::fs::write(&path, format!("{SCHEDULED_LINE}\n")).unwrap();
+
+        let state = state_in_memory().await;
+        let ev = stop_with_transcript(&state, &path, &tasks, "sess-t").await;
+
+        let stored = state.store.events_since(None).await.unwrap();
+        let row = stored.iter().find(|e| e.id == ev.id).unwrap();
+        assert_eq!(
+            row.lineage.trigger,
+            Some(dira_contract::SessionTrigger::Scheduled)
+        );
+        assert_eq!(row.lineage.trigger_name.as_deref(), Some("triage-refresh"));
+        let live = crate::control::lock_recover(&state.sessions).trigger_of("sess-t");
+        assert_eq!(
+            live,
+            (
+                Some(dira_contract::SessionTrigger::Scheduled),
+                Some("triage-refresh".to_string())
+            )
+        );
+        // Nothing of the prompt is anywhere in what was stored.
+        let dump = format!("{stored:?}");
+        assert!(!dump.contains("SECRET-PROMPT"), "{dump}");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_transcript_whose_task_dir_is_missing_keeps_only_the_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().join("scheduled-tasks"); // not created
+        let path = dir.path().join("sess-m.jsonl");
+        std::fs::write(&path, format!("{SCHEDULED_LINE}\n")).unwrap();
+
+        let state = state_in_memory().await;
+        stop_with_transcript(&state, &path, &tasks, "sess-m").await;
+
+        let live = crate::control::lock_recover(&state.sessions).trigger_of("sess-m");
+        assert_eq!(live, (Some(dira_contract::SessionTrigger::Scheduled), None));
+        let stored = state.store.events_since(None).await.unwrap();
+        assert_eq!(stored[0].lineage.trigger_name, None);
+    }
+
+    #[tokio::test]
+    async fn an_interactive_transcript_and_a_sidecar_never_set_a_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().join("scheduled-tasks");
+        std::fs::create_dir_all(tasks.join("triage-refresh")).unwrap();
+        let human = dir.path().join("sess-h.jsonl");
+        std::fs::write(
+            &human,
+            r#"{"type":"user","turnOrigin":"human","message":{"content":"scheduled-tasks/triage-refresh"}}
+"#,
+        )
+        .unwrap();
+        let state = state_in_memory().await;
+        stop_with_transcript(&state, &human, &tasks, "sess-h").await;
+        assert_eq!(
+            crate::control::lock_recover(&state.sessions).trigger_of("sess-h"),
+            (None, None)
+        );
+
+        // A subagent sidecar is never scanned, even if it looks scheduled.
+        let sidecar = dir.path().join("agent-1.jsonl");
+        std::fs::write(&sidecar, format!("{SCHEDULED_LINE}\n")).unwrap();
+        let mut found = None;
+        capture_tokens_into(
+            &state,
+            sidecar.to_str().unwrap(),
+            Harness::ClaudeCode,
+            "sess-h",
+            None,
+            &mut ProjectCache::new(),
+            Some(&mut found),
+        )
+        .await;
+        assert!(found.is_none());
     }
 
     async fn state_in_memory() -> AppState {

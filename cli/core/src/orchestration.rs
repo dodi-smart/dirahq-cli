@@ -105,11 +105,14 @@ pub fn inject_env_hints(payload: &mut serde_json::Value, var: impl Fn(&str) -> O
 /// can never disagree about what a session is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionLineage {
-    /// Derived on every [`Self::observe`]: the session worked from a scratch
-    /// workspace or spawned a child, and never resolved a repo from a cwd
-    /// outside every scratch workspace. A session that spawns from its own
-    /// repo is a *spawner* instead: it keeps its repo and heads a run only by
-    /// being its children's parent.
+    /// Derived on every [`Self::observe`]: the session actually coordinates
+    /// (it spawned a child, or worked from a scratch workspace and resolved at
+    /// least one repo) and never resolved a repo from a cwd outside every
+    /// scratch workspace. A scratch session that spawns nothing and touches no
+    /// repo (a scheduled dashboard refresh) is an ordinary session. A session
+    /// that spawns from its own repo is a *spawner* instead: it keeps its repo
+    /// and heads a run only by being its children's parent. The verdict can
+    /// flip on later (first repo evidence) or off (a repo outside scratch).
     pub orchestrator: bool,
     pub parent_session: Option<String>,
     pub workspace: Option<String>,
@@ -134,8 +137,9 @@ pub struct LineageWire {
 
 impl SessionLineage {
     /// Fold `ev` in. Returns whether any field [`Self::wire`] reads may have
-    /// changed — every flag only turns on, the links are set once and `repos`
-    /// only grows, so comparing their shape is exact and costs no clone.
+    /// changed — the raw flags only turn on, the links are set once and `repos`
+    /// only grows, and the derived `orchestrator` verdict is part of the shape,
+    /// so comparing it is exact and costs no clone.
     pub fn observe(&mut self, ev: &crate::model::RawEvent) -> bool {
         let before = self.shape();
         let l = &ev.lineage;
@@ -152,18 +156,22 @@ impl SessionLineage {
                 .as_deref()
                 .is_some_and(|cwd| scratch_workspace(Path::new(cwd)).is_none());
         }
-        self.orchestrator = (self.spawned || self.scratch) && !self.repo_outside_scratch;
-        if self.parent_session.is_none() {
-            self.parent_session.clone_from(&l.parent_session);
-        }
-        if self.workspace.is_none() {
-            self.workspace.clone_from(&l.workspace);
-        }
+        // Scratch alone is not coordination: it also hosts scheduled tasks that
+        // spawn nothing and touch no repo. The repo evidence below is folded
+        // before the verdict is read, so it is computed after `repos` grows.
         if let Some(p) = &ev.project {
             // Clone only for a repo not yet seen: this runs on every event.
             if self.repos.len() < MAX_REPOS && !self.repos.contains(p) {
                 self.repos.insert(p.clone());
             }
+        }
+        self.orchestrator = (self.spawned || (self.scratch && !self.repos.is_empty()))
+            && !self.repo_outside_scratch;
+        if self.parent_session.is_none() {
+            self.parent_session.clone_from(&l.parent_session);
+        }
+        if self.workspace.is_none() {
+            self.workspace.clone_from(&l.workspace);
         }
         self.shape() != before
     }
@@ -719,10 +727,27 @@ mod tests {
     }
 
     #[test]
-    fn a_scratch_only_session_is_an_orchestrator() {
+    fn a_scratch_only_session_with_no_spawn_and_no_repo_is_ordinary() {
+        // The hourly Claude Desktop scheduled task: scratch cwd, no repo.
         let l = fold(&[event(SCRATCH, None), event(SCRATCH, None)]);
+        assert!(!l.orchestrator);
+        assert_eq!(l.role(), None);
+        assert_eq!(l.workspace_ref(), None);
+        assert_eq!(l.repos_touched(), None);
+        assert_eq!(l.repo_canonical(None), None);
+    }
+
+    #[test]
+    fn a_scratch_session_that_later_resolves_a_repo_flips_to_orchestrator() {
+        let clone = format!("{SCRATCH}/repos/api");
+        let mut l = SessionLineage::default();
+        assert!(l.observe(&event(SCRATCH, None)));
+        assert!(!l.orchestrator);
+        // First repo evidence flips the verdict, so observe reports a change.
+        assert!(l.observe(&event(&clone, Some("github.com/acme/api"))));
         assert!(l.orchestrator);
         assert!(l.workspace_ref().is_some());
+        assert_eq!(l.repos_touched(), Some(vec!["github.com/acme/api".into()]));
     }
 
     #[test]
@@ -742,8 +767,8 @@ mod tests {
                 .as_deref(),
             Some("github.com/acme/app")
         );
-        // The verdict holds while the scratch preamble is still all we saw.
-        assert!(fold(&events[..11]).orchestrator);
+        // The scratch preamble alone never made it an orchestrator.
+        assert!(!fold(&events[..11]).orchestrator);
         // And a return to the scratch dir does not flip it back.
         events.push(event(SCRATCH, None));
         assert!(!fold(&events).orchestrator);
@@ -798,7 +823,11 @@ mod tests {
 
     #[test]
     fn spawning_from_scratch_or_from_no_repo_marks_an_orchestrator() {
-        assert!(fold(&[event(SCRATCH, None), spawn(SCRATCH, None)]).orchestrator);
+        // Spawning is coordination even with no repo resolved.
+        let l = fold(&[event(SCRATCH, None), spawn(SCRATCH, None)]);
+        assert!(l.orchestrator);
+        assert!(l.workspace_ref().is_some());
+        assert_eq!(l.repos_touched(), None);
         let l = fold(&[spawn("/Users/u", None), event("/Users/u", None)]);
         assert!(l.orchestrator);
         assert_eq!(l.repo_canonical(None), None);

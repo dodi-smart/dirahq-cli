@@ -10,6 +10,7 @@ checks:
   - a spawner keeps its repo :: cargo test -p dira-core --lib orchestration::tests::a_session_that_spawns_from_its_repo_keeps_the_repo
   - a spawner heads its run with its own repos :: cargo test -p dira-core --lib runs::tests::a_spawner_heads_its_run_with_its_own_repo_and_reach
   - a worktree spawner keeps its repo end to end :: cargo test -p dirad --test orchestration a_worktree_session_that_spawns_a_child_keeps_its_repo
+corrected-by: DIRASH-0044
 origin: recorded
 verified: true
 ---

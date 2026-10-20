@@ -613,10 +613,13 @@ fn enrich(
 
     // The session branch is volatile (a checkout can change it within a session),
     // so resolve it live per event rather than caching it with the project.
-    let branch = norm
-        .cwd
+    // `repo_dir` is the cwd for an ordinary cwd-resolved event and the evidence
+    // repo root otherwise (the cwd is then a scratch dir with no branch of its
+    // own); a repo named outright has no directory, so no branch.
+    let branch = repo_dir
         .as_ref()
-        .and_then(|cwd| project::current_branch(std::path::Path::new(cwd)));
+        .or(norm.cwd.as_ref())
+        .and_then(|dir| project::current_branch(std::path::Path::new(dir)));
 
     let ev = RawEvent {
         id: Ulid::generate().to_string(),
@@ -1252,6 +1255,88 @@ mod tests {
         };
         git(&["init", "-q", "-b", "main"]);
         git(&["remote", "add", "origin", origin]);
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    fn hook_in(
+        cwd: &std::path::Path,
+        evidence: Vec<orchestration::Evidence>,
+    ) -> dira_sources::Normalized {
+        dira_sources::Normalized {
+            session_id: "s1".into(),
+            kind: EventKind::PreTool,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            tool: Some("Edit".into()),
+            transcript_path: None,
+            source: None,
+            reason: None,
+            hints: Box::new(dira_sources::Hints {
+                evidence,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// An event whose repo came from tool evidence (cwd is a scratch dir) takes
+    /// its branch from the evidence repo root, not the branchless scratch cwd.
+    /// A repo named outright (no directory) keeps no branch.
+    #[test]
+    fn evidence_resolved_event_takes_the_branch_of_the_evidence_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        git_repo(&repo, "https://github.com/acme/api");
+        git_in(&repo, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        git_in(&repo, &["checkout", "-q", "-b", "feat/x"]);
+
+        let mut cache = ProjectCache::new();
+        let file = repo.join("src").join("a.rs");
+        let (ev, repo_dir) = enrich(
+            hook_in(&scratch, vec![orchestration::Evidence::Path(file)]),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.project.as_deref(), Some("github.com/acme/api"));
+        assert!(repo_dir.is_some());
+        assert_eq!(ev.branch.as_deref(), Some("feat/x"));
+
+        // An ordinary cwd-resolved event still reads its own cwd's branch.
+        let (ev, _) = enrich(
+            hook_in(&repo, vec![]),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.branch.as_deref(), Some("feat/x"));
+
+        // A repo named outright has no directory to ask.
+        let (ev, repo_dir) = enrich(
+            hook_in(
+                &scratch,
+                vec![orchestration::Evidence::Repo("github.com/acme/api".into())],
+            ),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert!(repo_dir.is_none());
+        assert_eq!(ev.branch, None);
     }
 
     /// Issue #93: a `Stop` whose OWN cwd fails to resolve used to strip

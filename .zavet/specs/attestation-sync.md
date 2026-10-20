@@ -1,6 +1,6 @@
 ---
 title: Attestation sync and session rollups
-version: 7
+version: 8
 origin: session
 verified: false
 confidence: high
@@ -97,11 +97,17 @@ single flush window (issue #40).
   compaction), and a history-derived end would fabricate a false terminal
   rollup. When both a stale and a real end exist, `(at, id)`-sorted merging
   makes the latest end win.
+- A rollup's `branch` is the one the work landed on, by one rule shared by
+  the partial and the ended rollup (`sync::SessionBranch`): among events in
+  the session's own (first-seen) repo, or all events when it has none, the
+  latest branch that is not trunk (`main`/`master`/`develop`/`trunk`) or
+  `HEAD`, else the latest branch at all. Code-tab worktrees start on a
+  throwaway `claude/*` branch and push from another, so the start branch
+  never matched a commit ref or a PR head. An event whose repo came from
+  tool evidence takes its branch from that repo's root, not the cwd.
 - Partial rollups describe still-live sessions from the daemon's in-memory
   registry: rolling clamped `active_seconds`, a live `prompts` counter,
-  and the last-resolved branch (last-wins is the honest answer for a live
-  session, deliberately unlike the terminal rollup's start-branch policy,
-  whose write supersedes the partial anyway). The registry is a pure
+  and the session branch. The registry is a pure
   reduction over events, so daemon-restart hydration replays it back for
   free.
 - A non-ended session with active time ships a partial whenever its

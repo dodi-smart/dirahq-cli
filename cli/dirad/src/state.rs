@@ -433,12 +433,13 @@ pub struct LiveSession {
     pub last_partial: Option<(u64, dira_core::orchestration::LineageWire)>,
     /// Human prompts (`UserPrompt` events) observed so far.
     pub prompts: u64,
-    /// Last resolved (non-null) branch across the session's events. Deliberately
-    /// last-wins — a *live* session's current branch is the honest answer for a
-    /// partial rollup — unlike `build_sessions`' start-branch-with-frequency-
-    /// fallback policy for ended rollups, whose terminal write overwrites this
-    /// anyway (issue #40).
+    /// The branch the session's work landed on, resolved by the same rule as
+    /// the ended rollup (`dira_core::sync::SessionBranch`): latest non-trunk
+    /// branch of the session's own repo, not the throwaway start branch.
+    /// Refreshed from `branch_tracker` on every observed event.
     pub branch: Option<String>,
+    /// Incremental state behind `branch`.
+    pub branch_tracker: dira_core::sync::SessionBranch,
     /// Orchestration facts folded from this session's events (role, parent,
     /// repos touched, workspace) — the same accumulator the synced rollup uses.
     pub lineage: dira_core::orchestration::SessionLineage,
@@ -597,7 +598,8 @@ impl SessionRegistry {
                 last_opens_span: false,
                 last_partial: None,
                 prompts: 0,
-                branch: ev.branch.clone(),
+                branch: None,
+                branch_tracker: Default::default(),
                 lineage: Default::default(),
                 wire: Default::default(),
                 had_signal: false,
@@ -650,9 +652,8 @@ impl SessionRegistry {
         if entry.spec.is_none() && ev.spec.is_some() {
             entry.spec = ev.spec.clone();
         }
-        if ev.branch.is_some() {
-            entry.branch = ev.branch.clone();
-        }
+        entry.branch_tracker.observe(ev);
+        entry.branch = entry.branch_tracker.resolve();
         if matches!(ev.kind, EventKind::UserPrompt) {
             entry.prompts += 1;
         }
@@ -1397,10 +1398,20 @@ mod tests {
         assert_eq!(send(&mut reg, t(50)), ["c1"], "a parent link");
         assert!(send(&mut reg, t(50)).is_empty(), "a parent link ships once");
 
-        // A verdict flip: a scratch preamble makes the session an orchestrator,
+        // A verdict flip: a scratch session that spawns is an orchestrator,
         // then a repo resolved outside the scratch dir retracts the verdict.
         reg.observe(&scratch_ev("o1", EventKind::UserPrompt, 60), IDLE);
-        reg.observe(&scratch_ev("o1", EventKind::PreTool, 70), IDLE);
+        reg.observe(
+            &RawEvent {
+                lineage: dira_core::model::Lineage {
+                    workspace: Some("ws".into()),
+                    spawned: Some("local_kid".into()),
+                    ..Default::default()
+                },
+                ..scratch_ev("o1", EventKind::PreTool, 70)
+            },
+            IDLE,
+        );
         assert!(reg.sessions["o1"].lineage.orchestrator);
         assert_eq!(send(&mut reg, t(70)), ["o1"], "first sight as orchestrator");
         reg.observe(
@@ -1419,6 +1430,23 @@ mod tests {
             send(&mut reg, t(80)).is_empty(),
             "a verdict flip ships once"
         );
+    }
+
+    /// A scratch session that spawns nothing and resolves no repo (a scheduled
+    /// dashboard refresh) is an ordinary session on the wire: no role, no
+    /// workspace ref, no repos (DIRASH-0044).
+    #[test]
+    fn a_repo_less_scratch_session_ships_no_orchestration_lineage() {
+        let t = |secs| OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs);
+        let mut reg = SessionRegistry::default();
+        reg.observe(&scratch_ev("cron", EventKind::UserPrompt, 0), IDLE);
+        reg.observe(&scratch_ev("cron", EventKind::PreTool, 10), IDLE);
+        let live = &reg.sessions["cron"];
+        assert!(!live.lineage.orchestrator);
+        assert_eq!(live.wire.role, None);
+        assert_eq!(live.wire.workspace_ref, None);
+        assert_eq!(live.wire.repos, None);
+        assert_eq!(send(&mut reg, t(10)), ["cron"], "first sight still ships");
     }
 
     /// The marks pin what was *sent*: a lineage change landing between the

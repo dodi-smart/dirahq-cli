@@ -1,7 +1,7 @@
-// Commitlint config (ESM .mjs so the commitlint-github-action accepts it and we
-// can express a function-based `ignores`).
+// Commitlint config (ESM .mjs so we can express a function-based `ignores`).
 //
-// Conventional Commits, enforced by the `commit-lint` CI job. The rules mirror
+// Conventional Commits, enforced by commitlint in the PR Checks workflow
+// (pr-checks.yml, `commitlint-config: commitlint.config.mjs`). The rules mirror
 // the documented policy in CLAUDE.md: a fixed type list, a mandatory scope from
 // the release-mapped set, and ≤180-char lines.
 //

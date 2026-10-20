@@ -1,18 +1,19 @@
 ---
 title: Attestation sync and session rollups
-version: 6
+version: 7
 origin: session
 verified: false
 confidence: high
-date: 2026-10-15
+date: 2026-10-16
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
+  - cli/core/src/stored_at.rs
   - cli/dirad/src/sync.rs
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043]
 ---
 
 ## Overview
@@ -103,6 +104,19 @@ single flush window (issue #40).
   whose write supersedes the partial anyway). The registry is a pure
   reduction over events, so daemon-restart hydration replays it back for
   free.
+- A non-ended session with active time ships a partial whenever its
+  rollup's lineage would differ from the last partial sent, whatever its age
+  (issue #179). "Lineage" is `SessionLineage::wire`'s `LineageWire`:
+  `repoCanonical`, `role`, `parentSession`, `repos` and `workspaceRef`, the
+  one projection both batch builders use. First sight counts as a change, so
+  the cloud has a sessions row within a flush instead of an hour later. A
+  plain session reaching a second repo changes nothing on its wire and ships
+  nothing. Re-sends for growth alone still wait for `partial_rollup_after`
+  and need new `active_seconds`. `partial_rollup_after = 0` still disables
+  partials.
+- An acked partial pins `last_partial = (active_seconds, wire)` from the
+  `PartialSession` that was sent, not from the registry at ack time, so a
+  change that lands mid-flush ships on the next one.
 
 ## Interfaces & data
 
@@ -171,6 +185,13 @@ single flush window (issue #40).
   therefore evidence of one pathological record, not of backlog size, and
   gets its own `SyncError` + `payload_too_large` health kind so it is never
   mistaken for a retryable failure.
+- `events.at`, `token_usage.at` and `artifacts.authored_at` are stored
+  fixed-width UTC (`…SS.fffffffffZ`), so text order is time order
+  (DIRASH-0043). Every `ORDER BY at` and every `at` bound (hydrate replay,
+  sync seeds, the compaction cutoff, token report totals) depends on this.
+  Binds go through `StoredAt`/`RawAt` only. Reads for the wire go through
+  `display_at`, so the wire keeps plain RFC 3339. Rows written before this
+  are rewritten once at `Store::open`.
 
 ## Open Questions
 

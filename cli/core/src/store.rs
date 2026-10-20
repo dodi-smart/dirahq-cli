@@ -8,6 +8,7 @@
 use crate::accounting;
 use crate::model::{EventKind, RawEvent, PROBE_LIKE_PATTERN};
 use crate::project::CapturedCommit;
+use crate::stored_at::{display_at, RawAt, StoredAt};
 use crate::sync::{ArtifactRow, TokenRow};
 use crate::tokens::TokenTurn;
 use crate::Error;
@@ -18,6 +19,93 @@ use std::collections::HashMap;
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+/// Meta key set once every time column holds the canonical [`StoredAt`] form.
+pub const META_STORED_AT_CANONICAL: &str = "stored_at_canonical_v1";
+
+/// The TEXT time columns that are compared and ordered as text, and so must
+/// hold [`StoredAt`]'s fixed-width form (DIRASH-0043).
+const TIME_COLUMNS: [(&str, &str); 3] = [
+    ("events", "at"),
+    ("token_usage", "at"),
+    ("artifacts", "authored_at"),
+];
+
+/// One-shot data migration: rewrite every [`TIME_COLUMNS`] value written
+/// before the canonical form (`time`'s trimming `Rfc3339`, git's `%aI` with
+/// the author's offset) into it. Gated by [`META_STORED_AT_CANONICAL`] and done
+/// in one `BEGIN IMMEDIATE` transaction, so a concurrent opener waits and then
+/// sees the flag.
+///
+/// This is Rust, not a SQL migration, so the format exists once
+/// ([`StoredAt::canonical`]); a SQL copy would need its own offset folding and
+/// its own guard against SQLite's millisecond rounding. Text that is not RFC
+/// 3339 is left untouched. The indexes on these columns are dropped for the
+/// bulk rewrite and recreated from their own `sqlite_master` definitions.
+async fn normalize_stored_at(pool: &SqlitePool) -> Result<(), Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let done = sqlx::query("SELECT 1 FROM meta WHERE key = ?1")
+        .bind(META_STORED_AT_CANONICAL)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+    if done {
+        return Ok(());
+    }
+    let mut indexes: Vec<(String, String)> = Vec::new();
+    for (table, col) in TIME_COLUMNS {
+        let rows = sqlx::query(
+            "SELECT m.name AS name, m.sql AS sql FROM sqlite_master m \
+             WHERE m.type = 'index' AND m.tbl_name = ?1 AND m.sql IS NOT NULL \
+             AND EXISTS (SELECT 1 FROM pragma_index_info(m.name) WHERE name = ?2)",
+        )
+        .bind(table)
+        .bind(col)
+        .fetch_all(&mut *tx)
+        .await?;
+        for r in rows {
+            indexes.push((r.get("name"), r.get("sql")));
+        }
+    }
+    for (name, _) in &indexes {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP INDEX \"{name}\"")))
+            .execute(&mut *tx)
+            .await?;
+    }
+    for (table, col) in TIME_COLUMNS {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT rowid, {col} AS v FROM {table} WHERE {col} IS NOT NULL"
+        )))
+        .fetch_all(&mut *tx)
+        .await?;
+        for r in rows {
+            let raw: String = r.get("v");
+            let Some(canon) = StoredAt::canonical(&raw) else {
+                continue;
+            };
+            if canon != raw {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {table} SET {col} = ?1 WHERE rowid = ?2"
+                )))
+                .bind(canon)
+                .bind(r.get::<i64, _>("rowid"))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+    }
+    for (_, sql) in indexes {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("INSERT INTO meta (key, value) VALUES (?1, '1')")
+        .bind(META_STORED_AT_CANONICAL)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
 
 /// Handle to the local SQLite store. Cheap to clone (wraps a pool).
 #[derive(Clone)]
@@ -82,6 +170,7 @@ impl Store {
             }
             return Err(e.into());
         }
+        normalize_stored_at(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -122,6 +211,7 @@ impl Store {
             .connect_with(SqliteConnectOptions::new().in_memory(true))
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        normalize_stored_at(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -134,7 +224,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )
         .bind(&ev.id)
-        .bind(ev.at.format(&Rfc3339).map_err(Error::time)?)
+        .bind(StoredAt(ev.at))
         .bind(&ev.session_id)
         .bind(enum_str(&ev.harness))
         .bind(enum_str(&ev.kind))
@@ -181,7 +271,7 @@ impl Store {
                     "SELECT * FROM events WHERE at >= ?1 AND session_id NOT LIKE ?2 \
                      ORDER BY at ASC",
                 )
-                .bind(ts.format(&Rfc3339).map_err(Error::time)?)
+                .bind(StoredAt(ts))
                 .bind(PROBE_LIKE_PATTERN)
                 .fetch_all(&self.pool)
                 .await?
@@ -299,8 +389,8 @@ impl Store {
              AND at >= ?2 AND at <= ?3 AND session_id NOT LIKE ?4 ORDER BY at ASC",
         )
         .bind(cursor)
-        .bind(at_lo.format(&Rfc3339).map_err(Error::time)?)
-        .bind(at_hi.format(&Rfc3339).map_err(Error::time)?)
+        .bind(StoredAt(at_lo))
+        .bind(StoredAt(at_hi))
         .bind(PROBE_LIKE_PATTERN)
         .fetch_all(&self.pool)
         .await?;
@@ -589,7 +679,7 @@ impl Store {
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&turn.id)
-        .bind(&turn.at)
+        .bind(RawAt(&turn.at))
         .bind(session_id)
         .bind(project)
         .bind(&turn.model)
@@ -653,7 +743,7 @@ impl Store {
         .bind(&commit.sha)
         .bind(repo)
         .bind(git_ref)
-        .bind(&commit.authored_at)
+        .bind(commit.authored_at.as_deref().map(RawAt))
         .bind(&commit.author_email)
         .bind(&commit.author_name)
         .bind(source_session)
@@ -800,7 +890,7 @@ impl Store {
                      COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
                      COALESCE(SUM(est_cost),0.0) cost FROM token_usage WHERE at >= ?1",
                 )
-                .bind(ts.format(&Rfc3339).map_err(Error::time)?)
+                .bind(StoredAt(ts))
                 .fetch_one(&self.pool)
                 .await?
             }
@@ -857,7 +947,7 @@ impl Store {
         let Some(cursor) = cursor else {
             return Ok(0); // nothing synced yet — never prune un-synced data
         };
-        let cutoff_str = cutoff.format(&Rfc3339).map_err(Error::time)?;
+        let cutoff_at = StoredAt(cutoff);
 
         let mut tx = self.pool.begin().await?;
 
@@ -871,7 +961,7 @@ impl Store {
              ORDER BY at ASC",
         )
         .bind(cursor)
-        .bind(&cutoff_str)
+        .bind(cutoff_at)
         .bind(PROBE_LIKE_PATTERN)
         .fetch_all(&mut *tx)
         .await?;
@@ -959,7 +1049,7 @@ impl Store {
         // Delete the summarized raw rows in the same transaction.
         let deleted = sqlx::query("DELETE FROM events WHERE id <= ?1 AND at < ?2")
             .bind(cursor)
-            .bind(&cutoff_str)
+            .bind(cutoff_at)
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -3037,7 +3127,7 @@ fn row_to_zavet_commit_ref(row: &sqlx::sqlite::SqliteRow) -> ZavetCommitRef {
     ZavetCommitRef {
         sha: row.get("sha"),
         message: row.get("message"),
-        authored_at: row.get("authored_at"),
+        authored_at: row.get::<Option<String>, _>("authored_at").map(display_at),
         source_session: row.get("source_session"),
     }
 }
@@ -3096,7 +3186,7 @@ fn row_to_artifact_row(row: &sqlx::sqlite::SqliteRow) -> ArtifactRow {
         repo: row.get("repo"),
         git_ref: row.get("git_ref"),
         kind: row.get("kind"),
-        authored_at: row.get("authored_at"),
+        authored_at: row.get::<Option<String>, _>("authored_at").map(display_at),
         author_email: row.get("author_email"),
         author_name: row.get("author_name"),
         source_session: row.get("source_session"),
@@ -3119,17 +3209,16 @@ fn row_to_token_row(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRow, Error> {
         cache_read: row.get::<i64, _>("cache_read") as u64,
         cache_create: row.get::<i64, _>("cache_create") as u64,
         est_cost_usd: row.get::<Option<f64>, _>("est_cost"),
-        at: row.get("at"),
+        at: display_at(row.get("at")),
     })
 }
 
 fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
-    let at: String = row.get("at");
     let harness: String = row.get("harness");
     let kind: String = row.get("kind");
     Ok(RawEvent {
         id: row.get("id"),
-        at: OffsetDateTime::parse(&at, &Rfc3339).map_err(Error::parse)?,
+        at: row.try_get::<StoredAt, _>("at")?.0,
         session_id: row.get("session_id"),
         harness: parse_enum::<Harness>(&harness)?,
         kind: parse_enum::<EventKind>(&kind)?,
@@ -4769,24 +4858,39 @@ mod tests {
         assert_eq!(n, 4, "c1 x2, c2 x1, c3 x1 — no duplicates, no empties");
     }
 
-    #[tokio::test]
-    async fn migration_0006_backfills_existing_spec_trailers_by_comma_split() {
-        // Apply 0001..0005 by hand, insert pre-0006 trailers, then run 0006:
-        // the recursive-CTE backfill must split exactly like spec_trailer_slugs.
+    /// A bare in-memory pool with every migration below `version` applied (and
+    /// no data migration), for a test that seeds pre-`version` rows.
+    async fn pool_before(version: i64) -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(SqliteConnectOptions::new().in_memory(true))
             .await
             .unwrap();
-        for sql in [
-            include_str!("../migrations/0001_init.sql"),
-            include_str!("../migrations/0002_zavet.sql"),
-            include_str!("../migrations/0003_zavet_specs.sql"),
-            include_str!("../migrations/0004_zavet_sync.sql"),
-            include_str!("../migrations/0005_zavet_checks.sql"),
-        ] {
-            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        for m in sqlx::migrate!("./migrations").iter() {
+            if m.version < version {
+                apply_migration(&pool, m.version).await;
+            }
         }
+        pool
+    }
+
+    async fn apply_migration(pool: &SqlitePool, version: i64) {
+        let migrator = sqlx::migrate!("./migrations");
+        let m = migrator
+            .iter()
+            .find(|m| m.version == version)
+            .unwrap_or_else(|| panic!("no migration {version}"));
+        sqlx::raw_sql(sqlx::AssertSqlSafe(m.sql.as_str().to_string()))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_0006_backfills_existing_spec_trailers_by_comma_split() {
+        // Apply 0001..0005 by hand, insert pre-0006 trailers, then run 0006:
+        // the recursive-CTE backfill must split exactly like spec_trailer_slugs.
+        let pool = pool_before(6).await;
         for (sha, seq, key, value) in [
             ("a", 0, "spec", " one , two ,,three"),
             ("b", 0, "spec", "solo"),
@@ -4805,10 +4909,7 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::raw_sql(include_str!("../migrations/0006_spec_sources.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
+        apply_migration(&pool, 6).await;
         let rows = sqlx::query("SELECT sha, value FROM zavet_trailer_values ORDER BY sha, value")
             .fetch_all(&pool)
             .await
@@ -4946,6 +5047,248 @@ mod tests {
         for banned in ["text", "body", "body_md", "md", "content", "rules"] {
             assert!(!cols.iter().any(|c| c == banned), "{banned} in {cols:?}");
         }
+    }
+
+    /// Two events in the same second whose fractions differ in width: `.12`
+    /// and `.123` used to be stored as `…05.12Z`/`…05.123Z`, and the text
+    /// order put `.12` LAST. Every `at`-ordered and `at`-bounded read must
+    /// return them in time order.
+    #[tokio::test]
+    async fn event_at_orders_by_time_across_fraction_widths() {
+        let store = Store::open_in_memory().await.unwrap();
+        let base = time::macros::datetime!(2026-10-16 12:00:05 UTC);
+        let early = base + time::Duration::milliseconds(120);
+        let late = base + time::Duration::milliseconds(123);
+        // Insert the later one first, so id order cannot mask the bug.
+        let mut b = ev("01B", EventKind::UserPrompt);
+        b.at = late;
+        let mut a = ev("01C", EventKind::UserPrompt);
+        a.at = early;
+        let mut whole = ev("01D", EventKind::UserPrompt);
+        whole.at = base;
+        for e in [&b, &a, &whole] {
+            store.append(e).await.unwrap();
+        }
+        let want = vec![base, early, late];
+        let ats = |v: Vec<RawEvent>| v.into_iter().map(|e| e.at).collect::<Vec<_>>();
+
+        assert_eq!(ats(store.events_since(None).await.unwrap()), want);
+        assert_eq!(ats(store.events_since(Some(base)).await.unwrap()), want);
+        assert_eq!(
+            ats(store.events_since(Some(early)).await.unwrap()),
+            vec![early, late],
+            "the `at >= since` bound must keep `.123` and drop the whole second"
+        );
+        assert_eq!(
+            ats(store
+                .events_for_sessions(&["s1".to_string()], "01Z")
+                .await
+                .unwrap()),
+            want
+        );
+        assert_eq!(
+            ats(store
+                .human_signal_seed(Some("01Z"), early, late)
+                .await
+                .unwrap()),
+            vec![early, late]
+        );
+        let stored: Vec<String> = sqlx::query("SELECT at FROM events ORDER BY at")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get("at"))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                "2026-10-16T12:00:05.000000000Z",
+                "2026-10-16T12:00:05.120000000Z",
+                "2026-10-16T12:00:05.123000000Z",
+            ]
+        );
+    }
+
+    /// The data migration rewrites every time column written before the
+    /// canonical form, folds offsets into UTC, leaves non-RFC 3339 text alone,
+    /// recreates the indexes it dropped, and runs once.
+    #[tokio::test]
+    async fn normalize_stored_at_rewrites_every_time_column_once() {
+        let pool = pool_before(i64::MAX).await;
+        let cases = [
+            (
+                "e1",
+                "2026-10-16T12:00:05.12Z",
+                "2026-10-16T12:00:05.120000000Z",
+            ),
+            (
+                "e2",
+                "2026-10-16T12:00:05.123Z",
+                "2026-10-16T12:00:05.123000000Z",
+            ),
+            (
+                "e3",
+                "2026-10-16T12:00:05Z",
+                "2026-10-16T12:00:05.000000000Z",
+            ),
+            (
+                "e4",
+                "2026-10-16T12:00:05.123456789Z",
+                "2026-10-16T12:00:05.123456789Z",
+            ),
+            (
+                "e5",
+                "2026-10-16T14:00:59.9999999+02:00",
+                "2026-10-16T12:00:59.999999900Z",
+            ),
+            (
+                "e6",
+                "2026-10-16T09:30:00-02:30",
+                "2026-10-16T12:00:00.000000000Z",
+            ),
+            ("e7", "not a time", "not a time"),
+            ("e8", "", ""),
+        ];
+        for (id, at, _) in cases {
+            for sql in [
+                "INSERT INTO events (id, at, session_id, harness, kind)
+                 VALUES (?1, ?2, 's', 'claude_code', 'user_prompt')",
+                "INSERT INTO token_usage
+                    (id, at, session_id, model, input, output, cache_read, cache_create)
+                 VALUES (?1, ?2, 's', 'm', 1, 0, 0, 0)",
+                "INSERT INTO artifacts (sha, kind, authored_at) VALUES (?1, 'commit', ?2)",
+            ] {
+                sqlx::query(sql)
+                    .bind(id)
+                    .bind(at)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        sqlx::query("INSERT INTO artifacts (sha, kind) VALUES ('null-date', 'commit')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let index_names = || async {
+            let mut v: Vec<String> = sqlx::query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get("name"))
+            .collect();
+            v.sort();
+            v
+        };
+        let before = index_names().await;
+        assert!(before.contains(&"idx_events_session_at".to_string()));
+
+        normalize_stored_at(&pool).await.unwrap();
+
+        for (table, col) in TIME_COLUMNS {
+            let key = if table == "artifacts" { "sha" } else { "id" };
+            for (id, _, want) in cases {
+                let got: String = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT {col} AS v FROM {table} WHERE {key} = ?1"
+                )))
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("v");
+                assert_eq!(got, want, "{table}.{col} {id}");
+            }
+        }
+        assert_eq!(
+            index_names().await,
+            before,
+            "indexes recreated as they were"
+        );
+
+        // Gated: a row written trimmed after the flag is set is not touched.
+        sqlx::query("UPDATE events SET at = '2026-10-16T12:00:05Z' WHERE id = 'e1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        normalize_stored_at(&pool).await.unwrap();
+        let e1: String = sqlx::query("SELECT at FROM events WHERE id = 'e1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("at");
+        assert_eq!(e1, "2026-10-16T12:00:05Z");
+    }
+
+    /// Token and commit timestamps a harness or git wrote are stored in the
+    /// canonical form, so `token_totals_since` compares on the index, and
+    /// they still read back as plain RFC 3339 for the wire. An empty
+    /// transcript timestamp is kept, not dropped (D-0018).
+    #[tokio::test]
+    async fn token_and_commit_times_are_stored_canonical_and_read_back_rfc3339() {
+        let store = Store::open_in_memory().await.unwrap();
+        let turn = |id: &str, at: &str| TokenTurn {
+            id: id.to_string(),
+            at: at.to_string(),
+            model: "m".to_string(),
+            input: 1,
+            output: 0,
+            cache_read: 0,
+            cache_create: 0,
+            cwd: None,
+        };
+        // As text, `…:05Z` sorts after a `…:05.1Z` bound (`Z` > `.`).
+        store
+            .upsert_token_usage(&turn("t1", "2026-10-16T12:00:05Z"), "s", None)
+            .await
+            .unwrap();
+        store
+            .upsert_token_usage(&turn("t2", "2026-10-16T14:00:05.12+02:00"), "s", None)
+            .await
+            .unwrap();
+        store
+            .upsert_token_usage(&turn("t3", ""), "s", None)
+            .await
+            .unwrap();
+        let since = time::macros::datetime!(2026-10-16 12:00:05.1 UTC);
+        let totals = store.token_totals_since(Some(since)).await.unwrap();
+        assert_eq!(
+            totals.input, 1,
+            "only t2 (12:00:05.12 UTC) is at/after since"
+        );
+
+        let rows = store.unsynced_token_usage(None, i64::MAX).await.unwrap();
+        let ats: Vec<&str> = rows.iter().map(|r| r.at.as_str()).collect();
+        assert_eq!(ats, ["2026-10-16T12:00:05Z", "2026-10-16T12:00:05.12Z", ""]);
+
+        let commit = CapturedCommit {
+            sha: "c1".to_string(),
+            authored_at: Some("2026-10-16T14:00:05+02:00".to_string()),
+            author_email: None,
+            author_name: None,
+            message: "m".to_string(),
+            additions: 0,
+            deletions: 0,
+            patch_id: None,
+        };
+        store
+            .record_commit(&commit, None, None, None, None)
+            .await
+            .unwrap();
+        let stored: String = sqlx::query("SELECT authored_at FROM artifacts WHERE sha = 'c1'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .get("authored_at");
+        assert_eq!(stored, "2026-10-16T12:00:05.000000000Z");
+        let shipped = store.unsynced_artifacts(None, i64::MAX).await.unwrap();
+        assert_eq!(
+            shipped[0].authored_at.as_deref(),
+            Some("2026-10-16T12:00:05Z")
+        );
     }
 
     fn source_spec(state: &str) -> ZavetSpecCapture {

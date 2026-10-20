@@ -1,5 +1,7 @@
 # Dira — CLI & contract (open source)
 
+[![shared workflows v1](https://img.shields.io/badge/shared_workflows-v1-0969da)](https://github.com/dodi-smart/.github)
+
 **AI-first time tracker — *"if you can clone it, you can bill it."***
 
 This repository is the open-source surface of **Dira**: the command-line client, the

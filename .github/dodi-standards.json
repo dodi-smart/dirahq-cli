@@ -1,0 +1,98 @@
+{
+  "$comment": "Managed by dev-standards (repo-triage-setup). Fleet sync re-renders the rendered files; edit a caller's with: block to change its inputs, or set \"mode\": \"local\" on an entry to stop managing that file.",
+  "channel": "v1",
+  "files": {
+    ".commitlintrc.json": {
+      "kind": "rendered",
+      "mode": "local",
+      "sha256": null,
+      "template": "commitlintrc.json",
+      "version": null
+    },
+    ".github/jactionlint.yaml": {
+      "kind": "rendered",
+      "sha256": "56ae569e233745eace56b2618fd65b740f4d5b04a7f46e7f847f14c2ca9664a2",
+      "template": "jactionlint.yaml",
+      "version": "1.25.3"
+    },
+    ".github/renovate.json5": {
+      "kind": "seeded",
+      "sha256": "7ba40823fc7e0c7e2d8fcfc304dbc2bd420ba704fb0c341b7ffe4b19a8edb9e6",
+      "template": "renovate.json5",
+      "version": "1.25.3"
+    },
+    ".github/workflows/agents.yml": {
+      "kind": "rendered",
+      "sha256": "cea19350c2bdec760aaaf9f8ce563be421cfdf4ebbc6ebe3beaf221536ba1b65",
+      "template": "workflows/agents.yml",
+      "version": "1.25.3"
+    },
+    ".github/workflows/deps-automerge.yml": {
+      "kind": "rendered",
+      "sha256": "d52b01759fff338d5917e8a5c496f6d7a086ef3d305b03c1a329cbe9dfd14c36",
+      "template": "workflows/deps-automerge.yml",
+      "version": "1.25.3"
+    },
+    ".github/workflows/deps-verify.yml": {
+      "kind": "rendered",
+      "sha256": "ab255638c055d2df31cfe13b3c085689f45da85cdd4111d4dfd5d9661691e912",
+      "template": "workflows/deps-verify.yml",
+      "version": "1.25.3"
+    },
+    ".github/workflows/pr-checks.yml": {
+      "kind": "rendered",
+      "sha256": "cc3ada85478a3f4604e106b7265707cbeb1a543aac24747af29d843842da7c21",
+      "template": "workflows/pr-checks.yml",
+      "version": "1.25.3"
+    },
+    ".github/workflows/pr-review.yml": {
+      "kind": "rendered",
+      "sha256": "de4ca62aac0ceecdacc60bc0745431ee3698eb7f7df71cf9fab6163236aad8cb",
+      "template": "workflows/pr-review.yml",
+      "version": "1.25.3"
+    },
+    ".github/workflows/release.yml": {
+      "kind": "rendered",
+      "mode": "local",
+      "sha256": null,
+      "template": "workflows/release.yml",
+      "version": null
+    },
+    ".gitleaks.toml": {
+      "kind": "seeded",
+      "sha256": "4984cf5b022a8222da5009f7ee38e9a12a609ab1c15f2fa175e318ca947aa6c9",
+      "template": "gitleaks.toml",
+      "version": "1.25.3"
+    },
+    "hk.pkl": {
+      "kind": "seeded",
+      "sha256": "a752ee02dd5883551b34d8d0da0e6a3dcdc9e3589b463a78a3b60da0694ef849",
+      "template": "hk.pkl",
+      "version": "1.25.3"
+    },
+    "mise.toml": {
+      "kind": "seeded",
+      "sha256": "d8782eff4b0cb8c680eb225228e4e77c34950a90c83845b691ae94dd4abfb6a0",
+      "template": "mise.toml",
+      "version": "1.28.0"
+    },
+    "typos.toml": {
+      "kind": "seeded",
+      "sha256": "2d4dedcac68aa5b295075a8a3e06c4891a37576d8782def1b17307ff2699d873",
+      "template": "typos.toml",
+      "version": "1.25.3"
+    }
+  },
+  "opt-ins": {
+    "commitlint": true,
+    "coverage": "none",
+    "hk": true,
+    "react-doctor": false,
+    "release": true,
+    "worktree-backend": "none",
+    "zavet": true
+  },
+  "schema": 1,
+  "stack": "rust",
+  "version": "1.28.0"
+}

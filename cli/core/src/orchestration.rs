@@ -120,8 +120,24 @@ pub struct SessionLineage {
     repo_outside_scratch: bool,
 }
 
+/// The lineage fields a session rollup carries on the wire, derived in one
+/// place so the partial and final rollups, and the daemon's "did the rollup
+/// change" watermark, can never drift apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineageWire {
+    pub repo_canonical: Option<String>,
+    pub role: Option<dira_contract::SessionRole>,
+    pub parent_session: Option<String>,
+    pub repos: Option<Vec<String>>,
+    pub workspace_ref: Option<String>,
+}
+
 impl SessionLineage {
-    pub fn observe(&mut self, ev: &crate::model::RawEvent) {
+    /// Fold `ev` in. Returns whether any field [`Self::wire`] reads may have
+    /// changed — every flag only turns on, the links are set once and `repos`
+    /// only grows, so comparing their shape is exact and costs no clone.
+    pub fn observe(&mut self, ev: &crate::model::RawEvent) -> bool {
+        let before = self.shape();
         let l = &ev.lineage;
         self.spawned |= l.spawned.is_some();
         self.scratch |= l.workspace.is_some();
@@ -149,6 +165,17 @@ impl SessionLineage {
                 self.repos.insert(p.clone());
             }
         }
+        self.shape() != before
+    }
+
+    fn shape(&self) -> (bool, bool, bool, bool, usize) {
+        (
+            self.orchestrator,
+            self.spawned,
+            self.parent_session.is_some(),
+            self.workspace.is_some(),
+            self.repos.len(),
+        )
     }
 
     /// The session's single repo for the rollup: never one for an
@@ -177,6 +204,18 @@ impl SessionLineage {
 
     pub fn workspace_ref(&self) -> Option<String> {
         self.orchestrator.then(|| self.workspace.clone()).flatten()
+    }
+
+    /// The wire projection for a session whose first-seen project is
+    /// `first_seen`.
+    pub fn wire(&self, first_seen: Option<String>) -> LineageWire {
+        LineageWire {
+            repo_canonical: self.repo_canonical(first_seen),
+            role: self.role(),
+            parent_session: self.parent_session.clone(),
+            repos: self.repos_touched(),
+            workspace_ref: self.workspace_ref(),
+        }
     }
 }
 
@@ -673,7 +712,9 @@ mod tests {
 
     fn fold<'a>(events: impl IntoIterator<Item = &'a crate::model::RawEvent>) -> SessionLineage {
         let mut l = SessionLineage::default();
-        events.into_iter().for_each(|e| l.observe(e));
+        events.into_iter().for_each(|e| {
+            l.observe(e);
+        });
         l
     }
 

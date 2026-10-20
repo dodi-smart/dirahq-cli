@@ -426,10 +426,11 @@ pub struct LiveSession {
     /// currently-open one to know whether the next gap is a tool call in flight
     /// (credited in full) or an ordinary quiet stretch (clamped).
     pub last_opens_span: bool,
-    /// `active_seconds` as of the last partial rollup we emitted for this session,
-    /// or `None` if none yet. Used to decide "new activity since the last partial"
-    /// (6c) without re-scanning.
-    pub last_partial_active_seconds: Option<u64>,
+    /// What the last partial rollup we emitted for this session reported:
+    /// `active_seconds` and the lineage wire fields, or `None` if none yet.
+    /// Used to decide "new activity since the last partial" (6c) and "the
+    /// rollup's lineage would differ" (issue #179) without re-scanning.
+    pub last_partial: Option<(u64, dira_core::orchestration::LineageWire)>,
     /// Human prompts (`UserPrompt` events) observed so far.
     pub prompts: u64,
     /// Last resolved (non-null) branch across the session's events. Deliberately
@@ -441,6 +442,10 @@ pub struct LiveSession {
     /// Orchestration facts folded from this session's events (role, parent,
     /// repos touched, workspace) — the same accumulator the synced rollup uses.
     pub lineage: dira_core::orchestration::SessionLineage,
+    /// `lineage.wire(project)`, cached by `observe` and recomputed only when
+    /// the lineage or the project changes, so the partial-candidate scan
+    /// compares it under the registry lock without building one per session.
+    pub wire: dira_core::orchestration::LineageWire,
     /// Has this session ever shown a *real* signal — a human signal or agent
     /// activity — as opposed to nothing but lifecycle noise (issue #74)?
     ///
@@ -457,6 +462,29 @@ pub struct LiveSession {
 }
 
 impl LiveSession {
+    /// The partial rollup this live session ships as.
+    pub fn into_partial(self) -> dira_core::sync::PartialSession {
+        dira_core::sync::PartialSession {
+            session_id: self.session_id,
+            harness: self.harness,
+            kind: self.kind,
+            repo_canonical: self.project,
+            identity_email: self.identity_email,
+            started_at: self.started_at,
+            active_seconds: self.active_seconds,
+            // The live registry now tracks both prompts and the last-resolved
+            // branch per session (issue #40), so a partial carries them straight
+            // through. `Some(0)` for a session with no prompts yet is deliberate —
+            // consistent with the ended path's `Some(a.prompts)` in `build_sessions`.
+            prompts: Some(self.prompts),
+            branch: self.branch,
+            note: self.note,
+            label: self.label,
+            spec: self.spec,
+            lineage: self.lineage,
+        }
+    }
+
     /// A session is idle if no human signal has arrived within the idle window.
     pub fn is_idle(&self, now: OffsetDateTime, idle: time::Duration) -> bool {
         match self.last_signal_at {
@@ -551,7 +579,8 @@ impl SessionRegistry {
                 session_id: ev.session_id.clone(),
                 harness: ev.harness,
                 kind,
-                project: ev.project.clone(),
+                // Set below like any later event's, so the wire cache sees it.
+                project: None,
                 identity_email: ev.identity_email.clone(),
                 label: ev.label.clone(),
                 activity: ev.activity.clone(),
@@ -566,13 +595,15 @@ impl SessionRegistry {
                 last_human_signal_at: None,
                 last_active_at: None,
                 last_opens_span: false,
-                last_partial_active_seconds: None,
+                last_partial: None,
                 prompts: 0,
                 branch: ev.branch.clone(),
                 lineage: Default::default(),
+                wire: Default::default(),
                 had_signal: false,
             });
-        entry.lineage.observe(ev);
+        let had_project = entry.project.is_some();
+        let lineage_changed = entry.lineage.observe(ev);
 
         // Sticky, and set before anything else can early-return: the first real
         // signal promotes the session out of "lifecycle noise" for good (issue #74).
@@ -602,6 +633,11 @@ impl SessionRegistry {
         // same one the synced rollup applies; it clears a project seen before
         // the role was learned (a later `start_session`).
         entry.project = entry.lineage.repo_canonical(entry.project.take());
+        // The project is sticky once set and only ever cleared by an
+        // orchestrator verdict, so its presence is all that can change.
+        if lineage_changed || entry.project.is_some() != had_project {
+            entry.wire = entry.lineage.wire(entry.project.clone());
+        }
         if entry.label.is_none() && ev.label.is_some() {
             entry.label = ev.label.clone();
         }
@@ -773,12 +809,19 @@ impl SessionRegistry {
         }
     }
 
-    /// Snapshot of long-running, not-yet-ended sessions eligible for a *partial*
-    /// rollup (Phase 6c): older than `now - older_than`, with positive active
-    /// time, and with *new* active time since the last partial we shipped for
-    /// them. Read-only — the caller marks them sent via [`mark_partials_sent`]
-    /// only after the cloud accepts the batch, so a failed flush re-offers the
-    /// same candidates next time.
+    /// Snapshot of not-yet-ended sessions with positive active time that are
+    /// eligible for a *partial* rollup (Phase 6c). A session qualifies when
+    /// either:
+    ///
+    /// - its lineage wire fields differ from the last ones shipped — first
+    ///   sight included — whatever its age (issue #179), so the cloud has a
+    ///   sessions row with the right role and repos while the session runs; or
+    /// - it started before `now - older_than` and has *new* active time since
+    ///   the last partial shipped for it.
+    ///
+    /// Read-only — the caller marks them sent via [`mark_partials_sent`] only
+    /// after the cloud accepts the batch, so a failed flush re-offers the same
+    /// candidates next time. `older_than <= 0` disables partials altogether.
     pub fn partial_rollup_candidates(
         &self,
         now: OffsetDateTime,
@@ -791,23 +834,27 @@ impl SessionRegistry {
         self.sessions
             .values()
             .filter(|s| !s.ended)
-            .filter(|s| s.started_at <= cutoff)
             .filter(|s| s.active_seconds > 0)
-            // New activity since the last partial (or never shipped one).
-            .filter(|s| s.last_partial_active_seconds != Some(s.active_seconds))
+            .filter(|s| match &s.last_partial {
+                None => true,
+                Some((active, wire)) => {
+                    *wire != s.wire || (s.started_at <= cutoff && *active != s.active_seconds)
+                }
+            })
             .cloned()
             .collect()
     }
 
-    /// Record that a partial rollup was shipped for each of `session_ids`, pinning
-    /// its `last_partial_active_seconds` watermark to the session's *current*
-    /// `active_seconds`. The next partial is then only offered once the counter
-    /// grows again, so an idle long session doesn't re-ship an identical rollup
-    /// every flush.
-    pub fn mark_partials_sent(&mut self, session_ids: &[String]) {
-        for id in session_ids {
-            if let Some(s) = self.sessions.get_mut(id) {
-                s.last_partial_active_seconds = Some(s.active_seconds);
+    /// Record that the partial rollups in `sent` were shipped, pinning each
+    /// session's `last_partial` watermark to what that partial reported — not
+    /// to the registry now, so a change that landed mid-flush is offered on the
+    /// next one (D-0020). The next partial is then only offered once the
+    /// lineage changes or the counter grows again, so an idle long session
+    /// doesn't re-ship an identical rollup every flush.
+    pub fn mark_partials_sent(&mut self, sent: &[dira_core::sync::PartialSession]) {
+        for p in sent {
+            if let Some(s) = self.sessions.get_mut(&p.session_id) {
+                s.last_partial = Some((p.active_seconds, p.lineage.wire(p.repo_canonical.clone())));
             }
         }
     }
@@ -1233,20 +1280,30 @@ mod tests {
         reg.observe(&ev_at("s1", EventKind::PreTool, p, 30), IDLE);
 
         let start = OffsetDateTime::UNIX_EPOCH;
-        // Too young (threshold 1h, only 30s old) ⇒ not a candidate.
-        let young =
-            reg.partial_rollup_candidates(start + Duration::seconds(30), Duration::hours(1));
-        assert!(young.is_empty(), "a fresh session is not eligible");
+        // Too young (threshold 1h, only 30s old), but never shipped ⇒ first sight
+        // is a candidate whatever its age (issue #179).
+        let young_at = start + Duration::seconds(30);
+        let young = reg.partial_rollup_candidates(young_at, Duration::hours(1));
+        assert_eq!(young.len(), 1, "first sight ships a partial at once");
+        send(&mut reg, young_at);
 
-        // Old enough now ⇒ eligible (positive active time, never shipped a partial).
+        // Growth on a young session waits for the age threshold.
+        reg.observe(&ev_at("s1", EventKind::PostTool, p, 45), IDLE);
+        assert!(
+            reg.partial_rollup_candidates(young_at, Duration::hours(1))
+                .is_empty(),
+            "a young session's growth alone is not a re-send"
+        );
+
+        // Old enough now ⇒ eligible (new active time since the last partial).
         let now = start + Duration::hours(2);
         let cands = reg.partial_rollup_candidates(now, Duration::hours(1));
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].session_id, "s1");
-        assert_eq!(cands[0].active_seconds, 30);
+        assert_eq!(cands[0].active_seconds, 45);
 
         // Mark it sent: the same active_seconds must no longer be offered.
-        reg.mark_partials_sent(&["s1".to_string()]);
+        send(&mut reg, now);
         let after = reg.partial_rollup_candidates(now, Duration::hours(1));
         assert!(after.is_empty(), "no new activity since last partial");
 
@@ -1258,7 +1315,7 @@ mod tests {
             .get("s1")
             .map(|s| s.active_seconds)
             .unwrap_or(0);
-        assert_eq!(grown, 60, "active grew from 30 to 60");
+        assert_eq!(grown, 60, "active grew from 45 to 60");
         let grown = reg.partial_rollup_candidates(now, Duration::hours(1));
         assert_eq!(grown.len(), 1, "growth re-offers the partial");
 
@@ -1266,6 +1323,154 @@ mod tests {
         assert!(reg
             .partial_rollup_candidates(now, Duration::ZERO)
             .is_empty());
+    }
+
+    /// Ship whatever is a candidate at `now` (1h threshold), as an acked flush
+    /// does, and return the ids that went out.
+    fn send(reg: &mut SessionRegistry, now: OffsetDateTime) -> Vec<String> {
+        let sent: Vec<_> = reg
+            .partial_rollup_candidates(now, Duration::hours(1))
+            .into_iter()
+            .map(LiveSession::into_partial)
+            .collect();
+        reg.mark_partials_sent(&sent);
+        let mut ids: Vec<String> = sent.into_iter().map(|p| p.session_id).collect();
+        ids.sort();
+        ids
+    }
+
+    /// An event in (or below) a Claude Desktop scratch workspace.
+    fn scratch_ev(session: &str, kind: EventKind, secs: i64) -> RawEvent {
+        RawEvent {
+            cwd: Some("/u/Claude/scratch-workspaces/acct/org/scratch-x".into()),
+            lineage: dira_core::model::Lineage {
+                workspace: Some("ws".into()),
+                ..Default::default()
+            },
+            ..ev_at(session, kind, None, secs)
+        }
+    }
+
+    /// Issue #179: each lineage change ships exactly one partial right away —
+    /// first sight, a spawn, a parent link and a verdict flip — however young
+    /// the session is, and nothing re-ships while the lineage holds still.
+    #[test]
+    fn lineage_changes_ship_one_partial_each_whatever_the_age() {
+        let p = Some("github.com/acme/api");
+        let t = |secs| OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs);
+        let mut reg = SessionRegistry::default();
+
+        // First sight: one partial, then quiet.
+        reg.observe(&ev_at("s1", EventKind::UserPrompt, p, 0), IDLE);
+        reg.observe(&ev_at("s1", EventKind::PreTool, p, 10), IDLE);
+        assert_eq!(send(&mut reg, t(10)), ["s1"], "first sight");
+        assert!(send(&mut reg, t(10)).is_empty(), "first sight ships once");
+
+        // A spawn: the session becomes a run head.
+        reg.observe(
+            &RawEvent {
+                lineage: dira_core::model::Lineage {
+                    spawned: Some("local_child".into()),
+                    ..Default::default()
+                },
+                ..ev_at("s1", EventKind::PostTool, p, 20)
+            },
+            IDLE,
+        );
+        assert_eq!(send(&mut reg, t(20)), ["s1"], "a spawn");
+        assert!(send(&mut reg, t(20)).is_empty(), "a spawn ships once");
+
+        // A parent link on a child already shipped without one.
+        reg.observe(&ev_at("c1", EventKind::UserPrompt, p, 30), IDLE);
+        reg.observe(&ev_at("c1", EventKind::PreTool, p, 40), IDLE);
+        assert_eq!(send(&mut reg, t(40)), ["c1"], "the child's first sight");
+        reg.observe(
+            &RawEvent {
+                lineage: dira_core::model::Lineage {
+                    parent_session: Some("s1".into()),
+                    ..Default::default()
+                },
+                ..ev_at("c1", EventKind::PostTool, p, 50)
+            },
+            IDLE,
+        );
+        assert_eq!(send(&mut reg, t(50)), ["c1"], "a parent link");
+        assert!(send(&mut reg, t(50)).is_empty(), "a parent link ships once");
+
+        // A verdict flip: a scratch preamble makes the session an orchestrator,
+        // then a repo resolved outside the scratch dir retracts the verdict.
+        reg.observe(&scratch_ev("o1", EventKind::UserPrompt, 60), IDLE);
+        reg.observe(&scratch_ev("o1", EventKind::PreTool, 70), IDLE);
+        assert!(reg.sessions["o1"].lineage.orchestrator);
+        assert_eq!(send(&mut reg, t(70)), ["o1"], "first sight as orchestrator");
+        reg.observe(
+            &RawEvent {
+                cwd: Some("/u/src/api".into()),
+                ..ev_at("o1", EventKind::PostTool, p, 80)
+            },
+            IDLE,
+        );
+        assert!(
+            !reg.sessions["o1"].lineage.orchestrator,
+            "the verdict flipped"
+        );
+        assert_eq!(send(&mut reg, t(80)), ["o1"], "a verdict flip");
+        assert!(
+            send(&mut reg, t(80)).is_empty(),
+            "a verdict flip ships once"
+        );
+    }
+
+    /// The marks pin what was *sent*: a lineage change landing between the
+    /// snapshot and the ack is still offered on the next flush.
+    #[test]
+    fn a_lineage_change_mid_flush_is_offered_next_flush() {
+        let p = Some("github.com/acme/api");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(20);
+        let mut reg = SessionRegistry::default();
+        reg.observe(&ev_at("s1", EventKind::UserPrompt, p, 0), IDLE);
+        reg.observe(&ev_at("s1", EventKind::PreTool, p, 10), IDLE);
+        let sent: Vec<_> = reg
+            .partial_rollup_candidates(now, Duration::hours(1))
+            .into_iter()
+            .map(LiveSession::into_partial)
+            .collect();
+        // The session spawns a child while that flush is in flight.
+        reg.observe(
+            &RawEvent {
+                lineage: dira_core::model::Lineage {
+                    spawned: Some("local_child".into()),
+                    ..Default::default()
+                },
+                ..ev_at("s1", EventKind::PostTool, p, 20)
+            },
+            IDLE,
+        );
+        reg.mark_partials_sent(&sent);
+        assert_eq!(send(&mut reg, now), ["s1"], "the spawn is not lost");
+    }
+
+    /// The watermark is what the rollup would carry, not the raw lineage: a
+    /// plain session reaching a second repo changes nothing on its wire (its
+    /// `repos` stays absent, its `repoCanonical` first-seen), so nothing ships.
+    #[test]
+    fn a_plain_session_reaching_another_repo_ships_nothing_new() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(20);
+        let mut reg = SessionRegistry::default();
+        reg.observe(
+            &ev_at("s1", EventKind::UserPrompt, Some("github.com/acme/api"), 0),
+            IDLE,
+        );
+        reg.observe(
+            &ev_at("s1", EventKind::PreTool, Some("github.com/acme/api"), 10),
+            IDLE,
+        );
+        assert_eq!(send(&mut reg, now), ["s1"], "first sight");
+        reg.observe(
+            &ev_at("s1", EventKind::PostTool, Some("github.com/acme/web"), 20),
+            IDLE,
+        );
+        assert!(send(&mut reg, now).is_empty(), "the wire did not change");
     }
 
     #[test]

@@ -9,8 +9,8 @@ and is not part of this project.
 
 ## Conventional commits (required)
 
-Every commit message MUST follow Conventional Commits and is enforced by the `commit-lint`
-CI job (`commitlint.config.mjs`, `wagoid/commitlint-github-action`).
+Every commit message MUST follow Conventional Commits and is enforced by commitlint in
+the `PR Checks` workflow (`commitlint.config.mjs`).
 
 ```
 type(scope): subject
@@ -60,6 +60,34 @@ Releases are run by **semantic-release** ([`.releaserc.js`](.releaserc.js)):
 - `develop` is the integration trunk and the **prerelease channel** → `…-develop.N` versions.
 - `main` is **stable** → clean `x.y.z` versions; `main` is auto-merged back into `develop`.
 - Work on short-lived `feat/…`, `fix/…` branches → PR into `develop` → promote `develop → main`.
+
+## Triage & labels (dodi-smart standard)
+
+Issues follow the org-wide model, and each fact lives on exactly one axis:
+
+- **Issue Type** (Bug, Feature, Improvement, Task, Chore, Spike, Epic, Initiative)
+  says what kind of work it is. There is no `type:bug` label.
+- **Issue Fields** (Priority, Effort, Risk, Source, Triage state, Agent mode)
+  say how urgent/big/risky and where in the pipeline. There is no `priority:high` label.
+- **Labels** say where in the code (`area:*`, mapped from paths by
+  [`.github/areas.yml`](.github/areas.yml); keep it in sync with the code and
+  the label list) and what is blocking (`needs:*`).
+
+**A label is a request; a field is a state.** `agent:triage` asks for triage,
+`agent:implement` asks for a draft PR (requires `Triage state = Plan ready`),
+`agent:review` asks for a PR review (or a dependency re-verify on a Renovate PR),
+and `agent:no-touch` stops every agent with no exemption. Agent labels self-clear;
+never leave one as a record. `@claude <verb>` comments trigger the same workflows.
+When filing issues locally, set the type and fields and apply `area:*` labels
+per `areas.yml`, the same taxonomy the CI agents use.
+
+## CI
+
+The required check is `checks / PR Checks` (`.github/workflows/pr-checks.yml`, the
+shared dodi-smart workflow with `stack: rust`): fmt + clippy, workspace tests, the
+contract drift gate, hk lint, commitlint and the zavet checks. `ci.yml` holds only
+what that cannot run: the native Windows lane, install-script linters and the
+cargo-deny license gate. Every PR-triggered job is GitHub-hosted (D-0012).
 
 ## Local checks before pushing
 

@@ -1222,6 +1222,7 @@ mod tests {
             last_partial: None,
             prompts: 0,
             branch: None,
+            branch_tracker: Default::default(),
             lineage: Default::default(),
             wire: Default::default(),
         }

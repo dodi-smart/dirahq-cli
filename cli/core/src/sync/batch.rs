@@ -631,6 +631,81 @@ fn interval_id(
     Ulid::from(value).to_string()
 }
 
+/// Branches that never name the work a session did: the integration trunks and
+/// a detached `HEAD`.
+fn is_trunk_branch(b: &str) -> bool {
+    matches!(b, "main" | "master" | "develop" | "trunk" | "HEAD")
+}
+
+/// Picks the branch a session reports on the wire, shared by the final rollup
+/// (`build_sessions`) and the live registry's partial rollup so both agree.
+///
+/// A harness may start a session on a throwaway placeholder branch
+/// (`claude/<name>-<hex>`) and push the work from a renamed one, and a
+/// multi-repo session has events in other repos on other branches. So:
+/// - only events of the session's own repo count (the first-seen project; every
+///   event counts when the session never has a project);
+/// - the LATEST such event on a non-trunk branch wins;
+/// - failing that, the latest branch of those events, trunk included.
+///
+/// Incremental and order-independent (compares `at`, ties go to the later call).
+#[derive(Debug, Clone, Default)]
+pub struct SessionBranch {
+    own_project: Option<String>,
+    all: BranchPick,
+    own: BranchPick,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BranchPick {
+    /// Latest event on a non-trunk branch.
+    work: Option<(OffsetDateTime, String)>,
+    /// Latest event on any branch.
+    any: Option<(OffsetDateTime, String)>,
+}
+
+impl BranchPick {
+    fn observe(&mut self, at: OffsetDateTime, branch: &str) {
+        let newer =
+            |slot: &Option<(OffsetDateTime, String)>| slot.as_ref().is_none_or(|(t, _)| at >= *t);
+        if newer(&self.any) {
+            self.any = Some((at, branch.to_string()));
+        }
+        if !is_trunk_branch(branch) && newer(&self.work) {
+            self.work = Some((at, branch.to_string()));
+        }
+    }
+
+    fn resolve(&self) -> Option<String> {
+        self.work
+            .as_ref()
+            .or(self.any.as_ref())
+            .map(|(_, b)| b.clone())
+    }
+}
+
+impl SessionBranch {
+    pub fn observe(&mut self, e: &RawEvent) {
+        if self.own_project.is_none() {
+            self.own_project = e.project.clone();
+        }
+        let Some(b) = e.branch.as_deref() else { return };
+        self.all.observe(e.at, b);
+        if self.own_project.is_some() && e.project == self.own_project {
+            self.own.observe(e.at, b);
+        }
+    }
+
+    /// The session's branch, or `None` when no qualifying event carried one.
+    pub fn resolve(&self) -> Option<String> {
+        if self.own_project.is_some() {
+            self.own.resolve()
+        } else {
+            self.all.resolve()
+        }
+    }
+}
+
 /// Per-session rollups, emitted only for sessions that have ended in this window.
 ///
 /// `idle` trims the session's `agent_wall_seconds`: rather than the raw `last -
@@ -682,10 +757,8 @@ fn build_sessions(
         prompts: u64,
         ended: bool,
         ended_at: Option<OffsetDateTime>,
-        /// Branch on the session's *earliest* observed event (session start).
-        start_branch: Option<String>,
-        /// Frequency of each branch across the session's events (fallback).
-        branch_counts: BTreeMap<String, u64>,
+        /// The branch the session's work landed on (see [`SessionBranch`]).
+        branch: SessionBranch,
         /// Every event timestamp in the session, for idle-trimmed wall-clock.
         event_times: Vec<crate::accounting::AgentSample>,
         /// First non-null free-text note / operational label across the session's
@@ -719,7 +792,7 @@ fn build_sessions(
         ended_ids.contains(e.session_id.as_str()) && !slice_ids.contains(e.id.as_str())
     }));
     // Sort by (at, id): the accumulator below is order-dependent (first-non-null
-    // project/email/note/label, `start_branch` via `e.at < entry.first`), and a
+    // project/email/note/label, `first` via `e.at < entry.first`), and a
     // history-carried stale end (e.g. a compaction `SessionEnd`) must lose to a
     // later real end on `ended_at` — sorting by `at` (ties broken by id) makes the
     // last-processed end win, which is always the temporally-latest one.
@@ -740,8 +813,7 @@ fn build_sessions(
                 prompts: 0,
                 ended: false,
                 ended_at: None,
-                start_branch: e.branch.clone(),
-                branch_counts: BTreeMap::new(),
+                branch: SessionBranch::default(),
                 event_times: Vec::new(),
                 note: e.note.clone(),
                 label: e.label.clone(),
@@ -753,13 +825,9 @@ fn build_sessions(
             at: e.at,
             opens_span: e.kind.opens_agent_span(),
         });
-        if let Some(b) = &e.branch {
-            *entry.branch_counts.entry(b.clone()).or_insert(0) += 1;
-        }
-        // Track the branch at the session's earliest event (its start).
+        entry.branch.observe(e);
         if e.at < entry.first {
             entry.first = e.at;
-            entry.start_branch = e.branch.clone();
         }
         if e.at > entry.last {
             entry.last = e.at;
@@ -803,15 +871,9 @@ fn build_sessions(
             } else {
                 0
             };
-            // Branch at session start, falling back to the most frequent branch
-            // among the session's events (ties broken by branch name for
-            // determinism). `None` when no event carried a branch.
-            let branch = a.start_branch.clone().or_else(|| {
-                a.branch_counts
-                    .iter()
-                    .max_by(|(an, ac), (bn, bc)| ac.cmp(bc).then(bn.cmp(an)))
-                    .map(|(name, _)| name.clone())
-            });
+            // The branch the work landed on, not the start branch (see
+            // [`SessionBranch`]); `None` when no qualifying event carried one.
+            let branch = a.branch.resolve();
             let wire = a.lineage.wire(a.project);
             SessionRollup {
                 session_id: id.to_string(),
@@ -1678,23 +1740,108 @@ mod tests {
         assert_eq!(a.blobs.as_ref().unwrap()[0].blob, "blob-a");
     }
 
-    #[test]
-    fn session_branch_propagates_from_events() {
-        // Branch on the start event wins over later branches.
-        let mut start = ev("s1", 0, EventKind::SessionStart, "p");
-        start.branch = Some("feat/x".into());
-        let mut work = ev("s1", 10, EventKind::PreTool, "p");
-        work.branch = Some("feat/y".into());
-        let mut end = ev("s1", 20, EventKind::SessionEnd, "p");
-        end.branch = Some("feat/y".into());
-        let batch = build_batch(&[start, work, end], &[], &[], "d", IDLE, AGENT, NOW);
+    fn ev_pb(session: &str, secs: i64, kind: EventKind, project: &str, branch: &str) -> RawEvent {
+        ev_b(session, secs, kind, project, branch)
+    }
+
+    fn rolled_branch(events: &[RawEvent]) -> Option<String> {
+        let batch = build_batch(events, &[], &[], "d", IDLE, AGENT, NOW);
         assert_eq!(batch.sessions.len(), 1);
-        assert_eq!(batch.sessions[0].branch.as_deref(), Some("feat/x"));
+        batch.sessions[0].branch.clone()
     }
 
     #[test]
-    fn session_branch_falls_back_to_most_frequent() {
-        // No branch on the start event ⇒ fall back to the most frequent branch.
+    fn session_branch_propagates_from_events() {
+        // The latest non-trunk branch wins over the start branch.
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "feat/x");
+        let work = ev_pb("s1", 10, EventKind::PreTool, "p", "feat/y");
+        let end = ev_pb("s1", 20, EventKind::SessionEnd, "p", "feat/y");
+        assert_eq!(
+            rolled_branch(&[start, work, end]).as_deref(),
+            Some("feat/y")
+        );
+    }
+
+    #[test]
+    fn session_branch_placeholder_start_then_renamed_work_branch() {
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "claude/zen-ab12cd");
+        let work = ev_pb("s1", 10, EventKind::PreTool, "p", "feat/x");
+        let end = ev_pb("s1", 20, EventKind::SessionEnd, "p", "feat/x");
+        assert_eq!(
+            rolled_branch(&[start, work, end]).as_deref(),
+            Some("feat/x")
+        );
+    }
+
+    #[test]
+    fn session_branch_ignores_trailing_trunk() {
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "feat/x");
+        let work = ev_pb("s1", 10, EventKind::PreTool, "p", "feat/x");
+        let end = ev_pb("s1", 20, EventKind::SessionEnd, "p", "main");
+        assert_eq!(
+            rolled_branch(&[start, work, end]).as_deref(),
+            Some("feat/x")
+        );
+    }
+
+    #[test]
+    fn session_branch_trunk_only_falls_back_to_trunk() {
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "main");
+        let work = ev("s1", 10, EventKind::PreTool, "p");
+        let end = ev("s1", 20, EventKind::SessionEnd, "p");
+        assert_eq!(rolled_branch(&[start, work, end]).as_deref(), Some("main"));
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "p", "main");
+        let work = ev_pb("s1", 10, EventKind::PreTool, "p", "HEAD");
+        let end = ev("s1", 20, EventKind::SessionEnd, "p");
+        assert_eq!(rolled_branch(&[start, work, end]).as_deref(), Some("HEAD"));
+    }
+
+    #[test]
+    fn session_branch_ignores_other_repos_events() {
+        let start = ev_pb("s1", 0, EventKind::SessionStart, "own", "feat/own");
+        let other = ev_pb("s1", 10, EventKind::PreTool, "other", "fix/elsewhere");
+        let end = ev_pb("s1", 20, EventKind::SessionEnd, "own", "main");
+        assert_eq!(
+            rolled_branch(&[start, other, end]).as_deref(),
+            Some("feat/own")
+        );
+    }
+
+    #[test]
+    fn session_branch_without_project_considers_all_events() {
+        let mut start = ev_pb("s1", 0, EventKind::SessionStart, "p", "claude/x-1");
+        start.project = None;
+        let mut work = ev_pb("s1", 10, EventKind::PreTool, "p", "feat/x");
+        work.project = None;
+        let mut end = ev("s1", 20, EventKind::SessionEnd, "p");
+        end.project = None;
+        assert_eq!(
+            rolled_branch(&[start, work, end]).as_deref(),
+            Some("feat/x")
+        );
+    }
+
+    #[test]
+    fn partial_and_final_rollups_share_the_branch_rule() {
+        let events = [
+            ev_pb("s1", 0, EventKind::SessionStart, "own", "claude/x-1"),
+            ev_pb("s1", 5, EventKind::PreTool, "other", "fix/elsewhere"),
+            ev_pb("s1", 10, EventKind::PreTool, "own", "feat/x"),
+            ev_pb("s1", 20, EventKind::PostTool, "own", "main"),
+        ];
+        let mut tracker = SessionBranch::default();
+        for e in &events {
+            tracker.observe(e);
+        }
+        let mut ended = events.to_vec();
+        ended.push(ev("s1", 30, EventKind::SessionEnd, "own"));
+        assert_eq!(tracker.resolve().as_deref(), Some("feat/x"));
+        assert_eq!(rolled_branch(&ended), tracker.resolve());
+    }
+
+    #[test]
+    fn session_branch_latest_non_trunk_wins_over_frequency() {
+        // Frequency is irrelevant: the latest non-trunk branch wins.
         let start = ev("s1", 0, EventKind::SessionStart, "p"); // branch None
         let mut w1 = ev("s1", 10, EventKind::PreTool, "p");
         w1.branch = Some("feat/x".into());
@@ -1702,9 +1849,10 @@ mod tests {
         w2.branch = Some("feat/x".into());
         let mut end = ev("s1", 30, EventKind::SessionEnd, "p");
         end.branch = Some("feat/y".into());
-        let batch = build_batch(&[start, w1, w2, end], &[], &[], "d", IDLE, AGENT, NOW);
-        assert_eq!(batch.sessions.len(), 1);
-        assert_eq!(batch.sessions[0].branch.as_deref(), Some("feat/x"));
+        assert_eq!(
+            rolled_branch(&[start, w1, w2, end]).as_deref(),
+            Some("feat/y")
+        );
     }
 
     #[test]

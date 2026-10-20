@@ -1,6 +1,6 @@
 ---
 title: Orchestration sessions and runs
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
@@ -14,7 +14,7 @@ paths:
   - cli/dirad/src/writer.rs
   - cli/dira/src/session_titles.rs
   - cli/dirad/src/state.rs
-decisions: [D-0001, DIRASH-0027, DIRASH-0041, DIRASH-0042]
+decisions: [D-0001, DIRASH-0027, DIRASH-0041, DIRASH-0042, DIRASH-0044]
 ---
 
 ## Overview
@@ -27,10 +27,13 @@ links their children, and shows the whole thing as one run.
 
 ## Behavior
 
-- A session is an orchestrator when it spawned a child or an event's cwd sits
-  in a scratch workspace and is not itself a repo, unless the session also
-  resolved a repo from a cwd outside every scratch workspace. A clone inside
-  the workspace (`scratch-…/repos/x`) does not cancel the role.
+- A session is an orchestrator only when it coordinates (DIRASH-0044): it
+  spawned a child, or it worked from a scratch workspace and resolved at least
+  one repo. Either way it never resolved a repo from a cwd outside every
+  scratch workspace. A clone inside the workspace (`scratch-…/repos/x`) does
+  not cancel the role. A scratch session that spawns nothing and resolves no
+  repo (a scheduled dashboard refresh) is ordinary: no role, no workspaceRef,
+  no repos, and its repo-less time stays unresolved.
 - A session that spawns from its own repo is a spawner (DIRASH-0042). It keeps
   its sticky project and `repoCanonical`, has no role, and lists the repos it
   touched in `repos`. It heads a run because its children name it as parent.
@@ -38,10 +41,10 @@ links their children, and shows the whole thing as one run.
   moves to its own worktree of a real repo. It is an ordinary session: it keeps
   its sticky project and its rollup's `repoCanonical`. Its scratch events still
   carry the `workspace` digest; only the session-level verdict changes.
-- `SessionLineage` folds the verdict from flags that only ever turn on, so the
-  rollup, the live registry and reports agree whatever the event order. While a
-  child's scratch preamble is all the registry has seen, it reads as an
-  orchestrator; the first event in its worktree flips it for good. Any change
+- `SessionLineage` folds the verdict from flags and repo evidence that only ever grow, so the
+  rollup, the live registry and reports agree whatever the event order. A scratch
+  session turns into an orchestrator on its first repo evidence or spawn; a
+  child that then resolves a repo in its own worktree flips it off for good. Any change
   to what the rollup would carry (role, parent, repos, workspace, repo) ships
   a partial rollup on the next flush (see attestation-sync), so the cloud's live view follows
   the flip. That early partial is only safe from contract 1.7, where the

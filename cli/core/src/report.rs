@@ -271,6 +271,28 @@ mod tests {
     }
 
     #[test]
+    fn a_repo_less_scratch_session_is_unresolved_not_orchestration() {
+        // A scheduled-task session: scratch workspace, no spawn, no repo.
+        let mut a = ev("cron", 0, EventKind::UserPrompt, "x");
+        a.project = None;
+        a.lineage.workspace = Some("0123456789abcdef".into());
+        let mut b = a.clone();
+        b.at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(60);
+        let r = build(&[a, b], Duration::minutes(5), Default::default());
+        assert!(
+            r.projects.iter().all(|p| !p.orchestration),
+            "no orchestration line: {:#?}",
+            r.projects
+        );
+        let unresolved = r
+            .projects
+            .iter()
+            .find(|p| p.project.is_none() && !p.orchestration)
+            .map(|p| p.human_seconds);
+        assert_eq!(unresolved, Some(60));
+    }
+
+    #[test]
     fn human_dedups_but_agent_sums() {
         // Two concurrent sessions on the same project, human prompts interleaved.
         let events = vec![

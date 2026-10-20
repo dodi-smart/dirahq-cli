@@ -421,7 +421,7 @@ fn flush_partials(state: &AppState) -> Vec<SessionRollup> {
 
 /// Issue #179: a session gets its sessions row on first sight, not an hour in,
 /// and a lineage change re-ships it at once. Here a child's scratch preamble
-/// first reads as an orchestrator; moving to its own worktree flips the verdict
+/// (working in a clone under the scratch dir) first reads as an orchestrator; moving to its own worktree flips the verdict
 /// and the very next flush retracts it (the cloud honours that from 1.7).
 #[tokio::test]
 async fn a_young_session_ships_a_partial_on_first_sight_and_on_a_verdict_flip() {
@@ -430,8 +430,9 @@ async fn a_young_session_ships_a_partial_on_first_sight_and_on_a_verdict_flip() 
         state.config.partial_rollup_after() > time::Duration::seconds(60),
         "the age threshold must not be what ships these partials"
     );
-    let (tmp, scratch, _clone) = scratch_with_clone();
+    let (tmp, scratch, clone) = scratch_with_clone();
     let cwd = scratch.display().to_string();
+    let clone_cwd = clone.display().to_string();
     let wt_cwd = git_repo(
         &tmp.path().join("Workspace/app/.claude/worktrees/x"),
         "acme/app",
@@ -458,7 +459,7 @@ async fn a_young_session_ships_a_partial_on_first_sight_and_on_a_verdict_flip() 
     hook(
         &state,
         json!({ "hook_event_name": "PreToolUse", "session_id": "kid",
-        "cwd": cwd, "dira_env": env(KID_HOST), "tool_name": "Read",
+        "cwd": clone_cwd, "dira_env": env(KID_HOST), "tool_name": "Read",
         "tool_input": { "file_path": "notes.md" } }),
     )
     .await;

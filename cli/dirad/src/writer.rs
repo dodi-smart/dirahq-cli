@@ -604,19 +604,27 @@ fn enrich(
         .as_deref()
         .filter(|_| repo_dir.is_none())
         .and_then(|cwd| orchestration::scratch_workspace(std::path::Path::new(cwd)));
+    let mut from_evidence = false;
     if repo_dir.is_none() && !norm.hints.evidence.is_empty() {
         if let Some((r, dir)) = resolve_evidence(&norm.hints.evidence, cache) {
             resolved = Some(r);
             repo_dir = dir;
+            from_evidence = true;
         }
     }
 
     // The session branch is volatile (a checkout can change it within a session),
     // so resolve it live per event rather than caching it with the project.
-    let branch = norm
-        .cwd
-        .as_ref()
-        .and_then(|cwd| project::current_branch(std::path::Path::new(cwd)));
+    // When tool evidence named the repo, only that repo's root can say its
+    // branch: a repo named outright (`gh -R`) has no directory, so no branch,
+    // and the cwd — a scratch dir, or a repo with no usable remote — belongs to
+    // some other checkout whose branch would be a lie. Otherwise the cwd decides.
+    let branch_dir = if from_evidence {
+        repo_dir.as_ref()
+    } else {
+        norm.cwd.as_ref()
+    };
+    let branch = branch_dir.and_then(|dir| project::current_branch(std::path::Path::new(dir)));
 
     let ev = RawEvent {
         id: Ulid::generate().to_string(),
@@ -1252,6 +1260,118 @@ mod tests {
         };
         git(&["init", "-q", "-b", "main"]);
         git(&["remote", "add", "origin", origin]);
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    fn hook_in(
+        cwd: &std::path::Path,
+        evidence: Vec<orchestration::Evidence>,
+    ) -> dira_sources::Normalized {
+        dira_sources::Normalized {
+            session_id: "s1".into(),
+            kind: EventKind::PreTool,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            tool: Some("Edit".into()),
+            transcript_path: None,
+            source: None,
+            reason: None,
+            hints: Box::new(dira_sources::Hints {
+                evidence,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// An event whose repo came from tool evidence (cwd is a scratch dir) takes
+    /// its branch from the evidence repo root, not the branchless scratch cwd.
+    /// A repo named outright (no directory) keeps no branch.
+    #[test]
+    fn evidence_resolved_event_takes_the_branch_of_the_evidence_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        git_repo(&repo, "https://github.com/acme/api");
+        git_in(&repo, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        git_in(&repo, &["checkout", "-q", "-b", "feat/x"]);
+
+        let mut cache = ProjectCache::new();
+        let file = repo.join("src").join("a.rs");
+        let (ev, repo_dir) = enrich(
+            hook_in(&scratch, vec![orchestration::Evidence::Path(file)]),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.project.as_deref(), Some("github.com/acme/api"));
+        assert!(repo_dir.is_some());
+        assert_eq!(ev.branch.as_deref(), Some("feat/x"));
+
+        // An ordinary cwd-resolved event still reads its own cwd's branch.
+        let (ev, _) = enrich(
+            hook_in(&repo, vec![]),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.branch.as_deref(), Some("feat/x"));
+
+        // A repo named outright has no directory to ask.
+        let (ev, repo_dir) = enrich(
+            hook_in(
+                &scratch,
+                vec![orchestration::Evidence::Repo("github.com/acme/api".into())],
+            ),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert!(repo_dir.is_none());
+        assert_eq!(ev.branch, None);
+    }
+
+    /// A cwd that is a git checkout with no usable remote resolves no project,
+    /// so `gh -R` evidence names the repo — and the cwd's own branch belongs to
+    /// another checkout entirely. It must never be stamped on the event.
+    #[test]
+    fn repo_named_by_evidence_never_takes_a_remote_less_cwds_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        git_in(dir.path(), &["init", "-q", notes.to_str().unwrap()]);
+        git_in(&notes, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        git_in(&notes, &["checkout", "-q", "-b", "wip/notes"]);
+
+        let mut cache = ProjectCache::new();
+        let (ev, repo_dir) = enrich(
+            hook_in(
+                &notes,
+                vec![orchestration::Evidence::Repo("github.com/acme/api".into())],
+            ),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.project.as_deref(), Some("github.com/acme/api"));
+        assert!(repo_dir.is_none());
+        assert_eq!(
+            ev.branch, None,
+            "the remote-less cwd's wip/notes must not leak"
+        );
     }
 
     /// Issue #93: a `Stop` whose OWN cwd fails to resolve used to strip

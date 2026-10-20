@@ -130,6 +130,11 @@ pub struct SessionLineage {
     pub orchestrator: bool,
     pub parent_session: Option<String>,
     pub workspace: Option<String>,
+    /// What started the session when it was not a person. First non-null wins
+    /// and is never cleared: a scheduled session stays scheduled (DIRASH-0046).
+    pub trigger: Option<dira_contract::SessionTrigger>,
+    /// The verified scheduled-task slug, first non-null wins.
+    pub trigger_name: Option<String>,
     /// Every canonical repo an event of this session resolved to.
     pub repos: std::collections::BTreeSet<String>,
     spawned: bool,
@@ -147,6 +152,8 @@ pub struct LineageWire {
     pub parent_session: Option<String>,
     pub repos: Option<Vec<String>>,
     pub workspace_ref: Option<String>,
+    pub trigger: Option<dira_contract::SessionTrigger>,
+    pub trigger_name: Option<String>,
 }
 
 impl SessionLineage {
@@ -187,16 +194,38 @@ impl SessionLineage {
         if self.workspace.is_none() {
             self.workspace.clone_from(&l.workspace);
         }
+        self.observe_trigger(l.trigger, l.trigger_name.as_deref());
         self.shape() != before
     }
 
-    fn shape(&self) -> (bool, bool, bool, bool, usize) {
+    /// Fold a trigger found outside an event (the transcript pass finds it after
+    /// the event that prompted the read was stored). First non-null wins per
+    /// field and nothing is ever cleared. Returns whether either field changed.
+    pub fn observe_trigger(
+        &mut self,
+        trigger: Option<dira_contract::SessionTrigger>,
+        name: Option<&str>,
+    ) -> bool {
+        let before = (self.trigger, self.trigger_name.is_some());
+        if self.trigger.is_none() {
+            self.trigger = trigger;
+        }
+        if self.trigger_name.is_none() {
+            self.trigger_name = name.map(str::to_string);
+        }
+        before != (self.trigger, self.trigger_name.is_some())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn shape(&self) -> (bool, bool, bool, bool, usize, bool, bool) {
         (
             self.orchestrator,
             self.spawned,
             self.parent_session.is_some(),
             self.workspace.is_some(),
             self.repos.len(),
+            self.trigger.is_some(),
+            self.trigger_name.is_some(),
         )
     }
 
@@ -237,7 +266,25 @@ impl SessionLineage {
             parent_session: self.parent_session.clone(),
             repos: self.repos_touched(),
             workspace_ref: self.workspace_ref(),
+            trigger: self.trigger,
+            trigger_name: self.trigger_name.clone(),
         }
+    }
+}
+
+/// The store text for a trigger column.
+pub fn trigger_str(t: dira_contract::SessionTrigger) -> &'static str {
+    match t {
+        dira_contract::SessionTrigger::Scheduled => "scheduled",
+    }
+}
+
+/// Parse a stored trigger column. An unknown value (a newer build wrote it) is
+/// `None`, never an error: the column is informational.
+pub fn parse_trigger(s: &str) -> Option<dira_contract::SessionTrigger> {
+    match s {
+        "scheduled" => Some(dira_contract::SessionTrigger::Scheduled),
+        _ => None,
     }
 }
 

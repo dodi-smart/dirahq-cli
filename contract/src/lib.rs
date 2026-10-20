@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.7.0";
+pub const SCHEMA_VERSION: &str = "1.8.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -94,6 +94,17 @@ pub enum SessionRole {
     /// its own repo is not one: it keeps its `repoCanonical` and heads a run
     /// only because its children name it as their parent.
     Orchestrator,
+}
+
+/// What started a session when it was not a person. Absent for an interactive
+/// session, and for one whose origin is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTrigger {
+    /// A Claude Desktop scheduled task fired the session. The producer reads
+    /// the transcript's first-turn origin metadata (never its content) to
+    /// know.
+    Scheduled,
 }
 
 /// Which harness produced a session.
@@ -223,6 +234,24 @@ pub struct SessionRollup {
     /// Optional + omitted-when-absent so pre-1.6 payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_ref: Option<String>,
+    /// What started this session when it was a trigger rather than a person
+    /// (see [`SessionTrigger`]). Absent means "not started by a trigger, or
+    /// unknown". A trigger is never retracted: a newer rollup that omits it
+    /// does not clear one an earlier rollup sent.
+    /// Optional + omitted-when-absent so pre-1.8 payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<SessionTrigger>,
+    /// The slug of the Claude Desktop scheduled task that started this session
+    /// (`dodi-smart-triage-refresh`), only ever set alongside
+    /// `trigger = scheduled`. The producer sends it only when it names an
+    /// existing directory under `~/.claude/scheduled-tasks/`, so it matches
+    /// `[a-z0-9][a-z0-9_-]*` and is at most 64 chars. It is a user-chosen
+    /// identifier like a branch name, never prompt text, a task description,
+    /// a schedule or SKILL.md content (DIRASH-0046, an exception to D-0001
+    /// scoped to this verified identifier).
+    /// Optional + omitted-when-absent so pre-1.8 payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_name: Option<String>,
 }
 
 /// Token usage for a session/turn. Cost is always an estimate, separate from time.
@@ -1572,6 +1601,9 @@ mod tests {
                     parent_session: Some("ps".into()),
                     repos: Some(vec!["r".into()]),
                     workspace_ref: Some("0123456789abcdef".into()),
+                    // Populated so the content-token walk covers the 1.8 fields.
+                    trigger: Some(SessionTrigger::Scheduled),
+                    trigger_name: Some("dodi-smart-triage-refresh".into()),
                 }],
                 token_usage: vec![TokenUsage {
                     id: "t".into(),
@@ -1846,6 +1878,8 @@ mod tests {
             parent_session: None,
             repos: None,
             workspace_ref: None,
+            trigger: None,
+            trigger_name: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"spec\":\"bmad:epic-1\""));
@@ -1880,8 +1914,12 @@ mod tests {
             parent_session: Some("parent".into()),
             repos: Some(vec!["github.com/a/b".into(), "github.com/a/c".into()]),
             workspace_ref: Some("0123456789abcdef".into()),
+            trigger: Some(SessionTrigger::Scheduled),
+            trigger_name: Some("dodi-smart-triage-refresh".into()),
         };
         let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"trigger\":\"scheduled\""));
+        assert!(json.contains("\"triggerName\":\"dodi-smart-triage-refresh\""));
         assert!(json.contains("\"role\":\"orchestrator\""));
         assert!(json.contains("\"parentSession\":\"parent\""));
         assert!(json.contains("\"repos\":[\"github.com/a/b\",\"github.com/a/c\"]"));
@@ -1889,13 +1927,27 @@ mod tests {
         let back: SessionRollup = serde_json::from_str(&json).unwrap();
         assert_eq!(back.role, Some(SessionRole::Orchestrator));
         assert_eq!(back.repos.as_ref().map(Vec::len), Some(2));
+        assert_eq!(back.trigger, Some(SessionTrigger::Scheduled));
+        assert_eq!(
+            back.trigger_name.as_deref(),
+            Some("dodi-smart-triage-refresh")
+        );
 
         s.role = None;
         s.parent_session = None;
         s.repos = None;
         s.workspace_ref = None;
+        s.trigger = None;
+        s.trigger_name = None;
         let json = serde_json::to_string(&s).unwrap();
-        for absent in ["role", "parentSession", "repos", "workspaceRef"] {
+        for absent in [
+            "role",
+            "parentSession",
+            "repos",
+            "workspaceRef",
+            "trigger",
+            "triggerName",
+        ] {
             assert!(!json.contains(absent), "`{absent}` should be omitted");
         }
         let old: SessionRollup = serde_json::from_str(&json).unwrap();
@@ -2031,6 +2083,8 @@ mod tests {
             parent_session: None,
             repos: None,
             workspace_ref: None,
+            trigger: None,
+            trigger_name: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"runtime\":\"claude-web\""));

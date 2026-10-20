@@ -93,6 +93,10 @@ pub fn build_vector() -> serde_json::Value {
                 "github.com/dodi-smart/dira-cloud".to_string(),
             ]),
             workspace_ref: Some("9f86d081884c7d65".to_string()),
+            // Populated so the 1.8 trigger fields are exercised by the
+            // cross-language vector, not just tolerated.
+            trigger: Some(dira_contract::SessionTrigger::Scheduled),
+            trigger_name: Some("dodi-smart-triage-refresh".to_string()),
         }],
         token_usage: vec![],
         artifacts: vec![],

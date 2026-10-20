@@ -41,9 +41,9 @@
     },
     ".github/workflows/pr-checks.yml": {
       "kind": "rendered",
-      "sha256": "cc3ada85478a3f4604e106b7265707cbeb1a543aac24747af29d843842da7c21",
+      "sha256": "216039e9a230b87589cb61184bc85632dae82a830efaa43f0ac2f4d98cfd140c",
       "template": "workflows/pr-checks.yml",
-      "version": "1.25.3"
+      "version": "1.31.0"
     },
     ".github/workflows/pr-review.yml": {
       "kind": "rendered",
@@ -94,5 +94,5 @@
   },
   "schema": 1,
   "stack": "rust",
-  "version": "1.28.0"
+  "version": "1.31.0"
 }

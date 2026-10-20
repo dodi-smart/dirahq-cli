@@ -3,33 +3,45 @@
 # Replaces a hand-written ci.yml / pr-checks.yml. Lint and typecheck run on the
 # small pool, tests and build on the large one.
 #
-# `concurrency` is set HERE, in the caller, because it depends on this repo's
-# branches. Do not drop it: without it every push runs a full build to
-# completion instead of cancelling the superseded one.
+# `concurrency` is set HERE, in the caller, because only the caller knows the
+# pull request a run belongs to. Do not drop it: without it every push runs a
+# full build to completion instead of cancelling the superseded one.
 #
 # Do NOT add `paths-ignore` here. The shared workflow already skips the real
 # jobs on a docs-only change itself (`docs-only-paths` input, default Markdown
 # and `docs/**`) but still runs its summary job, so the required status check
 # is created either way. A caller-side `paths-ignore` would skip that summary
 # job too, on a docs-only PR — leaving a required check waiting forever.
+#
+# `push` seeds the caches: only a run on the default branch saves the Actions
+# cache (Gradle, Kotlin/Native, Next.js) that pull requests restore. The job's
+# `if:` keeps only the repo's default branch, read from the event, so this file
+# is the same in every repo.
 name: PR Checks
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [develop, main]
+  push:
+    branches: [develop, main]
   workflow_dispatch:
 
+# A newer commit on the same pull request cancels the older run. Any other run
+# gets a group of its own, so a push run is never cancelled or left pending: each
+# one saves the cache for its own commit.
 concurrency:
-  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  group: pr-checks-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   checks:
-    # workflow_dispatch has no pull_request, so a bare draft gate evaluates
-    # null == false -> FALSE and every dispatch silently runs nothing. The
-    # trigger was decorative in every repo that copied this file until the
-    # event-name arm was added. Keep both arms together.
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    # Only a pull_request carries a draft flag. workflow_dispatch and push have
+    # none, so a bare draft gate evaluates null == false -> FALSE and those runs
+    # silently do nothing. Keep both arms together. The first clause drops a
+    # push to the branch that is not the default.
+    if: >-
+      (github.event_name != 'push' || github.ref_name == github.event.repository.default_branch)
+      && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     uses: dodi-smart/.github/.github/workflows/pr-checks.yml@v1
     secrets: inherit
     # A called job can only ask for what the calling job grants. The opt-in

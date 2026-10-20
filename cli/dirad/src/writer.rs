@@ -604,22 +604,27 @@ fn enrich(
         .as_deref()
         .filter(|_| repo_dir.is_none())
         .and_then(|cwd| orchestration::scratch_workspace(std::path::Path::new(cwd)));
+    let mut from_evidence = false;
     if repo_dir.is_none() && !norm.hints.evidence.is_empty() {
         if let Some((r, dir)) = resolve_evidence(&norm.hints.evidence, cache) {
             resolved = Some(r);
             repo_dir = dir;
+            from_evidence = true;
         }
     }
 
     // The session branch is volatile (a checkout can change it within a session),
     // so resolve it live per event rather than caching it with the project.
-    // `repo_dir` is the cwd for an ordinary cwd-resolved event and the evidence
-    // repo root otherwise (the cwd is then a scratch dir with no branch of its
-    // own); a repo named outright has no directory, so no branch.
-    let branch = repo_dir
-        .as_ref()
-        .or(norm.cwd.as_ref())
-        .and_then(|dir| project::current_branch(std::path::Path::new(dir)));
+    // When tool evidence named the repo, only that repo's root can say its
+    // branch: a repo named outright (`gh -R`) has no directory, so no branch,
+    // and the cwd — a scratch dir, or a repo with no usable remote — belongs to
+    // some other checkout whose branch would be a lie. Otherwise the cwd decides.
+    let branch_dir = if from_evidence {
+        repo_dir.as_ref()
+    } else {
+        norm.cwd.as_ref()
+    };
+    let branch = branch_dir.and_then(|dir| project::current_branch(std::path::Path::new(dir)));
 
     let ev = RawEvent {
         id: Ulid::generate().to_string(),
@@ -1337,6 +1342,36 @@ mod tests {
         );
         assert!(repo_dir.is_none());
         assert_eq!(ev.branch, None);
+    }
+
+    /// A cwd that is a git checkout with no usable remote resolves no project,
+    /// so `gh -R` evidence names the repo — and the cwd's own branch belongs to
+    /// another checkout entirely. It must never be stamped on the event.
+    #[test]
+    fn repo_named_by_evidence_never_takes_a_remote_less_cwds_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        git_in(dir.path(), &["init", "-q", notes.to_str().unwrap()]);
+        git_in(&notes, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        git_in(&notes, &["checkout", "-q", "-b", "wip/notes"]);
+
+        let mut cache = ProjectCache::new();
+        let (ev, repo_dir) = enrich(
+            hook_in(
+                &notes,
+                vec![orchestration::Evidence::Repo("github.com/acme/api".into())],
+            ),
+            Harness::ClaudeCode,
+            OffsetDateTime::now_utc(),
+            &mut cache,
+        );
+        assert_eq!(ev.project.as_deref(), Some("github.com/acme/api"));
+        assert!(repo_dir.is_none());
+        assert_eq!(
+            ev.branch, None,
+            "the remote-less cwd's wip/notes must not leak"
+        );
     }
 
     /// Issue #93: a `Stop` whose OWN cwd fails to resolve used to strip

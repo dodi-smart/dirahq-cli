@@ -47,7 +47,9 @@ Each shipped `role=orchestrator` with a workspaceRef, showed up as an orchestrat
 ## Verification
 
 The `checks:` entries cover the rule, the late flip, the spawn path, the report line and the live registry's wire.
-Prod rows already shipped as orchestrators are retracted by the next 1.7 rollup, since an absent `role` is authoritative.
+A 1.7 rollup's absent `role` is authoritative, but only live sessions ship another rollup (a partial on lineage change).
+An ended session's rollup ships once, so prod rows that ended as orchestrators stay wrong until the one-shot re-send of
+ended rollups lands (https://github.com/dodi-smart/dirahq-cli/issues/180).
 
 ## Open questions
 

@@ -112,6 +112,7 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
     // Consecutive failed flush attempts since the last success, surfaced on the
     // sync-health snapshot (`META_SYNC_HEALTH`) alongside `backoff`.
     let mut consecutive_failures: u32 = 0;
+    let mut resend = LineageResend::new();
 
     loop {
         tokio::select! {
@@ -141,8 +142,13 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
         // or not it finds anything to send — mirrors the writer-health pattern
         // (WP-B7) of a small set of process-wide counters on `ProgressTracker`.
         state.progress.mark_flush_attempt();
+        // Whether the cloud answered this flush cleanly (the gate for the
+        // one-shot lineage re-send below, which must never compete with a
+        // failing or backing-off normal sync).
+        let mut flush_healthy = false;
         match flush(&state, &device_key, &state.http).await {
             Ok(FlushOutcome::Synced) => {
+                flush_healthy = true;
                 backoff = StdDuration::ZERO;
                 consecutive_failures = 0;
                 state.progress.mark_flush_success();
@@ -152,6 +158,7 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
                 state.billing_refresh.notify_one();
             }
             Ok(FlushOutcome::Nothing) => {
+                flush_healthy = true;
                 backoff = StdDuration::ZERO;
                 consecutive_failures = 0;
                 state.progress.mark_flush_success();
@@ -342,6 +349,79 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<()>) {
                 sleep(backoff).await;
             }
         }
+
+        // One-shot lineage re-send (DIRASH-0045), after a healthy regular flush
+        // and never in the foreground. Its failures back off on their own clock
+        // and never sleep this loop, so normal sync is not held up by it.
+        if flush_healthy {
+            resend.step(&state, &device_key).await;
+        }
+    }
+}
+
+/// Run-loop bookkeeping for the lineage re-send: whether it is finished, and
+/// when it may next try after a failure.
+struct LineageResend {
+    done: bool,
+    backoff: StdDuration,
+    not_before: Option<Instant>,
+}
+
+impl LineageResend {
+    fn new() -> Self {
+        Self {
+            done: false,
+            backoff: StdDuration::ZERO,
+            not_before: None,
+        }
+    }
+
+    /// Attempt the pass if it is still owed and not backing off. Errors are
+    /// logged and slow only this pass; the marker stays unwritten so the next
+    /// attempt resumes.
+    async fn step(&mut self, state: &AppState, device_key: &DeviceKey) {
+        if self.done || self.not_before.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        let now = time::OffsetDateTime::now_utc();
+        match resend_lineage(state, device_key, &state.http, now).await {
+            Ok(ResendOutcome::UpToDate) => self.done = true,
+            Ok(ResendOutcome::Resent(sessions)) => {
+                tracing::debug!(sessions, "sync: lineage re-send complete");
+                self.done = true;
+            }
+            // Not linked or sync off: stay owed, and look again on a later tick.
+            Ok(ResendOutcome::Skipped) => {}
+            Err(e) => {
+                self.backoff = match &e {
+                    SyncError::Transient { retry_after, .. } => {
+                        transient_wait(*retry_after, self.backoff)
+                    }
+                    SyncError::ReLinkRequired
+                    | SyncError::SignatureRejected(_)
+                    | SyncError::SchemaSkew(_) => MAX_BACKOFF,
+                    _ => next_backoff(self.backoff),
+                };
+                self.not_before = Some(Instant::now() + self.backoff);
+                tracing::warn!(
+                    "sync: lineage re-send failed, retrying in {:?}: {}",
+                    self.backoff,
+                    describe(&e)
+                );
+            }
+        }
+    }
+}
+
+/// One-line text for a [`SyncError`], for logs that do not own the error.
+fn describe(e: &SyncError) -> String {
+    match e {
+        SyncError::Transient { message, .. } => message.clone(),
+        SyncError::ReLinkRequired => "unknown_device".to_string(),
+        SyncError::SignatureRejected(b)
+        | SyncError::SchemaSkew(b)
+        | SyncError::PayloadTooLarge(b)
+        | SyncError::Fatal(b) => b.clone(),
     }
 }
 
@@ -838,13 +918,8 @@ async fn flush(
     // and it is safe after assembly because batch ids derive from events/
     // artifacts/intervals only, never from the session rollups. Local daemons
     // detect nothing and the fields stay off the wire, byte-identical to 1.3.
-    if let Some(rt) = dira_core::runtime::detect() {
-        for chunk in &mut chunks {
-            for s in &mut chunk.batch.sessions {
-                s.runtime = Some(rt.id.clone());
-                s.runtime_session_ref = rt.session_ref.clone();
-            }
-        }
+    for chunk in &mut chunks {
+        stamp_runtime(&mut chunk.batch.sessions);
     }
 
     // 4. POST each chunk in order; advance the event cursor to that chunk's high-water
@@ -900,23 +975,6 @@ async fn flush(
                 retry_after: None,
             })?;
         let status = resp.status();
-
-        // 429: checked BEFORE the success/401 branches below. Cursors for
-        // already-acked chunks in this flush stay advanced (we return before
-        // touching this chunk's), so a retry only re-sends the remainder.
-        // Header form first (cheap, standard); the typed JSON body is the
-        // fallback for a proxy that strips the header.
-        if status.as_u16() == 429 {
-            let header_hint = retry_after_from_headers(resp.headers());
-            let body = resp.text().await.unwrap_or_default();
-            let retry_after = header_hint.or_else(|| {
-                dira_core::sync::parse_retry_after_body(&body).map(StdDuration::from_secs)
-            });
-            return Err(SyncError::Transient {
-                message: format!("ingest 429: {body}"),
-                retry_after,
-            });
-        }
 
         if status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -1004,36 +1062,10 @@ async fn flush(
             continue;
         }
 
-        // Non-2xx: cursors for already-acked chunks stay advanced, so the next flush
-        // re-chunks only the remaining window. Classify why this chunk was rejected.
-        let body = resp.text().await.unwrap_or_default();
-        if status.as_u16() == 401 {
-            if is_unknown_device(&body) {
-                return Err(SyncError::ReLinkRequired);
-            }
-            if is_bad_signature(&body) {
-                return Err(SyncError::SignatureRejected(body));
-            }
-            return Err(SyncError::Fatal(format!("401 from ingest: {body}")));
-        }
-        if status.is_server_error() {
-            return Err(SyncError::Transient {
-                message: format!("ingest {status}"),
-                retry_after: None,
-            });
-        }
-        // 4xx: unknown_device can arrive here (gateways map auth → 403); an
-        // unsupported contract major is a skew we pause on rather than hot-loop.
-        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-            return Err(SyncError::PayloadTooLarge(body));
-        }
-        if is_unknown_device(&body) {
-            return Err(SyncError::ReLinkRequired);
-        }
-        if is_unsupported_schema(&body) {
-            return Err(SyncError::SchemaSkew(body));
-        }
-        return Err(SyncError::Fatal(format!("ingest {status}: {body}")));
+        // Non-2xx: cursors for already-acked chunks stay advanced (a 429 included,
+        // so a retry only re-sends the remainder), so the next flush re-chunks only
+        // the remaining window.
+        return Err(ingest_error(resp).await);
     }
 
     // 5. The advisory handshake (epoch + watermark) was already applied
@@ -1071,6 +1103,220 @@ async fn flush(
         "sync: flushed batch(es) to cloud"
     );
     Ok(FlushOutcome::Synced)
+}
+
+/// Classify a non-2xx ingest response into the [`SyncError`] the run loop backs
+/// off on. Shared by `flush` and the lineage re-send so both read the cloud's
+/// rejections identically.
+///
+/// 429 is checked first: header form first (cheap, standard), the typed JSON
+/// body as the fallback for a proxy that strips the header.
+async fn ingest_error(resp: reqwest::Response) -> SyncError {
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        let header_hint = retry_after_from_headers(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        let retry_after = header_hint
+            .or_else(|| dira_core::sync::parse_retry_after_body(&body).map(StdDuration::from_secs));
+        return SyncError::Transient {
+            message: format!("ingest 429: {body}"),
+            retry_after,
+        };
+    }
+    let body = resp.text().await.unwrap_or_default();
+    if status.as_u16() == 401 {
+        if is_unknown_device(&body) {
+            return SyncError::ReLinkRequired;
+        }
+        if is_bad_signature(&body) {
+            return SyncError::SignatureRejected(body);
+        }
+        return SyncError::Fatal(format!("401 from ingest: {body}"));
+    }
+    if status.is_server_error() {
+        return SyncError::Transient {
+            message: format!("ingest {status}"),
+            retry_after: None,
+        };
+    }
+    // 4xx: unknown_device can arrive here (gateways map auth → 403); an
+    // unsupported contract major is a skew we pause on rather than hot-loop.
+    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        return SyncError::PayloadTooLarge(body);
+    }
+    if is_unknown_device(&body) {
+        return SyncError::ReLinkRequired;
+    }
+    if is_unsupported_schema(&body) {
+        return SyncError::SchemaSkew(body);
+    }
+    SyncError::Fatal(format!("ingest {status}: {body}"))
+}
+
+/// Stamp the cloud runtime (contract 1.4) onto rollups leaving this process.
+/// A property of the running environment, not of the stored events, so it is
+/// applied at send time. Local daemons detect nothing and nothing is stamped.
+fn stamp_runtime(sessions: &mut [dira_contract::SessionRollup]) {
+    if let Some(rt) = dira_core::runtime::detect() {
+        for s in sessions {
+            s.runtime = Some(rt.id.clone());
+            s.runtime_session_ref = rt.session_ref.clone();
+        }
+    }
+}
+
+/// How far back the lineage re-send looks for ended sessions.
+const LINEAGE_RESEND_WINDOW: time::Duration = time::Duration::days(30);
+
+/// What a lineage re-send pass did.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum ResendOutcome {
+    /// The recorded rules version is current; nothing to do (ever, until a bump).
+    UpToDate,
+    /// Sync is not configured or the device is not linked. The marker is NOT
+    /// written, so the pass runs once the device links.
+    Skipped,
+    /// Every chunk was acked and the marker written. Carries the sessions sent.
+    Resent(usize),
+}
+
+/// One-shot re-send of corrected ended-session rollups after the lineage rules
+/// changed (DIRASH-0045).
+///
+/// An ended rollup ships once, on the flush holding its `SessionEnd`, so rows
+/// synced under older rules keep stale `role`/`repos`/`branch` in the cloud,
+/// which cannot recompute them. When `LINEAGE_RULES_VERSION` is newer than the
+/// `meta` marker, this rebuilds the final rollup of every session that ended in
+/// the last 30 days from the local store and POSTs it. A 1.7 cloud treats
+/// those fields as authoritative when `agentWallSeconds` is not lower.
+///
+/// Guards that make it safe:
+/// - **Ended only.** A session whose latest event is not a `session_end` is
+///   not sent. A partial for an ended or abandoned session would reopen its
+///   cloud row (cloud#253); live sessions already ship corrected lineage
+///   through the registry's partial-on-lineage-change path.
+/// - **Sessions only.** Batches carry no intervals, tokens or artifacts, so no
+///   time is counted twice, and the pass touches no sync cursor.
+/// - **Marker last.** The marker is written only after every chunk was acked.
+///   A failure leaves it unwritten and the next attempt re-sends (idempotent
+///   upserts), so progress is never lost, only repeated.
+///
+/// Not a foreground path: only the sync task calls it, after a healthy flush.
+/// The ack body is deliberately not fed to `apply_handshake`: an epoch reset
+/// blanks the cursors and re-sends everything through the normal path anyway,
+/// and the next flush's ack carries the same epoch.
+async fn resend_lineage(
+    state: &AppState,
+    device_key: &DeviceKey,
+    client: &reqwest::Client,
+    now: time::OffsetDateTime,
+) -> Result<ResendOutcome, SyncError> {
+    use dira_core::orchestration::LINEAGE_RULES_VERSION;
+    use dira_core::sync::META_LINEAGE_RULES_VERSION;
+
+    let recorded = state
+        .store
+        .meta_get(META_LINEAGE_RULES_VERSION)
+        .await
+        .map_err(|e| SyncError::Fatal(format!("read lineage rules version: {e}")))?
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if recorded >= LINEAGE_RULES_VERSION {
+        return Ok(ResendOutcome::UpToDate);
+    }
+    let Some(cloud_url) = state.config.cloud_url.clone() else {
+        return Ok(ResendOutcome::Skipped);
+    };
+    let device_id = match identity::device_id(&state.store).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(ResendOutcome::Skipped),
+        Err(e) => return Err(SyncError::Fatal(format!("read device_id: {e}"))),
+    };
+
+    let ids = state
+        .store
+        .ended_sessions_since(now - LINEAGE_RESEND_WINDOW)
+        .await
+        .map_err(|e| SyncError::Fatal(format!("list ended sessions: {e}")))?;
+    let until = state
+        .store
+        .max_event_id()
+        .await
+        .map_err(|e| SyncError::Fatal(format!("read max id: {e}")))?;
+    let agent = state.config.agent_policy();
+    let url = format!("{}/api/v1/ingest", cloud_url.trim_end_matches('/'));
+
+    let mut sent = 0usize;
+    let mut last_post: Option<Instant> = None;
+    if let Some(until) = until {
+        let id_chunks: Vec<&[String]> =
+            ids.chunks(dira_core::sync::CHUNK_RESEND_SESSIONS).collect();
+        let chunk_count = id_chunks.len();
+        for (i, id_chunk) in id_chunks.into_iter().enumerate() {
+            let history = state
+                .store
+                .events_for_sessions(id_chunk, &until)
+                .await
+                .map_err(|e| SyncError::Fatal(format!("load session history: {e}")))?;
+            let rollups = dira_core::sync::build_lineage_resend_rollups(&history, agent);
+            let mut batches = dira_core::sync::build_lineage_resend_batches(
+                rollups,
+                &history,
+                LINEAGE_RULES_VERSION,
+                &device_id,
+                now,
+            );
+            for batch in &mut batches {
+                stamp_runtime(&mut batch.sessions);
+                let count = batch.sessions.len();
+                let sig = device_key
+                    .sign_payload(batch)
+                    .map_err(|e| SyncError::Fatal(format!("sign: {e}")))?;
+                let envelope = Envelope {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    device_id: device_id.clone(),
+                    payload: batch.clone(),
+                    sig,
+                };
+                last_post = Some(Instant::now());
+                let resp = client
+                    .post(&url)
+                    .timeout(HTTP_TIMEOUT)
+                    .json(&envelope)
+                    .send()
+                    .await
+                    .map_err(|e| SyncError::Transient {
+                        message: format!("post lineage re-send: {e}"),
+                        retry_after: None,
+                    })?;
+                if !resp.status().is_success() {
+                    return Err(ingest_error(resp).await);
+                }
+                sent += count;
+            }
+            // Same pacing as a long flush drain (D-0020).
+            if let (true, Some(at)) = (i + 1 < chunk_count, last_post) {
+                if let Some(wait) = chunk_pace_delay(chunk_count, at.elapsed()) {
+                    sleep(wait).await;
+                }
+            }
+        }
+    }
+
+    state
+        .store
+        .meta_set(
+            META_LINEAGE_RULES_VERSION,
+            &LINEAGE_RULES_VERSION.to_string(),
+        )
+        .await
+        .map_err(|e| SyncError::Fatal(format!("write lineage rules version: {e}")))?;
+    tracing::info!(
+        sessions = sent,
+        version = LINEAGE_RULES_VERSION,
+        "sync: re-sent corrected rollups for ended sessions after a lineage rules change"
+    );
+    Ok(ResendOutcome::Resent(sent))
 }
 
 /// Whether a non-2xx ingest error body is the typed `unsupported_schema_version`
@@ -3302,5 +3548,194 @@ mod tests {
         assert_eq!(parse_version("1"), Some((1, 0, 0)));
         assert_eq!(parse_version(""), None);
         assert_eq!(parse_version("abc"), None);
+    }
+    // --- DIRASH-0045: one-shot lineage re-send -------------------------------
+
+    const INGEST: &str = "/api/v1/ingest";
+
+    /// A linked state holding one ended agent session (`done`) and one live
+    /// session whose compaction-style end is followed by more work (`live`).
+    async fn state_with_ended_and_live_sessions(cloud: &MockCloud) -> AppState {
+        use dira_core::model::EventKind::*;
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        dira_core::identity::set_device_id(&store, "01TESTDEVICE")
+            .await
+            .unwrap();
+        let base = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let sec = time::Duration::seconds;
+        let rows = [
+            ("done", 0, SessionStart),
+            ("done", 10, UserPrompt),
+            ("done", 20, PreTool),
+            ("done", 40, PostTool),
+            ("done", 60, SessionEnd),
+            ("live", 100, UserPrompt),
+            ("live", 110, PreTool),
+            ("live", 120, SessionEnd),
+            ("live", 130, PreTool),
+        ];
+        for (i, (sid, secs, kind)) in rows.into_iter().enumerate() {
+            let mut e = human_event(&format!("{:010}", i + 1), sid, base + sec(secs), kind);
+            e.harness = dira_contract::Harness::ClaudeCode;
+            store.append(&e).await.unwrap();
+        }
+        let config = dira_core::Config {
+            cloud_url: Some(cloud.base_url().to_string()),
+            ..Default::default()
+        };
+        let (state, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
+        state
+    }
+
+    async fn cursors(state: &AppState) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        for k in [META_SYNC_CURSOR, META_ARTIFACTS_CURSOR, META_TOKEN_CURSOR] {
+            out.push(state.store.meta_get(k).await.unwrap());
+        }
+        out
+    }
+
+    async fn marker(state: &AppState) -> Option<String> {
+        state
+            .store
+            .meta_get(dira_core::sync::META_LINEAGE_RULES_VERSION)
+            .await
+            .unwrap()
+    }
+
+    fn payload_of(body: &str) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["payload"].clone()
+    }
+
+    /// The regression the re-send must never cause: a session synced normally and
+    /// then re-sent counts its time once. The re-send batch has no intervals, the
+    /// same wall-clock and prompts as the original rollup, and moves no cursor.
+    #[tokio::test]
+    async fn a_lineage_resend_after_a_normal_sync_double_counts_nothing_and_moves_no_cursor() {
+        let cloud = MockCloud::start(&[INGEST]).await;
+        let state = state_with_ended_and_live_sessions(&cloud).await;
+        let key = DeviceKey::generate();
+
+        cloud.push(INGEST, MockResp::ok(OK_INGEST));
+        flush(&state, &key, &state.http).await.expect("normal sync");
+        let first = payload_of(&cloud.requests(INGEST)[0]);
+        let original = first["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["sessionId"] == "done")
+            .expect("the ended session shipped normally")
+            .clone();
+        let cursors_before = cursors(&state).await;
+        assert!(marker(&state).await.is_none());
+
+        cloud.push(INGEST, MockResp::ok(OK_INGEST));
+        let now = time::OffsetDateTime::now_utc();
+        let out = resend_lineage(&state, &key, &state.http, now)
+            .await
+            .expect("re-send");
+        assert_eq!(out, ResendOutcome::Resent(1), "only the ended session");
+
+        let reqs = cloud.requests(INGEST);
+        assert_eq!(reqs.len(), 2);
+        let p = payload_of(&reqs[1]);
+        assert!(p["intervals"].as_array().is_none_or(|a| a.is_empty()));
+        assert!(p["tokenUsage"].as_array().is_none_or(|a| a.is_empty()));
+        assert!(p["artifacts"].as_array().is_none_or(|a| a.is_empty()));
+        let sessions = p["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "the live session is not re-sent");
+        let resent = &sessions[0];
+        assert_eq!(resent["sessionId"], "done");
+        assert!(resent["endedAt"].is_string(), "final, never a partial");
+        for field in ["startedAt", "endedAt", "agentWallSeconds", "prompts"] {
+            assert_eq!(resent[field], original[field], "{field}");
+        }
+        assert_eq!(cursors(&state).await, cursors_before, "no cursor moved");
+        assert_eq!(
+            marker(&state).await,
+            Some(dira_core::orchestration::LINEAGE_RULES_VERSION.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lineage_resend_runs_when_the_marker_is_missing_or_older_and_not_when_current() {
+        use dira_core::orchestration::LINEAGE_RULES_VERSION;
+        let cloud = MockCloud::start(&[INGEST]).await;
+        let state = state_with_ended_and_live_sessions(&cloud).await;
+        let key = DeviceKey::generate();
+        let now = time::OffsetDateTime::now_utc();
+        let key_name = dira_core::sync::META_LINEAGE_RULES_VERSION;
+
+        // Older marker: runs, and records the current version.
+        state.store.meta_set(key_name, "1").await.unwrap();
+        let out = resend_lineage(&state, &key, &state.http, now)
+            .await
+            .unwrap();
+        assert_eq!(out, ResendOutcome::Resent(1));
+        assert_eq!(cloud.requests(INGEST).len(), 1);
+        assert_eq!(
+            marker(&state).await,
+            Some(LINEAGE_RULES_VERSION.to_string())
+        );
+
+        // Current marker: nothing is sent, ever again.
+        let out = resend_lineage(&state, &key, &state.http, now)
+            .await
+            .unwrap();
+        assert_eq!(out, ResendOutcome::UpToDate);
+        assert_eq!(cloud.requests(INGEST).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_lineage_resend_leaves_the_marker_unwritten_and_resumes() {
+        let cloud = MockCloud::start(&[INGEST]).await;
+        let state = state_with_ended_and_live_sessions(&cloud).await;
+        let key = DeviceKey::generate();
+        let now = time::OffsetDateTime::now_utc();
+
+        cloud.push(INGEST, MockResp::status(503, "{}"));
+        let err = resend_lineage(&state, &key, &state.http, now)
+            .await
+            .expect_err("a 5xx fails the pass");
+        assert!(matches!(err, SyncError::Transient { .. }));
+        assert!(marker(&state).await.is_none(), "no marker after a failure");
+
+        cloud.push(INGEST, MockResp::ok(OK_INGEST));
+        let out = resend_lineage(&state, &key, &state.http, now)
+            .await
+            .unwrap();
+        assert_eq!(out, ResendOutcome::Resent(1));
+        assert!(marker(&state).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_lineage_resend_is_a_silent_no_op_while_unlinked_or_unconfigured() {
+        let cloud = MockCloud::start(&[INGEST]).await;
+        let key = DeviceKey::generate();
+        let now = time::OffsetDateTime::now_utc();
+
+        // No cloud url at all.
+        let unconfigured = unconfigured_state().await;
+        let out = resend_lineage(&unconfigured, &key, &unconfigured.http, now)
+            .await
+            .unwrap();
+        assert_eq!(out, ResendOutcome::Skipped);
+        assert!(marker(&unconfigured).await.is_none());
+
+        // A cloud url but no device id.
+        let store = dira_core::Store::open_in_memory().await.unwrap();
+        let config = dira_core::Config {
+            cloud_url: Some(cloud.base_url().to_string()),
+            ..Default::default()
+        };
+        let (unlinked, _rx, _sync_rx, _knowledge_rx) =
+            crate::build_state(store, config).await.unwrap();
+        let out = resend_lineage(&unlinked, &key, &unlinked.http, now)
+            .await
+            .unwrap();
+        assert_eq!(out, ResendOutcome::Skipped);
+        assert!(marker(&unlinked).await.is_none());
+        assert!(cloud.requests(INGEST).is_empty());
     }
 }

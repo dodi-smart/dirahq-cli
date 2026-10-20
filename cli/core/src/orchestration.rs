@@ -99,6 +99,20 @@ pub fn inject_env_hints(payload: &mut serde_json::Value, var: impl Fn(&str) -> O
     }
 }
 
+/// The version of the lineage and branch rules that decide what an ended
+/// session's rollup carries (`role`, `repos`, `workspaceRef`, `repoCanonical`,
+/// and the `branch` chosen by `sync::SessionBranch`).
+///
+/// An ended rollup ships once, so a row synced under older rules keeps its
+/// stale verdict in the cloud. When a build's version is newer than the one
+/// recorded in `meta` (`sync::META_LINEAGE_RULES_VERSION`), the daemon re-sends
+/// the corrected rollups of recently ended sessions once (DIRASH-0045).
+///
+/// BUMP THIS whenever a change to [`SessionLineage`], `SessionBranch` or the
+/// role/repo/workspace derivation can change a rollup for events already
+/// stored. A change that only affects future events needs no bump.
+pub const LINEAGE_RULES_VERSION: u32 = 2;
+
 /// A session's orchestration facts, folded from its events in time order.
 /// The single implementation behind both the synced rollup
 /// (`sync::batch::build_sessions`) and the daemon's live registry, so the two

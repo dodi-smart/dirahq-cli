@@ -95,6 +95,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0042 — A session that spawns from its own repo keeps the repo, and 1.7 rollups can retract a verdict (active)
 - DIRASH-0043 — Store time columns hold one fixed-width UTC form, bound only through StoredAt or RawAt (active)
 - DIRASH-0044 — A scratch session is an orchestrator only when it coordinates (active)
+- DIRASH-0045 — A lineage rule change re-sends the ended rollups once, sessions only (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

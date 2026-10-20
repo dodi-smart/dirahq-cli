@@ -902,6 +902,110 @@ fn build_sessions(
         .collect()
 }
 
+/// Most sessions one lineage re-send batch carries. A rollup is a few hundred
+/// bytes (the repo list is capped), so this stays far under the request-body
+/// ceiling while keeping a 30-day backlog to a handful of POSTs.
+pub const CHUNK_RESEND_SESSIONS: usize = 100;
+
+/// Rebuild the FINAL rollups of sessions that are definitely over, from their
+/// full retained event history, for the one-shot lineage re-send
+/// ([`crate::orchestration::LINEAGE_RULES_VERSION`], DIRASH-0045).
+///
+/// `history` holds every retained event of the sessions to rebuild. A session
+/// is rolled up only when its LATEST event, by `(at, id)`, is a `SessionEnd`:
+/// a session that kept going after an end (Claude Code emits one on
+/// compaction) is live, and a partial for it must never be sent from here,
+/// because the cloud reopens an ended row when a partial arrives (cloud#253).
+/// Live sessions ship their corrected lineage through the registry's
+/// partial-on-lineage-change path instead.
+///
+/// The rollup comes from the same accumulator as the normal path
+/// ([`build_sessions`], with the whole history as the window), so its time
+/// fields (`started_at`, `ended_at`, `agent_wall_seconds`, `prompts`) are what
+/// the first send carried and the cloud's `agentWallSeconds >= stored` guard
+/// accepts it. A session with no agent time is skipped: it has no lineage to
+/// correct and was only ever shipped for its human intervals.
+pub fn build_lineage_resend_rollups(
+    history: &[RawEvent],
+    agent: crate::accounting::AgentPolicy,
+) -> Vec<SessionRollup> {
+    let mut latest: BTreeMap<&str, &RawEvent> = BTreeMap::new();
+    for e in history {
+        let slot = latest.entry(e.session_id.as_str()).or_insert(e);
+        if (e.at, e.id.as_str()) > (slot.at, slot.id.as_str()) {
+            *slot = e;
+        }
+    }
+    let over: std::collections::HashSet<&str> = latest
+        .into_iter()
+        .filter(|(_, e)| matches!(e.kind, EventKind::SessionEnd))
+        .map(|(id, _)| id)
+        .collect();
+    let events: Vec<RawEvent> = history
+        .iter()
+        .filter(|e| over.contains(e.session_id.as_str()))
+        .cloned()
+        .collect();
+    build_sessions(&events, &[], agent)
+        .into_iter()
+        .filter(|s| s.agent_wall_seconds > 0)
+        .collect()
+}
+
+/// Package re-sent rollups as sessions-only batches of at most
+/// [`CHUNK_RESEND_SESSIONS`]. `intervals`, `token_usage` and `artifacts` are
+/// always empty, so the re-send can never count a second of time twice, and
+/// the batches carry no cursor: the caller moves none.
+///
+/// The batch id hashes the rules version and the rollup content, so a retry
+/// of the same chunk dedups at the cloud while a corrected rollup (or a later
+/// rules version) gets a fresh id. Its ULID timestamp is the newest covered
+/// event's, like [`batch_id_for_chunk`], so the cloud's `max(batchId)`
+/// watermark never runs ahead of the event cursor.
+pub fn build_lineage_resend_batches(
+    rollups: Vec<SessionRollup>,
+    history: &[RawEvent],
+    rules_version: u32,
+    device_id: &str,
+    now: OffsetDateTime,
+) -> Vec<AttestationBatch> {
+    rollups
+        .chunks(CHUNK_RESEND_SESSIONS)
+        .map(|chunk| {
+            let body = serde_json::to_vec(chunk).unwrap_or_default();
+            let mut seed_bytes = rules_version.to_be_bytes().to_vec();
+            seed_bytes.extend_from_slice(&body);
+            let lo = fnv1a_bytes(&seed_bytes, 0xcbf29ce484222325);
+            let hi = fnv1a_bytes(&seed_bytes, 0x100000001b3);
+            let content = ((hi as u128) << 64) | lo as u128;
+            let ids: std::collections::HashSet<&str> =
+                chunk.iter().map(|s| s.session_id.as_str()).collect();
+            let max_ts_ms = history
+                .iter()
+                .filter(|e| ids.contains(e.session_id.as_str()))
+                .map(|e| e.id.as_str())
+                .max()
+                .and_then(|id| Ulid::from_string(id).ok())
+                .map(|u| u.timestamp_ms());
+            let batch_id = match max_ts_ms {
+                Some(ts) => {
+                    Ulid::from(((ts as u128) << 80) | (content & ((1u128 << 80) - 1))).to_string()
+                }
+                None => Ulid::from(content).to_string(),
+            };
+            AttestationBatch {
+                batch_id,
+                device_id: device_id.to_string(),
+                generated_at: fmt(now),
+                intervals: Vec::new(),
+                sessions: chunk.to_vec(),
+                token_usage: Vec::new(),
+                artifacts: Vec::new(),
+            }
+        })
+        .collect()
+}
+
 /// Map stored token rows to the contract's `TokenUsage`.
 fn build_token_usage(rows: &[TokenRow]) -> Vec<TokenUsage> {
     rows.iter()
@@ -2339,5 +2443,84 @@ mod tests {
             Some(fmt(OffsetDateTime::UNIX_EPOCH + Duration::seconds(500))),
             "ended_at must be the temporally-latest end, not the stale history one"
         );
+    }
+    // --- DIRASH-0045: one-shot lineage re-send ------------------------------------
+
+    fn ended_history(session: &str) -> Vec<RawEvent> {
+        vec![
+            ev_b(session, 0, EventKind::SessionStart, "p", "feat/x"),
+            ev_b(session, 10, EventKind::UserPrompt, "p", "feat/x"),
+            ev_b(session, 30, EventKind::PreTool, "p", "feat/x"),
+            ev_b(session, 60, EventKind::PostTool, "p", "feat/x"),
+            ev_b(session, 90, EventKind::UserPrompt, "p", "feat/x"),
+            ev_b(session, 120, EventKind::SessionEnd, "p", "feat/x"),
+        ]
+    }
+
+    #[test]
+    fn a_lineage_resend_rollup_equals_the_normal_ended_rollup_over_the_same_history() {
+        let history = ended_history("s1");
+        // What the first send produced: the bare end in the window, the rest as history.
+        let window = vec![history[5].clone()];
+        let normal =
+            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &history);
+        let first = &normal[0].batch.sessions;
+        assert_eq!(first.len(), 1);
+
+        let resent = build_lineage_resend_rollups(&history, AGENT);
+        assert_eq!(resent.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&resent[0]).unwrap(),
+            serde_json::to_value(&first[0]).unwrap(),
+            "time fields and lineage must match what the first send carried"
+        );
+        assert!(resent[0].agent_wall_seconds > 0);
+        assert_eq!(resent[0].prompts, Some(2));
+    }
+
+    #[test]
+    fn a_session_whose_last_event_is_not_an_end_is_not_resent() {
+        // A compaction-style end followed by more work: live, so no final
+        // rollup and, above all, no partial that would reopen an ended row.
+        let mut live = ended_history("live");
+        live.push(ev("live", 300, EventKind::PreTool, "p"));
+        let mut all = ended_history("done");
+        all.extend(live);
+        let out = build_lineage_resend_rollups(&all, AGENT);
+        let ids: Vec<&str> = out.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["done"]);
+        assert!(out.iter().all(|s| s.ended_at.is_some()));
+    }
+
+    #[test]
+    fn lineage_resend_batches_carry_only_sessions() {
+        let mut history = ended_history("s1");
+        history.extend(ended_history("s2"));
+        let rollups = build_lineage_resend_rollups(&history, AGENT);
+        assert_eq!(rollups.len(), 2);
+        let batches = build_lineage_resend_batches(rollups.clone(), &history, 2, "d", NOW);
+        assert_eq!(batches.len(), 1);
+        let b = &batches[0];
+        assert_eq!(b.sessions.len(), 2);
+        assert!(b.intervals.is_empty() && b.token_usage.is_empty() && b.artifacts.is_empty());
+
+        // Same content, same id (retry dedup); another rules version, another id.
+        let again = build_lineage_resend_batches(rollups.clone(), &history, 2, "d", NOW);
+        assert_eq!(again[0].batch_id, b.batch_id);
+        let bumped = build_lineage_resend_batches(rollups, &history, 3, "d", NOW);
+        assert_ne!(bumped[0].batch_id, b.batch_id);
+    }
+
+    #[test]
+    fn lineage_resend_batches_are_capped_per_chunk() {
+        let mut history = Vec::new();
+        for i in 0..(CHUNK_RESEND_SESSIONS + 1) {
+            history.extend(ended_history(&format!("s{i:04}")));
+        }
+        let rollups = build_lineage_resend_rollups(&history, AGENT);
+        let batches = build_lineage_resend_batches(rollups, &history, 2, "d", NOW);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].sessions.len(), CHUNK_RESEND_SESSIONS);
+        assert_eq!(batches[1].sessions.len(), 1);
     }
 }

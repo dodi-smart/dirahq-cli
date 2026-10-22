@@ -97,6 +97,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0044 — A scratch session is an orchestrator only when it coordinates (active)
 - DIRASH-0045 — A lineage rule change re-sends the ended rollups once, sessions only (active)
 - DIRASH-0046 — A scheduled-task slug may cross the wire as triggerName, only when its directory exists (active)
+- DIRASH-0047 — Meeting time comes from local device-in-use signals, never call content or a bot (proposed)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 
@@ -108,6 +109,7 @@ agent context at session start. Keep it short and non-negotiable.
 - doctor — Diagnostics — dira doctor and the capture probe (session, high)
 - harness-sources — Harness sources and hook ingestion (session, high)
 - knowledge-sync — Knowledge sync — the consent-gated second channel (session, medium)
+- meeting-capture — Meeting capture — local device-in-use signals, no bot (session, med)
 - onboarding — Onboarding — dira onboard and the installer handoff (session, high)
 - orchestration-sessions — Orchestration sessions and runs (session, high)
 

@@ -783,12 +783,12 @@ level only) makes this repeatable by anyone.
 - **Employer-facing use.** The Google Meet terms note and EU works-council rules
   mean any manager view of detected meeting time needs legal review and an
   explicit employee-visible disclosure. Out of scope here.
-- **Should `calendar = "primary"` exist at all?** It is the user's call: it
-  buys coverage of calls joined muted from a browser, at the cost of recording
-  scheduled-but-skipped meetings when the user happened to be at the machine.
-  The spec offers it per calendar, remote events only, clipped to observed
-  presence, and still never for in-person. Does that line sit right, or should
-  `primary` stay out of the first release?
+- **Decided (2026-10-22, product owner): `calendar = "primary"` ships in the
+  first release**, as a per-calendar opt-in, remote events only, clipped to
+  observed presence, never for in-person. It buys coverage of calls joined
+  muted from a browser, at the cost of recording a scheduled-but-skipped
+  meeting when the user happened to be at the machine. Revisit once the
+  validation matrix shows how often that happens.
 - **In-person meetings.** A laptop cannot tell a skipped meeting from an
   in-person one, so they are suggestions. Is a one-tap "confirm all in-person"
   batch enough, or should an accepted organiser-owned event with other invitees

@@ -24,9 +24,21 @@ user confirms, and are never billed silently. The capture is opt-in
 (`[modules] meetings`, default off) and runs inside `dirad`, one adapter per OS
 behind a single `MeetingSignal` trait.
 
-Calendar correlation and enterprise org-API reconcile are later, separately
-opted-in layers. They may *raise* confidence or *correct* durations; neither is
-required for the base layer to work.
+Two further evidence families are optional and separately opted in: **user
+presence** (provider call-state such as Teams `InACall`, and local
+idle/locked) and the **calendar** (accepted, eligible events). They cross-check
+device evidence (raise a low run to high, veto implausible events) and, only if
+the user chooses `calendar = "primary"` for a given calendar, can be the main
+evidence for remote meetings the devices cannot see. Calendar-only evidence is
+clipped to observed presence, device bounds always win, and in-person events
+are only ever suggestions. Local idle/lock never vetoes a device-confirmed
+call. Coverage is any call-capable app via a data-driven catalogue (Zoom,
+Teams, Slack, Discord, Webex, FaceTime, Telegram, WhatsApp, Signal, Tuple and
+more), with a deny list and a relay list so dictation tools and noise-cancel
+apps do not read as meetings.
+
+Enterprise org-API reconcile is a later, admin-granted layer that may correct
+durations. It is never required for the base layer.
 
 Full design, the per-OS signal matrix and the muted-mic evidence are in the
 `meeting-capture` spec.
@@ -63,8 +75,16 @@ directions.
 - **Window-title or calendar-title matching as a primary signal.** Titles are
   content. They would also need Screen Recording permission on macOS 10.15+
   (`kCGWindowName`). Class/state-only is the rule for window checks.
-- **Calendar as the primary source.** Needs OAuth, misses ad-hoc calls, and
-  records meetings that never happened. Kept as an optional corroborating layer.
+- **Calendar as the always-on primary source.** Needs OAuth, misses ad-hoc
+  calls, and records meetings that never happened or that the user skipped. It
+  stays an optional family: a cross-check by default, main evidence only by a
+  per-calendar opt-in, and never auto-recorded for in-person events.
+- **Provider presence as primary evidence.** Most "in a meeting" states are
+  calendar echoes (Teams `InAMeeting`, Slack's calendar status), the real
+  call-states lag by minutes, Google Meet exposes none, and Discord's is
+  partner-only. Usable as a cross-check only.
+- **OS idle/locked as a veto on every meeting.** A person listening to a call
+  touches no input. Idle/locked only qualifies calendar-only evidence.
 - **Org-API (attendance reports) as the primary source.** Admin-gated, lagging,
   and Google's Meet API terms forbid performance-evaluation use. Kept as an
   optional enterprise reconcile only.
@@ -78,6 +98,17 @@ directions.
   `dira doctor --json`. A provider is reduced to a closed `provider_class`
   enum at the adapter boundary and the original string is dropped there.
 - Never bill a low-confidence interval without an explicit user confirmation.
+- Calendar and provider presence are separate opt-ins with their own prompts
+  (DIRASH-0030). Never fold them into the device step, device linking or
+  billing consent. Tokens live in the OS keychain.
+- Never use a local idle/locked reading to veto device-confirmed evidence.
+- Never count a provider's calendar-derived "in a meeting" status as presence.
+- Never auto-record an in-person calendar event, and never record calendar-only
+  time outside observed presence.
+- App coverage is data (`cli/meetings/data/apps.toml`); the wire `providerClass`
+  stays a small closed enum so a new app never forces a cloud change.
+- A mic holder on the deny list never starts a meeting; a relay (virtual mic,
+  noise cancel) alone never starts one either.
 - `dirad` must not request a TCC/privacy permission for this feature. If a
   signal needs one, that signal is disabled and reported as `skip` by
   `dira doctor`, never prompted for.

@@ -1,6 +1,6 @@
 ---
 title: Meeting capture — local device-in-use signals, no bot
-version: 1
+version: 2
 status: proposed
 origin: session
 verified: false
@@ -25,16 +25,34 @@ Windows and Linux, and with nothing content-bearing leaving the machine (D-0001)
 
 The approach (DIRASH-0047) is to read what the OS already knows: **which
 process holds a capture device or an active audio stream**. The same state
-drives the OS's own orange/green privacy indicators. `dirad` samples it, fuses
-four independent signals into a confidence level, and then:
+drives the OS's own orange/green privacy indicators. `dirad` samples it, and
+fuses evidence from up to three independent **families** into a confidence
+level:
+
+| Family | What it says | Needs | Default |
+|---|---|---|---|
+| **Device** (signals A to D) | a known call app holds a mic/camera/audio stream | nothing, runs in `dirad` | on with the module |
+| **Presence** | a provider says the user is in a call, and/or the OS says whether the user is at the machine | optional provider token (provider presence); none for local idle/lock | off, separately opted in |
+| **Calendar** | an accepted, online or in-person event was scheduled | optional calendar token | off, separately opted in |
+
+Then:
 
 - **high** confidence becomes meeting time, recorded as an `Interval` with
   `activity: "meeting"`;
 - **low** confidence becomes a *suggestion* the user confirms or dismisses.
   It is never billed silently.
 
-Calendar correlation and enterprise org-API reconcile are later, separately
-opted-in layers (see "Later layers"). The base layer needs neither.
+Device evidence alone is enough for high confidence on a native app, so the
+base layer needs neither presence nor calendar. Calendar and presence do two
+jobs: they **cross-check** the device signal (raise low to high, veto
+implausible events), and, if the user opts in per calendar, they can be the
+**main evidence** where devices are blind (a call joined muted from a browser,
+an in-person meeting). Enterprise org-API reconcile remains a later,
+admin-granted layer (see "Later layers").
+
+Coverage is **every app that does calls**, not only the big four: a data-driven
+catalogue of about 35 apps (Zoom, Teams, Slack, Discord, Webex, FaceTime,
+Tuple, Telegram, WhatsApp, Signal, and more; see "App coverage").
 
 ### Evidence legend
 
@@ -77,6 +95,91 @@ attributable to a meeting; `application.*` PipeWire keys are client-supplied
 and spoofable (only `pipewire.sec.*` is trustworthy), and Flatpak/Snap PIDs may
 be namespace-local, so fall back to `pipewire.sec.app-id` or
 `application.name`.
+
+### App coverage
+
+Apps are not hard-coded. A versioned, embedded **catalogue**
+(`cli/meetings/data/apps.toml`) maps process identity to a provider class and
+a *kind*. Adding an app is a data change, not a code change, and a catalogue
+entry can carry a note but never user data. Matching is by **prefix on the
+bundle id / exe name / Flatpak id**, because the process that holds the mic is
+often a helper, not the app (every fact below is R unless marked):
+
+- Discord's call mic was held by `com.hnc.Discord.helper.Renderer` (measured
+  2026-09-26), so an exact-id match missed the call.
+- Slack huddle audio is in `com.tinyspeck.slackmacgap.helper`.
+- FaceTime moves input and output to the system daemon
+  `com.apple.avconferenced` once connected; iPhone-relay calls use
+  `com.apple.TelephonyUtilities`.
+- Prefix `com.microsoft.teams` covers new Teams (`teams2`, V) and its helpers;
+  prefix `us.zoom.` covers Zoom and its helpers (`us.zoom.xos` is V).
+- Safari and every WebKit client share `com.apple.WebKit.GPU`: **unattributable,
+  excluded**.
+
+**Kinds** drive how much corroboration a holder needs:
+
+| Kind | Meaning | Rule |
+|---|---|---|
+| `platform` | a meeting product (Zoom, Teams, Webex, FaceTime, GoTo, RingCentral, Tuple, Jitsi, 8x8, Dialpad, Lark, DingTalk, Tencent Meeting, Gather) | a held mic is enough, once debounced |
+| `messaging` | a chat app that also calls (Slack, Discord, Telegram, WhatsApp, Signal, Messenger, LINE, Viber, WeChat, KakaoTalk, Element) | also holds the mic for **voice notes**, so: longer confirm window (90 s, vs 30 s) and a held mic must be corroborated by output activity (B) or presence |
+| `browser` | Chrome, Edge, Firefox, Brave, Arc and PWAs (`com.google.Chrome.app.*`, `com.microsoft.edgemac.app.*`) | duplex audio (A and B) only; Meet and Whereby are browser-only |
+| `off_by_default` | probably not a work meeting: Mumble, TeamSpeak, Steam voice, Parsec, AnyDesk, TeamViewer, Dino, SIP softphones | listed so `doctor` can say "ignored"; user can enable |
+
+**Do not add** (retired): Skype consumer (retired 2025-05-05, V), classic Teams
+(unavailable from 2025-07-01, R), Amazon Chime (support ended 2026-02-20, V),
+BlueJeans (wound down 2024, R) and Around (R). Keep an alias only if cheap.
+
+**Never a meeting on their own** (the mic holder is not evidence of a call):
+
+- *Deny list.* Dictation and voice typing (Superwhisper, Wispr Flow, MacWhisper,
+  VoiceInk and about 15 more), Apple Voice Memos, Siri and the Sound settings
+  pane (which held the mic for 18 h), recorders (Loom, OBS, Screen Studio, Cap,
+  CleanShot), AI assistants with voice, launchers (Raycast) and other
+  note-takers (Granola, Fathom, Krisp), who are *consumers* of the call, not
+  evidence of it. Rule that worked in another detector: skip detection only
+  when **every** mic holder is on the deny list, and fail open when the holder
+  list is unknown. dirad's own pid is always dropped.
+- *Relay list.* Krisp, NVIDIA Broadcast, Voicemod, BlackHole, Loopback, Elgato
+  Wave Link and PipeWire filter-chains sit between the physical mic and the
+  call app and can hold the physical device permanently (that they do is U).
+  Never declare a call from the device-level flag alone; when the only holders
+  are relays do not start; when a relay is co-active with a known call app,
+  count the call app; treat an output device that is itself virtual as no
+  evidence for B.
+
+**Browser calls.** Without titles a browser holder is ambiguous (any website
+can open a mic), so it is high only with duplex audio, or with calendar or
+provider-presence corroboration (below). Title or URL matching is *not* used,
+by DIRASH-0047: titles are content.
+
+A small starter catalogue (full ids, Windows exe names, Flatpak ids and the
+evidence behind each are in the shared notes `research-app-catalogue.md`;
+**spot-check every id on a real machine before shipping**, the cask data was
+read through a summarising fetch):
+
+| Class | Kind | macOS prefix | Windows | Linux |
+|---|---|---|---|---|
+| `zoom` | platform | `us.zoom.` | `Zoom.exe`, `CptHost.exe`, `aomhost64.exe` (R) | Flatpak `us.zoom.Zoom` (V) |
+| `teams` | platform | `com.microsoft.teams` | `ms-teams.exe`; package family `MSTeams_8wekyb3d8bbwe` (V) | no official client |
+| `slack` | messaging | `com.tinyspeck.slackmacgap` (V) | `slack.exe` (R) | Flatpak `com.slack.Slack` (V) |
+| `discord` | messaging | `com.hnc.Discord` (V) incl. `.helper.Renderer` | `Discord.exe` (R) | Flatpak `com.discordapp.Discord` (V) |
+| `webex` | platform | `Cisco-Systems.Spark`, `com.cisco.webexmeetingsapp` (V) | `CiscoCollabHost.exe`, `webexhost.exe` (V) | no Flatpak found |
+| `facetime` | platform | `com.apple.FaceTime`, `com.apple.avconferenced` (R) | n/a | n/a |
+| `tuple` | platform | `app.tuple.app` (V) | U | U |
+| `telegram` | messaging | `ru.keepcoder.Telegram`, `com.tdesktop.Telegram` (V, two builds) | `Telegram.exe` (R) | Flatpak `org.telegram.desktop` (V) |
+| `whatsapp` | messaging | `net.whatsapp.WhatsApp` (V) | `WhatsApp.exe` (R) | unofficial only |
+| `signal` | messaging | `org.whispersystems.signal-desktop` (V) | `Signal.exe` (R) | Flatpak `org.signal.Signal` (V) |
+| `meet` | browser | PWA prefix `com.google.Chrome.app.` (ids conflict between sources, U) | browser exe | any browser |
+| `jitsi`, `gotomeeting`, `ringcentral`, `8x8`, `dialpad`, `lark`, `dingtalk`, `tencent_meeting`, `gather`, `viber`, `wechat`, `element`, `line`, `messenger`, `kakaotalk` | per catalogue | see notes | see notes | see notes |
+
+Known id conflicts to settle on a real Mac (`defaults read
+/Applications/X.app/Contents/Info CFBundleIdentifier`): Slack has
+`com.tinyspeck.slackmacgap` (V) and an unsourced `com.slack.Slack`; Discord's
+`com.discordapp.Discord` is U (likely the Flatpak id leaking in).
+
+Wire note: the *local* catalogue has fine-grained classes, but the *wire*
+`providerClass` is a smaller closed enum (see "Contract proposal"), so a new
+catalogue entry never forces a cloud change.
 
 ### The muted-mic and camera-off case
 
@@ -125,22 +228,79 @@ Chrome releases via a stop-and-reacquire workaround (R). Camera is therefore a
 Linux has **no evidence at all** for any app (U). macOS has the most (R),
 Windows one tested report (R).
 
+For the apps added in "App coverage" (Discord, Telegram, WhatsApp, Signal,
+Tuple, GoTo and the rest) there is **essentially no muted-mic evidence**. The
+only item is Discord on iOS, where the dot stays on while muted in a call and
+support called it expected (R, iOS only). Treat them as "likely hold while
+connected, unverified", which is a second reason `messaging` apps need
+corroboration and the validation matrix must cover them.
+
 ### Fusion into a confidence level
 
-Inputs per sample: A, B, C, D, each `On/Off/Unavailable`, plus the provider
-class of the holder. A `ProviderClass` is *native* (Zoom, Teams, Slack, Webex,
-other known desktop client) or *browser* (Chrome, Edge, Firefox, other; never
-Safari, see above).
+Evidence has three families (Overview). Within a sample every signal is
+`On`, `Off` or `Unavailable`, and the holder carries a provider class and kind.
+
+**Device family (A to D).**
 
 | Rule | Confidence |
 |---|---|
-| Native: A on for a native meeting process | **high** |
-| Native: B on and C on and D on (listen-only, joined muted) | **high** |
-| Browser: A on **and** B on in the same browser (duplex audio), sustained | **high** |
-| Native: B on and D on, no C | low |
-| Browser: A on only, or B on only, or camera only | low |
-| Any: only D on, or only C on | not a meeting (no interval, no suggestion) |
-| Calendar layer (later): an overlapping scheduled online meeting | raises low to high; never creates time alone |
+| `platform`: A on for a meeting process | **high** |
+| `platform`: B on and C on and D on (listen-only, joined muted) | **high** |
+| `messaging`: A on and B on (voice notes excluded), longer confirm | **high** |
+| `browser`: A on **and** B on in the same browser (duplex audio), sustained | **high** |
+| `platform`: B on and D on, no C | low |
+| `messaging`: A on only; `browser`: A only, B only, or camera only | low |
+| Only D on, or only C on | not a meeting (no interval, no suggestion) |
+
+**Presence family.** Two different things, kept apart:
+
+- *Provider call-state* (P): the provider says the user is in a call. Only
+  some states are real attendance: Teams `InACall` (Graph presence), Slack
+  `huddle_state = in_a_huddle`, Zoom "In a Zoom meeting" / "On a call", Webex
+  `call`. **Many "in a meeting" states are calendar echoes, not attendance**:
+  Teams `InAMeeting` is "automatically reflected during scheduled calendar
+  meeting events" (V), Slack's calendar integration sets "In a meeting" only
+  for events you accepted (V), and Zoom lists "In a calendar event"
+  separately (R). Echoes are therefore classified as **calendar** evidence and
+  never double-counted as presence. P has minutes of latency (the Teams client
+  polls; changes lag a few minutes, R), so it can corroborate a run but never
+  places its edges.
+- *Local presence* (L): whether the human is at the machine, as `idle seconds`
+  and `locked` tri-states. **L never vetoes device evidence**: a person
+  listening to a call touches no input and may have locked nothing, so
+  idle-means-away would delete real meetings (this is exactly how ActivityWatch's
+  AFK logic would behave, and why we do not copy it). L is consulted only for
+  calendar-only evidence (below).
+
+**Calendar family (K).** An *eligible* event is: not cancelled, the user's own
+RSVP not `declined`, `tentative` or `needsAction`, shown busy (not free/OOO),
+not all-day, not a focus-time / out-of-office / working-location type, and
+with another invitee or a conference link (a solo block is a personal
+reminder, not a meeting). Eligible events are `remote` (has a conference link
+or online-meeting flag) or `in_person` (none).
+
+**Combined ladder**, strongest first:
+
+| Tier | Evidence | Result | Source on the wire |
+|---|---|---|---|
+| 1 | Device high | **high**, recorded (auto mode) | `device` |
+| 2 | Device low, plus a corroborating P or an eligible overlapping K | **high**, recorded | `device` (device bounds win) |
+| 3 | Eligible `remote` K, no device or P, L shows the user at the machine at some point in the window (unlocked and input within it) | **low**, suggestion | `calendar` |
+| 4 | Eligible `remote` K, no device or P, L shows locked or idle throughout | not a meeting; listed only as "skipped, you looked away" in `dira meetings` | n/a |
+| 5 | Eligible `in_person` K | **low**, suggestion; never auto-recorded (a skipped meeting and an in-person one look the same to a laptop). Machine locked or idle through the window is mild support; active coding during it contradicts | `calendar` |
+| 6 | **`calendar = "primary"`** (per-calendar opt-in): tier 3 events are promoted to **high** and recorded | **high** | `calendar` |
+
+**Contradiction (downgrade).** dira already holds the user's own work
+timeline. Heavy human-engaged repo time (prompts, edits) during the *entire*
+window of a calendar-only event lowers it one tier (primary mode records it as
+a suggestion instead). It never applies to tier 1 or 2, where the device says
+the call was live.
+
+**Bounds.** Device bounds always override scheduled bounds: a meeting that ran
+10 minutes short or long is recorded as the device saw it. Calendar-only time
+(tier 6) is clipped to the span where L shows presence, never the full
+scheduled slot; the calendar APIs do not expose ran-short or no-show
+meetings, so only a device edge or an attendance report can correct those.
 
 State machine, all values provisional tunables to be set from the validation
 matrix:
@@ -180,6 +340,22 @@ the low span is a suggestion.
   calendar entries or attendees"). It is never bundled with device linking or
   billing consent (DIRASH-0030). `--print` stays byte-identical.
 - Nothing is sampled while the knob is `off`: no adapter is constructed.
+- **Calendar and presence are separate opt-ins**, each with its own prompt
+  naming exactly what is read and what is not (DIRASH-0030: never bundled with
+  the device step, with device linking or with billing consent):
+  - `[meetings] calendar = "off" | "crosscheck" | "primary"`, default `off`.
+    `crosscheck` uses calendar only to raise device-low runs and to suggest.
+    `primary` additionally records tier-3 events (above) as high; it is chosen
+    **per calendar** (a work calendar yes, a personal one no) and needs
+    `modules.meetings = "auto"`.
+  - `[meetings] presence = "off" | "on"`, default `off`. `on` enables provider
+    call-state (one token per provider the user connects).
+  - Local presence (idle seconds, locked) is sampled **only while a calendar
+    mode is on**, because the device family never needs it.
+  - `dira meetings connect <google|microsoft|teams|slack|zoom|webex>` runs the
+    provider's own OAuth flow; tokens live in the OS keychain; `dira meetings
+    disconnect <provider>` revokes and deletes. Both are settable and listed in
+    `dira status`, so consent is never only a prompt.
 
 ### Surfacing
 
@@ -190,12 +366,16 @@ meetings  auto · idle                       # nothing detected
 meetings  auto · in a meeting (zoom, high, 12m)
 meetings  auto · 2 suggestions to review    # run: dira meetings
 meetings  auto · degraded: window signal unavailable (wayland)
+meetings  auto · calendar crosscheck (google) · presence: teams
 ```
 
 `dira meetings` lists pending suggestions (time range, provider class, which
-signals fired, never a name); `dira meetings confirm <id>` records one,
-`dira meetings dismiss <id>` drops it. Suggestions expire after 14 days.
-Confirmed time is recorded with `source: user_confirmed`.
+evidence fired: device / presence / calendar / local presence, never a name);
+`dira meetings confirm <id>` records one, `dira meetings dismiss <id>` drops
+it, `dira meetings confirm --all-in-person` batches the tier-5 events.
+Suggestions expire after 14 days. Confirmed time is recorded with
+`source: user_confirmed`. Calendar-only events skipped because the user looked
+away (tier 4) appear in a separate list so nothing is silently hidden.
 
 `dira doctor` gains `meetings.*` checks (ids added to `CHECK_IDS`, additive per
 DIRASH-0022):
@@ -206,6 +386,10 @@ DIRASH-0022):
 | `meetings.adapter` | adapter constructed, signals listed per `On/Off/Unavailable` | daemon unreachable (no evidence) | n/a |
 | `meetings.signals` | every signal available | evidence absent (no audio stack, no `DISPLAY`, headless, pre-macOS-14) | a signal is `Unavailable` where it normally exists (for example a TCC denial) |
 | `meetings.stuck_holder` | none | no samples yet | a device held over 3 h with no output |
+| `meetings.catalogue` | catalogue loaded; lists classes ignored via deny/relay/`off_by_default` (class names only) | module off | n/a |
+| `meetings.calendar` | connected, last poll within 2 h | calendar mode `off`, or daemon unreachable | token expired or revoked (remedy: `dira meetings connect <provider>`); calendar returned no events for 7 days |
+| `meetings.presence` | provider connected and answering | presence `off` | token expired; provider returns presence as hidden (Webex omits status when sharing is off) |
+| `meetings.local_presence` | idle and lock readable | calendar mode `off`, or evidence absent (no logind hints, no `DISPLAY`) | n/a |
 
 Doctor **reports and never repairs**: there is no `--fix`, the remedy is prose
 or a command the user runs, and absent evidence is a `Skip`, never a `Fail`
@@ -231,6 +415,16 @@ unsandboxed per-user process (LaunchAgent, Windows user process, `systemd
 | Windows 11 Insider 26340.9212 (Aug 2026) | Reported to add per-app consent prompts when Win32 apps use the mic | R, not in Microsoft's notes; re-test registry and session reads on it |
 | Linux PipeWire | A same-user native client sees all nodes; restricted portal clients see less | V |
 | Linux X11 | `DISPLAY` required | V |
+| **Local presence, macOS** idle | `CGEventSourceSecondsSinceLastEventType(HIDSystemState, kCGAnyInputEventType)` returns a duration only. No Apple source says it needs Input Monitoring (only event *taps* prompt, R) | V that the call exists in the SDK header; no-prompt on a clean account is **U, test** |
+| Local presence, macOS lock | **No supported API.** `CGSSessionScreenIsLocked` is not in the SDK headers; Apple DTS says lock notifications are not public. Report lock as `Unavailable` and use idle only | V |
+| Local presence, Windows | `GetLastInputInfo` (per-session, not guaranteed monotonic); `WTSRegisterSessionNotification` for lock/unlock needs a message-only window in `dirad`; no permission documented | V |
+| Local presence, Linux | logind `IdleHint` / `LockedHint` are set by the desktop, so absence means *unknown*; `ext-idle-notify-v1` on KWin, Sway, Hyprland, niri, COSMIC but **not Mutter**; GNOME `Mutter.IdleMonitor` on the session bus (blocked for Snap, R); X11 `XScreenSaverQueryInfo` | V/R |
+| Provider presence and calendar | An OAuth consent screen at connect time, run by the user via `dira meetings connect`. **This is the one unavoidable prompt in the whole feature, and it is explicit, opt-in and provider-owned**, never an OS permission | by design |
+
+No local-presence call reads keystroke or pointer content; each returns a
+duration or a lock bit. ActivityWatch's Linux AFK watcher counts raw
+keyboard/mouse listener events, which is more invasive, and we deliberately
+do not copy it.
 
 Mitigation for the macOS risk: poll the cheap device-level flag first and walk
 process objects only when an input is active, backing off to 5 s, as the
@@ -248,15 +442,23 @@ Proposal for the producer contract; **no contract code changes in this PR**.
 An `Interval` whose `activity` is `"meeting"` may carry one additive optional
 field, `meeting`, an object with exactly three closed-enum fields:
 
-- `providerClass`: `zoom | teams | slack | webex | meet | browser | other`.
+- `providerClass`: `zoom | teams | slack | webex | meet | discord | facetime |
+  chat | browser | in_person | other`. This is deliberately **coarser than the
+  local catalogue**: the catalogue's ~35 apps fold into these (Telegram,
+  WhatsApp, Signal, Element and similar become `chat`; Tuple, GoTo, Jitsi and
+  the long tail become `other`), so adding an app never changes the wire.
   `meet` is only produced when the calendar layer proves it, since without
-  titles a browser call is just `browser`.
+  titles a browser call is just `browser`. `in_person` comes only from
+  calendar evidence. Cloud validators must treat an unknown value as `other`;
+  that tolerance is a cloud issue to land before the first extension of this
+  enum.
 - `confidence`: `high | low`. Only `high` and user-confirmed intervals exist on
   the wire; unconfirmed low runs are local suggestions and never leave the
   device.
-- `source`: `capture | output | calendar | user_confirmed`, the basis of the
-  decision (what A and B contributed, what the calendar layer added, or the
-  human).
+- `source`: `device | calendar | presence | user_confirmed`, the family that
+  carried the decision (`device` when the device family set the bounds even if
+  calendar or presence corroborated; `presence` when provider call-state did;
+  `calendar` for tier 6; or the human).
 
 Why this holds D-0001:
 
@@ -283,14 +485,18 @@ Repo attribution: a meeting interval has `repoCanonical` absent. Whether the
 cloud nets meeting time against concurrent repo time is cloud policy
 (capture stays policy-free); see Open Questions.
 
-### Later layers
+### Calendar and presence providers
 
 Both are **optional, separately opted in, and never required** for the base
-layer.
+layer. They run device-side, with a user-granted token, inside `dirad`.
+Provider push (Graph webhooks, Google Calendar `watch`) needs a public HTTPS
+endpoint (V), which a local daemon does not have, so everything here is
+**polling**.
 
-**Calendar correlation (device-side, OAuth).** Corroborates and classifies; it
-never creates time by itself (a calendar entry is not evidence a meeting
-happened).
+**Calendar (family K).** A cross-check by default (`crosscheck`), main
+evidence only where the user chooses `primary` per calendar. A calendar entry
+is not itself evidence a meeting happened, which is why tiers 3 and 5 are
+suggestions and tier 6 is gated by local presence.
 
 - Google: `calendar.events.readonly` (V; Sensitive scope, so a public app needs
   Google verification, V). Narrower `calendar.events.owned.readonly` (owned
@@ -298,8 +504,10 @@ happened).
   scopes (`calendar.freebusy`, `calendar.events.freebusy`) return busy ranges
   only, **no conference data** (V); whether `events.list` under a freebusy
   scope returns anything useful is U. A `fields` mask requesting only
-  `start,end,conferenceData.conferenceSolution.key.type` strips titles and
-  attendees from the response, but it is a bandwidth filter, not a consent
+  `start,end,status,transparency,eventType,conferenceData.conferenceSolution.key.type`
+  plus the eligibility fields below strips titles and attendees from the
+  response (selecting only the self attendee's `responseStatus` through a
+  nested `fields` mask is U; the fallback is `maxAttendees=1`), but it is a bandwidth filter, not a consent
   boundary: the consent screen still says "view events" and the UI must say so.
   `conferenceSolution.key.type` is `hangoutsMeet` or `addOn` (V). Zoom links
   pasted into the location or description do not show up there (U).
@@ -313,8 +521,60 @@ happened).
   location, which `ReadBasic` withholds, so Microsoft correlation recognises
   Teams meetings only. `getSchedule` is not a substitute: its sample response
   carries subject and location (V).
-- Tokens live in the OS keychain. Only start, end and a provider class are
-  ever read into the daemon.
+- Tokens live in the OS keychain. Only start, end, an eligibility verdict and
+  a provider class are ever kept; everything else is dropped at the client.
+
+*Eligibility fields* (used to compute the verdict, then discarded):
+
+| Exclude when | Google Calendar | Microsoft Graph |
+|---|---|---|
+| declined, tentative or unanswered | self attendee `responseStatus` (`maxAttendees=1` still returns your own row, V; with over 200 guests RSVP is not propagated, V) | `responseStatus.response` |
+| cancelled | `status = cancelled` | `isCancelled` |
+| free / out of office | `transparency = transparent`; `eventType` focusTime, outOfOffice, workingLocation | `showAs` free, oof, workingElsewhere |
+| all-day | `start.date` | `isAllDay` |
+| personal block, no other invitee | `organizer.self` and no attendees | `isOrganizer` and no attendees |
+| remote vs in-person | `conferenceData` or `hangoutLink` | `isOnlineMeeting` + `onlineMeetingProvider` (Teams only) |
+
+**Graph caveat (U):** `Calendars.ReadBasic` documents what it *excludes* (body,
+attachments, extensions) but not what it returns. Whether `responseStatus`,
+`showAs` and `isOnlineMeeting` are present needs a live test; if they are not,
+the filter needs `Calendars.Read`, a larger consent, and the spec must say so
+in the prompt. Recurring events: Google `singleEvents=true`; Graph
+`calendarView` returns occurrences and exceptions, not series masters (V).
+Sync: windowed polling (about -1 to +2 days) diffed by `id` + `updated`,
+because Google `syncToken` cannot be combined with `timeMin/timeMax` (V) and
+Graph `calendarView/delta` needs a fixed window and does not support
+`$select` (V). Google `reader` delegates see private events with details
+hidden (V); which fields survive is U.
+
+**Provider presence (family P).** Only the call-state values count; calendar
+echoes are filtered out (see Fusion).
+
+| Provider | Call-state signal | Access | Status |
+|---|---|---|---|
+| Teams | Graph `GET /me/presence`, `activity = InACall` (`InAMeeting` is calendar-derived) | `Presence.Read`, delegated work/school only (no personal MSA). Poll limit 1,500 req / 30 s / app / tenant; the Teams client lags a few minutes. Admin consent for `Presence.Read`: older Q&A says required, **test per tenant** | V/R |
+| Slack | `huddle_state = in_a_huddle` via `users.profile.get` (`users.profile:read`) or `user_huddle_changed` (`users:read`); `users.getPresence` is only active/away | `huddle_state` is missing from the field table, so the contract is soft | V/U |
+| Zoom | presence "In a Zoom meeting" / "On a call" | `user:read:presence_status` or `user:read`; docs lag behaviour, an undocumented `In_Meeting` value was confirmed by staff | R |
+| Webex | `GET /people/me` `status`: `call`, `meeting`, `presenting` | `spark:people_read`; omitted if the user's status sharing is off; same-org only; enum from an SDK mirror | V (mirror) |
+| Discord | local RPC voice state | `rpc.voice.read` is partner-only | **not viable** (V) |
+| Google (Meet) | none. Chat `users.availability` exists but only ACTIVE/IDLE/AWAY/DND, own user | | V |
+| GoTo, RingCentral | nothing usable found | | U |
+
+Verdict: provider presence is a per-vendor, minutes-latency classifier. It is
+a good **cross-check** and a poor **main evidence**: that is why it can lift a
+device-low run to high but never creates an interval by itself.
+
+**Prior art on posture.** Calendar-as-suggestion is the norm (Harvest and
+Timely prefill from an event, RescueTime reports meetings). Toggl has an opt-in
+that auto-converts events, with no RSVP filter mentioned. Rize is closest to
+this design: it detects live Meet/Teams calls on the device and logs them
+without a calendar entry, then relabels from the calendar. Auto-logging from
+the calendar alone is opt-in everywhere it exists, which is why `primary` is
+per-calendar opt-in here and the default posture is `crosscheck`.
+
+### Later layers
+
+Optional and never required for the base layer.
 
 **Enterprise org-API reconcile (cloud-led, admin-granted).** Reconciles
 durations after the fact. Device-side capture remains the source of truth for
@@ -364,16 +624,31 @@ cli/core/                      Store (suggestions table), accounting, events
 cli/sources/                   harness hooks -> Normalized   (unchanged)
 cli/meetings/    (new)
   src/lib.rs                   ProviderClass, Reading<T>, Sample, MeetingSignal
-  src/classify.rs              process identity -> ProviderClass, then drop it
-  src/fuse.rs                  pure: samples -> confidence; the table above
+  data/apps.toml               the catalogue: prefixes -> class + kind; deny, relay
+  src/catalog.rs               loads the catalogue; process identity -> Holder,
+                               then drops the source string
+  src/fuse.rs                  pure: device + presence + calendar -> tier
+  src/eligible.rs              pure: event facts -> eligible? remote/in_person
   src/tracker.rs               pure: debounce, grace, split, min length
   src/macos.rs   #[cfg(target_os = "macos")]
   src/windows.rs #[cfg(target_os = "windows")]
   src/linux.rs   #[cfg(target_os = "linux")]
   src/fake.rs                  replayable fixtures for tests
 cli/dirad/src/meetings.rs      the poll task; owns the adapter
+cli/dirad/src/meetings/        provider clients (HTTP via dira_core::httpclient,
+                               tokens via the keychain): google, microsoft,
+                               slack, zoom, webex. Each yields facts, not text
 cli/dira/src/doctor/meetings.rs  reads the daemon's self-report
 ```
+
+Two seams. `MeetingSignal` is the **local, synchronous, permission-free** seam
+(device family plus local presence). The provider clients sit behind two small
+async traits, `PlanSource` (events -> `EventFacts`, the eligibility inputs
+only) and `PresenceSource` (call-state -> `CallState`), so the pure fuser can be
+tested with fixtures and a provider can be added without touching fusion.
+Provider clients convert a response straight into `EventFacts` / `CallState`
+and drop the response: no title, attendee or id reaches a type that can be
+stored or logged.
 
 ```rust
 /// One OS adapter. `sample` is cheap, synchronous and side-effect free.
@@ -389,9 +664,16 @@ pub struct Sample {
     pub output: Reading<Vec<Holder>>,          // B
     pub window: Reading<Vec<Holder>>,          // C
     pub process: Reading<Vec<Holder>>,         // D
+    pub idle: Reading<std::time::Duration>,    // local presence; sampled only
+    pub locked: Reading<bool>,                 //   while a calendar mode is on
 }
-pub struct Holder { pub class: ProviderClass, pub kind: HolderKind }
+pub struct Holder { pub class: LocalClass, pub kind: AppKind, pub role: HolderRole }
+pub enum AppKind { Platform, Messaging, Browser, OffByDefault }
+pub enum HolderRole { Call, Deny, Relay }      // Deny/Relay holders never start a meeting
 ```
+
+`LocalClass` is the catalogue's fine-grained class; `fuse` maps it to the
+coarse wire `ProviderClass` only when it emits an interval.
 
 `fuse` and `tracker` are pure and cross-platform, so the fusion table,
 debounce, grace, split and stuck-holder rules are unit-tested with fixtures on
@@ -413,7 +695,10 @@ attestation batch.
 ### Control channel
 
 New requests: `MeetingsStatus` (feeds `dira status` and doctor),
-`MeetingsList`, `MeetingsConfirm{id}`, `MeetingsDismiss{id}`. Responses carry
+`MeetingsList`, `MeetingsConfirm{id}`, `MeetingsDismiss{id}`,
+`MeetingsReload` (after `connect`/`disconnect`). OAuth runs in the `dira` CLI
+process (loopback redirect), which writes the token to the keychain and then
+asks the daemon to reload; the daemon never opens a browser. Responses carry
 only provider class, times, signal flags and counts.
 
 ## Invariants
@@ -429,6 +714,20 @@ only provider class, times, signal flags and counts.
   (DIRASH-0022).
 - The wire gains only closed enums, and the denylist test populates them.
 - With the knob `off`, no adapter is constructed and no device is sampled.
+- Local presence (idle, lock) **never vetoes device evidence**; it only
+  qualifies calendar-only evidence.
+- Calendar-only and in-person evidence is never recorded without either an
+  explicit per-calendar `primary` opt-in (remote events only) or a user
+  confirmation. In-person events are never auto-recorded.
+- Calendar echoes of presence (Teams `InAMeeting`, Slack calendar status, Zoom
+  "In a calendar event") are calendar evidence, never presence evidence, so
+  nothing is counted twice.
+- Device bounds override scheduled bounds; calendar-only time is clipped to
+  observed local presence.
+- Provider and calendar tokens live in the OS keychain, are revocable with
+  `dira meetings disconnect`, and are shown in `dira status`.
+- A Google Meet-sourced duration is never surfaced in a manager-facing
+  evaluation view (see Terms).
 
 ## Validation before this becomes active
 
@@ -446,6 +745,17 @@ recorded here (and the provisional timings above tuned from it):
 5. Windows: ConsentStore `LastUsedTimeStop` semantics after an app crash and
    after sleep; re-test on the Insider build above.
 6. Linux: everything. There is no evidence for any app.
+7. The added apps (Discord, Telegram, WhatsApp, Signal, Tuple, GoTo, Telegram's
+   two builds): `defaults read ... CFBundleIdentifier` per app, the helper ids
+   that actually hold input (`kAudioProcessPropertyIsRunningInput`), join
+   muted, and the Windows ConsentStore keys and exe paths during a real call.
+8. Relays: with Krisp / NVIDIA Broadcast running and no call, which process and
+   device read as "running"?
+9. Graph `Calendars.ReadBasic`: does it return `responseStatus`, `showAs`,
+   `isOnlineMeeting`? Slack `huddle_state` self-read; Zoom presence scope;
+   Teams `Presence.Read` admin-consent behaviour per tenant.
+10. Local presence: macOS idle call on a clean account (any prompt?), Windows
+    `SessionFlags` lock semantics, Linux `LockedHint` population per desktop.
 
 A developer-facing `dira meetings trace` that prints per-signal states (class
 level only) makes this repeatable by anyone.
@@ -473,14 +783,35 @@ level only) makes this repeatable by anyone.
 - **Employer-facing use.** The Google Meet terms note and EU works-council rules
   mean any manager view of detected meeting time needs legal review and an
   explicit employee-visible disclosure. Out of scope here.
-- Provisional thresholds (30 s start, 60 s grace, 2 min minimum, 3 h stuck
-  holder, 5/10 s polling) are unvalidated.
+- **Should `calendar = "primary"` exist at all?** It is the user's call: it
+  buys coverage of calls joined muted from a browser, at the cost of recording
+  scheduled-but-skipped meetings when the user happened to be at the machine.
+  The spec offers it per calendar, remote events only, clipped to observed
+  presence, and still never for in-person. Does that line sit right, or should
+  `primary` stay out of the first release?
+- **In-person meetings.** A laptop cannot tell a skipped meeting from an
+  in-person one, so they are suggestions. Is a one-tap "confirm all in-person"
+  batch enough, or should an accepted organiser-owned event with other invitees
+  be recorded by default?
+- **Counting attendees** to tell a personal block from a meeting needs the
+  attendee *count*, not identities. With Google `maxAttendees=1` the count is
+  hidden; `attendeesOmitted` only says "more exist". Whether that is enough is
+  U.
+- **Messaging apps.** The 90 s confirm window and the A-and-B requirement are a
+  guess to keep voice notes out. Needs the validation matrix.
+- **Wire enum tolerance.** `providerClass` is closed but coarse; the cloud must
+  map unknown values to `other` before the first extension.
+- **Local presence on macOS lock.** No supported API; idle only. Acceptable?
+- Provisional thresholds (30 s start, 90 s for messaging, 60 s grace, 2 min
+  minimum, 3 h stuck holder, 5/10 s polling, 14 d suggestion expiry) are
+  unvalidated.
 
 ## Sources
 
 Full notes with every URL and tag are in the shared side-session notes folder
 (`research-muted-mic.md`, `research-os-signals.md`,
-`research-calendar-orgapi.md`). Primary sources read: the macOS SDK headers
+`research-calendar-orgapi.md`, `research-app-catalogue.md`,
+`research-presence-calendar.md`). Primary sources read: the macOS SDK headers
 (`AudioHardware.h`, `CMIOHardwareObject.h`), Microsoft Learn (WASAPI session
 interfaces, Graph permissions and `attendanceReport`, Microsoft APIs Terms of
 Use), PipeWire docs, wayland.app protocol registry, Google Meet REST API and

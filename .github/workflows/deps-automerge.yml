@@ -8,6 +8,10 @@
 # The rules live in the shared merge gate, not here. The org variable
 # DEPS_AUTOMERGE='false' stops every merge.
 #
+# The same caller also lets the shared merge gate merge a release back-merge PR (a
+# hotfix's main -> develop merge, from a `chore/backmerge-*` branch) once PR Checks
+# pass. The org variable BACKMERGE_AUTOMERGE='false' stops those merges.
+#
 # Each event below can complete the evidence. A run decides once and exits, so
 # nothing holds a runner while it waits:
 #   pull_request labeled   deps-verify set its verdict label
@@ -23,11 +27,12 @@ on:
     types: [labeled]
   status:
   # `workflows:` must match the PR Checks caller's `name:`; `branches:` keeps
-  # human PRs from creating runs at all.
+  # human PRs from creating runs at all. `chore/backmerge-**` is the release
+  # back-merge PR.
   workflow_run:
     workflows: [PR Checks]
     types: [completed]
-    branches: ['renovate/**', 'dependabot/**']
+    branches: ['renovate/**', 'dependabot/**', 'chore/backmerge-**']
 jobs:
   merge:
     uses: dodi-smart/.github/.github/workflows/deps-automerge.yml@v1

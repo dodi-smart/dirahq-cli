@@ -29,9 +29,9 @@
     },
     ".github/workflows/deps-automerge.yml": {
       "kind": "rendered",
-      "sha256": "d52b01759fff338d5917e8a5c496f6d7a086ef3d305b03c1a329cbe9dfd14c36",
+      "sha256": "033bd54d3f39cce55b5b323a9ac23d0ae192061597064f09076548a7f655bb81",
       "template": "workflows/deps-automerge.yml",
-      "version": "1.25.3"
+      "version": "1.33.0"
     },
     ".github/workflows/deps-verify.yml": {
       "kind": "rendered",
@@ -94,5 +94,5 @@
   },
   "schema": 1,
   "stack": "rust",
-  "version": "1.31.0"
+  "version": "1.33.0"
 }

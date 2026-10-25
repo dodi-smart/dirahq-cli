@@ -15,6 +15,7 @@ paths:
   - cli/dira/src/json_splice.rs
 decisions: [D-0001, D-0009, D-0011, DIRASH-0029, DIRASH-0033, DIRASH-0037, DIRASH-0038]
 checks:
+  - a committed hook command exits 0 without its script and passes the script's status through with it; refresh upgrades the unguarded spelling :: cargo test -p dira --bin dira -- cloud_init::tests::guarded_commands_exit_zero_without_the_script_and_run_it_with cloud_init::tests::replace_mode_upgrades_the_unguarded_spelling
   - status: freshness/pin/per-harness judgment matches what apply would do :: cargo test -p dira --bin dira -- cloud_init::tests::status_
   - select_harnesses accepts aliases and rejects non-cloud-capable ones :: cargo test -p dira --bin dira -- cloud_init::tests::select_harnesses_accepts_aliases_and_rejects_non_cloud_ones
   - generated scripts substituted + POSIX + contracts :: cargo test -p dira --bin dira -- cloud_init::tests::generated_scripts_are_substituted_and_shell_sane
@@ -323,6 +324,14 @@ live wiring instead (DIRASH-0037).
   back to the working directory instead of resolving to `/.dira/…`.
 - Generated scripts are POSIX sh (no bashisms), and hook.sh's exit status is
   0 on every path.
+- A committed hook command exits 0 even when its script is missing. Every
+  command is `[ ! -f <script> ] || sh <script> <harness>`. A harness may load
+  the config from one tree and run it in another: claude-code-action restores
+  `.claude/` from a PR's base but keeps the head's working tree. A bare
+  `sh <missing>` exits 2 under dash, and exit 2 from `UserPromptSubmit` blocks
+  the prompt, so the run ends after 0 turns. The command still ends in the
+  `<script> <harness>` suffix the reader matches on, so `cloud refresh` replaces
+  the old unguarded spelling instead of adding a second entry.
 - `DIRA_RUNNER_TOKEN`'s value never appears in diagnostics, logs, or facts, or
   on any subprocess's argv — only its presence.
 - The portable hook yields, it never dedups: no cache, no time window,

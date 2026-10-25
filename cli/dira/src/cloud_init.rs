@@ -869,13 +869,19 @@ fn write_script(path: &Path, content: &str) -> Result<bool> {
 /// an ambient variable. The closing quote sits before the path tail so the
 /// command still ends in the exact `hook.sh <harness>` suffix
 /// [`command_invokes_hook`] matches on.
+///
+/// The command checks that the script exists before running it (see
+/// [`guarded`]).
 fn claude_command(event: &str) -> String {
     let script = if event == "SessionStart" {
         BOOTSTRAP_SCRIPT
     } else {
         HOOK_SCRIPT
     };
-    format!("sh \"${{CLAUDE_PROJECT_DIR:-.}}\"/.dira/{script} claude")
+    guarded(
+        &format!("\"${{CLAUDE_PROJECT_DIR:-.}}\"/.dira/{script}"),
+        "claude",
+    )
 }
 
 /// The portable command for a Cursor event. Cursor runs hook commands from
@@ -886,7 +892,15 @@ fn cursor_command(event: &str) -> String {
     } else {
         HOOK_SCRIPT
     };
-    format!("sh .dira/{script} cursor")
+    guarded(&format!(".dira/{script}"), "cursor")
+}
+
+/// `sh <path> <harness>`, skipped with exit 0 when the script is missing (a
+/// PR head cut before `.dira/` existed; see the cloud-runtime spec). Written
+/// `[ ! -f … ] ||` so it still ends in the `<script> <harness>` suffix the
+/// reader matches on and never masks the script's own exit status.
+fn guarded(path: &str, harness: &str) -> String {
+    format!("[ ! -f {path} ] || sh {path} {harness}")
 }
 
 /// `"timeout"` for the SessionStart bootstrap entry only; every other Claude
@@ -1224,6 +1238,62 @@ mod tests {
                 "{event}"
             );
         }
+    }
+
+    /// A command loaded from a tree whose working copy has no `.dira/` must
+    /// exit 0, never dash's 2 (which blocks a `UserPromptSubmit` prompt). With
+    /// the script present it runs it and passes its status through.
+    #[test]
+    fn guarded_commands_exit_zero_without_the_script_and_run_it_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |command: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(dir.path())
+                .env("CLAUDE_PROJECT_DIR", dir.path())
+                .status()
+                .unwrap()
+                .code()
+        };
+        for command in [
+            claude_command("Stop"),
+            claude_command("SessionStart"),
+            cursor_command("stop"),
+        ] {
+            assert_eq!(
+                run(&command),
+                Some(0),
+                "missing script must not fail: {command}"
+            );
+        }
+        std::fs::create_dir_all(dir.path().join(".dira")).unwrap();
+        std::fs::write(dir.path().join(".dira").join(HOOK_SCRIPT), "exit 7\n").unwrap();
+        for command in [claude_command("Stop"), cursor_command("stop")] {
+            assert_eq!(
+                run(&command),
+                Some(7),
+                "a present script runs and keeps its status: {command}"
+            );
+        }
+    }
+
+    /// `cloud refresh` over a repo wired by an older dira swaps the unguarded
+    /// spelling for the guarded one instead of keeping both.
+    #[test]
+    fn replace_mode_upgrades_the_unguarded_spelling() {
+        let old = "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude";
+        let mut s = json!({ "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": old } ] } ] } });
+        let write = portable_write(&claude_command, "claude", &claude_timeout);
+        assert!(inject_nested_hooks(&mut s, CLAUDE_EVENTS, "*", &write) > 0);
+        let commands: Vec<String> = s["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().clone())
+            .filter_map(|e| e["command"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(commands, vec![claude_command("Stop")]);
     }
 
     #[test]

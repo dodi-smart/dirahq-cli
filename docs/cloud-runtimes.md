@@ -35,7 +35,10 @@ reliably gets: cloud sessions clone your repository and honor its committed
 hook configs (`.claude/settings.json`, `.cursor/hooks.json`). The generated
 commands are **portable** — they invoke `.dira/hook.sh`, which resolves the
 `dira` binary at run time — unlike `dira init`'s local configs, which embed
-this machine's absolute path.
+this machine's absolute path. Each command first checks that the script exists
+(`[ ! -f … ] || sh …`), so a branch without `.dira/` still runs a hook config
+from one that has it (as claude-code-action does on pull requests) and never
+blocks the prompt.
 
 On your laptop the same files are harmless: `bootstrap.sh` detects it is not
 in a cloud runtime and skips straight to forwarding, and `hook.sh` silently

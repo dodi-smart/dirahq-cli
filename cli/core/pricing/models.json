@@ -126,7 +126,7 @@
     "deepseek-v4-pro": {
       "cacheRead": 0.145,
       "input": 1.74,
-      "output": 3.84
+      "output": 3.48
     },
     "deepseek-v4.1-flash": {
       "cacheRead": 0.006,
@@ -253,6 +253,11 @@
       "cacheRead": 0.03,
       "input": 0.3,
       "output": 2.5
+    },
+    "gemini-pro-latest": {
+      "cacheRead": 0.2,
+      "input": 2.0,
+      "output": 12.0
     },
     "gemini-robotics-er-1.6-preview": {
       "input": 1.0,
@@ -557,7 +562,7 @@
       "output": 2.5
     },
     "kimi-k2.5": {
-      "cacheRead": 0.08,
+      "cacheRead": 0.1,
       "input": 0.6,
       "output": 3.0
     },
@@ -573,6 +578,7 @@
     },
     "kimi-k3": {
       "cacheRead": 0.3,
+      "cacheWrite": 3.0,
       "input": 3.0,
       "output": 15.0
     },
@@ -610,6 +616,11 @@
       "cacheRead": 0.15,
       "input": 1.25,
       "output": 4.25
+    },
+    "muse-wonder-1.0": {
+      "cacheRead": 0.2,
+      "input": 4.0,
+      "output": 20.0
     },
     "o1": {
       "cacheRead": 7.5,

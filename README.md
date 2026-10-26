@@ -1,6 +1,8 @@
 # Dira — CLI & contract (open source)
 
-[![shared workflows v1](https://img.shields.io/badge/shared_workflows-v1-0969da)](https://github.com/dodi-smart/.github)
+<!-- dodi-badges:start -->
+[![standards v1](https://img.shields.io/badge/standards-v1-0969da)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here) [![CRA gap](https://img.shields.io/badge/CRA-gap-cf222e)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here) [![autonomy L0](https://img.shields.io/badge/autonomy-L0-6e7781)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here)
+<!-- dodi-badges:end -->
 
 **AI-first time tracker — *"if you can clone it, you can bill it."***
 

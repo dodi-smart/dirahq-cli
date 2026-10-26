@@ -351,7 +351,10 @@ fn extract_impl(archive: &Path, dest_dir: &Path) -> Result<()> {
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        // A name that does not decode cannot be one of ours, so skip it.
+        let Ok(name) = entry.name().map(|n| n.to_string()) else {
+            continue;
+        };
         // zip-slip guard: skip anything that isn't a bare file name.
         if name.contains('/') || name.contains('\\') {
             continue;

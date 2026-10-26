@@ -322,10 +322,8 @@ fn assign(doc: &mut DocumentMut, key: &str, item: toml_edit::Item) {
 fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_edit::Item> {
     match knob.key {
         "report_local_day" => {
-            let b = match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => true,
-                "0" | "false" | "no" | "off" => false,
-                _ => bail!("report_local_day must be a boolean (0/1, true/false)"),
+            let Some(b) = dira_core::env::parse_bool(raw) else {
+                bail!("report_local_day must be a boolean (0/1, true/false)");
             };
             Ok(value(b))
         }

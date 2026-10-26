@@ -13,7 +13,7 @@ paths:
   - cli/core/src/httpclient.rs
   - cli/dira/src/device.rs
   - cli/dira/src/json_splice.rs
-decisions: [D-0001, D-0009, D-0011, DIRASH-0029, DIRASH-0033, DIRASH-0037, DIRASH-0038]
+decisions: [D-0001, D-0009, D-0011, DIRASH-0029, DIRASH-0033, DIRASH-0037, DIRASH-0038, DIRASH-0047]
 checks:
   - a committed hook command exits 0 without its script and passes the script's status through with it; refresh upgrades the unguarded spelling :: cargo test -p dira --bin dira -- cloud_init::tests::guarded_commands_exit_zero_without_the_script_and_run_it_with cloud_init::tests::replace_mode_upgrades_the_unguarded_spelling
   - status: freshness/pin/per-harness judgment matches what apply would do :: cargo test -p dira --bin dira -- cloud_init::tests::status_
@@ -302,6 +302,10 @@ live wiring instead (DIRASH-0037).
 
 ## Invariants
 
+- Runtime detection never decides whether a person is present. A cloud VM
+  (`claude-web`) can have someone typing; a CI job (`github-actions`) cannot.
+  Presence is the hook shim's `DIRA_HEADLESS` / `GITHUB_ACTIONS` check, which
+  withholds human signals from a headless run (DIRASH-0047).
 - The wire stays content-free (D-0001): the runtime marker shipped in schema
   1.4 (`SessionRollup.runtime` + `runtimeSessionRef`) is a runtime *name* and
   a harness session id — metadata, never content. The daemon stamps both at

@@ -9,6 +9,7 @@ mod device;
 mod doctor;
 mod duration;
 mod format;
+mod headless;
 mod hook_health;
 mod hook_yield;
 mod init;
@@ -1682,6 +1683,11 @@ enum HookOutcome {
     /// is how someone confirms it actually happened rather than the event
     /// having simply gone missing. See `hook_yield`.
     Yielded,
+    /// Never forwarded: a human signal from a headless run, where nobody is
+    /// present to have sent it. Silent and excluded from `hook_health` for
+    /// the same reason as [`Self::Yielded`]; `DIRA_HOOK_DEBUG` prints a line.
+    /// See `headless`.
+    Withheld,
 }
 
 /// Exit code a probe-mode hook uses to report a transport failure.
@@ -1694,10 +1700,16 @@ fn note_hook_failure(label: &str, probe: bool, reason: &str) -> HookOutcome {
     if !probe {
         hook_health::record_failure(label, reason);
     }
-    if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
-        eprintln!("dira hook {label}: {reason}");
-    }
+    hook_debug(format_args!("dira hook {label}: {reason}"));
     HookOutcome::Failed
+}
+
+/// Print `msg` to stderr when `DIRA_HOOK_DEBUG` is set (and not `0`). The
+/// only channel a silent hook outcome has, since a hook never writes stdout.
+fn hook_debug(msg: std::fmt::Arguments<'_>) {
+    if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
+        eprintln!("{msg}");
+    }
 }
 
 /// Forward a harness hook payload from stdin to the daemon — unless this is a
@@ -1725,12 +1737,20 @@ async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcom
             let user_scope_live = hook_yield::user_scope_wires(harness, event);
             let project_wraps_portable = hook_yield::project_scope_wires_portable(harness, event);
             if hook_yield::should_yield(user_scope_live, project_wraps_portable) {
-                if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
-                    eprintln!("dira hook {harness}: yielded to user-scope wiring for {event}");
-                }
+                hook_debug(format_args!(
+                    "dira hook {harness}: yielded to user-scope wiring for {event}"
+                ));
                 return HookOutcome::Yielded;
             }
         }
+    }
+    // Probe mode always forwards: its synthetic `UserPromptSubmit` must land
+    // even when `dira doctor` runs inside a CI job (DIRASH-0023).
+    if !probe && headless::is_headless() && headless::is_human_signal(harness, &payload) {
+        hook_debug(format_args!(
+            "dira hook {harness}: withheld a human signal from a headless run"
+        ));
+        return HookOutcome::Withheld;
     }
     let mut payload = payload;
     // Claude Desktop names each session's host id only in the environment of

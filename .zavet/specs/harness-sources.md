@@ -1,6 +1,6 @@
 ---
 title: Harness sources and hook ingestion
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
@@ -8,8 +8,9 @@ date: 2026-10-15
 paths:
   - cli/sources/src/
   - cli/dira/src/init.rs
+  - cli/dira/src/headless.rs
   - contract/src/lib.rs
-decisions: [D-0001, DIRASH-0041]
+decisions: [D-0001, DIRASH-0041, DIRASH-0047]
 ---
 
 ## Overview
@@ -24,6 +25,12 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 - Supported sources: claude (default), codex, gemini, cursor, opencode
   (HTTP plugin), grok (grok-build), generic (harness-neutral JSON). `Manual`
   is a pseudo-harness for `dira start`, outside the sources crate.
+- In a headless run (`DIRA_HEADLESS` truthy, or `GITHUB_ACTIONS=true` with
+  `DIRA_HEADLESS` unset) the `dira hook` shim withholds every hook that
+  normalizes to a human signal and forwards the rest. A CI agent's prompt
+  therefore opens no human-engaged interval, while its session, agent
+  wall-clock, tools and tokens are captured as before (`prompts` reads 0).
+  The capture probe never withholds. See DIRASH-0047.
 - Alias spelling lives ONLY in `canonical_harness_id()`. `dira init` and hook
   dispatch both resolve through it, so accepted spellings can never drift.
 - A source returns `None` for unknown events or malformed payloads; the daemon

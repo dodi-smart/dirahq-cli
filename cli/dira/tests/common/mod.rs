@@ -63,6 +63,45 @@ pub fn output_staged(cmd: &mut Command) -> std::io::Result<Output> {
     child.wait_with_output()
 }
 
+/// [`output_staged`] with `stdin` written to the child and then closed, the
+/// way a harness feeds a hook its payload.
+pub fn output_with_stdin(cmd: &mut Command, stdin: &[u8]) -> std::io::Result<Output> {
+    let mut child = {
+        let _staging = lock_staging();
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?
+    };
+    {
+        use std::io::Write;
+        child.stdin.take().expect("piped stdin").write_all(stdin)?;
+    }
+    child.wait_with_output()
+}
+
+/// Recursively find a file named `name` under `root`, if any.
+pub fn find_file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Did a `dira hook` under the isolated `home` try to reach the daemon? The
+/// isolated socket is never created, so any forward attempt fails and leaves
+/// the `hook-health.json` breadcrumb; a hook that never forwards leaves none.
+pub fn hook_forward_attempted(home: &Path) -> bool {
+    find_file(home, "hook-health.json").is_some()
+}
+
 /// [`Command::status`] with the same serialisation. Inherits stdio, as
 /// `status()` does.
 pub fn status_staged(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {

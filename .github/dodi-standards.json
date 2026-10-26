@@ -94,5 +94,5 @@
   },
   "schema": 1,
   "stack": "rust",
-  "version": "1.33.0"
+  "version": "1.34.1"
 }

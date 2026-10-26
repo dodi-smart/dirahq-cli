@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "dira"
-version = "0.11.1-develop.1"
+version = "0.11.1-develop.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "dira-contract"
-version = "0.11.1-develop.1"
+version = "0.11.1-develop.2"
 dependencies = [
  "schemars",
  "serde",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "dira-core"
-version = "0.11.1-develop.1"
+version = "0.11.1-develop.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "dira-ipc"
-version = "0.11.1-develop.1"
+version = "0.11.1-develop.2"
 dependencies = [
  "tempfile",
  "tokio",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "dira-sources"
-version = "0.11.1-develop.1"
+version = "0.11.1-develop.2"
 dependencies = [
  "dira-contract",
  "dira-core",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "dirad"
-version = "0.11.1-develop.1"
+version = "0.11.1-develop.2"
 dependencies = [
  "anyhow",
  "axum",

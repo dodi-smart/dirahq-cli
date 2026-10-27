@@ -6,8 +6,8 @@
 //! parse the plain output (and pipes, which fall back to 80) stay stable.
 
 use crate::format::{
-    bar as bar_cells, billing_line, display_width, hms, kind_label, pad_cols, pad_left_cols,
-    project_label, session_project_label, tokens_compact, truncate_cols, usd_approx,
+    bar as bar_cells, billing_line, display_width, hms, pad_cols, pad_left_cols, project_label,
+    tokens_compact, truncate_cols, usd_approx,
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{
@@ -216,15 +216,16 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
         Response::Sessions { sessions } => {
             let shown: Vec<SessionView> =
                 sessions.iter().filter(|s| has_time(s)).cloned().collect();
-            print_sessions(
-                &shown,
-                &Layout::for_width(terminal_cols()),
-                SessionsOpts {
-                    flat: opts.flat,
-                    limit: opts.limit,
-                    now: OffsetDateTime::now_utc(),
-                },
-            );
+            let (shown, hidden) = match opts.limit {
+                Some(n) => crate::format::limit_entries(&shown, n),
+                None => (shown, 0),
+            };
+            print_sessions(&shown, &Layout::for_width(terminal_cols()), opts.flat);
+            if hidden > 0 {
+                let ell = theme::glyphs().ellipsis;
+                let line = format!("  {ell} {hidden} more (raise --limit to see them)");
+                println!("{}", theme::paint(&line, Role::Faint));
+            }
             true
         }
         Response::Report(r) => {
@@ -2066,15 +2067,7 @@ pub fn print_status(s: &StatusView, detailed: bool) {
                 .filter(has_time)
                 .collect();
             println!("{}", theme::paint("ACTIVE SESSIONS", Role::Muted));
-            print_sessions(
-                &tree,
-                &layout,
-                SessionsOpts {
-                    flat: false,
-                    limit: None,
-                    now: OffsetDateTime::now_utc(),
-                },
-            );
+            print_sessions(&tree, &layout, false);
             println!();
             print_parallel(&active, &tree, &s.today, &layout);
         }
@@ -2326,27 +2319,11 @@ fn billing_age_suffix(fetched_at: &str, now: OffsetDateTime) -> Option<String> {
     if age <= BILLING_STALE_AFTER_SECS {
         return None;
     }
-    let label = if age < 3600 {
-        format!("{}m", age / 60)
-    } else if age < 86_400 {
-        format!("{}h", age / 3600)
-    } else {
-        format!("{}d", age / 86_400)
-    };
+    let label = crate::format::age_compact(fetched_at, now);
     Some(format!("(as of {label} ago)"))
 }
 
-/// How [`print_sessions`] lays its table out.
-struct SessionsOpts {
-    /// One row per session, no run trees.
-    flat: bool,
-    /// At most this many top-level rows (a run is one).
-    limit: Option<usize>,
-    /// The instant the AGE column counts back from.
-    now: OffsetDateTime,
-}
-
-fn print_sessions(sessions: &[SessionView], layout: &Layout, opts: SessionsOpts) {
+fn print_sessions(sessions: &[SessionView], layout: &Layout, flat: bool) {
     if sessions.is_empty() {
         println!("  (none)");
         return;
@@ -2357,40 +2334,13 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout, opts: SessionsOpts)
         "HANDLE", "HARNESS", "KIND", "PROJECT", "HUMAN", "AGENT", "AGE"
     );
     println!("{}", theme::paint(&header, Role::Muted));
-    let limit = opts.limit.unwrap_or(usize::MAX);
-    let mut top = 0usize;
-    let mut hidden = 0usize;
-    if opts.flat {
-        for s in sessions {
-            top += 1;
-            if top > limit {
-                hidden += 1;
-                continue;
-            }
-            let scratch = crate::format::is_bare_scratch(s, sessions);
-            let project = if scratch {
-                crate::format::SCRATCH_LABEL.to_string()
-            } else {
-                session_project_label(s)
-            };
-            print_session_row(s, "  ", &s.handle, &project, scratch, pw, opts.now);
-            print_session_meta(s);
-        }
-        print_hidden(hidden);
-        return;
-    }
-    for row in crate::format::tree_rows(sessions, &titles_if_needed(sessions)) {
-        // A root or a lone session opens a top-level entry; its members and
-        // direct repos follow it in or out of the limit.
-        if matches!(row.glyph, "  " | "▾ ") {
-            top += 1;
-            if top > limit {
-                hidden += 1;
-            }
-        }
-        if top > limit {
-            continue;
-        }
+    let now = OffsetDateTime::now_utc();
+    let rows = if flat {
+        crate::format::flat_rows(sessions)
+    } else {
+        crate::format::tree_rows(sessions, &titles_if_needed(sessions))
+    };
+    for row in rows {
         match row.session {
             Some(s) => {
                 let (gutter, handle) = match row.glyph {
@@ -2398,7 +2348,7 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout, opts: SessionsOpts)
                     "  " => ("  ", row.handle.clone()),
                     branch => ("  ", format!("{branch}{}", row.handle)),
                 };
-                print_session_row(s, gutter, &handle, &row.project, row.scratch, pw, opts.now);
+                print_session_row(s, gutter, &handle, &row.project, row.kind, pw, now);
                 if row.glyph == "  " {
                     print_session_meta(s);
                 }
@@ -2408,21 +2358,12 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout, opts: SessionsOpts)
                     "  {:<8} {:<10} {:<7} {}",
                     format!("{}·", row.glyph),
                     "",
-                    "direct",
+                    row.kind,
                     truncate_cols(&row.project, pw),
                 );
                 println!("{}", theme::paint(&line, Role::Faint));
             }
         }
-    }
-    print_hidden(hidden);
-}
-
-/// The footer under a table cut by `--limit`.
-fn print_hidden(hidden: usize) {
-    if hidden > 0 {
-        let line = format!("  … {hidden} more (raise --limit to see them)");
-        println!("{}", theme::paint(&line, Role::Faint));
     }
 }
 
@@ -2443,7 +2384,7 @@ fn print_session_row(
     gutter: &str,
     handle: &str,
     project: &str,
-    scratch: bool,
+    kind: &str,
     pw: usize,
     now: OffsetDateTime,
 ) {
@@ -2457,13 +2398,6 @@ fn print_session_row(
         LiveState::Idle => ("idle", Role::Faint),
     };
     let state = theme::paint(label, role);
-    // A scratch session (#181) coordinated nothing, so it reads as the
-    // session it is rather than as `orch`.
-    let kind = if s.orchestrator && !scratch {
-        "orch"
-    } else {
-        kind_label(s.kind)
-    };
     println!(
         "{gutter}{:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8} {:>4}  {}",
         truncate_cols(handle, 8),
@@ -2560,26 +2494,15 @@ fn print_parallel(active: &[SessionView], tree: &[SessionView], today: &Report, 
     let agent_mark = theme::paint(theme::glyphs().diamond, Role::Agent);
     // Lanes follow the run trees the sessions table shows: an orchestrator,
     // then its members indented. Each lane is still one session's own time.
-    let live: std::collections::HashSet<&str> =
-        active.iter().map(|s| s.session_id.as_str()).collect();
-    let kept: Vec<_> = crate::format::tree_rows(tree, &titles_if_needed(tree))
-        .into_iter()
-        .filter(|r| {
-            r.session
-                .is_some_and(|s| s.accrues_agent_time() && live.contains(s.session_id.as_str()))
-        })
-        .collect();
-    let mut glyphs: Vec<&'static str> = kept.iter().map(|r| r.glyph).collect();
-    crate::format::retree(&mut glyphs);
-    for (row, glyph) in kept.iter().zip(glyphs) {
-        let s = row.session.expect("filtered to sessions");
-        let glyph = if glyph == "  " { "" } else { glyph };
+    let lanes = crate::format::lane_rows(tree, active, &titles_if_needed(tree), |s| {
+        s.accrues_agent_time()
+    });
+    for (s, glyph, short) in lanes {
         let label = truncate_cols(
             &format!(
-                "{glyph}{} {} {}",
+                "{glyph}{} {} {short}",
                 dira_sources::harness_id(s.harness),
                 dot_glyph(),
-                row.short
             ),
             lw,
         );

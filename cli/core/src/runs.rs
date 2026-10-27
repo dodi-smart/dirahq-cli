@@ -21,8 +21,9 @@ use crate::protocol::SessionView;
 use std::collections::{BTreeSet, HashMap};
 
 /// Ancestry deeper than this is treated as a cycle and cut. Real fan-outs are
-/// one or two levels deep.
-const MAX_DEPTH: usize = 8;
+/// one or two levels deep. Public so the daemon's run-children walk makes the
+/// same cut.
+pub const MAX_DEPTH: usize = 8;
 
 /// One orchestration run.
 #[derive(Debug)]
@@ -40,6 +41,13 @@ impl Run<'_> {
     /// Rule 3: a run over at most one repo is shown as that repo's work.
     pub fn folded(&self) -> bool {
         self.repos.len() <= 1
+    }
+
+    /// An orchestrator with no members and no repos: it coordinated nothing
+    /// that is listed (#181), so renderers name it a scratch session. Display
+    /// only; its role and its report bucket are unchanged.
+    pub fn is_scratch(&self) -> bool {
+        self.root.orchestrator && self.members.is_empty() && self.repos.is_empty()
     }
 }
 

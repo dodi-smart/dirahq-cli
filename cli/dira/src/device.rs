@@ -837,14 +837,24 @@ pub async fn status(config: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The `pending:` line. Token rows ride their own cursor (D-0018), so they are
-/// named only when there are some — an event-only line stays as it always was.
-fn pending_line(events: u64, tokens: u64) -> String {
+/// The un-synced backlog as a phrase: "N event(s)", plus "and M token row(s)"
+/// only when there are some. Token rows ride their own cursor (D-0018), so they
+/// can be queued behind a fully synced event stream; an event-only phrase stays
+/// as it always was. Shared by `device status` and doctor's `device.link`.
+pub(crate) fn backlog_phrase(events: u64, tokens: u64) -> String {
     if tokens == 0 {
-        format!("pending:   {events} event(s) awaiting sync")
+        format!("{events} event(s)")
     } else {
-        format!("pending:   {events} event(s) and {tokens} token row(s) awaiting sync")
+        format!("{events} event(s) and {tokens} token row(s)")
     }
+}
+
+/// The `pending:` line of `dira device status`.
+fn pending_line(events: u64, tokens: u64) -> String {
+    format!(
+        "pending:   {} awaiting sync",
+        backlog_phrase(events, tokens)
+    )
 }
 
 /// `dira device status --json`: one object, snake_case keys, the same facts
@@ -946,45 +956,47 @@ fn resync_lines(pending: u64, pending_tokens: u64, from: Option<&str>) -> Vec<St
 /// cached watermark (a batch ULID, timestamp-stamped with the latest event it
 /// covers) against the local event head to judge drift. Pure, so it's unit-testable.
 fn cloud_status_line(cloud_wm: Option<&str>, local_head: Option<&str>, pending: u64) -> String {
-    match (cloud_coverage(cloud_wm, local_head, pending), cloud_wm) {
-        (Coverage::Behind, _) => {
+    match cloud_coverage(cloud_wm, local_head, pending) {
+        Coverage::Behind => {
             "cloud:     behind — cloud is missing data; run `dira device resync`".into()
         }
-        (Coverage::InSync, Some(wm)) => format!("cloud:     in sync (watermark {wm})"),
-        (Coverage::Queued, _) => {
-            format!("cloud:     {pending} event(s) queued for the next sync")
-        }
-        (Coverage::NoHandshake, _) | (Coverage::InSync, None) => {
-            "cloud:     (no handshake yet — sync at least once)".into()
-        }
+        Coverage::InSync(wm) => format!("cloud:     in sync (watermark {wm})"),
+        Coverage::Queued => format!("cloud:     {pending} event(s) queued for the next sync"),
+        Coverage::NoHandshake => "cloud:     (no handshake yet — sync at least once)".into(),
     }
 }
 
 /// [`cloud_status_line`]'s verdict as a value, so `--json` carries the same
 /// judgement as the text without re-deriving it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Coverage {
+enum Coverage<'a> {
     NoHandshake,
     /// The cloud persisted noticeably less than the local head while nothing
     /// is queued ⇒ a silent gap the reconciler/epoch didn't cover; resync
     /// forces it.
     Behind,
-    InSync,
+    /// Nothing queued and the cloud's watermark (carried, so the text can
+    /// name it) covers the local head.
+    InSync(&'a str),
     Queued,
 }
 
-impl Coverage {
+impl Coverage<'_> {
     fn as_str(self) -> &'static str {
         match self {
             Coverage::NoHandshake => "no_handshake",
             Coverage::Behind => "behind",
-            Coverage::InSync => "in_sync",
+            Coverage::InSync(_) => "in_sync",
             Coverage::Queued => "queued",
         }
     }
 }
 
-fn cloud_coverage(cloud_wm: Option<&str>, local_head: Option<&str>, pending: u64) -> Coverage {
+fn cloud_coverage<'a>(
+    cloud_wm: Option<&'a str>,
+    local_head: Option<&str>,
+    pending: u64,
+) -> Coverage<'a> {
     let Some(wm) = cloud_wm else {
         return Coverage::NoHandshake;
     };
@@ -995,7 +1007,7 @@ fn cloud_coverage(cloud_wm: Option<&str>, local_head: Option<&str>, pending: u64
     if behind {
         Coverage::Behind
     } else if pending == 0 {
-        Coverage::InSync
+        Coverage::InSync(wm)
     } else {
         Coverage::Queued
     }

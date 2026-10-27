@@ -97,28 +97,20 @@ impl EndpointAccess {
                 client_elevated: is_elevated(),
             }
         }
-        #[cfg(not(windows))]
+        // The crate builds only for unix and windows (see `lib.rs`), so the
+        // two arms are exhaustive.
+        #[cfg(unix)]
         {
-            #[cfg(unix)]
-            let (owner_uid, mode, current_uid) = {
-                use std::os::unix::fs::MetadataExt;
-                let meta = std::fs::metadata(path).ok();
-                // SAFETY: `geteuid` takes no arguments, cannot fail, and
-                // touches no memory we own.
-                let euid = unsafe { libc::geteuid() };
-                (
-                    meta.as_ref().map(|m| m.uid()),
-                    meta.as_ref().map(|m| m.mode() & 0o7777),
-                    Some(euid),
-                )
-            };
-            #[cfg(not(unix))]
-            let (owner_uid, mode, current_uid) = (None, None, None);
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(path).ok();
+            // SAFETY: `geteuid` takes no arguments, cannot fail, and touches
+            // no memory we own.
+            let euid = unsafe { libc::geteuid() };
             EndpointAccess::UnixSocket {
                 path: path.to_path_buf(),
-                owner_uid,
-                current_uid,
-                mode,
+                owner_uid: meta.as_ref().map(|m| m.uid()),
+                current_uid: Some(euid),
+                mode: meta.as_ref().map(|m| m.mode() & 0o7777),
             }
         }
     }
@@ -160,7 +152,7 @@ impl EndpointAccess {
 /// a socket file that refuses us is held by someone, and a daemon started with
 /// `sudo` to "get past" the error leaves a root-owned socket behind, which is
 /// the same failure for the next ordinary command.
-pub fn unix_socket_denied_advice(
+fn unix_socket_denied_advice(
     path: &std::path::Path,
     owner_uid: Option<u32>,
     current_uid: Option<u32>,

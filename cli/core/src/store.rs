@@ -144,10 +144,21 @@ async fn day_token_sums(
 ///
 /// Gated by [`META_ROLLUP_TOKENS_BACKFILLED`] in one `BEGIN IMMEDIATE`
 /// transaction, as [`normalize_stored_at`] is, and run after it, because the
-/// day bounds compare against canonical `token_usage.at` text.
+/// day bounds compare against canonical `token_usage.at` text. A plain read
+/// of the flag comes first, so an open after the backfill took place takes
+/// no write lock for it.
 async fn backfill_rollup_tokens(pool: &SqlitePool) -> Result<(), Error> {
+    let flag = "SELECT 1 FROM meta WHERE key = ?1";
+    let done = sqlx::query(flag)
+        .bind(META_ROLLUP_TOKENS_BACKFILLED)
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+    if done {
+        return Ok(());
+    }
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let done = sqlx::query("SELECT 1 FROM meta WHERE key = ?1")
+    let done = sqlx::query(flag)
         .bind(META_ROLLUP_TOKENS_BACKFILLED)
         .fetch_optional(&mut *tx)
         .await?
@@ -1016,32 +1027,22 @@ impl Store {
     ) -> Result<TokenTotals, Error> {
         let row = match since {
             Some(ts) => {
-                sqlx::query(
-                    "SELECT COALESCE(SUM(input),0) i, COALESCE(SUM(output),0) o, \
-                     COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
-                     COALESCE(SUM(est_cost),0.0) cost FROM token_usage WHERE at >= ?1",
-                )
+                sqlx::query(concat!(
+                    "SELECT ",
+                    token_sum_cols!(),
+                    " FROM token_usage WHERE at >= ?1"
+                ))
                 .bind(StoredAt(ts))
                 .fetch_one(&self.pool)
                 .await?
             }
             None => {
-                sqlx::query(
-                    "SELECT COALESCE(SUM(input),0) i, COALESCE(SUM(output),0) o, \
-                     COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
-                     COALESCE(SUM(est_cost),0.0) cost FROM token_usage",
-                )
-                .fetch_one(&self.pool)
-                .await?
+                sqlx::query(concat!("SELECT ", token_sum_cols!(), " FROM token_usage"))
+                    .fetch_one(&self.pool)
+                    .await?
             }
         };
-        Ok(TokenTotals {
-            input: row.get::<i64, _>("i") as u64,
-            output: row.get::<i64, _>("o") as u64,
-            cache_read: row.get::<i64, _>("cr") as u64,
-            cache_create: row.get::<i64, _>("cc") as u64,
-            est_cost_usd: row.get::<f64, _>("cost"),
-        })
+        Ok(TokenTotals::from_sum_row(&row))
     }
 
     /// [`Self::token_totals_since`] per session, for the session list. Rows
@@ -1051,31 +1052,20 @@ impl Store {
         &self,
         since: OffsetDateTime,
     ) -> Result<std::collections::HashMap<String, TokenTotals>, Error> {
-        let rows = sqlx::query(
-            "SELECT session_id, COALESCE(SUM(input),0) i, COALESCE(SUM(output),0) o, \
-             COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
-             COALESCE(SUM(est_cost),0.0) cost FROM token_usage \
+        let rows = sqlx::query(concat!(
+            "SELECT session_id, ",
+            token_sum_cols!(),
+            " FROM token_usage \
              WHERE at >= ?1 AND session_id IS NOT NULL AND session_id NOT LIKE ?2 \
-             GROUP BY session_id",
-        )
+             GROUP BY session_id"
+        ))
         .bind(StoredAt(since))
         .bind(PROBE_LIKE_PATTERN)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("session_id"),
-                    TokenTotals {
-                        input: row.get::<i64, _>("i") as u64,
-                        output: row.get::<i64, _>("o") as u64,
-                        cache_read: row.get::<i64, _>("cr") as u64,
-                        cache_create: row.get::<i64, _>("cc") as u64,
-                        est_cost_usd: row.get::<f64, _>("cost"),
-                    },
-                )
-            })
+            .iter()
+            .map(|row| (row.get("session_id"), TokenTotals::from_sum_row(row)))
             .collect())
     }
 
@@ -1126,10 +1116,7 @@ impl Store {
         let Some(cursor) = cursor else {
             return Ok(0); // nothing synced yet — never prune un-synced data
         };
-        let utc_midnight = |t: OffsetDateTime| {
-            t.to_offset(time::UtcOffset::UTC)
-                .replace_time(time::Time::MIDNIGHT)
-        };
+        let utc_midnight = |t| crate::config::start_of_day(t, time::UtcOffset::UTC);
 
         let mut tx = self.pool.begin().await?;
 
@@ -2913,6 +2900,36 @@ pub struct TokenTotals {
     pub cache_read: u64,
     pub cache_create: u64,
     pub est_cost_usd: f64,
+}
+
+/// The select list every token-sum query shares, read back by
+/// [`TokenTotals::from_sum_row`]. A macro so the queries stay `&'static str`
+/// (sqlx refuses SQL built at run time).
+macro_rules! token_sum_cols {
+    () => {
+        "COALESCE(SUM(input),0) i, COALESCE(SUM(output),0) o, \
+         COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
+         COALESCE(SUM(est_cost),0.0) cost"
+    };
+}
+use token_sum_cols;
+
+impl TokenTotals {
+    /// Every token through the pipe: input, output and both cache counts —
+    /// what the status compute row and a session's `tokens.total` show.
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_create
+    }
+
+    fn from_sum_row(row: &sqlx::sqlite::SqliteRow) -> Self {
+        TokenTotals {
+            input: row.get::<i64, _>("i") as u64,
+            output: row.get::<i64, _>("o") as u64,
+            cache_read: row.get::<i64, _>("cr") as u64,
+            cache_create: row.get::<i64, _>("cc") as u64,
+            est_cost_usd: row.get::<f64, _>("cost"),
+        }
+    }
 }
 
 /// A decision record as parsed from a `.zavet/decisions/*.md` blob at capture

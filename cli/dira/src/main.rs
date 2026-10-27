@@ -281,8 +281,8 @@ Examples:
         /// orchestrator with the sessions it spawned.
         #[arg(long)]
         flat: bool,
-        /// Show at most N sessions, newest first; a run counts as one. With
-        /// `--json`, the N newest sessions.
+        /// Show at most N sessions, newest first; a run counts as one, in the
+        /// table and with `--json` alike.
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
@@ -1576,13 +1576,12 @@ async fn main() -> Result<()> {
     };
 
     let mut resp = client::send(&config.socket_path, &req).await?;
-    // `sessions --json --limit N`: the daemon lists newest-started first, so
-    // the first N are the N newest. The table applies the limit itself, a
-    // run counting as one.
+    // `sessions --json --limit N`: the same rule as the table (a run counts
+    // as one), over the daemon's newest-started-first list.
     if let (true, Some(n), Response::Sessions { sessions }) =
         (json_output, row_opts.limit, &mut resp)
     {
-        sessions.truncate(n);
+        *sessions = format::limit_entries(sessions, n).0;
     }
     if let Response::Error { message } = &resp {
         if let Some(hint) = daemon_skew_hint(message) {

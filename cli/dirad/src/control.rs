@@ -17,7 +17,7 @@ use dira_core::protocol::{
 };
 use dira_core::report;
 use dira_core::store::TokenTotals;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use time::{Duration, OffsetDateTime};
@@ -569,11 +569,18 @@ async fn status(state: &AppState) -> Response {
             OffsetDateTime::now_utc(),
             state.config.session_stale_after(),
         );
-        let children = run_children(&live, reg.all(), &events);
+        let children = reg.run_children(&live, since);
         (live, children)
     };
-    let active = build_session_views(state, &events, &session_tokens, live);
-    let run_children = build_session_views(state, &events, &session_tokens, ended_children);
+    // One pass over both, so the global human attribution is computed once.
+    let n_live = live.len();
+    let mut active = build_session_views(
+        state,
+        &events,
+        &session_tokens,
+        live.into_iter().chain(ended_children).collect(),
+    );
+    let run_children = active.split_off(n_live);
     // Un-synced backlog: events past the confirmed sync cursor.
     let cursor = state
         .store
@@ -610,7 +617,7 @@ async fn status(state: &AppState) -> Response {
         .await
         .ok()
         .map(|t| ComputeView {
-            total_tokens: t.input + t.output + t.cache_read + t.cache_create,
+            total_tokens: t.total(),
             est_cost_usd: t.est_cost_usd,
         });
     // Last-known cloud billing summary (fetched + hydrated by the billing task).
@@ -740,47 +747,6 @@ async fn report_cmd(state: &AppState, scope: ReportScope) -> Response {
     ))
 }
 
-/// The listed sessions' descendants that are no longer live but did something
-/// inside the window (`events`), so a listed run keeps its children after they
-/// end (#182). `runs::group` only sees the sessions it is handed; without these
-/// a run whose children had ended showed only its direct repos. Lifecycle-only
-/// sessions stay out, as they do from `active` (#74).
-pub(crate) fn run_children(
-    listed: &[LiveSession],
-    all: Vec<LiveSession>,
-    events: &[RawEvent],
-) -> Vec<LiveSession> {
-    let in_window: HashSet<&str> = events.iter().map(|e| e.session_id.as_str()).collect();
-    let mut ids: HashSet<String> = listed.iter().map(|s| s.session_id.clone()).collect();
-    let mut pool: Vec<LiveSession> = all
-        .into_iter()
-        .filter(|s| {
-            s.had_signal
-                && !ids.contains(&s.session_id)
-                && in_window.contains(s.session_id.as_str())
-        })
-        .collect();
-    let mut out = Vec::new();
-    // Nested fan-outs are one or two levels deep; the bound only stops a
-    // corrupt parent cycle from spinning (the same cut `runs::group` makes).
-    for _ in 0..8 {
-        let (joined, rest): (Vec<_>, Vec<_>) = pool.into_iter().partition(|s| {
-            s.lineage
-                .parent_session
-                .as_deref()
-                .is_some_and(|p| ids.contains(p))
-        });
-        pool = rest;
-        if joined.is_empty() {
-            break;
-        }
-        ids.extend(joined.iter().map(|s| s.session_id.clone()));
-        out.extend(joined);
-    }
-    out.sort_by_key(|s| s.started_at);
-    out
-}
-
 /// Build the views for `live`, with each session's token use inside the
 /// window from `tokens`.
 fn build_session_views(
@@ -861,7 +827,7 @@ fn build_session_views(
                 tokens: tokens
                     .get(&s.session_id)
                     .map(|t| SessionTokens {
-                        total: t.input + t.output + t.cache_read + t.cache_create,
+                        total: t.total(),
                         est_cost_usd: t.est_cost_usd,
                     })
                     .unwrap_or_default(),

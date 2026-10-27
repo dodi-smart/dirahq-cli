@@ -745,6 +745,44 @@ impl SessionRegistry {
         v
     }
 
+    /// The descendants of `listed` that are no longer listed but did something
+    /// since `since`, oldest-started first — a listed run's ended children
+    /// (#182). `runs::group` only sees the sessions it is handed, so without
+    /// these a run whose children had ended showed only its direct repos.
+    /// Lifecycle-only sessions stay out, as they do from [`Self::active`] (#74).
+    ///
+    /// Walks the registry by reference and clones only what it returns: this
+    /// runs under the registry lock on every `status` poll.
+    pub fn run_children(&self, listed: &[LiveSession], since: OffsetDateTime) -> Vec<LiveSession> {
+        let mut ids: std::collections::HashSet<&str> =
+            listed.iter().map(|s| s.session_id.as_str()).collect();
+        let mut pool: Vec<&LiveSession> = self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.had_signal && s.last_event_at >= since && !ids.contains(s.session_id.as_str())
+            })
+            .collect();
+        let mut out: Vec<&LiveSession> = Vec::new();
+        // The same depth cut `runs::group` makes against a corrupt parent cycle.
+        for _ in 0..dira_core::runs::MAX_DEPTH {
+            let (joined, rest): (Vec<_>, Vec<_>) = pool.into_iter().partition(|s| {
+                s.lineage
+                    .parent_session
+                    .as_deref()
+                    .is_some_and(|p| ids.contains(p))
+            });
+            pool = rest;
+            if joined.is_empty() {
+                break;
+            }
+            ids.extend(joined.iter().map(|s| s.session_id.as_str()));
+            out.extend(joined);
+        }
+        out.sort_by_key(|s| s.started_at);
+        out.into_iter().cloned().collect()
+    }
+
     /// All sessions, active first then recent, newest-started first.
     pub fn all(&self) -> Vec<LiveSession> {
         let mut v: Vec<LiveSession> = self.sessions.values().cloned().collect();

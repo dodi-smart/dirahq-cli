@@ -35,17 +35,43 @@ pub const ORCHESTRATION_LABEL: &str = "orchestration";
 /// orchestration report bucket (DIRASH-0041).
 pub const SCRATCH_LABEL: &str = "scratch session";
 
-/// Whether `s` is an orchestrator with no repos and, as far as `sessions`
-/// shows, no children — the case [`SCRATCH_LABEL`] names.
-pub fn is_bare_scratch(
-    s: &dira_core::protocol::SessionView,
+/// The KIND cell: `orch` for an orchestrator, except one shown as a
+/// [`SCRATCH_LABEL`] — it coordinated nothing, so it reads as the session it is.
+fn kind_cell(s: &dira_core::protocol::SessionView, scratch: bool) -> &'static str {
+    if s.orchestrator && !scratch {
+        "orch"
+    } else {
+        kind_label(s.kind)
+    }
+}
+
+/// Keep the first `n` top-level entries of `sessions` (a run counts as one,
+/// grouped by [`dira_core::runs::group`]), in list order, and say how many
+/// entries were left out. The one `--limit` rule for the table and `--json`.
+pub fn limit_entries(
     sessions: &[dira_core::protocol::SessionView],
-) -> bool {
-    s.orchestrator
-        && s.repos.is_empty()
-        && !sessions
-            .iter()
-            .any(|o| o.parent_session.as_deref() == Some(s.session_id.as_str()))
+    n: usize,
+) -> (Vec<dira_core::protocol::SessionView>, usize) {
+    use dira_core::runs::{group, Entry};
+    let entries = group(sessions);
+    let hidden = entries.len().saturating_sub(n);
+    let keep: std::collections::HashSet<&str> = entries
+        .iter()
+        .take(n)
+        .flat_map(|e| match e {
+            Entry::Session(s) => vec![s.session_id.as_str()],
+            Entry::Run(r) => std::iter::once(r.root)
+                .chain(r.members.iter().copied())
+                .map(|s| s.session_id.as_str())
+                .collect(),
+        })
+        .collect();
+    let kept = sessions
+        .iter()
+        .filter(|s| keep.contains(s.session_id.as_str()))
+        .cloned()
+        .collect();
+    (kept, hidden)
 }
 
 /// The sessions a status tree lays out: the live ones, then the ended
@@ -104,9 +130,8 @@ pub struct TreeRow<'a> {
     pub project: String,
     /// A short project label for narrow places (the dashboard's lanes).
     pub short: String,
-    /// A run root shown as [`SCRATCH_LABEL`]: its KIND reads as the
-    /// session's own, not `orch`.
-    pub scratch: bool,
+    /// The KIND cell ([`kind_cell`]; `direct` on a direct-repo row).
+    pub kind: &'static str,
 }
 
 /// Lay a session list out as run trees with [`dira_core::runs::group`] — the
@@ -121,17 +146,10 @@ pub fn tree_rows<'a>(
     let mut out = Vec::new();
     for entry in group(sessions) {
         match entry {
-            Entry::Session(s) => out.push(TreeRow {
-                glyph: "  ",
-                session: Some(s),
-                handle: s.handle.clone(),
-                project: session_project_label(s),
-                short: session_repo_short(s),
-                scratch: false,
-            }),
+            Entry::Session(s) => out.push(session_row("  ", s)),
             Entry::Run(run) => {
                 let root = run.root;
-                let scratch = root.orchestrator && run.repos.is_empty() && run.members.is_empty();
+                let scratch = run.is_scratch();
                 let (project, short) = if scratch {
                     (SCRATCH_LABEL.to_string(), "scratch".to_string())
                 } else if run.folded() {
@@ -156,18 +174,11 @@ pub fn tree_rows<'a>(
                     handle: root.handle.clone(),
                     project,
                     short,
-                    scratch,
+                    kind: kind_cell(root, scratch),
                 });
                 let branch = |i: usize| if i + 1 == total { "└ " } else { "├ " };
                 for (i, s) in run.members.iter().enumerate() {
-                    out.push(TreeRow {
-                        glyph: branch(i),
-                        session: Some(s),
-                        handle: s.handle.clone(),
-                        project: session_project_label(s),
-                        short: session_repo_short(s),
-                        scratch: false,
-                    });
+                    out.push(session_row(branch(i), s));
                 }
                 for (k, repo) in direct.iter().enumerate() {
                     out.push(TreeRow {
@@ -176,13 +187,82 @@ pub fn tree_rows<'a>(
                         handle: "·".to_string(),
                         project: repo.clone(),
                         short: repo_short(&Some(repo.clone())),
-                        scratch: false,
+                        kind: "direct",
                     });
                 }
             }
         }
     }
     out
+}
+
+/// A row for a session that is not a run root.
+fn session_row<'a>(glyph: &'static str, s: &'a dira_core::protocol::SessionView) -> TreeRow<'a> {
+    TreeRow {
+        glyph,
+        session: Some(s),
+        handle: s.handle.clone(),
+        project: session_project_label(s),
+        short: session_repo_short(s),
+        kind: kind_cell(s, false),
+    }
+}
+
+/// `sessions` one row each, in list order (`dira sessions --flat`), labelled
+/// the way [`tree_rows`] labels them — a run root that reads as a
+/// [`SCRATCH_LABEL`] there reads as one here.
+pub fn flat_rows(sessions: &[dira_core::protocol::SessionView]) -> Vec<TreeRow<'_>> {
+    use dira_core::runs::{group, Entry};
+    let scratch: std::collections::HashSet<&str> = group(sessions)
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Run(r) if r.is_scratch() => Some(r.root.session_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    sessions
+        .iter()
+        .map(|s| {
+            let mut row = session_row("  ", s);
+            if scratch.contains(s.session_id.as_str()) {
+                row.project = SCRATCH_LABEL.to_string();
+                row.short = "scratch".to_string();
+                row.kind = kind_cell(s, true);
+            }
+            row
+        })
+        .collect()
+}
+
+/// The agent lanes' rows (`status --detailed` PARALLEL and the `watch`
+/// chart): run trees grouped over `tree` — so a root whose children ended
+/// (#182) keeps its run label — keeping only sessions in `live` that `keep`
+/// accepts, with branches re-closed. Yields each session, its gutter glyph
+/// (`""` off-tree) and its short label.
+pub fn lane_rows<'a>(
+    tree: &'a [dira_core::protocol::SessionView],
+    live: &[dira_core::protocol::SessionView],
+    titles: &std::collections::HashMap<String, String>,
+    keep: impl Fn(&dira_core::protocol::SessionView) -> bool,
+) -> Vec<(&'a dira_core::protocol::SessionView, &'static str, String)> {
+    let live: std::collections::HashSet<&str> =
+        live.iter().map(|s| s.session_id.as_str()).collect();
+    let kept: Vec<TreeRow<'a>> = tree_rows(tree, titles)
+        .into_iter()
+        .filter(|r| {
+            r.session
+                .is_some_and(|s| live.contains(s.session_id.as_str()) && keep(s))
+        })
+        .collect();
+    let mut glyphs: Vec<&'static str> = kept.iter().map(|r| r.glyph).collect();
+    retree(&mut glyphs);
+    kept.into_iter()
+        .zip(glyphs)
+        .map(|(r, g)| {
+            let s = r.session.expect("filtered to sessions");
+            (s, if g == "  " { "" } else { g }, r.short)
+        })
+        .collect()
 }
 
 /// Re-close tree branches after rows were filtered out: a member glyph
@@ -241,10 +321,11 @@ pub fn display_width(s: &str) -> usize {
 /// Truncate `s` to at most `max` display columns, appending the ellipsis glyph
 /// when clipped.
 ///
-/// The only truncation in the CLI. It replaced a char-counting variant that
-/// also hardcoded `…`: two functions with near-identical names and divergent
-/// semantics meant a call site could silently pick the wrong one, and the
-/// hardcoded ellipsis leaked a non-ASCII glyph into `DIRA_ASCII` output.
+/// It replaced a char-counting variant that also hardcoded `…`: two functions
+/// with near-identical names and divergent semantics meant a call site could
+/// silently pick the wrong one, and the hardcoded ellipsis leaked a non-ASCII
+/// glyph into `DIRA_ASCII` output. [`truncate_middle_cols`] is the one other
+/// cut, sharing its width walk ([`take_cols`]).
 ///
 /// The result never exceeds `max` columns, including the ellipsis, and never
 /// splits a wide character in half.
@@ -257,9 +338,17 @@ pub fn truncate_cols(s: &str, max: usize) -> String {
     }
     let ell = crate::theme::glyphs().ellipsis;
     let budget = max.saturating_sub(display_width(ell));
+    let mut out = take_cols(s.chars(), budget);
+    out.push_str(ell);
+    out
+}
+
+/// The leading chars of `chars` that fit in `budget` display columns, never
+/// splitting a wide character.
+fn take_cols(chars: impl Iterator<Item = char>, budget: usize) -> String {
     let mut out = String::new();
     let mut w = 0;
-    for c in s.chars() {
+    for c in chars {
         let cw = UnicodeWidthChar::width(c).unwrap_or(0);
         if w + cw > budget {
             break;
@@ -267,7 +356,6 @@ pub fn truncate_cols(s: &str, max: usize) -> String {
         out.push(c);
         w += cw;
     }
-    out.push_str(ell);
     out
 }
 
@@ -286,23 +374,9 @@ pub fn truncate_middle_cols(s: &str, max: usize) -> String {
         return truncate_cols(s, max);
     }
     let tail_budget = budget / 2;
-    let head_budget = budget - tail_budget;
-    let take = |chars: &mut dyn Iterator<Item = char>, limit: usize| {
-        let mut out = Vec::new();
-        let mut w = 0;
-        for c in chars {
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw > limit {
-                break;
-            }
-            out.push(c);
-            w += cw;
-        }
-        out
-    };
-    let head: String = take(&mut s.chars(), head_budget).into_iter().collect();
-    let tail: String = take(&mut s.chars().rev(), tail_budget)
-        .into_iter()
+    let head = take_cols(s.chars(), budget - tail_budget);
+    let tail: String = take_cols(s.chars().rev(), tail_budget)
+        .chars()
         .rev()
         .collect();
     format!("{head}{ell}{tail}")
@@ -622,8 +696,8 @@ mod tests {
         let rows = tree_rows(&list, &Default::default());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].project, SCRATCH_LABEL);
-        assert!(rows[0].scratch);
-        assert!(is_bare_scratch(&bare, &list));
+        assert_eq!(rows[0].kind, "agent", "a scratch session is not `orch`");
+        assert_eq!(flat_rows(&list)[0].project, SCRATCH_LABEL, "--flat agrees");
 
         let kid = sv(
             "k",
@@ -631,17 +705,34 @@ mod tests {
         );
         let list = vec![bare.clone(), kid];
         let rows = tree_rows(&list, &Default::default());
-        assert!(!rows[0].scratch);
+        assert_eq!(rows[0].kind, "orch");
         assert_ne!(rows[0].project, SCRATCH_LABEL);
-        assert!(!is_bare_scratch(&bare, &list));
+        assert!(flat_rows(&list).iter().all(|r| r.project != SCRATCH_LABEL));
 
         let reached = sv(
             "r",
             serde_json::json!({"orchestrator": true, "repos": ["acme/api"]}),
         );
         let rows = tree_rows(std::slice::from_ref(&reached), &Default::default());
-        assert!(!rows[0].scratch);
+        assert_eq!(rows[0].kind, "orch");
         assert_eq!(rows[0].project, "acme/api");
+    }
+
+    /// `--limit` keeps whole runs: the root and every member stay or go
+    /// together, in list order, and the count says how many entries went.
+    #[test]
+    fn limit_entries_counts_a_run_as_one() {
+        let list = vec![
+            sv("o", serde_json::json!({"orchestrator": true})),
+            sv("k", serde_json::json!({"parent_session": "o"})),
+            sv("p", serde_json::json!({})),
+            sv("q", serde_json::json!({})),
+        ];
+        let (kept, hidden) = limit_entries(&list, 2);
+        let ids: Vec<&str> = kept.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["o", "k", "p"]);
+        assert_eq!(hidden, 1);
+        assert_eq!(limit_entries(&list, 10).1, 0);
     }
 
     #[test]

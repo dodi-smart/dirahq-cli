@@ -121,7 +121,8 @@ or yields (see Behavior below).
   0 event(s) and N token row(s) awaiting sync" instead of "0 event(s)". The
   count is `Store::count_token_usage_after(META_TOKEN_CURSOR)`, the same read
   the daemon's `Status.tokens_pending` makes, gathered by `device::probe`;
-  `detail` adds `tokens_pending` and `token_cursor`. A backlog is still `ok`,
+  `detail` adds `pending_tokens` (the key `dira device status --json` uses
+  for the same count) and `token_cursor`. A backlog is still `ok`,
   never a finding on its own.
 - `hooks.scope_overlap` judges the same `Vec<HarnessWiring>` facts `hooks.config`/
   `hooks.exe_path` read. A scope counts as wired for a harness when that scope's

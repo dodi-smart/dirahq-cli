@@ -448,9 +448,6 @@ async fn legacy_daemon_socket(config: &Config, legacy: &Path) -> Option<PathBuf>
     answers(legacy).await.then(|| legacy.to_path_buf())
 }
 
-/// The `dirad: up` line. A daemon whose hook ingress failed to bind answers
-/// every control request but captures nothing, so it is reported as **degraded**
-/// with the reason rather than as a healthy "up" (D-0009).
 /// A warning when `dira` and `dirad` resolved DIFFERENT capture stores.
 ///
 /// Neither process can see this alone. `project_dirs()` succeeds on both sides;
@@ -476,6 +473,9 @@ pub(crate) fn store_divergence_line(cli_db: &Path, daemon_db: Option<&str>) -> O
     ))
 }
 
+/// The `dirad: up` line. A daemon whose hook ingress failed to bind answers
+/// every control request but captures nothing, so it is reported as **degraded**
+/// with the reason rather than as a healthy "up" (D-0009).
 fn up_message(sock: &std::path::Path, ingress_error: Option<&str>) -> String {
     match ingress_error {
         None => format!("dirad: up  (socket {})", sock.display()),
@@ -492,15 +492,19 @@ fn up_message(sock: &std::path::Path, ingress_error: Option<&str>) -> String {
 /// Mirrors `Response::DaemonInfo` field for field so callers never have to
 /// re-send: `dira version`, `dira daemon status` and four `dira doctor` checks
 /// all read from one probe.
-#[derive(Debug, Clone)]
+///
+/// Serialized as-is for the `daemon` object of `dira daemon status --json` and
+/// `dira version --json`, so a field name here IS a JSON key: renaming one is a
+/// breaking change for scripts (additive-only, like `dira doctor --json`).
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Info {
     pub version: String,
     pub schema_version: String,
     pub pid: u32,
     pub uptime_seconds: u64,
+    pub db_path: Option<String>,
     pub http_ingress_error: Option<String>,
     pub control_channel_warning: Option<String>,
-    pub db_path: Option<String>,
     pub storage_warning: Option<String>,
 }
 
@@ -538,21 +542,95 @@ pub(crate) struct DaemonProbe {
     pub legacy: Option<PathBuf>,
 }
 
+/// How the daemon answered one [`DaemonProbe`], classified once.
+///
+/// The single source [`DaemonProbe::running`] (the exit code install.sh keys
+/// off), [`daemon_state`] (the `--json` word) and [`DaemonProbe::status_line`]
+/// (the text) all derive from, so the three cannot drift apart.
+///
+/// `Denied` and `Busy` are kept apart from `Down` for the same reason
+/// [`client::Reach`] is: a daemon that is running and refusing us is the
+/// opposite of one that is absent (D-0016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonState {
+    /// Answered `DaemonInfo`, or `Ping` (too old for `DaemonInfo`).
+    Up,
+    /// Answered `DaemonInfo` with something that was not a `DaemonInfo`.
+    Unexpected,
+    /// The configured socket is silent but a pre-D-0008 daemon answers on the
+    /// legacy one.
+    Legacy,
+    /// The control endpoint refused us.
+    Denied,
+    /// The control endpoint is there but did not take the connection.
+    Busy,
+    /// Nothing answered.
+    Down,
+}
+
+impl DaemonState {
+    /// The stable word both `--json` shapes report.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Unexpected => "unexpected",
+            Self::Legacy => "legacy",
+            Self::Denied => "denied",
+            Self::Busy => "busy",
+            Self::Down => "down",
+        }
+    }
+
+    /// A daemon is running somewhere — healthy, degraded, confused, or still
+    /// on the legacy socket. See [`status`] for why "legacy" counts.
+    fn is_running(self) -> bool {
+        matches!(self, Self::Up | Self::Unexpected | Self::Legacy)
+    }
+}
+
 impl DaemonProbe {
+    /// The one classification of this probe; see [`DaemonState`].
+    pub(crate) fn state(&self) -> DaemonState {
+        if self.unexpected {
+            return DaemonState::Unexpected;
+        }
+        if self.info.is_some() || self.answered_ping {
+            return DaemonState::Up;
+        }
+        if self.legacy.is_some() {
+            return DaemonState::Legacy;
+        }
+        match self.reach {
+            client::Reach::Denied => DaemonState::Denied,
+            client::Reach::Busy => DaemonState::Busy,
+            client::Reach::Up | client::Reach::Down | client::Reach::Other => DaemonState::Down,
+        }
+    }
+
     /// The `dira daemon status` line, unchanged from when `status_with` built
     /// it inline.
+    ///
+    /// Coarser than [`DaemonState`] on purpose (the text predates it): every
+    /// not-running state prints the `dirad: down` line, with the legacy-socket
+    /// hint when there is one, while `--json` names `legacy`/`denied`/`busy`.
     pub(crate) fn status_line(&self, sock: &Path) -> String {
-        match (&self.info, self.answered_ping) {
-            (Some(i), _) => up_message(sock, i.http_ingress_error.as_deref()),
-            (None, true) => up_message(sock, None),
-            (None, false) => down_message(self.legacy.as_deref()),
+        match self.state() {
+            DaemonState::Up | DaemonState::Unexpected => up_message(
+                sock,
+                self.info
+                    .as_ref()
+                    .and_then(|i| i.http_ingress_error.as_deref()),
+            ),
+            DaemonState::Legacy | DaemonState::Denied | DaemonState::Busy | DaemonState::Down => {
+                down_message(self.legacy.as_deref())
+            }
         }
     }
 
     /// `true` iff a daemon is running somewhere — see [`status`] for why
     /// "legacy" counts.
     pub(crate) fn running(&self) -> bool {
-        self.info.is_some() || self.answered_ping || self.legacy.is_some()
+        self.state().is_running()
     }
 }
 
@@ -708,26 +786,10 @@ pub async fn version_json_print(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// One word for how the daemon answered, shared by both `--json` shapes.
-///
-/// `denied` and `busy` are kept apart from `down` for the same reason
-/// [`client::Reach`] is: a daemon that is running and refusing us is the
-/// opposite of one that is absent (D-0016).
+/// One word for how the daemon answered, shared by both `--json` shapes:
+/// [`DaemonProbe::state`] as its stable string.
 pub(crate) fn daemon_state(p: &DaemonProbe) -> &'static str {
-    if p.unexpected {
-        return "unexpected";
-    }
-    if p.info.is_some() || p.answered_ping {
-        return "up";
-    }
-    if p.legacy.is_some() {
-        return "legacy";
-    }
-    match p.reach {
-        client::Reach::Denied => "denied",
-        client::Reach::Busy => "busy",
-        client::Reach::Up | client::Reach::Down | client::Reach::Other => "down",
-    }
+    p.state().as_str()
 }
 
 /// The machine-readable kind of a supervision state (the human form is
@@ -747,19 +809,9 @@ pub(crate) fn supervision_kind(s: &Supervision) -> &'static str {
 /// The daemon's self-report as JSON, or `null` when it did not answer
 /// `DaemonInfo`.
 fn info_json(i: Option<&Info>) -> serde_json::Value {
-    match i {
-        Some(i) => serde_json::json!({
-            "version": i.version,
-            "schema_version": i.schema_version,
-            "pid": i.pid,
-            "uptime_seconds": i.uptime_seconds,
-            "db_path": i.db_path,
-            "http_ingress_error": i.http_ingress_error,
-            "control_channel_warning": i.control_channel_warning,
-            "storage_warning": i.storage_warning,
-        }),
-        None => serde_json::Value::Null,
-    }
+    // `Option<&Info>` serializes `None` as `null`; a plain-data struct cannot
+    // fail to serialize, so the fallback is unreachable in practice.
+    serde_json::to_value(i).unwrap_or(serde_json::Value::Null)
 }
 
 /// `dira daemon status --json`. Pure so the shape is pinned by a test.
@@ -1844,6 +1896,27 @@ mod probe_tests {
         assert_eq!(v["daemon"]["version"], "0.3.0");
         assert_eq!(v["daemon"]["pid"], 1);
         assert_eq!(v["daemon"]["http_ingress_error"], "port busy");
+        // `Info` is serialized by derive, so its field names are the keys:
+        // pin the whole set so a field rename cannot slip through.
+        let mut got: Vec<&str> = v["daemon"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut want = vec![
+            "version",
+            "schema_version",
+            "pid",
+            "uptime_seconds",
+            "db_path",
+            "http_ingress_error",
+            "control_channel_warning",
+            "storage_warning",
+        ];
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
 
         let down = status_json(&probe_of(None, false, None), sock, &Supervision::NotRunning);
         assert_eq!(down["running"], false);
@@ -1870,6 +1943,13 @@ mod probe_tests {
         assert_eq!(daemon_state(&p), "denied");
         p.reach = client::Reach::Busy;
         assert_eq!(daemon_state(&p), "busy");
+        // Refusing or busy is not "running" for install.sh's exit code, and
+        // the text keeps its `dirad: down` line.
+        assert!(!p.running());
+        assert_eq!(
+            p.status_line(Path::new("/run/dira.sock")),
+            down_message(None)
+        );
     }
 
     /// `dira version --json` names both builds and the two comparisons the

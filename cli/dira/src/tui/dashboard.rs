@@ -70,7 +70,7 @@ pub struct Lane {
 /// single deduped human baseline lane. Idle/zero agent sessions are dropped so
 /// the chart shows actual concurrency. Lanes are returned human-first.
 pub fn lanes(s: &StatusView) -> Vec<Lane> {
-    lanes_with(s, &titles_for(&crate::format::status_tree_sessions(s)))
+    lanes_with(s, &titles_for(s.active.iter().chain(&s.run_children)))
 }
 
 /// [`lanes`] with the local titles supplied, so tests need no filesystem.
@@ -82,29 +82,13 @@ pub fn lanes_with(s: &StatusView, titles: &std::collections::HashMap<String, Str
         seconds: s.today.total_human_seconds,
         is_human: true,
     }];
-    // An agent lane is only interesting once it has accrued wall time, and
-    // only a live session gets one. The tree is grouped over the ended run
-    // children too (#182), so a run root whose children ended keeps its label.
+    // An agent lane is only interesting once it has accrued wall time.
     let tree = crate::format::status_tree_sessions(s);
-    let live: std::collections::HashSet<&str> =
-        s.active.iter().map(|v| v.session_id.as_str()).collect();
-    let kept: Vec<_> = crate::format::tree_rows(&tree, titles)
-        .into_iter()
-        .filter(|r| {
-            r.session.is_some_and(|v| {
-                v.accrues_agent_time()
-                    && v.agent_seconds > 0
-                    && live.contains(v.session_id.as_str())
-            })
-        })
-        .collect();
-    let mut glyphs: Vec<&'static str> = kept.iter().map(|r| r.glyph).collect();
-    crate::format::retree(&mut glyphs);
-    for (row, glyph) in kept.iter().zip(glyphs) {
-        let sess = row.session.expect("filtered to sessions");
-        let glyph = if glyph == "  " { "" } else { glyph };
+    for (sess, glyph, short) in crate::format::lane_rows(&tree, &s.active, titles, |v| {
+        v.accrues_agent_time() && v.agent_seconds > 0
+    }) {
         lanes.push(Lane {
-            label: format!("{glyph}{} · {}", sess.handle, row.short),
+            label: format!("{glyph}{} · {short}", sess.handle),
             seconds: sess.agent_seconds,
             is_human: false,
         });
@@ -113,8 +97,10 @@ pub fn lanes_with(s: &StatusView, titles: &std::collections::HashMap<String, Str
 }
 
 /// Local titles, only when an orchestrator is on screen. Never synced.
-fn titles_for(active: &[SessionView]) -> std::collections::HashMap<String, String> {
-    if active.iter().any(|s| s.orchestrator) {
+fn titles_for<'a>(
+    mut sessions: impl Iterator<Item = &'a SessionView>,
+) -> std::collections::HashMap<String, String> {
+    if sessions.any(|s| s.orchestrator) {
         crate::session_titles::cached_claude_titles()
     } else {
         Default::default()
@@ -328,7 +314,7 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
     // The table keeps a listed run's ended children (#182); lanes and the
     // header count stay on the live sessions.
     let tree = crate::format::status_tree_sessions(s);
-    let sessions_need = crate::format::tree_rows(&tree, &titles_for(&tree))
+    let sessions_need = crate::format::tree_rows(&tree, &titles_for(tree.iter()))
         .len()
         .max(1) as u16
         + 3; // tree rows + header + borders
@@ -402,7 +388,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
     let project_w = (area.width as usize)
         .saturating_sub(48 + 5 + 2)
         .clamp(12, 200);
-    let titles = titles_for(active);
+    let titles = titles_for(active.iter());
     let rows = crate::format::tree_rows(active, &titles)
         .into_iter()
         .map(|row| {
@@ -515,7 +501,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
         .iter()
         .map(|p| {
             Row::new([
-                Cell::from(truncate_cols(
+                Cell::from(crate::format::report_repo_cell(
                     &crate::format::report_line_label(p),
                     project_w,
                 )),

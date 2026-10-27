@@ -67,9 +67,9 @@ links their children, and shows the whole thing as one run.
 - `dira sessions` groups runs into a tree. A run over at most one repo is
   folded and shows that repo. `--flat` gives the old one-row view. Titles come
   from `~/.claude/sessions/*.json` at render time and never leave the machine.
-  `--limit N` keeps the N newest top-level rows (a run counts as one); with
-  `--json` it keeps the N newest sessions. An AGE column shows time since
-  each session started.
+  `--limit N` keeps the N newest top-level entries, a run counting as one,
+  in the table and with `--json` alike (`format::limit_entries`). An AGE
+  column shows time since each session started.
 - An orchestrator with no repos and no listed children reads as `scratch
   session` in `dira sessions`, `status --detailed` and `watch` (#181), and its
   KIND reads as the session's own rather than `orch`. Display only: the role,

@@ -715,7 +715,7 @@ pub(crate) fn device_link(d: &DeviceProbe, cloud_url: Option<&str>) -> Check {
         "cloud_url": cloud_url,
         "pending": d.pending,
         "cursor": d.cursor,
-        "tokens_pending": d.tokens_pending,
+        "pending_tokens": d.tokens_pending,
         "token_cursor": d.token_cursor,
         "cloud_watermark": d.cloud_watermark,
         "local_head": d.local_head,
@@ -741,14 +741,7 @@ pub(crate) fn device_link(d: &DeviceProbe, cloud_url: Option<&str>) -> Check {
     // Token rows ride their own cursor (D-0018), so a backlog of compute rows
     // can sit behind a fully synced event stream. Saying "0 event(s)" there
     // is the same invisible state `dira status` used to have.
-    let backlog = if d.tokens_pending == 0 {
-        format!("{} event(s)", d.pending)
-    } else {
-        format!(
-            "{} event(s) and {} token row(s)",
-            d.pending, d.tokens_pending
-        )
-    };
+    let backlog = crate::device::backlog_phrase(d.pending, d.tokens_pending);
     Check::ok(ID, format!("linked, {backlog} awaiting sync")).detail(detail)
 }
 
@@ -1849,7 +1842,7 @@ pub(crate) mod tests {
         let url = Some("https://api.dira.sh");
         let c = device_link(&device(true), url);
         assert_eq!(c.summary, "linked, 3 event(s) awaiting sync");
-        assert_eq!(c.detail["tokens_pending"], 0);
+        assert_eq!(c.detail["pending_tokens"], 0);
 
         let mut d = device(true);
         d.pending = 0;
@@ -1859,7 +1852,7 @@ pub(crate) mod tests {
         assert_eq!(c.level, Level::Ok, "a backlog is not a finding");
         assert!(c.summary.contains("0 event(s)"), "{}", c.summary);
         assert!(c.summary.contains("12 token row(s)"), "{}", c.summary);
-        assert_eq!(c.detail["tokens_pending"], 12);
+        assert_eq!(c.detail["pending_tokens"], 12);
         assert_eq!(c.detail["token_cursor"], 40);
     }
 

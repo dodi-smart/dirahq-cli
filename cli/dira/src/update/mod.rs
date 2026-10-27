@@ -590,32 +590,51 @@ fn downgrade_refusal(
 /// load-bearing — [`notice::spawn_refresh`] runs this detached purely to warm
 /// the cache.
 fn check_message(resolved: &str, current: &str, channel: Channel) -> String {
-    match resolve::compare_versions(resolved, current) {
-        Some(std::cmp::Ordering::Greater) => {
+    match check_verdict(resolved, current) {
+        CheckVerdict::Available => {
             format!("dira {resolved} is available (you have {current}) — run `dira update`")
         }
-        Some(std::cmp::Ordering::Equal) => format!("dira is up to date ({current})"),
-        // Older, or a version either side of the comparison can't parse: in
-        // both cases there is nothing to offer, and claiming otherwise is the
-        // bug. `None` is near-unreachable (`pick_latest` drops unparseable
-        // tags and `current` is `CARGO_PKG_VERSION`) but must not fall through
-        // to "available".
-        _ => format!(
+        CheckVerdict::UpToDate => format!("dira is up to date ({current})"),
+        CheckVerdict::Ahead => format!(
             "dira is up to date ({current} — ahead of the {} channel's {resolved})",
             channel.label()
         ),
     }
 }
 
-/// `--check`'s three-way verdict as a stable word — the same comparison
-/// [`check_message`] words for humans, so the two cannot disagree.
-fn check_status(resolved: &str, current: &str) -> &'static str {
+/// `--check`'s three-way verdict on a successful resolve. The single source
+/// both [`check_message`] (humans) and [`check_json`] (`status`) word, so the
+/// two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckVerdict {
+    /// The channel head is newer than this build.
+    Available,
+    /// The channel head is this build.
+    UpToDate,
+    /// The channel head is older than this build — or either side is
+    /// unparseable. In both cases there is nothing to offer, and claiming
+    /// otherwise is the bug. Unparseable is near-unreachable (`pick_latest`
+    /// drops unparseable tags and `current` is `CARGO_PKG_VERSION`) but must
+    /// not fall through to "available".
+    Ahead,
+}
+
+impl CheckVerdict {
+    /// The stable word `--check --json` reports as `status`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::UpToDate => "up_to_date",
+            Self::Ahead => "ahead",
+        }
+    }
+}
+
+fn check_verdict(resolved: &str, current: &str) -> CheckVerdict {
     match resolve::compare_versions(resolved, current) {
-        Some(std::cmp::Ordering::Greater) => "available",
-        Some(std::cmp::Ordering::Equal) => "up_to_date",
-        // Same reasoning as `check_message`: older, or unparseable, is never
-        // an offer.
-        _ => "ahead",
+        Some(std::cmp::Ordering::Greater) => CheckVerdict::Available,
+        Some(std::cmp::Ordering::Equal) => CheckVerdict::UpToDate,
+        _ => CheckVerdict::Ahead,
     }
 }
 
@@ -633,7 +652,7 @@ fn check_json(
     resolved: Result<&str, &str>,
 ) -> serde_json::Value {
     let (latest, status, error) = match resolved {
-        Ok(v) => (Some(v), check_status(v, current), None),
+        Ok(v) => (Some(v), check_verdict(v, current).as_str(), None),
         Err(e) => (None, "error", Some(e)),
     };
     serde_json::json!({
@@ -673,14 +692,20 @@ async fn run_check(
         Err(e) => eprintln!("dira update --check: could not serialize: {e}"),
     };
 
+    // Every error takes the same path: one JSON object on stdout with
+    // `--json`, a line on stderr without.
+    let report_error = |e: &anyhow::Error| {
+        if json {
+            emit_json(Err(&format!("{e:#}")));
+        } else {
+            eprintln!("dira update --check: {e:#}");
+        }
+    };
+
     let target = match artifact::detect_target() {
         Ok(t) => t,
         Err(e) => {
-            if json {
-                emit_json(Err(&format!("{e:#}")));
-            } else {
-                eprintln!("dira update --check: {e:#}");
-            }
+            report_error(&e);
             return;
         }
     };
@@ -699,11 +724,7 @@ async fn run_check(
             }
         }
         Err(e) => {
-            if json {
-                emit_json(Err(&format!("{e:#}")));
-            } else {
-                eprintln!("dira update --check: {e:#}");
-            }
+            report_error(&e);
             if version_pin.is_none() {
                 notice::record_check(now, None, channel.label(), Some(&e.to_string()));
             }

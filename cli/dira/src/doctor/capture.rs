@@ -127,8 +127,10 @@ pub(crate) fn split_command(cmd: &str) -> Option<Vec<String>> {
 
 /// Run the probe. Never returns `Err`: every failure is a stage.
 pub(crate) async fn run(config: &Config, facts: &super::Facts) -> Check {
+    // `gather` already probed this process's elevation into `facts.endpoint`;
+    // reading it there keeps one answer for the whole doctor run.
     let mut ctx = Ctx {
-        doctor_elevated: dira_ipc::elevation::is_elevated(),
+        doctor_elevated: facts.endpoint.client_elevated(),
         ..Default::default()
     };
     let stage = stage_of(config, facts, &mut ctx).await;

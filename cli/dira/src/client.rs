@@ -59,20 +59,17 @@ pub fn classify(e: &std::io::Error) -> Reach {
 /// Only a refusal pays for the endpoint probe (a `stat` and a `geteuid` on
 /// unix, a token query on windows); every other arm is a fixed string.
 pub fn connect_message(e: &std::io::Error, socket: &Path) -> String {
-    reach_message(classify(e), e, || {
-        dira_ipc::elevation::EndpointAccess::probe(socket)
-    })
+    reach_message(e, || dira_ipc::elevation::EndpointAccess::probe(socket))
 }
 
 /// [`connect_message`] with the platform facts injected, so the selection is
 /// pinned by tests on every host: the windows elevation advice for a pipe, the
 /// ownership/mode advice for a unix socket (D-0016).
 fn reach_message(
-    reach: Reach,
     e: &std::io::Error,
     access: impl FnOnce() -> dira_ipc::elevation::EndpointAccess,
 ) -> String {
-    match reach {
+    match classify(e) {
         Reach::Denied => access().denied_advice(),
         Reach::Down => "daemon not running — start it with `dira daemon start`".to_string(),
         Reach::Busy => format!(
@@ -239,9 +236,6 @@ mod tests {
         );
     }
 
-    /// Following the old advice spawned a second daemon that died on
-    /// `first_pipe_instance` *after* the CLI had overwritten the live pidfile.
-    /// No denied-path message may ever suggest it again.
     fn pipe(elevated: bool) -> EndpointAccess {
         EndpointAccess::WindowsPipe {
             client_elevated: elevated,
@@ -257,11 +251,14 @@ mod tests {
         }
     }
 
+    /// Following the old advice spawned a second daemon that died on
+    /// `first_pipe_instance` *after* the CLI had overwritten the live pidfile.
+    /// No denied-path message may ever suggest it again.
     #[test]
     fn the_denied_message_never_advises_a_bare_daemon_start() {
         let e = Error::from_raw_os_error(5);
         for access in [pipe(false), pipe(true), socket(0, 501), socket(501, 501)] {
-            let msg = reach_message(classify(&e), &e, || access.clone());
+            let msg = reach_message(&e, || access.clone());
             assert!(!msg.contains("start it with `dira daemon start`"), "{msg}");
             assert!(msg.contains("denied"), "{msg}");
         }
@@ -276,10 +273,10 @@ mod tests {
     #[test]
     fn only_a_windows_pipe_gets_the_administrator_hint() {
         let e = Error::new(ErrorKind::PermissionDenied, "denied");
-        let win = reach_message(Reach::Denied, &e, || pipe(false));
+        let win = reach_message(&e, || pipe(false));
         assert!(win.contains("Administrator"), "{win}");
 
-        let unix = reach_message(Reach::Denied, &e, || socket(0, 501));
+        let unix = reach_message(&e, || socket(0, 501));
         assert!(!unix.contains("Administrator"), "{unix}");
         assert!(!unix.to_lowercase().contains("elevat"), "{unix}");
         assert!(
@@ -294,9 +291,7 @@ mod tests {
     #[test]
     fn only_a_refusal_probes_the_endpoint() {
         let e = Error::new(ErrorKind::NotFound, "nope");
-        let msg = reach_message(classify(&e), &e, || {
-            panic!("a missing endpoint must not be probed")
-        });
+        let msg = reach_message(&e, || panic!("a missing endpoint must not be probed"));
         assert!(msg.contains("dira daemon start"));
     }
 

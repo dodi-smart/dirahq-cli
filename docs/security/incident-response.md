@@ -6,7 +6,7 @@ Resilience Act (Regulation (EU) 2024/2847, Article 14) requires. Article 14 has
 applied since **11 September 2026**, to products already on the market as well.
 
 Keep this file short enough to follow under pressure. Product-specific details
-live in the CRA architecture document: `docs/cra/dirahq-cli-cra.html` (not written yet).
+live in the CRA architecture document: https://github.com/dodi-smart/dirahq-cloud/blob/develop/docs/cra/dira-cra.html.
 
 ## Roles
 

@@ -87,12 +87,8 @@ pub(crate) fn reachable(f: &Facts) -> Check {
                  (access denied) — every hook is being dropped the same way"
             ),
         )
-        .remedy(dira_ipc::elevation::access_denied_advice(f.doctor_elevated))
-        .detail(json!({
-            "reach": "denied",
-            "socket": sock,
-            "client_elevated": f.doctor_elevated,
-        })),
+        .remedy(f.endpoint.denied_advice())
+        .detail(denied_detail(sock, &f.endpoint)),
         Reach::Busy => Check::warn(ID, "every daemon channel instance was momentarily taken")
             .remedy("re-run `dira doctor`; if it persists, `dira daemon restart`")
             .detail(json!({ "reach": "busy", "socket": sock })),
@@ -113,6 +109,30 @@ pub(crate) fn reachable(f: &Facts) -> Check {
                 .detail(json!({ "reach": "down", "socket": sock })),
         },
     }
+}
+
+/// `daemon.reachable`'s `Denied` detail. `client_elevated` is kept on every
+/// platform (always `false` off windows) so `--json` consumers see one key
+/// set; the unix ownership facts are additive (DIRASH-0022).
+fn denied_detail(sock: &str, endpoint: &dira_ipc::elevation::EndpointAccess) -> serde_json::Value {
+    use dira_ipc::elevation::EndpointAccess;
+    let mut d = json!({
+        "reach": "denied",
+        "socket": sock,
+        "client_elevated": endpoint.client_elevated(),
+    });
+    if let EndpointAccess::UnixSocket {
+        owner_uid,
+        current_uid,
+        mode,
+        ..
+    } = endpoint
+    {
+        d["socket_owner_uid"] = json!(owner_uid);
+        d["current_uid"] = json!(current_uid);
+        d["socket_mode"] = json!(mode.map(|m| format!("{m:04o}")));
+    }
+    d
 }
 
 /// Will capture survive a reboot?
@@ -433,7 +453,10 @@ pub(crate) fn hooks_exe_path(wiring: &[HarnessWiring], current_exe: Option<&str>
 
     let mut exes: Vec<String> = Vec::new();
     for c in &commands {
-        if let Some(exe) = crate::init::hook_command_exe(c) {
+        // Expanded BEFORE de-duplicating: `$HOME/.local/bin/dira` in one
+        // config and `~/.local/bin/dira` in another are the same binary, and
+        // listing it twice reads like two installs competing for the hooks.
+        if let Some(exe) = crate::init::hook_command_exe(c).map(|e| expand_home(&e)) {
             if !exes.contains(&exe) {
                 exes.push(exe);
             }
@@ -692,6 +715,8 @@ pub(crate) fn device_link(d: &DeviceProbe, cloud_url: Option<&str>) -> Check {
         "cloud_url": cloud_url,
         "pending": d.pending,
         "cursor": d.cursor,
+        "tokens_pending": d.tokens_pending,
+        "token_cursor": d.token_cursor,
         "cloud_watermark": d.cloud_watermark,
         "local_head": d.local_head,
     });
@@ -713,7 +738,18 @@ pub(crate) fn device_link(d: &DeviceProbe, cloud_url: Option<&str>) -> Check {
             .remedy("dira device rotate-key")
             .detail(detail);
     }
-    Check::ok(ID, format!("linked, {} event(s) awaiting sync", d.pending)).detail(detail)
+    // Token rows ride their own cursor (D-0018), so a backlog of compute rows
+    // can sit behind a fully synced event stream. Saying "0 event(s)" there
+    // is the same invisible state `dira status` used to have.
+    let backlog = if d.tokens_pending == 0 {
+        format!("{} event(s)", d.pending)
+    } else {
+        format!(
+            "{} event(s) and {} token row(s)",
+            d.pending, d.tokens_pending
+        )
+    };
+    Check::ok(ID, format!("linked, {backlog} awaiting sync")).detail(detail)
 }
 
 // --- is `dira update` actually landing? ---------------------------------
@@ -1184,14 +1220,32 @@ pub(crate) fn cloud_bootstrap(c: &CloudFacts) -> Check {
             unreachable!("both arms handled above")
         }
     };
+    // A pin behind the installed binary means every cloud VM keeps installing
+    // the old dira: the refresh `dira update` runs (DIRASH-0038) only fires in
+    // the repo the update was run from, so every other repo drifts silently.
+    // A warning, never a failure — cloud capture still works on the old
+    // version. It converges: the pin only ever moves forward, so only the
+    // teammate on the newest dira sees this, and their refresh clears it for
+    // everyone.
+    if pin_relation == PinRelation::Older {
+        return Check::warn(
+            ID,
+            format!(
+                ".dira/bootstrap.sh pins v{pin}, behind this dira v{running} — cloud \
+                 sessions still install v{pin}"
+            ),
+        )
+        .remedy("dira cloud refresh — moves the pin forward, never back (or dira onboard)")
+        .detail(detail);
+    }
     let mut summary = match pin_relation {
-        PinRelation::Older => format!(
-            "teleport artifacts present (pinned v{pin}; this dira is v{running} — dira onboard refreshes the pin)"
-        ),
         PinRelation::Newer => {
             format!("teleport artifacts present (pinned v{pin}, newer than this dira v{running})")
         }
-        PinRelation::Same | PinRelation::Missing | PinRelation::Unparseable => {
+        PinRelation::Older
+        | PinRelation::Same
+        | PinRelation::Missing
+        | PinRelation::Unparseable => {
             format!("teleport artifacts present (pinned v{pin})")
         }
     };
@@ -1225,7 +1279,9 @@ pub(crate) mod tests {
             hooks: Vec::new(),
             breadcrumb: None,
             current_exe: None,
-            doctor_elevated: false,
+            endpoint: dira_ipc::elevation::EndpointAccess::WindowsPipe {
+                client_elevated: false,
+            },
             cwd: Some("/work/api".into()),
             project: Ok("github.com/acme/api".into()),
             update: super::super::UpdateFacts::default(),
@@ -1338,14 +1394,35 @@ pub(crate) mod tests {
     /// `client.rs`'s `the_denied_message_never_advises_a_bare_daemon_start`.
     #[test]
     fn denied_is_a_failure_and_never_advises_daemon_start() {
-        // Both elevation states, explicitly — `doctor_elevated` is a gathered
-        // fact precisely so this test is the same on every host. An earlier
-        // version read `is_elevated()` inside the judge and passed on unix
-        // while failing on an elevated Windows CI runner.
-        for elevated in [false, true] {
+        use dira_ipc::elevation::EndpointAccess;
+        // Both elevation states and a unix socket, explicitly — `endpoint` is a
+        // gathered fact precisely so this test is the same on every host. An
+        // earlier version read `is_elevated()` inside the judge and passed on
+        // unix while failing on an elevated Windows CI runner.
+        let unix = EndpointAccess::UnixSocket {
+            path: "/run/dira.sock".into(),
+            owner_uid: Some(0),
+            current_uid: Some(501),
+            mode: Some(0o600),
+        };
+        for (endpoint, elevated) in [
+            (
+                EndpointAccess::WindowsPipe {
+                    client_elevated: false,
+                },
+                false,
+            ),
+            (
+                EndpointAccess::WindowsPipe {
+                    client_elevated: true,
+                },
+                true,
+            ),
+            (unix.clone(), false),
+        ] {
             let mut f = facts_with_no_daemon();
             f.daemon.reach = Reach::Denied;
-            f.doctor_elevated = elevated;
+            f.endpoint = endpoint;
 
             let c = reachable(&f);
             assert_eq!(c.level, Level::Fail, "elevated={elevated}");
@@ -1378,6 +1455,18 @@ pub(crate) mod tests {
         f.daemon.reach = Reach::Denied;
         let remedy = reachable(&f).remedy.expect("advice");
         assert!(remedy.to_lowercase().contains("do not run"), "{remedy}");
+
+        // A unix socket never hears about Administrator terminals: it gets the
+        // ownership facts, the path, and how to check them.
+        f.endpoint = unix;
+        let c = reachable(&f);
+        let remedy = c.remedy.expect("advice");
+        assert!(!remedy.contains("Administrator"), "{remedy}");
+        assert!(remedy.contains("ls -l /run/dira.sock"), "{remedy}");
+        assert!(remedy.to_lowercase().contains("do not run"), "{remedy}");
+        assert_eq!(c.detail["socket_owner_uid"], 0);
+        assert_eq!(c.detail["current_uid"], 501);
+        assert_eq!(c.detail["socket_mode"], "0600");
     }
 
     #[test]
@@ -1482,6 +1571,40 @@ pub(crate) mod tests {
             missing: missing.iter().map(|s| s.to_string()).collect(),
             commands: vec![cmd.to_string()],
         }
+    }
+
+    /// One binary written three ways — `$HOME`, `${HOME}`, `~` — and once
+    /// literally is one executable, not four.
+    #[test]
+    fn exe_path_counts_a_home_relative_binary_once() {
+        let home = dira_core::config::home_dir()
+            .expect("home dir")
+            .display()
+            .to_string();
+        let w = |cmd: String| wiring("claude", 1, &[], &cmd);
+        let all = [
+            w("$HOME/.local/bin/dira-doctor-test hook claude".into()),
+            w("${HOME}/.local/bin/dira-doctor-test hook claude".into()),
+            w("~/.local/bin/dira-doctor-test hook claude".into()),
+            w(format!("{home}/.local/bin/dira-doctor-test hook claude")),
+        ];
+        let c = hooks_exe_path(&all, None);
+        let exes = c.detail["executables"].as_array().expect("executables");
+        assert_eq!(exes.len(), 1, "{exes:?}");
+        assert_eq!(
+            exes[0],
+            format!("{home}/.local/bin/dira-doctor-test"),
+            "reported expanded"
+        );
+        // It does not exist, so it is named once in the failure — not four
+        // times.
+        assert_eq!(c.level, Level::Fail);
+        assert_eq!(
+            c.summary.matches("dira-doctor-test").count(),
+            1,
+            "{}",
+            c.summary
+        );
     }
 
     #[test]
@@ -1660,6 +1783,8 @@ pub(crate) mod tests {
             device_id: linked.then(|| "dev_1".to_string()),
             cursor: None,
             pending: 3,
+            token_cursor: None,
+            tokens_pending: 0,
             cloud_watermark: None,
             local_head: None,
             sync_health: None,
@@ -1715,6 +1840,27 @@ pub(crate) mod tests {
         let c = device_link(&rotating, Some("https://api.dira.sh"));
         assert_eq!(c.level, Level::Warn);
         assert_eq!(c.remedy.as_deref(), Some("dira device rotate-key"));
+    }
+
+    /// The token backlog rides its own cursor (D-0018): a linked device with
+    /// every event synced but compute rows queued must say so, not "0 events".
+    #[test]
+    fn device_link_reports_pending_token_rows() {
+        let url = Some("https://api.dira.sh");
+        let c = device_link(&device(true), url);
+        assert_eq!(c.summary, "linked, 3 event(s) awaiting sync");
+        assert_eq!(c.detail["tokens_pending"], 0);
+
+        let mut d = device(true);
+        d.pending = 0;
+        d.tokens_pending = 12;
+        d.token_cursor = Some(40);
+        let c = device_link(&d, url);
+        assert_eq!(c.level, Level::Ok, "a backlog is not a finding");
+        assert!(c.summary.contains("0 event(s)"), "{}", c.summary);
+        assert!(c.summary.contains("12 token row(s)"), "{}", c.summary);
+        assert_eq!(c.detail["tokens_pending"], 12);
+        assert_eq!(c.detail["token_cursor"], 40);
     }
 
     // --- update.* checks (#117) ----------------------------------------
@@ -2070,22 +2216,51 @@ pub(crate) mod tests {
         assert_eq!(c.level, Level::Ok, "{}", c.summary);
     }
 
-    /// An older pin is a note in the `ok` summary, not a warning — it is
-    /// merely older than the binary running `doctor`, not broken, and
-    /// teammates on different `dira` versions must not all warn about it.
+    /// A pin that lags the installed binary warns: every cloud VM keeps
+    /// installing the old dira until someone refreshes it. Never a failure,
+    /// and the remedy only ever moves the pin forward.
     #[test]
-    fn an_older_pin_is_ok_and_names_onboard() {
+    fn an_older_pin_warns_and_names_cloud_refresh() {
         let mut f = in_claude_web();
         f.bootstrap = Some(wired_status("0.0.1"));
         let c = cloud_bootstrap(&f);
-        assert_eq!(c.level, Level::Ok);
+        assert_eq!(c.level, Level::Warn);
         assert!(c.summary.contains("0.0.1"), "{}", c.summary);
         assert!(
             c.summary.contains(env!("CARGO_PKG_VERSION")),
             "{}",
             c.summary
         );
-        assert!(c.summary.contains("dira onboard"), "{}", c.summary);
+        let remedy = c.remedy.expect("a lagging pin names its refresh");
+        assert!(remedy.contains("dira cloud refresh"), "{remedy}");
+        assert_eq!(c.detail["pin_relation"], "Older");
+        assert_eq!(c.detail["pinned_version"], "0.0.1");
+    }
+
+    /// No pin, no lag verdict: a missing `bootstrap.sh` is the missing-scripts
+    /// warning, never "behind", and a repo with no `.dira/` skips outright.
+    #[test]
+    fn no_pin_never_reports_a_lag() {
+        let mut f = in_claude_web();
+        assert_eq!(cloud_bootstrap(&f).level, Level::Skip);
+        let mut s = wired_status("0.0.1");
+        s.bootstrap = BootstrapState::Missing;
+        f.bootstrap = Some(s);
+        let c = cloud_bootstrap(&f);
+        assert!(!c.summary.contains("behind"), "{}", c.summary);
+        assert!(
+            c.summary.contains("missing generated scripts"),
+            "{}",
+            c.summary
+        );
+    }
+
+    /// The same pin as this binary is not a lag.
+    #[test]
+    fn a_pin_matching_this_dira_is_ok() {
+        let mut f = in_claude_web();
+        f.bootstrap = Some(wired_status(env!("CARGO_PKG_VERSION")));
+        assert_eq!(cloud_bootstrap(&f).level, Level::Ok);
     }
 
     /// A pin newer than this binary is also `ok` — a pin only ever moves

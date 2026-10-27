@@ -56,7 +56,168 @@ pub fn daemon_elevation_warning(elevated: bool) -> Option<String> {
     )
 }
 
-/// What `dira` should say when the control channel answers with access-denied.
+/// What could be established about a control endpoint that refused us.
+///
+/// The two platforms refuse for unrelated reasons, and the advice must not
+/// cross over. On windows the pipe's DACL and integrity label turn on token
+/// elevation (D-0016), so "started from an Administrator terminal" is the
+/// diagnosis. On unix the socket is a `0600` file (D-0008): permission denied
+/// means it belongs to another user or has the wrong mode, and talk of
+/// Administrator terminals there is simply wrong.
+///
+/// Gathered once by [`EndpointAccess::probe`], the only platform-dependent
+/// part; [`EndpointAccess::denied_advice`] is a pure function of the variant,
+/// so both arms are unit-tested on every host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointAccess {
+    /// A windows named pipe. Only this process's elevation matters.
+    WindowsPipe { client_elevated: bool },
+    /// A unix domain socket file, with what `stat` could tell us. Every field
+    /// is optional: a socket we cannot even `stat` (a parent directory is not
+    /// searchable) is still a socket that refused us.
+    UnixSocket {
+        path: std::path::PathBuf,
+        /// The socket file's owning uid.
+        owner_uid: Option<u32>,
+        /// This process's effective uid.
+        current_uid: Option<u32>,
+        /// The permission bits (`mode & 0o7777`).
+        mode: Option<u32>,
+    },
+}
+
+impl EndpointAccess {
+    /// Gather the facts for this platform's endpoint at `path`. Never fails:
+    /// anything unreadable is left `None`.
+    pub fn probe(path: &std::path::Path) -> Self {
+        #[cfg(windows)]
+        {
+            let _ = path;
+            EndpointAccess::WindowsPipe {
+                client_elevated: is_elevated(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            #[cfg(unix)]
+            let (owner_uid, mode, current_uid) = {
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::metadata(path).ok();
+                // SAFETY: `geteuid` takes no arguments, cannot fail, and
+                // touches no memory we own.
+                let euid = unsafe { libc::geteuid() };
+                (
+                    meta.as_ref().map(|m| m.uid()),
+                    meta.as_ref().map(|m| m.mode() & 0o7777),
+                    Some(euid),
+                )
+            };
+            #[cfg(not(unix))]
+            let (owner_uid, mode, current_uid) = (None, None, None);
+            EndpointAccess::UnixSocket {
+                path: path.to_path_buf(),
+                owner_uid,
+                current_uid,
+                mode,
+            }
+        }
+    }
+
+    /// Whether this process is elevated, as far as the endpoint is concerned.
+    /// Always `false` for a unix socket (see [`is_elevated`] for why root is
+    /// not "elevated" here).
+    pub fn client_elevated(&self) -> bool {
+        matches!(
+            self,
+            EndpointAccess::WindowsPipe {
+                client_elevated: true
+            }
+        )
+    }
+
+    /// What `dira` should say when this endpoint answered access-denied.
+    ///
+    /// The elevation story is produced only for [`EndpointAccess::WindowsPipe`].
+    pub fn denied_advice(&self) -> String {
+        match self {
+            EndpointAccess::WindowsPipe { client_elevated } => {
+                access_denied_advice(*client_elevated)
+            }
+            EndpointAccess::UnixSocket {
+                path,
+                owner_uid,
+                current_uid,
+                mode,
+            } => unix_socket_denied_advice(path, *owner_uid, *current_uid, *mode),
+        }
+    }
+}
+
+/// The unix arm of [`EndpointAccess::denied_advice`]: an ownership or mode
+/// problem on a `0600` socket file, never an elevation one.
+///
+/// Like the windows advice it never says "try `dira daemon start`" on its own:
+/// a socket file that refuses us is held by someone, and a daemon started with
+/// `sudo` to "get past" the error leaves a root-owned socket behind, which is
+/// the same failure for the next ordinary command.
+pub fn unix_socket_denied_advice(
+    path: &std::path::Path,
+    owner_uid: Option<u32>,
+    current_uid: Option<u32>,
+    mode: Option<u32>,
+) -> String {
+    let path = path.display();
+    let mode_str = mode.map(|m| format!("{m:04o}"));
+    let other_user = "Then either run dira as the user that owns that daemon, or stop it as \
+                      that user (`sudo dira daemon stop` if root started it) and start it \
+                      again as yourself with `dira daemon start`.";
+    let (diagnosis, remedy) = match (owner_uid, current_uid) {
+        (Some(owner), Some(me)) if owner != me => (
+            format!(
+                "the socket is owned by uid {owner}, but you are uid {me}{} — most likely \
+                 a dirad running as another user (or started with sudo)",
+                mode_str
+                    .as_deref()
+                    .map(|m| format!(" (mode {m})"))
+                    .unwrap_or_default()
+            ),
+            other_user.to_string(),
+        ),
+        (Some(owner), Some(_)) => (
+            format!(
+                "the socket is yours (uid {owner}) but its mode is {} — dirad creates it \
+                 0600, so something changed it, or a parent directory is not searchable",
+                mode_str.as_deref().unwrap_or("unknown")
+            ),
+            format!(
+                "Then restore the mode (`chmod 600 {path}`), or restart the daemon so it \
+                 recreates the socket: dira daemon restart"
+            ),
+        ),
+        _ => (
+            "its owner or mode could not be read — a parent directory may not be \
+             searchable by you, or the socket belongs to another user"
+                .to_string(),
+            other_user.to_string(),
+        ),
+    };
+    format!(
+        "the daemon's control socket refused this connection (permission denied on \
+         {path}): {diagnosis}.\n\
+         \n\
+         Check who owns it:\n\
+         \x20 ls -l {path}\n\
+         \n\
+         {remedy}\n\
+         \n\
+         Do NOT run `sudo dira daemon start` — a root-owned socket recreates the problem."
+    )
+}
+
+/// What `dira` should say when the windows control pipe answers with
+/// access-denied. Callers on any platform go through
+/// [`EndpointAccess::denied_advice`]; this stays public and platform-free so
+/// its wording is testable everywhere.
 ///
 /// `client_elevated` is *this* process's elevation, which flips the diagnosis:
 /// an unelevated client being refused almost always means the daemon is elevated,
@@ -188,6 +349,95 @@ mod tests {
         let advice = access_denied_advice(true);
         assert!(advice.contains("different user account"));
         assert!(!advice.contains("dira daemon stop"));
+    }
+
+    /// The bug this split exists for: a unix permission-denied socket was told
+    /// to go find an Administrator terminal. The unix arm must talk about
+    /// ownership and mode, name the path, and never mention elevation.
+    #[test]
+    fn the_unix_socket_advice_never_mentions_elevation() {
+        let a = EndpointAccess::UnixSocket {
+            path: "/run/user/501/dira/dira.sock".into(),
+            owner_uid: Some(0),
+            current_uid: Some(501),
+            mode: Some(0o600),
+        };
+        let advice = a.denied_advice();
+        assert!(!advice.contains("Administrator"), "{advice}");
+        assert!(!advice.to_lowercase().contains("elevat"), "{advice}");
+        assert!(
+            advice.contains("ls -l /run/user/501/dira/dira.sock"),
+            "{advice}"
+        );
+        assert!(advice.contains("uid 0"), "{advice}");
+        assert!(advice.contains("uid 501"), "{advice}");
+        assert!(advice.contains("0600"), "{advice}");
+        assert!(advice.contains("Do NOT run `sudo dira daemon start`"));
+        assert!(!a.client_elevated());
+    }
+
+    /// Same owner but refused: the mode (or a parent directory) is the
+    /// problem, not another user.
+    #[test]
+    fn a_socket_we_own_points_at_the_mode() {
+        let advice = unix_socket_denied_advice(
+            std::path::Path::new("/tmp/x.sock"),
+            Some(501),
+            Some(501),
+            Some(0o000),
+        );
+        assert!(advice.contains("is yours (uid 501)"), "{advice}");
+        assert!(advice.contains("0000"), "{advice}");
+        assert!(advice.contains("chmod 600 /tmp/x.sock"), "{advice}");
+        assert!(advice.contains("dira daemon restart"), "{advice}");
+        assert!(!advice.contains("another user (or"), "{advice}");
+    }
+
+    /// An unreadable owner still produces actionable advice with the path.
+    #[test]
+    fn an_unstattable_socket_still_names_the_path() {
+        let advice =
+            unix_socket_denied_advice(std::path::Path::new("/x/dira.sock"), None, Some(1), None);
+        assert!(advice.contains("ls -l /x/dira.sock"), "{advice}");
+        assert!(advice.contains("could not be read"), "{advice}");
+    }
+
+    /// The windows pipe keeps its elevation diagnosis, for both tokens.
+    #[test]
+    fn the_windows_pipe_keeps_the_elevation_advice() {
+        for elevated in [false, true] {
+            let a = EndpointAccess::WindowsPipe {
+                client_elevated: elevated,
+            };
+            assert_eq!(a.denied_advice(), access_denied_advice(elevated));
+            assert_eq!(a.client_elevated(), elevated);
+        }
+    }
+
+    /// The runtime selection: only a windows build ever produces the pipe
+    /// variant; a unix build reads the socket file and its own uid.
+    #[test]
+    fn probe_selects_this_platforms_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-socket");
+        std::fs::write(&path, b"").unwrap();
+        let a = EndpointAccess::probe(&path);
+        #[cfg(windows)]
+        assert!(matches!(a, EndpointAccess::WindowsPipe { .. }), "{a:?}");
+        #[cfg(unix)]
+        match a {
+            EndpointAccess::UnixSocket {
+                owner_uid,
+                current_uid,
+                mode,
+                ..
+            } => {
+                // We just created it, so we own it.
+                assert_eq!(owner_uid, current_uid);
+                assert!(mode.is_some());
+            }
+            other => panic!("unix must probe the socket file: {other:?}"),
+        }
     }
 
     /// It must not panic, and on non-windows it is definitionally false. No

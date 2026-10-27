@@ -54,12 +54,26 @@ pub fn classify(e: &std::io::Error) -> Reach {
     }
 }
 
-/// The user-facing message for a failed connect.
-pub fn connect_message(e: &std::io::Error) -> String {
-    match classify(e) {
-        Reach::Denied => {
-            dira_ipc::elevation::access_denied_advice(dira_ipc::elevation::is_elevated())
-        }
+/// The user-facing message for a failed connect to `socket`.
+///
+/// Only a refusal pays for the endpoint probe (a `stat` and a `geteuid` on
+/// unix, a token query on windows); every other arm is a fixed string.
+pub fn connect_message(e: &std::io::Error, socket: &Path) -> String {
+    reach_message(classify(e), e, || {
+        dira_ipc::elevation::EndpointAccess::probe(socket)
+    })
+}
+
+/// [`connect_message`] with the platform facts injected, so the selection is
+/// pinned by tests on every host: the windows elevation advice for a pipe, the
+/// ownership/mode advice for a unix socket (D-0016).
+fn reach_message(
+    reach: Reach,
+    e: &std::io::Error,
+    access: impl FnOnce() -> dira_ipc::elevation::EndpointAccess,
+) -> String {
+    match reach {
+        Reach::Denied => access().denied_advice(),
         Reach::Down => "daemon not running — start it with `dira daemon start`".to_string(),
         Reach::Busy => format!(
             "the daemon is busy and did not accept a connection in time ({e}) — \
@@ -90,7 +104,7 @@ pub async fn send_with_budget(
 ) -> Result<Response> {
     let mut stream = dira_ipc::connect_with_budget(socket, connect_budget)
         .await
-        .map_err(|e| anyhow!("{}", connect_message(&e)))?;
+        .map_err(|e| anyhow!("{}", connect_message(&e, socket)))?;
 
     let bytes = serde_json::to_vec(req)?;
     dira_ipc::write_frame(&mut stream, &bytes).await?;
@@ -176,6 +190,7 @@ async fn daemon_version(socket: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dira_ipc::elevation::EndpointAccess;
     use std::io::{Error, ErrorKind};
 
     /// Every skew message names a remedy, and never leaves the reader with a
@@ -227,16 +242,70 @@ mod tests {
     /// Following the old advice spawned a second daemon that died on
     /// `first_pipe_instance` *after* the CLI had overwritten the live pidfile.
     /// No denied-path message may ever suggest it again.
+    fn pipe(elevated: bool) -> EndpointAccess {
+        EndpointAccess::WindowsPipe {
+            client_elevated: elevated,
+        }
+    }
+
+    fn socket(owner: u32, me: u32) -> EndpointAccess {
+        EndpointAccess::UnixSocket {
+            path: "/run/user/501/dira/dira.sock".into(),
+            owner_uid: Some(owner),
+            current_uid: Some(me),
+            mode: Some(0o600),
+        }
+    }
+
     #[test]
     fn the_denied_message_never_advises_a_bare_daemon_start() {
-        let msg = connect_message(&Error::from_raw_os_error(5));
-        assert!(!msg.contains("start it with `dira daemon start`"));
-        assert!(msg.contains("access denied"));
+        let e = Error::from_raw_os_error(5);
+        for access in [pipe(false), pipe(true), socket(0, 501), socket(501, 501)] {
+            let msg = reach_message(classify(&e), &e, || access.clone());
+            assert!(!msg.contains("start it with `dira daemon start`"), "{msg}");
+            assert!(msg.contains("denied"), "{msg}");
+        }
+        // The real entry point too, on whatever host this runs.
+        let msg = connect_message(&e, Path::new("/nonexistent/dira.sock"));
+        assert!(!msg.contains("start it with `dira daemon start`"), "{msg}");
+    }
+
+    /// The elevation story belongs to the windows pipe alone. A unix socket
+    /// refused with EACCES is an ownership/mode problem, and the message says
+    /// so with the path and how to look at it.
+    #[test]
+    fn only_a_windows_pipe_gets_the_administrator_hint() {
+        let e = Error::new(ErrorKind::PermissionDenied, "denied");
+        let win = reach_message(Reach::Denied, &e, || pipe(false));
+        assert!(win.contains("Administrator"), "{win}");
+
+        let unix = reach_message(Reach::Denied, &e, || socket(0, 501));
+        assert!(!unix.contains("Administrator"), "{unix}");
+        assert!(!unix.to_lowercase().contains("elevat"), "{unix}");
+        assert!(
+            unix.contains("ls -l /run/user/501/dira/dira.sock"),
+            "{unix}"
+        );
+        assert!(unix.contains("owned by uid 0"), "{unix}");
+        assert!(unix.contains("you are uid 501"), "{unix}");
+    }
+
+    /// The probe is lazy: no other arm pays for a `stat` or a token query.
+    #[test]
+    fn only_a_refusal_probes_the_endpoint() {
+        let e = Error::new(ErrorKind::NotFound, "nope");
+        let msg = reach_message(classify(&e), &e, || {
+            panic!("a missing endpoint must not be probed")
+        });
+        assert!(msg.contains("dira daemon start"));
     }
 
     #[test]
     fn the_down_message_still_says_how_to_start() {
-        let msg = connect_message(&Error::new(ErrorKind::NotFound, "nope"));
+        let msg = connect_message(
+            &Error::new(ErrorKind::NotFound, "nope"),
+            Path::new("/x.sock"),
+        );
         assert!(msg.contains("dira daemon start"));
     }
 
@@ -244,7 +313,10 @@ mod tests {
     /// the user to an action we cannot justify.
     #[test]
     fn an_unknown_error_points_at_status_not_at_start() {
-        let msg = connect_message(&Error::new(ErrorKind::BrokenPipe, "boom"));
+        let msg = connect_message(
+            &Error::new(ErrorKind::BrokenPipe, "boom"),
+            Path::new("/x.sock"),
+        );
         assert!(msg.contains("dira daemon status"));
         assert!(!msg.contains("dira daemon start"));
     }

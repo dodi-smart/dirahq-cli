@@ -118,6 +118,10 @@ pub struct UpdateArgs {
     pub no_zavet: bool,
     /// Don't refresh this repo's committed cloud wiring after the update.
     pub no_cloud: bool,
+    /// With `check`: print [`check_json`] as one object on stdout instead of
+    /// the human line. Errors become `"status": "error"` in that object, so
+    /// stdout always parses.
+    pub json: bool,
 }
 
 /// A post-update step [`run`]'s success arm can take, as a value —
@@ -203,7 +207,7 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
         .context("build HTTP client")?;
 
     if args.check {
-        run_check(&http, args.version.as_deref(), channel).await;
+        run_check(&http, args.version.as_deref(), channel, args.json).await;
         return Ok(());
     }
 
@@ -603,28 +607,91 @@ fn check_message(resolved: &str, current: &str, channel: Channel) -> String {
     }
 }
 
+/// `--check`'s three-way verdict as a stable word — the same comparison
+/// [`check_message`] words for humans, so the two cannot disagree.
+fn check_status(resolved: &str, current: &str) -> &'static str {
+    match resolve::compare_versions(resolved, current) {
+        Some(std::cmp::Ordering::Greater) => "available",
+        Some(std::cmp::Ordering::Equal) => "up_to_date",
+        // Same reasoning as `check_message`: older, or unparseable, is never
+        // an offer.
+        _ => "ahead",
+    }
+}
+
+/// `dira update --check --json`: one object, snake_case keys. Pure so the
+/// shape is pinned by a test.
+///
+/// `resolved` is the resolve outcome: `Ok(version)` or `Err(message)`. An
+/// error is still one object on stdout (`"status": "error"`), and the process
+/// still exits 0 — the same contract as the text form, which prints the
+/// error to stderr.
+fn check_json(
+    current: &str,
+    channel: Channel,
+    version_pin: Option<&str>,
+    resolved: Result<&str, &str>,
+) -> serde_json::Value {
+    let (latest, status, error) = match resolved {
+        Ok(v) => (Some(v), check_status(v, current), None),
+        Err(e) => (None, "error", Some(e)),
+    };
+    serde_json::json!({
+        "current_version": current,
+        "channel": channel.label(),
+        "requested_version": version_pin,
+        "resolved_version": latest,
+        "status": status,
+        "update_available": status == "available",
+        "error": error,
+    })
+}
+
 /// `--check`: resolve only, write nothing to disk except (when not pinned to
 /// an exact version) a refresh of [`notice`]'s update-check cache, and exit
 /// 0 in every non-error case — including offline. Errors are printed to
 /// stderr, never propagated, so this stays safe to run speculatively (e.g.
 /// from [`notice::maybe_print`]'s detached background refresh).
-async fn run_check(http: &reqwest::Client, version_pin: Option<&str>, channel: Channel) {
+///
+/// With `json`, stdout carries exactly one [`check_json`] object in every
+/// case, errors included; nothing else is printed to stdout.
+async fn run_check(
+    http: &reqwest::Client,
+    version_pin: Option<&str>,
+    channel: Channel,
+    json: bool,
+) {
     let now = now_unix();
+    let current = env!("CARGO_PKG_VERSION");
+    let emit_json = |resolved: Result<&str, &str>| match serde_json::to_string_pretty(&check_json(
+        current,
+        channel,
+        version_pin,
+        resolved,
+    )) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("dira update --check: could not serialize: {e}"),
+    };
 
     let target = match artifact::detect_target() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("dira update --check: {e:#}");
+            if json {
+                emit_json(Err(&format!("{e:#}")));
+            } else {
+                eprintln!("dira update --check: {e:#}");
+            }
             return;
         }
     };
 
     match resolve::resolve(http, &target, version_pin, channel).await {
         Ok(resolved) => {
-            println!(
-                "{}",
-                check_message(&resolved.version, env!("CARGO_PKG_VERSION"), channel)
-            );
+            if json {
+                emit_json(Ok(&resolved.version));
+            } else {
+                println!("{}", check_message(&resolved.version, current, channel));
+            }
             // A pinned `--version` check isn't "the latest" — don't let it
             // clobber the passive notice's idea of what's current.
             if version_pin.is_none() {
@@ -632,7 +699,11 @@ async fn run_check(http: &reqwest::Client, version_pin: Option<&str>, channel: C
             }
         }
         Err(e) => {
-            eprintln!("dira update --check: {e:#}");
+            if json {
+                emit_json(Err(&format!("{e:#}")));
+            } else {
+                eprintln!("dira update --check: {e:#}");
+            }
             if version_pin.is_none() {
                 notice::record_check(now, None, channel.label(), Some(&e.to_string()));
             }
@@ -819,6 +890,37 @@ mod tests {
     // The bug these pin down: every one of these compared with `==` and read
     // any inequality as an upgrade, so a prerelease build announced — and then
     // installed — an older stable release.
+
+    /// `--check --json` agrees with the text verdict and always parses, even
+    /// for a failed resolve.
+    #[test]
+    fn check_json_has_the_documented_shape() {
+        let v = check_json("0.2.0", Channel::Stable, None, Ok("0.3.0"));
+        assert_eq!(v["current_version"], "0.2.0");
+        assert_eq!(v["channel"], "stable");
+        assert!(v["requested_version"].is_null());
+        assert_eq!(v["resolved_version"], "0.3.0");
+        assert_eq!(v["status"], "available");
+        assert_eq!(v["update_available"], true);
+        assert!(v["error"].is_null());
+
+        let v = check_json("0.2.0", Channel::Stable, None, Ok("0.2.0"));
+        assert_eq!(v["status"], "up_to_date");
+        assert_eq!(v["update_available"], false);
+
+        // Ahead of the channel is never an offer — the same bug
+        // `check_message_says_ahead_instead_of_offering_a_downgrade` pins.
+        let v = check_json("0.1.1-develop.1", Channel::Stable, None, Ok("0.1.0"));
+        assert_eq!(v["status"], "ahead");
+        assert_eq!(v["update_available"], false);
+
+        let v = check_json("0.2.0", Channel::Prerelease, Some("0.1.0"), Err("offline"));
+        assert_eq!(v["channel"], "prerelease");
+        assert_eq!(v["requested_version"], "0.1.0");
+        assert!(v["resolved_version"].is_null());
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"], "offline");
+    }
 
     #[test]
     fn check_message_offers_a_genuinely_newer_release() {

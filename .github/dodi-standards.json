@@ -70,6 +70,12 @@
       "template": "cra:SECURITY.template.md",
       "version": "1.36.0"
     },
+    "docs/security/incident-response.md": {
+      "kind": "filled",
+      "sha256": "bda9e8d17709289f49643eb36f4b9dc900b0fbf02a782a971dc61cf8a1b95248",
+      "template": "cra:incident-response.template.md",
+      "version": "1.36.2"
+    },
     "hk.pkl": {
       "kind": "seeded",
       "sha256": "a752ee02dd5883551b34d8d0da0e6a3dcdc9e3589b463a78a3b60da0694ef849",
@@ -100,5 +106,5 @@
   },
   "schema": 1,
   "stack": "rust",
-  "version": "1.36.0"
+  "version": "1.36.2"
 }

@@ -1,6 +1,6 @@
 ---
 title: Attestation sync and session rollups
-version: 10
+version: 11
 origin: session
 verified: false
 confidence: high
@@ -92,6 +92,27 @@ single flush window (issue #40).
   session. Best-effort: compaction prunes events that are both synced and
   past retention, so a session outliving retention rolls up from what
   remains (still a superset of the tail window).
+- Compaction (`Store::compact`) rolls synced events past retention into
+  `session_rollup_daily`, one row per UTC day and session, and deletes them.
+  It compacts whole UTC days only. The cutoff is aligned down to its UTC
+  midnight, and further down to the midnight of the oldest unsynced event's
+  day, so one bound serves both the selection and the delete. Reports add a
+  day's rollup rows to that day's raw events, so a day left part rollup and
+  part raw put one session in both. A mid-day cutoff now leaves that whole
+  day raw until the next sweep after its midnight.
+- A rollup row carries its day's `input_tokens`, `output_tokens` and
+  `est_cost`, summed from `token_usage` for the same session and UTC day
+  (`at` in `[day, day + 1)`, bound through `StoredAt`). Compaction keeps the
+  `token_usage` rows, which ride their own cursor (D-0018), so each pass
+  recomputes the sums and keeps them with `MAX`. Time and prompts still add
+  up across passes. Before this, every rollup row had zero tokens. A reader
+  that sums both tables counts a rollup's tokens only for a day with no
+  `token_usage` rows left for that session (`Store::zavet_session_totals`).
+- Rollup rows written before that are filled once at `Store::open`, after the
+  time-column rewrite, from whatever `token_usage` still holds for their day.
+  It is gated by the `meta` key `rollup_tokens_backfill_v1` in one
+  `BEGIN IMMEDIATE` transaction and only touches rows whose three token
+  columns are all zero.
 - "Ended" is decided from the window slice ONLY, never from history: a live
   session's history can carry stale `SessionEnd`s (Claude Code emits one on
   compaction), and a history-derived end would fabricate a false terminal

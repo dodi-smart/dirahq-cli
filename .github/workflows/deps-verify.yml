@@ -9,22 +9,23 @@
 #   ""                     = this repo has no such step
 name: Dependency Verification
 on:
+  # `labeled` is the manual re-run: apply `agent:review` to a Renovate PR. Do
+  # NOT close/reopen one, Renovate reads a closed PR as "don't want this update".
+  # No `opened`/`synchronize`: that run starts beside PR Checks and finds no
+  # verdict yet. Only a repo that builds here instead (no PR Checks caller, or
+  # `ci-workflow: ""`) adds `opened, synchronize, reopened` back.
   pull_request:
-    # `labeled` is the safe manual re-run: apply `agent:review` to a Renovate PR.
-    # Do NOT close/reopen one to re-trigger, Renovate reads a closed PR as
-    # "don't want this update" and stops recreating it.
-    types: [opened, synchronize, reopened, labeled]
-  # PR Checks finishing starts verification again with its verdict ready, so no
-  # job holds a runner while CI runs. `workflows:` must match the PR Checks
-  # caller's `name:`; `branches:` keeps human PRs from creating runs at all.
+    types: [labeled]
+  # PR Checks finishing starts verification with its verdict ready, so no job
+  # holds a runner while CI runs. `workflows:` must match the PR Checks caller's
+  # `name:`; `branches:` keeps human PRs from creating runs at all.
   workflow_run:
     workflows: [PR Checks]
     types: [completed]
     branches: ['renovate/**', 'dependabot/**']
 jobs:
   verify:
-    # Cheap pre-filter: the shared workflow gates again, but this avoids a
-    # hosted job start on every human push.
+    # Cheap pre-filter; the shared workflow gates again.
     if: >-
       (github.event_name == 'pull_request'
         && contains(fromJson('["renovate[bot]","app/renovate","dependabot[bot]"]'), github.event.pull_request.user.login)

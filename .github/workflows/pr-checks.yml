@@ -26,12 +26,12 @@ on:
     branches: [develop, main]
   workflow_dispatch:
 
-# A newer commit on the same pull request cancels the older run. Any other run
-# gets a group of its own, so a push run is never cancelled or left pending: each
-# one saves the cache for its own commit.
+# A newer commit on the same pull request cancels the older run. Push and
+# dispatch runs queue per branch and always finish, so each saves its cache, and
+# a burst of merges holds one running and one queued run, not a runner each.
 concurrency:
-  group: pr-checks-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:
@@ -80,3 +80,5 @@ jobs:
       # Knowledge layer: the decision checks are mostly `cargo test`.
       zavet: true
       zavet-stack: rust
+      dependency-check: true
+      dependency-check-fail-on: high

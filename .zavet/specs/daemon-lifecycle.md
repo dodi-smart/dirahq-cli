@@ -1,10 +1,10 @@
 ---
 title: Daemon startup and ingress lifecycle
-version: 6
+version: 7
 origin: session
 verified: false
 confidence: high
-date: 2026-08-09
+date: 2026-10-27
 paths:
   - cli/dirad/src/lib.rs
   - cli/dirad/src/control.rs
@@ -100,7 +100,12 @@ the interactive user entirely. That was a silent, total capture outage.
 - `dira daemon status` exits 0 when any daemon is running (healthy, degraded,
   or legacy) and 1 when none is; install.sh keys its restart-after-upgrade
   decision off this. `dira version` and `dira daemon status` both point at a
-  legacy daemon when the fixed socket is silent.
+  legacy daemon when the fixed socket is silent. Both take `--json` (one
+  object on stdout: `state` is up, unexpected, legacy, denied, busy or down);
+  the exit code is the same as the text form's.
+- A socket that refuses the client gets platform-true advice. Only a Windows
+  pipe talks about elevation and Administrator terminals (D-0016); a Unix
+  socket names its path, owner uid against the caller's, and its mode.
 
 ## Interfaces & data
 

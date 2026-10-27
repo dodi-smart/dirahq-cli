@@ -487,8 +487,13 @@ Install:
     #[command(after_help = "\
 Examples:
   dira version               CLI + daemon build, wire schema, uptime — and a
-                             warning when the CLI and daemon builds differ")]
-    Version,
+                             warning when the CLI and daemon builds differ
+  dira version --json        the same as one JSON object, for scripts")]
+    Version {
+        /// Emit one JSON object on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Diagnose whether capture is actually working.
     #[command(
         long_about = "\
@@ -550,6 +555,7 @@ that. Neither step ever creates artifacts a repo didn't already opt into.",
         after_help = "\
 Examples:
   dira update --check               is a newer release available?
+  dira update --check --json        the same as one JSON object, for scripts
   dira update                       update to the latest release, restart the daemon
   dira update --channel prerelease  opt into a prerelease build
   dira update --version 0.2.0       pin to (or downgrade to) an exact version
@@ -582,6 +588,9 @@ Examples:
         /// Don't refresh this repo's committed cloud wiring after the update.
         #[arg(long)]
         no_cloud: bool,
+        /// With --check: emit one JSON object on stdout instead of text.
+        #[arg(long, requires = "check")]
+        json: bool,
     },
     /// Zavet knowledge module: what the tracked time produced, and why.
     #[command(
@@ -910,9 +919,18 @@ Examples:
     /// Show whether this device is linked, the cloud URL, and the sync backlog.
     #[command(after_help = "\
 Reports the link state, the cloud this device talks to, and how many captured
-events are still waiting to be sent. A growing backlog with a linked device
-usually means the daemon can't reach the cloud — `dira doctor` diagnoses it.")]
-    Status,
+events (and token-usage rows) are still waiting to be sent. A growing backlog
+with a linked device usually means the daemon can't reach the cloud —
+`dira doctor` diagnoses it.
+
+Examples:
+  dira device status         linked? cloud URL? sync backlog?
+  dira device status --json  the same as one JSON object, for scripts")]
+    Status {
+        /// Emit one JSON object on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Rotate this device's signing key (new keypair, signed by the old key).
     #[command(long_about = "\
 Generate a new signing keypair and register it with the cloud, authenticated
@@ -1007,10 +1025,19 @@ launchd/systemd directly.")]
     /// Show whether the daemon is up (exit 0 if any daemon is running — even
     /// a pre-upgrade one; 1 if none).
     #[command(after_help = "\
-Exit 0 if any daemon answers, 1 if none does. A daemon running under a
-different user or an elevated token can refuse this connection and still be
-reported as down — `dira doctor` is what distinguishes those.")]
-    Status,
+Exit 0 if any daemon answers, 1 if none does — in both modes. A daemon
+running under a different user or an elevated token can refuse this
+connection and still be reported as down — `dira doctor` is what
+distinguishes those (`--json` reports it as \"state\": \"denied\").
+
+Examples:
+  dira daemon status         up? which socket? who supervises it?
+  dira daemon status --json  the same as one JSON object, for scripts")]
+    Status {
+        /// Emit one JSON object on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Install an OS service (launchd/systemd-user/scheduled task) so it survives reboots.
     #[command(long_about = "\
 Register the daemon with this machine's own service manager — launchd on
@@ -1186,11 +1213,21 @@ async fn main() -> Result<()> {
             return match action {
                 DaemonAction::Start => daemon::start(&config).await,
                 DaemonAction::Stop => daemon::stop(&config).await,
-                DaemonAction::Status => {
-                    let running = daemon::status(&config).await?;
-                    print_supervision(&config).await;
+                DaemonAction::Status { json } => {
+                    // `--json`: stdout carries exactly one object. The
+                    // breadcrumb is stderr (as with `dira status --json`); the
+                    // update notice is skipped to keep that explicit.
+                    let running = if *json {
+                        daemon::status_json_print(&config).await?
+                    } else {
+                        let running = daemon::status(&config).await?;
+                        print_supervision(&config).await;
+                        running
+                    };
                     hook_health::maybe_warn();
-                    update::notice::maybe_print(&config);
+                    if !*json {
+                        update::notice::maybe_print(&config);
+                    }
                     if !running {
                         std::process::exit(1);
                     }
@@ -1239,7 +1276,14 @@ async fn main() -> Result<()> {
             });
         }
         Command::Nuke { yes } => return nuke(&config, *yes).await,
-        Command::Version => {
+        Command::Version { json } => {
+            // `--json`: one object on stdout. The breadcrumb goes to stderr;
+            // the update notice is skipped, as `dira doctor --json` does.
+            if *json {
+                daemon::version_json_print(&config).await?;
+                hook_health::maybe_warn();
+                return Ok(());
+            }
             print_version(&config).await?;
             hook_health::maybe_warn();
             update::notice::maybe_print(&config);
@@ -1279,6 +1323,7 @@ async fn main() -> Result<()> {
             bin_dir,
             no_zavet,
             no_cloud,
+            json,
         } => {
             return update::run(
                 &config,
@@ -1291,6 +1336,7 @@ async fn main() -> Result<()> {
                     bin_dir: bin_dir.clone(),
                     no_zavet: *no_zavet,
                     no_cloud: *no_cloud,
+                    json: *json,
                 },
             )
             .await;
@@ -1302,7 +1348,7 @@ async fn main() -> Result<()> {
                     label,
                     runner_token,
                 } => device::link(&config, code.clone(), label.clone(), runner_token.clone()).await,
-                DeviceAction::Status => device::status(&config).await,
+                DeviceAction::Status { json } => device::status(&config, *json).await,
                 DeviceAction::RotateKey => device::rotate_key(&config).await,
                 DeviceAction::Unlink { yes } => device::unlink(&config, *yes).await,
                 DeviceAction::Resync { from } => device::resync(&config, from.clone()).await,
@@ -1511,7 +1557,7 @@ async fn main() -> Result<()> {
         | Command::Hook { .. }
         | Command::Nuke { .. }
         | Command::Completions { .. }
-        | Command::Version
+        | Command::Version { .. }
         | Command::Doctor { .. }
         | Command::Update { .. } => unreachable!(),
     };

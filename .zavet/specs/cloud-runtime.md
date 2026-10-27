@@ -1,10 +1,10 @@
 ---
 title: Cloud agent runtimes (teleport)
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
-date: 2026-09-09
+date: 2026-10-27
 paths:
   - cli/dira/src/cloud_init.rs
   - cli/dira/templates/
@@ -284,7 +284,8 @@ live wiring instead (DIRASH-0037).
   `timeout(2s)`; a TLS failure names `DIRA_EXTRA_CA_CERTS`, other transport
   failures name the egress allowlist, and the verdict is `warn`, never `fail`,
   on any transport error — an unreachable cloud is not broken local capture),
-  and `cloud.bootstrap` (artifact completeness + the version pin). Absent
+  and `cloud.bootstrap` (artifact completeness + the version pin; a pin
+  older than the installed dira warns and names `dira cloud refresh`). Absent
   evidence skips (DIRASH-0022); a VM without a runner token warns. The
   `hooks.scope_overlap` check (not cloud-specific, but load-bearing for the
   yield story above) judges the same harness-wiring facts `hooks.config`/

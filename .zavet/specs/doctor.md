@@ -1,25 +1,33 @@
 ---
 title: Diagnostics — dira doctor and the capture probe
-version: 5
+version: 6
 origin: session
 verified: false
 confidence: high
-date: 2026-10-12
+date: 2026-10-27
 paths:
   - cli/dira/src/doctor/**
   - cli/dirad/src/probe.rs
   - cli/dira/src/hook_health.rs
   - cli/dira/src/init.rs
-decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029, DIRASH-0033, DIRASH-0039]
+  - cli/ipc/src/elevation.rs
+decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0018, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029, DIRASH-0033, DIRASH-0039]
 checks:
   - a stale hook.sh warns and names dira onboard :: cargo test -p dira --bin dira -- doctor::checks::tests::a_stale_hook_sh_warns_with_onboard_as_the_remedy
   - a present but unwired harness config warns :: cargo test -p dira --bin dira -- doctor::checks::tests::a_present_but_unwired_harness_config_warns
   - an absent harness config is not a warning :: cargo test -p dira --bin dira -- doctor::checks::tests::an_absent_harness_config_is_not_a_warning
-  - an older pin is ok and names onboard :: cargo test -p dira --bin dira -- doctor::checks::tests::an_older_pin_is_ok_and_names_onboard
+  - an older pin warns and names cloud refresh :: cargo test -p dira --bin dira -- doctor::checks::tests::an_older_pin_warns_and_names_cloud_refresh
+  - no pin never reports a lag :: cargo test -p dira --bin dira -- doctor::checks::tests::no_pin_never_reports_a_lag
+  - a pin matching this dira is ok :: cargo test -p dira --bin dira -- doctor::checks::tests::a_pin_matching_this_dira_is_ok
   - a newer pin is ok and says so :: cargo test -p dira --bin dira -- doctor::checks::tests::a_newer_pin_is_ok_and_says_so
   - bootstrap completeness and the pin are judged together :: cargo test -p dira --bin dira -- doctor::checks::tests::bootstrap_artifacts_judge_completeness_and_read_the_pin
   - the generated template's pin reads back through the shared reader :: cargo test -p dira --bin dira -- doctor::checks::tests::the_pin_parser_reads_the_generated_template
   - a plain machine still skips every cloud check :: cargo test -p dira --bin dira -- doctor::checks::tests::a_plain_machine_skips_every_cloud_check
+  - denied never advises a bare daemon start, on either platform :: cargo test -p dira --bin dira -- doctor::checks::tests::denied_is_a_failure_and_never_advises_daemon_start
+  - only a windows pipe gets the Administrator hint :: cargo test -p dira --bin dira -- client::tests::only_a_windows_pipe_gets_the_administrator_hint
+  - the unix socket advice never mentions elevation :: cargo test -p dira-ipc -- elevation::tests::the_unix_socket_advice_never_mentions_elevation
+  - device.link reports pending token rows :: cargo test -p dira --bin dira -- doctor::checks::tests::device_link_reports_pending_token_rows
+  - a home-relative hook binary counts once :: cargo test -p dira --bin dira -- doctor::checks::tests::exe_path_counts_a_home_relative_binary_once
 ---
 
 ## Overview
@@ -52,10 +60,16 @@ harness's project-scope portable hook entries — is complete and current
 read-only snapshot rather than re-deriving any of it, so it cannot disagree
 with what `dira onboard` / `dira cloud init` consider done; every remedy it
 prints names `dira onboard` (with `dira cloud init` as the narrower
-alternative), and a stale version pin is folded into the `ok` summary as a
-note, never a `warn` — teammates on different `dira` versions committing the
-same repo must not all warn at each other over a pin that is merely older
-than the binary currently running `doctor`. A fourth, `hooks.scope_overlap`,
+alternative), and a version pin older than the installed `dira` is a `warn`
+whose remedy is `dira cloud refresh`: every cloud VM keeps installing the
+pinned version, and the post-update refresh (DIRASH-0038) only reaches the
+repo the update ran in, so other repos drift with nothing reporting it. The
+warning converges rather than ping-pongs between teammates on different
+versions: a pin only ever moves forward, so only whoever runs the newest
+`dira` sees it, and their refresh clears it for everyone. (Until version 6 of
+this spec a lagging pin was only a note in the `ok` summary, to keep teammates
+from warning at each other; that hid exactly the drift DIRASH-0038 exists
+to end.) A fourth, `hooks.scope_overlap`,
 judges the same harness-wiring facts `hooks.config`/`hooks.exe_path` read to
 say whether a harness wired at both project and global scope double-delivers
 or yields (see Behavior below).
@@ -83,12 +97,32 @@ or yields (see Behavior below).
   readable. That is the form people paste into an issue.
 - `daemon.reachable` distinguishes `Denied` from `Down`. A daemon that is
   running and refusing us must never be answered with a bare
-  `dira daemon start`; the remedy is `elevation::access_denied_advice`.
+  `dira daemon start`; the remedy is `elevation::EndpointAccess::denied_advice`,
+  judged from a gathered `Facts::endpoint`. The elevation / Administrator
+  advice is produced only for a windows pipe (D-0016). On unix a refused
+  socket is an ownership or mode problem on a `0600` file (D-0008), so the
+  remedy names the socket path, its owning uid against ours and its mode,
+  says how to check (`ls -l <path>`), and warns against `sudo dira daemon
+  start`. The `detail` keeps `client_elevated` on every platform (always
+  `false` off windows) and adds `socket_owner_uid`, `current_uid` and
+  `socket_mode` on unix — additive under DIRASH-0022's schema rule. The same
+  selection drives `client::connect_message` and `daemon::start`'s refusal.
 - `hooks.config` asks whether *a* dira hook entry exists, not whether it names
   *this* binary. It matches on the command's suffix, because the pre-upgrade
   unquoted form can contain spaces. Binary identity is `hooks.exe_path`'s
-  question, and it expands `$HOME`/`~` before testing existence, reporting
-  anything else as unverifiable rather than as a false alarm.
+  question, and it expands `$HOME`/`${HOME}`/`~` before de-duplicating and
+  before testing existence: one binary written two ways across configs is
+  one executable, not two installs competing for the hooks. `detail.executables`
+  lists the expanded paths. Anything it still cannot expand is reported as
+  unverifiable rather than as a false alarm.
+- `device.link` names the token-usage backlog alongside the event backlog.
+  Token rows ride their own rowid cursor (D-0018), so compute rows can sit
+  unsent behind a fully synced event stream; the summary then reads "linked,
+  0 event(s) and N token row(s) awaiting sync" instead of "0 event(s)". The
+  count is `Store::count_token_usage_after(META_TOKEN_CURSOR)`, the same read
+  the daemon's `Status.tokens_pending` makes, gathered by `device::probe`;
+  `detail` adds `tokens_pending` and `token_cursor`. A backlog is still `ok`,
+  never a finding on its own.
 - `hooks.scope_overlap` judges the same `Vec<HarnessWiring>` facts `hooks.config`/
   `hooks.exe_path` read. A scope counts as wired for a harness when that scope's
   file wires at least one of its events. When a harness is wired at both project
@@ -134,12 +168,13 @@ or yields (see Behavior below).
   harness with no config file at all is not a warning, because a repo may
   deliberately wire only one of `cloud_init::CLOUD_WIRABLE`. Every warning
   remedy names `dira onboard` first, `dira cloud init` as the narrower
-  alternative. Once none of that applies it is `ok`, naming the pinned
-  version; when the pin is older than the running binary the summary still
-  says so and names `dira onboard` as what would refresh it (a note, not a
-  warning — see Overview); when the pin is newer it says so too and stops
-  there, since a pin only ever moves forward and an older `dira` has nothing
-  to contribute. A `.gitattributes` that is missing or stale is also folded
+  alternative. A parseable pin older than the running binary then warns
+  (".dira/bootstrap.sh pins vX, behind this dira vY"), remedy
+  `dira cloud refresh` (or `dira onboard`) — see Overview. With no pin there
+  is no lag verdict: no `.dira/` skips, and a missing `bootstrap.sh` is the
+  missing-scripts warning. Otherwise it is `ok`, naming the pinned version;
+  when the pin is newer it says so too and stops there, since a pin only
+  ever moves forward and an older `dira` has nothing to contribute. A `.gitattributes` that is missing or stale is also folded
   into the `ok` summary as a trailing note rather than a warning: it only
   affects Windows checkouts.
 - Three `update.*` checks answer whether self-update is actually taking effect,
@@ -243,6 +278,8 @@ changing what a level means for an existing id, does.
   runtime or an explicit `--check cloud.reachability`, and never returns
   `fail`.** The D-0006 exemption is scoped to that one probe, not a general
   license for `dira doctor` to touch the network.
+- **The elevation / Administrator advice is windows-only.** A unix
+  permission-denied socket is diagnosed by owner and mode, never by elevation.
 - **No `cloud.*` or `hooks.scope_overlap` check ever returns `fail`.** Missing
   cloud provisioning, an unreachable cloud, stale `.dira/` artifacts, and a
   double-firing hook are all real findings, but none of them is lost local

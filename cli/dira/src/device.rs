@@ -44,7 +44,7 @@ use dira_contract::{
 };
 use dira_core::protocol::{Request, Response};
 use dira_core::signing::DeviceKey;
-use dira_core::sync::{META_CLOUD_WATERMARK, META_SYNC_CURSOR};
+use dira_core::sync::{META_CLOUD_WATERMARK, META_SYNC_CURSOR, META_TOKEN_CURSOR};
 use dira_core::{identity, Config, Store};
 use std::io::Write;
 use time::format_description::well_known::Rfc3339;
@@ -714,6 +714,13 @@ pub(crate) struct DeviceProbe {
     pub device_id: Option<String>,
     pub cursor: Option<String>,
     pub pending: u64,
+    /// The token-usage rowid cursor (`META_TOKEN_CURSOR`, D-0018). `None`
+    /// before the first token chunk is acked.
+    pub token_cursor: Option<i64>,
+    /// `token_usage` rows past [`DeviceProbe::token_cursor`] — the compute
+    /// backlog. Its own cursor, so it can be non-zero while `pending` is 0;
+    /// counted exactly the way the daemon's `Status` counts `tokens_pending`.
+    pub tokens_pending: u64,
     pub cloud_watermark: Option<String>,
     pub local_head: Option<String>,
     pub sync_health: Option<dira_core::sync::SyncHealth>,
@@ -731,10 +738,19 @@ pub(crate) async fn probe(store: &Store) -> Result<DeviceProbe> {
         .await?
         .filter(|s| !s.is_empty());
     let pending = store.count_events_after(cursor.as_deref()).await?;
+    // Same read as the daemon's `Status`: an unparseable or empty cursor counts
+    // every row, which is what an install that never acked a token chunk sees.
+    let token_cursor = store
+        .meta_get(META_TOKEN_CURSOR)
+        .await?
+        .and_then(|s| s.parse::<i64>().ok());
+    let tokens_pending = store.count_token_usage_after(token_cursor).await?;
     Ok(DeviceProbe {
         device_id: identity::device_id(store).await?,
         cursor,
         pending,
+        token_cursor,
+        tokens_pending,
         cloud_watermark: store
             .meta_get(META_CLOUD_WATERMARK)
             .await?
@@ -753,11 +769,22 @@ pub(crate) async fn probe(store: &Store) -> Result<DeviceProbe> {
 }
 
 /// `dira device status`: print linkage, cloud URL, and the un-synced backlog.
-pub async fn status(config: &Config) -> Result<()> {
+///
+/// `json` prints [`status_json`] as one object on stdout instead — the same
+/// facts, nothing else on stdout.
+pub async fn status(config: &Config, json: bool) -> Result<()> {
     let store = Store::open(&config.db_path)
         .await
         .with_context(|| format!("open store at {}", config.db_path.display()))?;
     let p = probe(&store).await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status_json(&p, config.cloud_url.as_deref()))?
+        );
+        return Ok(());
+    }
 
     match &p.device_id {
         Some(id) => println!("device:    linked ({id})"),
@@ -774,7 +801,7 @@ pub async fn status(config: &Config) -> Result<()> {
         Some(c) => println!("cursor:    {c}"),
         None => println!("cursor:    (none — nothing synced yet)"),
     }
-    println!("pending:   {} event(s) awaiting sync", p.pending);
+    println!("{}", pending_line(p.pending, p.tokens_pending));
 
     // Cloud coverage, from the watermark the daemon cached on its last flush.
     println!(
@@ -808,6 +835,49 @@ pub async fn status(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The `pending:` line. Token rows ride their own cursor (D-0018), so they are
+/// named only when there are some — an event-only line stays as it always was.
+fn pending_line(events: u64, tokens: u64) -> String {
+    if tokens == 0 {
+        format!("pending:   {events} event(s) awaiting sync")
+    } else {
+        format!("pending:   {events} event(s) and {tokens} token row(s) awaiting sync")
+    }
+}
+
+/// `dira device status --json`: one object, snake_case keys, the same facts
+/// the text form prints. Pure so the shape is pinned by a test.
+///
+/// Additive-only by convention, like `dira doctor --json`: a new key is free,
+/// renaming or removing one breaks scripts.
+pub(crate) fn status_json(p: &DeviceProbe, cloud_url: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "linked": p.device_id.is_some(),
+        "device_id": p.device_id,
+        "cloud_url": cloud_url,
+        "cursor": p.cursor,
+        "pending_events": p.pending,
+        "token_cursor": p.token_cursor,
+        "pending_tokens": p.tokens_pending,
+        "cloud_watermark": p.cloud_watermark,
+        "local_head": p.local_head,
+        "cloud_coverage": cloud_coverage(
+            p.cloud_watermark.as_deref(),
+            p.local_head.as_deref(),
+            p.pending,
+        )
+        .as_str(),
+        "sync_health": p.sync_health.as_ref().map(|h| serde_json::json!({
+            "consecutive_failures": h.consecutive_failures,
+            "last_error_kind": h.last_error_kind,
+            "backoff_secs": h.backoff_secs,
+            "last_attempt_at": h.last_attempt_at,
+            "last_success_at": h.last_success_at,
+        })),
+        "pending_rotation_at": p.pending_rotation_at,
+    })
 }
 
 /// The `rotation:` line for an unresolved two-phase rotation. Pure, so the
@@ -876,21 +946,58 @@ fn resync_lines(pending: u64, pending_tokens: u64, from: Option<&str>) -> Vec<St
 /// cached watermark (a batch ULID, timestamp-stamped with the latest event it
 /// covers) against the local event head to judge drift. Pure, so it's unit-testable.
 fn cloud_status_line(cloud_wm: Option<&str>, local_head: Option<&str>, pending: u64) -> String {
+    match (cloud_coverage(cloud_wm, local_head, pending), cloud_wm) {
+        (Coverage::Behind, _) => {
+            "cloud:     behind — cloud is missing data; run `dira device resync`".into()
+        }
+        (Coverage::InSync, Some(wm)) => format!("cloud:     in sync (watermark {wm})"),
+        (Coverage::Queued, _) => {
+            format!("cloud:     {pending} event(s) queued for the next sync")
+        }
+        (Coverage::NoHandshake, _) | (Coverage::InSync, None) => {
+            "cloud:     (no handshake yet — sync at least once)".into()
+        }
+    }
+}
+
+/// [`cloud_status_line`]'s verdict as a value, so `--json` carries the same
+/// judgement as the text without re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coverage {
+    NoHandshake,
+    /// The cloud persisted noticeably less than the local head while nothing
+    /// is queued ⇒ a silent gap the reconciler/epoch didn't cover; resync
+    /// forces it.
+    Behind,
+    InSync,
+    Queued,
+}
+
+impl Coverage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Coverage::NoHandshake => "no_handshake",
+            Coverage::Behind => "behind",
+            Coverage::InSync => "in_sync",
+            Coverage::Queued => "queued",
+        }
+    }
+}
+
+fn cloud_coverage(cloud_wm: Option<&str>, local_head: Option<&str>, pending: u64) -> Coverage {
     let Some(wm) = cloud_wm else {
-        return "cloud:     (no handshake yet — sync at least once)".into();
+        return Coverage::NoHandshake;
     };
-    // The cloud persisted noticeably less than the local head while nothing is
-    // queued ⇒ a silent gap the reconciler/epoch didn't cover; resync forces it.
     let behind = matches!(
         (Ulid::from_string(wm), local_head.and_then(|h| Ulid::from_string(h).ok())),
         (Ok(w), Some(h)) if w.timestamp_ms() + 1000 < h.timestamp_ms()
     ) && pending == 0;
     if behind {
-        "cloud:     behind — cloud is missing data; run `dira device resync`".into()
+        Coverage::Behind
     } else if pending == 0 {
-        format!("cloud:     in sync (watermark {wm})")
+        Coverage::InSync
     } else {
-        format!("cloud:     {pending} event(s) queued for the next sync")
+        Coverage::Queued
     }
 }
 
@@ -1217,6 +1324,76 @@ mod tests {
         let queued = cloud_status_line(Some(&old), Some(&new), 5);
         assert!(queued.contains("5 event(s) queued"), "{queued}");
         assert!(!queued.contains("resync"), "{queued}");
+    }
+
+    /// `--json` carries every fact the text form prints, under stable
+    /// snake_case keys, including the token backlog the text names.
+    #[test]
+    fn status_json_has_the_documented_shape() {
+        let head = ulid::Ulid::from_parts(9_000_000, 0).to_string();
+        let p = DeviceProbe {
+            device_id: Some("dev_1".into()),
+            cursor: Some(head.clone()),
+            pending: 0,
+            token_cursor: Some(41),
+            tokens_pending: 7,
+            cloud_watermark: Some(head.clone()),
+            local_head: Some(head.clone()),
+            sync_health: Some(dira_core::sync::SyncHealth {
+                consecutive_failures: 2,
+                last_error_kind: Some("transient".into()),
+                backoff_secs: 30,
+                ..Default::default()
+            }),
+            pending_rotation_at: None,
+        };
+        let v = status_json(&p, Some("https://api.dira.sh"));
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        for k in [
+            "linked",
+            "device_id",
+            "cloud_url",
+            "cursor",
+            "pending_events",
+            "token_cursor",
+            "pending_tokens",
+            "cloud_watermark",
+            "local_head",
+            "cloud_coverage",
+            "sync_health",
+            "pending_rotation_at",
+        ] {
+            assert!(keys.contains(&k), "missing {k}: {v}");
+        }
+        assert_eq!(v["linked"], true);
+        assert_eq!(v["pending_events"], 0);
+        assert_eq!(v["pending_tokens"], 7);
+        assert_eq!(v["token_cursor"], 41);
+        assert_eq!(v["cloud_coverage"], "in_sync");
+        assert_eq!(v["sync_health"]["consecutive_failures"], 2);
+        assert_eq!(v["sync_health"]["last_error_kind"], "transient");
+
+        let unlinked = DeviceProbe {
+            device_id: None,
+            sync_health: None,
+            cloud_watermark: None,
+            ..p
+        };
+        let v = status_json(&unlinked, None);
+        assert_eq!(v["linked"], false);
+        assert!(v["cloud_url"].is_null());
+        assert!(v["sync_health"].is_null());
+        assert_eq!(v["cloud_coverage"], "no_handshake");
+    }
+
+    /// Token rows are named only when there are some; the event-only line is
+    /// unchanged.
+    #[test]
+    fn the_pending_line_names_token_rows_only_when_present() {
+        assert_eq!(pending_line(3, 0), "pending:   3 event(s) awaiting sync");
+        let both = pending_line(0, 12);
+        assert!(both.contains("0 event(s)"), "{both}");
+        assert!(both.contains("12 token row(s)"), "{both}");
     }
 
     /// The full runner-token link path, end to end against a mock cloud: no

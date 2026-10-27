@@ -1,10 +1,10 @@
 ---
 title: Distribution and self-update
-version: 10
+version: 11
 origin: session
 verified: false
 confidence: high
-date: 2026-09-09
+date: 2026-10-27
 paths:
   - install.sh
   - install.ps1
@@ -13,7 +13,7 @@ paths:
   - cli/dira/src/daemon.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038]
 checks:
   - the post-update steps honour --no-zavet and --no-cloud :: cargo test -p dira --bin dira -- update::tests::post_update_steps_honour_no_zavet_and_no_cloud
   - refresh never creates artifacts and never lowers a pin :: cargo test -p dira --bin dira -- cloud_init::tests::refresh_never_creates_artifacts_and_never_downgrades
@@ -21,6 +21,9 @@ checks:
   - cloud refresh bumps an older pin and lists other stale repos :: cargo test -p dira --test cloud_init_e2e cloud_refresh_bumps_an_older_pin_and_lists_other_stale_repos
   - a repo without .dira/ is a silent no-op :: cargo test -p dira --test cloud_init_e2e cloud_refresh_outside_a_wired_repo_is_a_silent_noop
   - a newer pin is left alone :: cargo test -p dira --test cloud_init_e2e cloud_refresh_never_lowers_a_newer_pin
+  - update --check --json agrees with the text verdict and always parses :: cargo test -p dira --bin dira -- update::tests::check_json_has_the_documented_shape
+  - version --json names both builds and both comparisons :: cargo test -p dira --bin dira -- daemon::probe_tests::version_json_has_the_documented_shape
+  - daemon status --json keeps the install.sh running contract :: cargo test -p dira --bin dira -- daemon::probe_tests::status_json_has_the_documented_shape
 ---
 
 ## Overview
@@ -130,7 +133,23 @@ both executables and restarts whatever is supervising the daemon.
 - `dira update` resolves → downloads → verifies → swaps → restarts, then
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
-  is safe in a script.
+  is safe in a script. `--check --json` (`--json` requires `--check`) prints
+  exactly one object on stdout in every case, a failed resolve included, so a
+  script can parse stdout unconditionally; it still exits 0. Its `status` is
+  the same three-way `compare_versions` verdict the text line words
+  (`available` / `up_to_date` / `ahead`), plus `error`:
+
+  ```json
+  {
+    "channel": "stable",
+    "current_version": "0.11.1-develop.2",
+    "error": null,
+    "requested_version": null,
+    "resolved_version": "0.11.0",
+    "status": "ahead",
+    "update_available": false
+  }
+  ```
 - After a successful swap-and-restart, `dira update` also spawns the freshly
   installed `bin_dir/dira cloud refresh --after-update` (DIRASH-0038): it
   refreshes the *cwd repo's* committed cloud wiring (`.dira/hook.sh` +
@@ -267,6 +286,35 @@ both executables and restarts whatever is supervising the daemon.
   `install.sh` keys its post-upgrade restart decision off that exit code, so
   a legacy daemon must count as "running" (a restart will migrate it) rather
   than "down" (which would make install.sh skip the restart and strand it).
+  `--json` prints one object (`running`, `state`, `degraded`, `socket`,
+  `legacy_socket`, `supervision`, `supervision_label`, `daemon`) and keeps the
+  same exit code. `state` is `up` / `unexpected` / `legacy` / `denied` /
+  `busy` / `down`: a refusing daemon is `denied`, never `down` (D-0016).
+- `dira version --json` prints one object with the same facts as the text:
+  this CLI's `version` and `schema_version`, `daemon_state`, the daemon's
+  self-report under `daemon` (or `null`), `legacy_socket`, and the two
+  comparisons the text warns about, `version_skew` (bool) and
+  `store_divergence` (`{cli_db_path, daemon_db_path}` or `null`). A daemon too
+  old or too absent to say yields `false`/`null`, never an invented finding:
+
+  ```json
+  {
+    "daemon": { "version": "0.11.0", "schema_version": "1.8.0", "pid": 4242,
+                "uptime_seconds": 3600, "db_path": "/Users/u/.local/share/dira/dira.db",
+                "http_ingress_error": null, "control_channel_warning": null,
+                "storage_warning": null },
+    "daemon_state": "up",
+    "legacy_socket": null,
+    "schema_version": "1.8.0",
+    "store_divergence": null,
+    "version": "0.11.1-develop.2",
+    "version_skew": true
+  }
+  ```
+- Every `--json` above follows `dira doctor --json`'s stdout rule
+  (DIRASH-0022): stdout carries exactly one object. The hook breadcrumb stays
+  on stderr and the passive update notice is skipped. Keys are snake_case and
+  additive-only: a new key is free, a rename or removal breaks scripts.
 
 ## Interfaces & data
 

@@ -149,7 +149,7 @@ pub async fn start(config: &Config) -> Result<()> {
     if reach(config).await == client::Reach::Denied {
         anyhow::bail!(
             "{}",
-            dira_ipc::elevation::access_denied_advice(dira_ipc::elevation::is_elevated())
+            dira_ipc::elevation::EndpointAccess::probe(&config.socket_path).denied_advice()
         );
     }
     let bin = locate_dirad();
@@ -678,6 +678,137 @@ async fn status_with(config: &Config, legacy_sock: &Path) -> Result<bool> {
     let probe = probe_with(config, legacy_sock).await;
     println!("{}", probe.status_line(&config.socket_path));
     Ok(probe.running())
+}
+
+/// `dira daemon status --json`: [`status_json`] as one object on stdout.
+/// Returns [`DaemonProbe::running`], so the exit code contract install.sh keys
+/// off is the same in both modes.
+pub async fn status_json_print(config: &Config) -> Result<bool> {
+    let probe = probe(config).await;
+    let supervision = detect_supervision(config).await;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status_json(&probe, &config.socket_path, &supervision))?
+    );
+    Ok(probe.running())
+}
+
+/// `dira version --json`: [`version_json`] as one object on stdout.
+pub async fn version_json_print(config: &Config) -> Result<()> {
+    let probe = probe(config).await;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&version_json(
+            env!("CARGO_PKG_VERSION"),
+            dira_contract::SCHEMA_VERSION,
+            &probe,
+            &config.db_path,
+        ))?
+    );
+    Ok(())
+}
+
+/// One word for how the daemon answered, shared by both `--json` shapes.
+///
+/// `denied` and `busy` are kept apart from `down` for the same reason
+/// [`client::Reach`] is: a daemon that is running and refusing us is the
+/// opposite of one that is absent (D-0016).
+pub(crate) fn daemon_state(p: &DaemonProbe) -> &'static str {
+    if p.unexpected {
+        return "unexpected";
+    }
+    if p.info.is_some() || p.answered_ping {
+        return "up";
+    }
+    if p.legacy.is_some() {
+        return "legacy";
+    }
+    match p.reach {
+        client::Reach::Denied => "denied",
+        client::Reach::Busy => "busy",
+        client::Reach::Up | client::Reach::Down | client::Reach::Other => "down",
+    }
+}
+
+/// The machine-readable kind of a supervision state (the human form is
+/// [`supervision_label`]).
+pub(crate) fn supervision_kind(s: &Supervision) -> &'static str {
+    match s {
+        Supervision::Launchd => "launchd",
+        Supervision::SystemdUser => "systemd_user",
+        Supervision::ScheduledTask => "scheduled_task",
+        Supervision::Pidfile(_) => "pidfile",
+        Supervision::Socket(_) => "socket",
+        Supervision::LegacySocket { .. } => "legacy_socket",
+        Supervision::NotRunning => "not_running",
+    }
+}
+
+/// The daemon's self-report as JSON, or `null` when it did not answer
+/// `DaemonInfo`.
+fn info_json(i: Option<&Info>) -> serde_json::Value {
+    match i {
+        Some(i) => serde_json::json!({
+            "version": i.version,
+            "schema_version": i.schema_version,
+            "pid": i.pid,
+            "uptime_seconds": i.uptime_seconds,
+            "db_path": i.db_path,
+            "http_ingress_error": i.http_ingress_error,
+            "control_channel_warning": i.control_channel_warning,
+            "storage_warning": i.storage_warning,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// `dira daemon status --json`. Pure so the shape is pinned by a test.
+/// Additive-only, like `dira doctor --json`: new keys are free, renames are
+/// breaking.
+pub(crate) fn status_json(
+    p: &DaemonProbe,
+    sock: &Path,
+    supervision: &Supervision,
+) -> serde_json::Value {
+    serde_json::json!({
+        "running": p.running(),
+        "state": daemon_state(p),
+        "degraded": p.info.as_ref().is_some_and(|i| i.http_ingress_error.is_some()),
+        "socket": sock.display().to_string(),
+        "legacy_socket": p.legacy.as_ref().map(|l| l.display().to_string()),
+        "supervision": supervision_kind(supervision),
+        "supervision_label": supervision_label(supervision),
+        "daemon": info_json(p.info.as_ref()),
+    })
+}
+
+/// `dira version --json`. Pure so the shape is pinned by a test.
+///
+/// `version_skew` and `store_divergence` are the same comparisons the text
+/// form prints as warnings; both are `false`/`null` when the daemon is too
+/// old (or too absent) to say, because an unknown is not a finding.
+pub(crate) fn version_json(
+    cli: &str,
+    schema: &str,
+    p: &DaemonProbe,
+    cli_db: &Path,
+) -> serde_json::Value {
+    let info = p.info.as_ref();
+    serde_json::json!({
+        "version": cli,
+        "schema_version": schema,
+        "daemon_state": daemon_state(p),
+        "daemon": info_json(info),
+        "legacy_socket": p.legacy.as_ref().map(|l| l.display().to_string()),
+        "version_skew": info.is_some_and(|i| version_skew_line(cli, &i.version).is_some()),
+        "store_divergence": info
+            .and_then(|i| i.db_path.as_deref())
+            .filter(|d| store_divergence_line(cli_db, Some(d)).is_some())
+            .map(|d| serde_json::json!({
+                "cli_db_path": cli_db.display().to_string(),
+                "daemon_db_path": d,
+            })),
+    })
 }
 
 /// Write and load an OS service so the daemon survives reboots.
@@ -1689,6 +1820,89 @@ mod probe_tests {
             probe_of(None, false, None).status_line(sock),
             down_message(None)
         );
+    }
+
+    /// `dira daemon status --json` carries what the text prints, plus the
+    /// machine-readable supervision kind, under stable snake_case keys.
+    #[test]
+    fn status_json_has_the_documented_shape() {
+        let sock = Path::new("/run/dira.sock");
+        let mut degraded = info("0.3.0");
+        degraded.http_ingress_error = Some("port busy".into());
+        let v = status_json(
+            &probe_of(Some(degraded), true, None),
+            sock,
+            &Supervision::Launchd,
+        );
+        assert_eq!(v["running"], true);
+        assert_eq!(v["state"], "up");
+        assert_eq!(v["degraded"], true);
+        assert_eq!(v["socket"], "/run/dira.sock");
+        assert!(v["legacy_socket"].is_null());
+        assert_eq!(v["supervision"], "launchd");
+        assert_eq!(v["supervision_label"], "launchd");
+        assert_eq!(v["daemon"]["version"], "0.3.0");
+        assert_eq!(v["daemon"]["pid"], 1);
+        assert_eq!(v["daemon"]["http_ingress_error"], "port busy");
+
+        let down = status_json(&probe_of(None, false, None), sock, &Supervision::NotRunning);
+        assert_eq!(down["running"], false);
+        assert_eq!(down["state"], "down");
+        assert_eq!(down["supervision"], "not_running");
+        assert!(down["supervision_label"].is_null());
+        assert!(down["daemon"].is_null());
+
+        let legacy = status_json(
+            &probe_of(None, false, Some(PathBuf::from("/tmp/dira.sock"))),
+            sock,
+            &Supervision::NotRunning,
+        );
+        assert_eq!(legacy["running"], true, "legacy counts as running (W1)");
+        assert_eq!(legacy["state"], "legacy");
+        assert_eq!(legacy["legacy_socket"], "/tmp/dira.sock");
+    }
+
+    /// A refusing daemon is `denied`, never `down` (D-0016).
+    #[test]
+    fn a_refusing_daemon_is_denied_not_down() {
+        let mut p = probe_of(None, false, None);
+        p.reach = client::Reach::Denied;
+        assert_eq!(daemon_state(&p), "denied");
+        p.reach = client::Reach::Busy;
+        assert_eq!(daemon_state(&p), "busy");
+    }
+
+    /// `dira version --json` names both builds and the two comparisons the
+    /// text form warns about.
+    #[test]
+    fn version_json_has_the_documented_shape() {
+        let cli_db = Path::new("/home/u/.local/share/dira/dira.db");
+        let mut i = info("0.3.0");
+        i.db_path = Some("/var/root/dira.db".into());
+        let v = version_json("0.4.0", "1.5.0", &probe_of(Some(i), true, None), cli_db);
+        assert_eq!(v["version"], "0.4.0");
+        assert_eq!(v["schema_version"], "1.5.0");
+        assert_eq!(v["daemon_state"], "up");
+        assert_eq!(v["daemon"]["version"], "0.3.0");
+        assert_eq!(v["daemon"]["schema_version"], "3");
+        assert_eq!(v["version_skew"], true);
+        assert_eq!(v["store_divergence"]["daemon_db_path"], "/var/root/dira.db");
+        assert_eq!(
+            v["store_divergence"]["cli_db_path"],
+            "/home/u/.local/share/dira/dira.db"
+        );
+
+        let mut same = info("0.4.0");
+        same.db_path = Some(cli_db.display().to_string());
+        let v = version_json("0.4.0", "1.5.0", &probe_of(Some(same), true, None), cli_db);
+        assert_eq!(v["version_skew"], false);
+        assert!(v["store_divergence"].is_null());
+
+        // Not running: no daemon object, no invented skew.
+        let v = version_json("0.4.0", "1.5.0", &probe_of(None, false, None), cli_db);
+        assert_eq!(v["daemon_state"], "down");
+        assert!(v["daemon"].is_null());
+        assert_eq!(v["version_skew"], false);
     }
 
     #[test]

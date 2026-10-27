@@ -198,11 +198,13 @@ pub(crate) struct Facts {
     /// stays a pure function of already-gathered facts.
     pub cwd: Option<String>,
     pub project: Result<String, dira_core::project::ProjectMiss>,
-    /// Is THIS process elevated? Gathered rather than probed inside a judge:
-    /// the advice for a refused channel differs by it, and a judge that asks
-    /// the OS is a judge whose verdict changes with the host it runs on — which
-    /// is exactly how the Windows arm escapes its own tests.
-    pub doctor_elevated: bool,
+    /// What the control endpoint looks like to THIS process: the windows
+    /// pipe and this token's elevation, or the unix socket file's owner and
+    /// mode against our uid. Gathered rather than probed inside a judge: the
+    /// advice for a refused channel differs by it, and a judge that asks the OS
+    /// is a judge whose verdict changes with the host it runs on — which is
+    /// exactly how the Windows arm escapes its own tests.
+    pub endpoint: dira_ipc::elevation::EndpointAccess,
     /// What the update-check cache knows, and where an update would land.
     pub update: UpdateFacts,
     /// Cloud-runtime facts: detected runtime, provisioning env, committed
@@ -404,7 +406,7 @@ async fn gather(config: &Config, args: &Args) -> Facts {
         hooks: checks::read_harness_wiring(),
         breadcrumb: crate::hook_health::snapshot(),
         current_exe: Some(crate::init::dira_exe_path()),
-        doctor_elevated: dira_ipc::elevation::is_elevated(),
+        endpoint: dira_ipc::elevation::EndpointAccess::probe(&config.socket_path),
         store_write,
         device,
     }

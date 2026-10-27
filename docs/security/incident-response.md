@@ -1,12 +1,12 @@
 # Security incident and vulnerability response
 
-How {{MANUFACTURER}} handles an actively exploited vulnerability or a severe
-security incident in {{PRODUCT}}, including the reports the EU Cyber
+How DODI SMART Ltd. handles an actively exploited vulnerability or a severe
+security incident in the Dira CLI (`dira` and `dirad`), including the reports the EU Cyber
 Resilience Act (Regulation (EU) 2024/2847, Article 14) requires. Article 14 has
 applied since **11 September 2026**, to products already on the market as well.
 
 Keep this file short enough to follow under pressure. Product-specific details
-live in the CRA architecture document: {{CRA_DOC_PATH}}.
+live in the CRA architecture document: `docs/cra/dirahq-cli-cra.html` (not written yet).
 
 ## Roles
 
@@ -15,18 +15,18 @@ but every role needs a named deputy.
 
 | Role | Responsibility | Person | Deputy |
 |---|---|---|---|
-| Incident lead | Declares the incident, runs the response, decides on containment | {{INCIDENT_LEAD}} | {{INCIDENT_LEAD_DEPUTY}} |
-| Reporter of record | Decides whether it is reportable and submits the CRA reports | {{REPORTER}} | {{REPORTER_DEPUTY}} |
-| Communications | Tells affected customers, partners and users | {{COMMS}} | {{COMMS_DEPUTY}} |
+| Incident lead | Declares the incident, runs the response, decides on containment | Asen Lekov | Asen Lekov |
+| Reporter of record | Decides whether it is reportable and submits the CRA reports | Asen Lekov | Asen Lekov |
+| Communications | Tells affected customers, partners and users | Asen Lekov | Asen Lekov |
 
 ## Contacts
 
 | Who | How |
 |---|---|
 | Security mailbox (incoming reports) | asen.lekov@dodi.li |
-| ENISA Single Reporting Platform | {{ENISA_SRP_ACCOUNT}} |
-| CSIRT designated as coordinator | {{CSIRT_COORDINATOR}} (the Member State of the manufacturer's main establishment) |
-| Hosting providers' security support | {{PROVIDER_CONTACTS}} |
+| ENISA Single Reporting Platform | Not registered yet |
+| CSIRT designated as coordinator | CERT Bulgaria, Bulgaria's national CSIRT, https://www.govcert.bg (the Member State of the manufacturer's main establishment) |
+| Hosting providers' security support | GitHub (source, CI, release binaries): https://hackerone.com/github; Vercel (serves the installers at dirahq.sh): https://hackerone.com/vercel or responsible.disclosure@vercel.com |
 
 ## Is it reportable?
 
@@ -79,7 +79,15 @@ unnecessary costs much less than a missed deadline.
 List the controls this product has, cheapest first, so nobody has to find them
 during an incident.
 
-{{CONTAINMENT_CONTROLS}}
+1. **Withdraw a bad release.** Mark it as a prerelease or delete it on GitHub.
+   `install.sh`, `install.ps1` and `dira update` on the stable channel resolve
+   `releases/latest`, so they stop offering it.
+2. **Roll users back.** `dira update --version <last good>` downgrades in place.
+3. **Roll back the installers.** They are served from the `dirahq-landing` Vercel
+   project: use its instant rollback, then run that repo's Installer Drift
+   workflow to confirm the served scripts match `main` here.
+4. **Stop a device's syncs being accepted** in Dira cloud: revoke its runner
+   token there. Revocation fails closed, and the device gets `403 runner_revoked`.
 
 ## Evidence
 

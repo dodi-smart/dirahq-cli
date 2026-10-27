@@ -7,15 +7,17 @@
 //! one length-prefixed JSON request and gets one length-prefixed JSON response.
 
 use crate::events::{handle_of, manual_event, materialize_interval};
-use crate::state::{AppState, EventMsg};
+use crate::state::{AppState, EventMsg, LiveSession};
 use dira_core::accounting;
 use dira_core::model::{EventKind, RawEvent};
 use dira_core::project;
 use dira_core::protocol::{
-    BillingView, ComputeView, ReportScope, Request, Response, SessionView, StatusView,
-    StopSelector, SyncHealthView, WriterHealthView,
+    BillingView, ComputeView, ReportScope, Request, Response, SessionTokens, SessionView,
+    StatusView, StopSelector, SyncHealthView, WriterHealthView,
 };
 use dira_core::report;
+use dira_core::store::TokenTotals;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use time::{Duration, OffsetDateTime};
@@ -556,7 +558,22 @@ async fn status(state: &AppState) -> Response {
         .await
         .unwrap_or_default();
     let today = report::build(&events, state.config.idle(), state.config.agent_policy());
-    let active = build_session_views(state, &events, true);
+    let session_tokens = state
+        .store
+        .token_totals_by_session_since(since)
+        .await
+        .unwrap_or_default();
+    let (live, ended_children) = {
+        let reg = lock_recover(&state.sessions);
+        let live = reg.active(
+            OffsetDateTime::now_utc(),
+            state.config.session_stale_after(),
+        );
+        let children = run_children(&live, reg.all(), &events);
+        (live, children)
+    };
+    let active = build_session_views(state, &events, &session_tokens, live);
+    let run_children = build_session_views(state, &events, &session_tokens, ended_children);
     // Un-synced backlog: events past the confirmed sync cursor.
     let cursor = state
         .store
@@ -650,6 +667,7 @@ async fn status(state: &AppState) -> Response {
     };
     Response::Status(Box::new(StatusView {
         active,
+        run_children,
         today,
         sync_pending,
         tokens_pending,
@@ -662,13 +680,20 @@ async fn status(state: &AppState) -> Response {
 }
 
 async fn sessions(state: &AppState) -> Response {
+    let since = start_of_today(state);
     let events = state
         .store
-        .events_since(Some(start_of_today(state)))
+        .events_since(Some(since))
         .await
         .unwrap_or_default();
+    let session_tokens = state
+        .store
+        .token_totals_by_session_since(since)
+        .await
+        .unwrap_or_default();
+    let live = lock_recover(&state.sessions).all();
     Response::Sessions {
-        sessions: build_session_views(state, &events, false),
+        sessions: build_session_views(state, &events, &session_tokens, live),
     }
 }
 
@@ -715,19 +740,56 @@ async fn report_cmd(state: &AppState, scope: ReportScope) -> Response {
     ))
 }
 
-/// Build session views, optionally only active ones.
+/// The listed sessions' descendants that are no longer live but did something
+/// inside the window (`events`), so a listed run keeps its children after they
+/// end (#182). `runs::group` only sees the sessions it is handed; without these
+/// a run whose children had ended showed only its direct repos. Lifecycle-only
+/// sessions stay out, as they do from `active` (#74).
+pub(crate) fn run_children(
+    listed: &[LiveSession],
+    all: Vec<LiveSession>,
+    events: &[RawEvent],
+) -> Vec<LiveSession> {
+    let in_window: HashSet<&str> = events.iter().map(|e| e.session_id.as_str()).collect();
+    let mut ids: HashSet<String> = listed.iter().map(|s| s.session_id.clone()).collect();
+    let mut pool: Vec<LiveSession> = all
+        .into_iter()
+        .filter(|s| {
+            s.had_signal
+                && !ids.contains(&s.session_id)
+                && in_window.contains(s.session_id.as_str())
+        })
+        .collect();
+    let mut out = Vec::new();
+    // Nested fan-outs are one or two levels deep; the bound only stops a
+    // corrupt parent cycle from spinning (the same cut `runs::group` makes).
+    for _ in 0..8 {
+        let (joined, rest): (Vec<_>, Vec<_>) = pool.into_iter().partition(|s| {
+            s.lineage
+                .parent_session
+                .as_deref()
+                .is_some_and(|p| ids.contains(p))
+        });
+        pool = rest;
+        if joined.is_empty() {
+            break;
+        }
+        ids.extend(joined.iter().map(|s| s.session_id.clone()));
+        out.extend(joined);
+    }
+    out.sort_by_key(|s| s.started_at);
+    out
+}
+
+/// Build the views for `live`, with each session's token use inside the
+/// window from `tokens`.
 fn build_session_views(
     state: &AppState,
     events: &[RawEvent],
-    active_only: bool,
+    tokens: &HashMap<String, TokenTotals>,
+    live: Vec<LiveSession>,
 ) -> Vec<SessionView> {
     let now = OffsetDateTime::now_utc();
-    let reg = lock_recover(&state.sessions);
-    let live = if active_only {
-        reg.active(now, state.config.session_stale_after())
-    } else {
-        reg.all()
-    };
     let idle = state.config.idle();
     let agent_policy = state.config.agent_policy();
 
@@ -794,6 +856,15 @@ fn build_session_views(
                 orchestrator: s.lineage.orchestrator,
                 parent_session: s.lineage.parent_session.clone(),
                 repos: s.lineage.repos_touched().unwrap_or_default(),
+                branch: s.branch.clone(),
+                spec: s.spec.clone(),
+                tokens: tokens
+                    .get(&s.session_id)
+                    .map(|t| SessionTokens {
+                        total: t.input + t.output + t.cache_read + t.cache_create,
+                        est_cost_usd: t.est_cost_usd,
+                    })
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -921,6 +992,88 @@ mod tests {
             cache_create: 0,
             cwd: None,
         }
+    }
+
+    /// An event for `session` at `now` — the live window's "today".
+    fn live_ev(id: &str, session: &str, kind: EventKind) -> RawEvent {
+        RawEvent {
+            at: OffsetDateTime::now_utc(),
+            session_id: session.to_string(),
+            ..ev(id, kind)
+        }
+    }
+
+    /// Append `e` to the store and fold it into the registry, as the writer does.
+    async fn ingest(state: &AppState, e: RawEvent) {
+        state.store.append(&e).await.unwrap();
+        lock_recover(&state.sessions).observe(&e, state.config.idle());
+    }
+
+    /// #171: a session view carries its branch, its spec and its token use
+    /// inside the window; token rows before the window do not count.
+    #[tokio::test]
+    async fn session_views_carry_branch_spec_and_window_tokens() {
+        let state = test_state().await;
+        ingest(&state, live_ev("01A", "s1", EventKind::SessionStart)).await;
+        ingest(
+            &state,
+            RawEvent {
+                branch: Some("feat/x".into()),
+                spec: Some("doctor".into()),
+                ..live_ev("01B", "s1", EventKind::UserPrompt)
+            },
+        )
+        .await;
+        let today = TokenTurn {
+            at: OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            ..turn("tok-today")
+        };
+        for t in [today, turn("tok-old")] {
+            state
+                .store
+                .upsert_token_usage(&t, "s1", Some("github.com/acme/api"))
+                .await
+                .unwrap();
+        }
+
+        let Response::Sessions { sessions: views } = sessions(&state).await else {
+            panic!("expected Sessions");
+        };
+        let v = views.iter().find(|v| v.session_id == "s1").unwrap();
+        assert_eq!(v.branch.as_deref(), Some("feat/x"));
+        assert_eq!(v.spec.as_deref(), Some("doctor"));
+        assert_eq!(v.tokens.total, 30, "only today's row: 10 in + 20 out");
+        let wire = serde_json::to_value(v).unwrap();
+        assert_eq!(wire["tokens"]["total"], 30);
+    }
+
+    /// #182: once a run's child ends it leaves `active`, but `status` still
+    /// hands it back in `run_children` so the run's tree keeps it. A
+    /// lifecycle-only child and an unrelated ended session stay out.
+    #[tokio::test]
+    async fn status_keeps_a_listed_runs_ended_children() {
+        let state = test_state().await;
+        ingest(&state, live_ev("01A", "orch", EventKind::UserPrompt)).await;
+        let child = |id: &str, session: &str, kind| {
+            let mut e = live_ev(id, session, kind);
+            e.lineage.parent_session = Some("orch".into());
+            e
+        };
+        ingest(&state, child("01B", "kid", EventKind::UserPrompt)).await;
+        ingest(&state, child("01C", "kid", EventKind::SessionEnd)).await;
+        ingest(&state, child("01D", "noise", EventKind::SessionStart)).await;
+        ingest(&state, child("01E", "noise", EventKind::SessionEnd)).await;
+        ingest(&state, live_ev("01F", "other", EventKind::UserPrompt)).await;
+        ingest(&state, live_ev("01G", "other", EventKind::SessionEnd)).await;
+
+        let Response::Status(v) = status(&state).await else {
+            panic!("expected Status");
+        };
+        let ids = |l: &[SessionView]| l.iter().map(|s| s.session_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&v.active), ["orch"]);
+        assert_eq!(ids(&v.run_children), ["kid"]);
     }
 
     /// Regression for issue #94: a full resync used to report an events-only

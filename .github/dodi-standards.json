@@ -29,21 +29,21 @@
     },
     ".github/workflows/deps-automerge.yml": {
       "kind": "rendered",
-      "sha256": "033bd54d3f39cce55b5b323a9ac23d0ae192061597064f09076548a7f655bb81",
+      "sha256": "86e958e1851f4bf3ee714d3cffbcedcfd78e2472920d4be8a6222c8b4882f9ab",
       "template": "workflows/deps-automerge.yml",
-      "version": "1.33.0"
+      "version": "1.36.0"
     },
     ".github/workflows/deps-verify.yml": {
       "kind": "rendered",
-      "sha256": "ab255638c055d2df31cfe13b3c085689f45da85cdd4111d4dfd5d9661691e912",
+      "sha256": "9697bced8ecf64ac210f092632ba56f773eb359d247557dafdb2c03e2ea1ef0e",
       "template": "workflows/deps-verify.yml",
-      "version": "1.25.3"
+      "version": "1.36.0"
     },
     ".github/workflows/pr-checks.yml": {
       "kind": "rendered",
-      "sha256": "216039e9a230b87589cb61184bc85632dae82a830efaa43f0ac2f4d98cfd140c",
+      "sha256": "866f910f8f1c6a7ab9b1b95b7de84bec78c5f75523d220af742ca0d257969820",
       "template": "workflows/pr-checks.yml",
-      "version": "1.31.0"
+      "version": "1.36.0"
     },
     ".github/workflows/pr-review.yml": {
       "kind": "rendered",
@@ -63,6 +63,12 @@
       "sha256": "4984cf5b022a8222da5009f7ee38e9a12a609ab1c15f2fa175e318ca947aa6c9",
       "template": "gitleaks.toml",
       "version": "1.25.3"
+    },
+    "SECURITY.md": {
+      "kind": "filled",
+      "sha256": "334fad525de3cc7ee80b4d59235aebcdef9ad80a2d51160d101dd932b5408e85",
+      "template": "cra:SECURITY.template.md",
+      "version": "1.36.0"
     },
     "hk.pkl": {
       "kind": "seeded",
@@ -94,5 +100,5 @@
   },
   "schema": 1,
   "stack": "rust",
-  "version": "1.34.1"
+  "version": "1.36.0"
 }

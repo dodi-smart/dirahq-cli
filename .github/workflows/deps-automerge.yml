@@ -2,20 +2,33 @@
 #
 # Part of the standard once a repo has deps-verify and extends the shared Renovate
 # preset; fleet sync adds it then.
-# Merges a Renovate or Dependabot minor, patch or lock file maintenance PR once
-# deps-verify labelled it `deps:verified` (or `deps:fixed` and pr-review
-# approved), and the required check is green. Majors always wait for a person.
-# The rules live in the shared merge gate, not here. The org variable
-# DEPS_AUTOMERGE='false' stops every merge.
-#
-# The same caller also lets the shared merge gate merge a release back-merge PR (a
-# hotfix's main -> develop merge, from a `chore/backmerge-*` branch) once PR Checks
-# pass. The org variable BACKMERGE_AUTOMERGE='false' stops those merges.
+# The one caller of the shared merge gate. The shared workflow runs one job per
+# merge-gate policy, each with its own org kill switch, so stopping one kind of
+# merge stops nothing else (a variable set to 'false' stops that job's merges):
+#   merge      policy deps: a Renovate or Dependabot minor, patch or lock file
+#              maintenance PR into the default branch, once deps-verify labelled
+#              it `deps:verified` (or `deps:fixed` and pr-review approved) and the
+#              required check is green. Majors always wait for a person. DEPS_AUTOMERGE.
+#   backmerge  policy backmerge: the release's main -> develop back-merge PR, from a
+#              `chore/backmerge-*` branch, once PR Checks pass. BACKMERGE_AUTOMERGE.
+#   hotfix     policy hotfix: a security patch on the hotfix lane into main (a
+#              `fix/security-*` branch or Renovate's [SECURITY] update), once
+#              target-guard calls it a lane PR, PR Checks pass and pr-review
+#              approves. HOTFIX_AUTOMERGE.
+#   sync       policy standards-sync: the org App's `chore/standards-sync` PR, once
+#              its `standards / verify` and `standards / render` statuses say no
+#              new verify failure and a pure render, PR Checks pass and pr-review
+#              approves. SYNC_AUTOMERGE.
+# The rules live in the shared merge gate, not here. A caller cannot call one job
+# of a reusable workflow, so this is one job, and the run lists each policy as
+# `merge / <job>`.
 #
 # Each event below can complete the evidence. A run decides once and exits, so
 # nothing holds a runner while it waits:
-#   pull_request labeled   deps-verify set its verdict label
-#   status                 pr-review posted `review / verdict`
+#   pull_request labeled   deps-verify set its verdict label, or a back-merge got
+#                          `backmerge:regenerated`
+#   status                 pr-review posted `review / verdict`, or the standards
+#                          sync posted its statuses
 #   workflow_run           PR Checks finished
 # The shared workflow's own `if:` drops every other case before a runner is
 # booked, so there is no pre-filter here. The repo must extend the shared
@@ -27,12 +40,12 @@ on:
     types: [labeled]
   status:
   # `workflows:` must match the PR Checks caller's `name:`; `branches:` keeps
-  # human PRs from creating runs at all. `chore/backmerge-**` is the release
-  # back-merge PR.
+  # human PRs from creating runs at all: the dependency bots, the release
+  # back-merge, the hotfix lane and the standards sync.
   workflow_run:
     workflows: [PR Checks]
     types: [completed]
-    branches: ['renovate/**', 'dependabot/**', 'chore/backmerge-**']
+    branches: ['renovate/**', 'dependabot/**', 'chore/backmerge-**', 'fix/security-**', 'chore/standards-sync']
 jobs:
   merge:
     uses: dodi-smart/.github/.github/workflows/deps-automerge.yml@v1
@@ -45,6 +58,8 @@ jobs:
       pull-requests: read
       checks: read
       statuses: read
-    # Set only when the required check is not the pr-checks summary job.
+    # Set only when the required check is not the pr-checks summary job, or the
+    # release branch the hotfix and back-merge jobs read is not main.
     # with:
     #   required-check: "checks / PR Checks"
+    #   release-branch: main

@@ -166,6 +166,9 @@ mod tests {
             orchestrator: false,
             parent_session: None,
             repos: Vec::new(),
+            branch: None,
+            spec: None,
+            tokens: Default::default(),
         }
     }
 

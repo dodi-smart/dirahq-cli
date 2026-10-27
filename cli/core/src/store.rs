@@ -1044,6 +1044,41 @@ impl Store {
         })
     }
 
+    /// [`Self::token_totals_since`] per session, for the session list. Rows
+    /// with no session id are left out: they belong to no listed session.
+    /// Reporting only — never a sync selector (D-0018).
+    pub async fn token_totals_by_session_since(
+        &self,
+        since: OffsetDateTime,
+    ) -> Result<std::collections::HashMap<String, TokenTotals>, Error> {
+        let rows = sqlx::query(
+            "SELECT session_id, COALESCE(SUM(input),0) i, COALESCE(SUM(output),0) o, \
+             COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
+             COALESCE(SUM(est_cost),0.0) cost FROM token_usage \
+             WHERE at >= ?1 AND session_id IS NOT NULL AND session_id NOT LIKE ?2 \
+             GROUP BY session_id",
+        )
+        .bind(StoredAt(since))
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("session_id"),
+                    TokenTotals {
+                        input: row.get::<i64, _>("i") as u64,
+                        output: row.get::<i64, _>("o") as u64,
+                        cache_read: row.get::<i64, _>("cr") as u64,
+                        cache_create: row.get::<i64, _>("cc") as u64,
+                        est_cost_usd: row.get::<f64, _>("cost"),
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// The current sync cursor (last event id confirmed-synced), or `None` if
     /// nothing has been synced yet. Compaction is gated on this so un-synced rows
     /// are never pruned.
@@ -5741,6 +5776,40 @@ mod tests {
             .unwrap()
             .get("at");
         assert_eq!(e1, "2026-10-16T12:00:05Z");
+    }
+
+    /// The per-session split sums each session's rows inside the window and
+    /// leaves out rows before it and probe rows (DIRASH-0023).
+    #[tokio::test]
+    async fn token_totals_by_session_split_the_window_per_session() {
+        let store = Store::open_in_memory().await.unwrap();
+        let turn = |id: &str, at: &str, input: u64| TokenTurn {
+            id: id.to_string(),
+            at: at.to_string(),
+            model: "m".to_string(),
+            input,
+            output: 1,
+            cache_read: 0,
+            cache_create: 0,
+            cwd: None,
+        };
+        for (id, at, input, session) in [
+            ("t1", "2026-10-16T09:00:00Z", 100, "a"),
+            ("t2", "2026-10-16T13:00:00Z", 10, "a"),
+            ("t3", "2026-10-16T14:00:00Z", 5, "a"),
+            ("t4", "2026-10-16T13:30:00Z", 7, "b"),
+            ("t5", "2026-10-16T13:30:00Z", 9, "dira-probe-x"),
+        ] {
+            store
+                .upsert_token_usage(&turn(id, at, input), session, None)
+                .await
+                .unwrap();
+        }
+        let since = time::macros::datetime!(2026-10-16 12:00 UTC);
+        let by = store.token_totals_by_session_since(since).await.unwrap();
+        assert_eq!(by.len(), 2, "probe rows never surface: {by:?}");
+        assert_eq!((by["a"].input, by["a"].output), (15, 2));
+        assert_eq!((by["b"].input, by["b"].output), (7, 1));
     }
 
     /// Token and commit timestamps a harness or git wrote are stored in the

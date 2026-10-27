@@ -446,6 +446,28 @@ pub struct SessionView {
     /// Canonical repos an orchestrator's own tool calls touched, sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<String>,
+    /// The branch the session's work landed on, by the ended rollup's rule
+    /// (`dira_core::sync::SessionBranch`): the latest non-trunk branch of its
+    /// own repo. This and the next two fields are defaulted for version skew:
+    /// an older daemon omits them and they read as unknown / zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The spec slug the session works under, when one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
+    /// The session's `token_usage` inside the listed window — the same rows
+    /// `dira status` sums for today's compute row, split per session.
+    #[serde(default)]
+    pub tokens: SessionTokens,
+}
+
+/// One session's token use: every token through the pipe (input + output +
+/// cache read/create) and the local USD estimate. A display estimate, never a
+/// billing base.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionTokens {
+    pub total: u64,
+    pub est_cost_usd: f64,
 }
 
 /// Lenient deserializers for the two typed enums above.
@@ -548,6 +570,12 @@ impl SessionView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusView {
     pub active: Vec<SessionView>,
+    /// Sessions that are no longer live but descend from a session in
+    /// `active` and did something today: a run's ended children (#182), so
+    /// its tree keeps them. Never counted as active. Defaulted so an older
+    /// daemon degrades to the previous tree, which dropped them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_children: Vec<SessionView>,
     pub today: Report,
     pub sync_pending: u64,
     /// Un-synced `token_usage` rows past the confirmed token cursor. Reported
@@ -1219,6 +1247,9 @@ mod tests {
             orchestrator: false,
             parent_session: None,
             repos: Vec::new(),
+            branch: None,
+            spec: None,
+            tokens: Default::default(),
         }
     }
 
@@ -1264,6 +1295,7 @@ mod tests {
         // fields ignored, but keep the payload minimal) sees the pre-field shape.
         let v = StatusView {
             active: vec![],
+            run_children: vec![],
             today: Report {
                 projects: vec![],
                 total_human_seconds: 0,

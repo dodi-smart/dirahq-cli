@@ -269,7 +269,8 @@ Examples:
 Examples:
   dira sessions              handles, projects, human/agent time, state
   dira sessions --json       the same rows as one JSON object, for scripts
-  dira sessions --flat       one row per session, without grouping orchestration runs")]
+  dira sessions --flat       one row per session, without grouping orchestration runs
+  dira sessions --limit 10   only the 10 newest (a run counts as one)")]
     Sessions {
         /// Emit the session list as JSON instead of a table. Scriptable proof
         /// of what was captured (`jq '.sessions | length'`), and what CI
@@ -280,6 +281,10 @@ Examples:
         /// orchestrator with the sessions it spawned.
         #[arg(long)]
         flat: bool,
+        /// Show at most N sessions, newest first; a run counts as one. With
+        /// `--json`, the N newest sessions.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
     /// Retroactive manual entry, e.g. `dira invoice 1h Meeting with Fol` (bare = minutes).
     #[command(
@@ -329,7 +334,8 @@ Examples:
   dira report                today (default)
   dira report --week         the last 7 days
   dira report --all          everything on this device
-  dira report --project github.com/acme/api"
+  dira report --project github.com/acme/api
+  dira report --week --json  the same report as one JSON object, for scripts"
     )]
     Report {
         /// Today only (the default).
@@ -344,6 +350,10 @@ Examples:
         /// Only this repo/project (any scope).
         #[arg(long, value_name = "REPO")]
         project: Option<String>,
+        /// Emit the report as JSON instead of a table: full repo names, every
+        /// line, for scripts.
+        #[arg(long)]
+        json: bool,
     },
     /// Wire a harness's hooks to report to the daemon (default: claude).
     #[command(
@@ -1421,6 +1431,7 @@ async fn main() -> Result<()> {
                 | ZavetAction::Wiki { json: true, .. }
                 | ZavetAction::Specs { json: true, .. }
         } | Command::Sessions { json: true, .. }
+            | Command::Report { json: true, .. }
     );
     let row_opts = match &cli.command {
         Command::Zavet {
@@ -1430,8 +1441,9 @@ async fn main() -> Result<()> {
             branch_only: *branch,
             ..Default::default()
         },
-        Command::Sessions { flat, .. } => render::RowOpts {
+        Command::Sessions { flat, limit, .. } => render::RowOpts {
             flat: *flat,
+            limit: *limit,
             ..Default::default()
         },
         _ => render::RowOpts::default(),
@@ -1495,6 +1507,7 @@ async fn main() -> Result<()> {
             week,
             all,
             project,
+            ..
         } => {
             let scope = if let Some(p) = project {
                 ReportScope::Project { project: p }
@@ -1562,7 +1575,15 @@ async fn main() -> Result<()> {
         | Command::Update { .. } => unreachable!(),
     };
 
-    let resp = client::send(&config.socket_path, &req).await?;
+    let mut resp = client::send(&config.socket_path, &req).await?;
+    // `sessions --json --limit N`: the daemon lists newest-started first, so
+    // the first N are the N newest. The table applies the limit itself, a
+    // run counting as one.
+    if let (true, Some(n), Response::Sessions { sessions }) =
+        (json_output, row_opts.limit, &mut resp)
+    {
+        sessions.truncate(n);
+    }
     if let Response::Error { message } = &resp {
         if let Some(hint) = daemon_skew_hint(message) {
             eprintln!("{hint}");

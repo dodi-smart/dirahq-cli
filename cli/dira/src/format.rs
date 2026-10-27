@@ -29,6 +29,34 @@ pub fn project_label(p: &Option<String>) -> String {
 /// What orchestration time is called wherever a repo name would go.
 pub const ORCHESTRATION_LABEL: &str = "orchestration";
 
+/// What an orchestrator that spawned nothing and touched no repo is called
+/// (#181): an hourly scheduled run in a scratch workspace, say. Display only —
+/// the session keeps its role, and its repo-less time stays in the
+/// orchestration report bucket (DIRASH-0041).
+pub const SCRATCH_LABEL: &str = "scratch session";
+
+/// Whether `s` is an orchestrator with no repos and, as far as `sessions`
+/// shows, no children — the case [`SCRATCH_LABEL`] names.
+pub fn is_bare_scratch(
+    s: &dira_core::protocol::SessionView,
+    sessions: &[dira_core::protocol::SessionView],
+) -> bool {
+    s.orchestrator
+        && s.repos.is_empty()
+        && !sessions
+            .iter()
+            .any(|o| o.parent_session.as_deref() == Some(s.session_id.as_str()))
+}
+
+/// The sessions a status tree lays out: the live ones, then the ended
+/// children of listed runs (#182), so a run keeps its members after they end.
+/// Counts and lanes stay on `active` alone.
+pub fn status_tree_sessions(
+    s: &dira_core::protocol::StatusView,
+) -> Vec<dira_core::protocol::SessionView> {
+    s.active.iter().chain(&s.run_children).cloned().collect()
+}
+
 /// The PROJECT cell for a report line: the orchestration bucket is named as
 /// such, never folded into `(unresolved)`.
 pub fn report_line_label(p: &dira_core::report::ProjectReport) -> String {
@@ -76,6 +104,9 @@ pub struct TreeRow<'a> {
     pub project: String,
     /// A short project label for narrow places (the dashboard's lanes).
     pub short: String,
+    /// A run root shown as [`SCRATCH_LABEL`]: its KIND reads as the
+    /// session's own, not `orch`.
+    pub scratch: bool,
 }
 
 /// Lay a session list out as run trees with [`dira_core::runs::group`] — the
@@ -96,10 +127,14 @@ pub fn tree_rows<'a>(
                 handle: s.handle.clone(),
                 project: session_project_label(s),
                 short: session_repo_short(s),
+                scratch: false,
             }),
             Entry::Run(run) => {
                 let root = run.root;
-                let (project, short) = if run.folded() {
+                let scratch = root.orchestrator && run.repos.is_empty() && run.members.is_empty();
+                let (project, short) = if scratch {
+                    (SCRATCH_LABEL.to_string(), "scratch".to_string())
+                } else if run.folded() {
                     let repo = run.repos.first().cloned();
                     (
                         repo.clone()
@@ -121,6 +156,7 @@ pub fn tree_rows<'a>(
                     handle: root.handle.clone(),
                     project,
                     short,
+                    scratch,
                 });
                 let branch = |i: usize| if i + 1 == total { "└ " } else { "├ " };
                 for (i, s) in run.members.iter().enumerate() {
@@ -130,6 +166,7 @@ pub fn tree_rows<'a>(
                         handle: s.handle.clone(),
                         project: session_project_label(s),
                         short: session_repo_short(s),
+                        scratch: false,
                     });
                 }
                 for (k, repo) in direct.iter().enumerate() {
@@ -139,6 +176,7 @@ pub fn tree_rows<'a>(
                         handle: "·".to_string(),
                         project: repo.clone(),
                         short: repo_short(&Some(repo.clone())),
+                        scratch: false,
                     });
                 }
             }
@@ -231,6 +269,71 @@ pub fn truncate_cols(s: &str, max: usize) -> String {
     }
     out.push_str(ell);
     out
+}
+
+/// Truncate `s` to at most `max` display columns by cutting the middle, so
+/// both ends survive: `acme/platform-api` and `acme/platform-web` stay
+/// distinguishable where [`truncate_cols`] would clip both to `acme/platf…`.
+/// Same guarantees as [`truncate_cols`]: never wider than `max`, never splits
+/// a wide character.
+pub fn truncate_middle_cols(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    let ell = crate::theme::glyphs().ellipsis;
+    let budget = max.saturating_sub(display_width(ell));
+    if budget == 0 {
+        return truncate_cols(s, max);
+    }
+    let tail_budget = budget / 2;
+    let head_budget = budget - tail_budget;
+    let take = |chars: &mut dyn Iterator<Item = char>, limit: usize| {
+        let mut out = Vec::new();
+        let mut w = 0;
+        for c in chars {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > limit {
+                break;
+            }
+            out.push(c);
+            w += cw;
+        }
+        out
+    };
+    let head: String = take(&mut s.chars(), head_budget).into_iter().collect();
+    let tail: String = take(&mut s.chars().rev(), tail_budget)
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}{ell}{tail}")
+}
+
+/// A repo label for the report table: the forge host is dropped
+/// (`github.com/acme/api` → `acme/api`) — it is the same on nearly every row
+/// and only pushed the part that tells repos apart past the column edge — and
+/// what is still too wide is cut in the middle ([`truncate_middle_cols`]).
+pub fn report_repo_cell(label: &str, max: usize) -> String {
+    let short = match label.split_once('/') {
+        Some((host, rest)) if host.contains('.') && rest.contains('/') => rest,
+        _ => label,
+    };
+    truncate_middle_cols(short, max)
+}
+
+/// Compact age since `started_at` for the sessions table: `45s`, `12m`,
+/// `3h`, `2d`. Empty when the timestamp is missing or in the future.
+pub fn age_compact(started_at: &str, now: time::OffsetDateTime) -> String {
+    let Some(t) = parse_ts(Some(started_at)) else {
+        return String::new();
+    };
+    let secs = (now - t).whole_seconds();
+    match secs {
+        s if s < 0 => String::new(),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
 }
 
 /// Pad `s` on the right to `width` display columns. Use before painting — SGR
@@ -496,5 +599,81 @@ mod tests {
         assert_eq!(money("€", 0.0), "€0");
         assert_eq!(money("$", 1_234_567.0), "$1,234,567");
         assert_eq!(money("£", 999.5), "£1,000");
+    }
+
+    fn sv(id: &str, extra: serde_json::Value) -> dira_core::protocol::SessionView {
+        let mut v = serde_json::json!({
+            "handle": id, "session_id": id, "harness": "claude_code", "kind": "agent",
+            "started_at": "2026-10-27T10:00:00Z", "human_seconds": 0,
+            "agent_seconds": 60, "idle": true,
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// #181: an orchestrator that spawned nothing listed and touched no repo
+    /// reads as a scratch session; one with a child or a repo stays a run.
+    #[test]
+    fn a_bare_orchestrator_reads_as_a_scratch_session() {
+        let bare = sv("o", serde_json::json!({"orchestrator": true}));
+        let list = vec![bare.clone()];
+        let rows = tree_rows(&list, &Default::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project, SCRATCH_LABEL);
+        assert!(rows[0].scratch);
+        assert!(is_bare_scratch(&bare, &list));
+
+        let kid = sv(
+            "k",
+            serde_json::json!({"parent_session": "o", "project": "acme/api"}),
+        );
+        let list = vec![bare.clone(), kid];
+        let rows = tree_rows(&list, &Default::default());
+        assert!(!rows[0].scratch);
+        assert_ne!(rows[0].project, SCRATCH_LABEL);
+        assert!(!is_bare_scratch(&bare, &list));
+
+        let reached = sv(
+            "r",
+            serde_json::json!({"orchestrator": true, "repos": ["acme/api"]}),
+        );
+        let rows = tree_rows(std::slice::from_ref(&reached), &Default::default());
+        assert!(!rows[0].scratch);
+        assert_eq!(rows[0].project, "acme/api");
+    }
+
+    #[test]
+    fn report_repo_cell_drops_the_host_and_keeps_both_ends() {
+        assert_eq!(report_repo_cell("github.com/acme/api", 32), "acme/api");
+        // A bare name or a two-part slug keeps its first segment.
+        assert_eq!(report_repo_cell("acme/api", 32), "acme/api");
+        assert_eq!(report_repo_cell("scratch", 32), "scratch");
+        let a = report_repo_cell("github.com/dodi-smart/dirahq-platform-api", 20);
+        let b = report_repo_cell("github.com/dodi-smart/dirahq-platform-web", 20);
+        assert_ne!(a, b, "distinct repos stay distinguishable");
+        assert!(display_width(&a) <= 20, "{a}");
+        assert!(a.starts_with("dodi-smart") && a.ends_with("-api"), "{a}");
+    }
+
+    #[test]
+    fn truncate_middle_never_exceeds_the_width() {
+        for max in 0..12 {
+            let t = truncate_middle_cols("abcdefghijklmnop", max);
+            assert!(display_width(&t) <= max, "{max}: {t}");
+        }
+        assert_eq!(truncate_middle_cols("short", 10), "short");
+    }
+
+    #[test]
+    fn age_compact_buckets_by_magnitude() {
+        let now = time::macros::datetime!(2026-10-27 12:00 UTC);
+        assert_eq!(age_compact("2026-10-27T11:59:15Z", now), "45s");
+        assert_eq!(age_compact("2026-10-27T11:48:00Z", now), "12m");
+        assert_eq!(age_compact("2026-10-27T09:00:00Z", now), "3h");
+        assert_eq!(age_compact("2026-10-25T12:00:00Z", now), "2d");
+        assert_eq!(age_compact("2026-10-27T13:00:00Z", now), "", "future");
+        assert_eq!(age_compact("", now), "", "unparseable");
     }
 }

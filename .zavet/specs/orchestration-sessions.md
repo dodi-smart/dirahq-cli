@@ -1,10 +1,10 @@
 ---
 title: Orchestration sessions and runs
-version: 5
+version: 6
 origin: session
 verified: false
 confidence: high
-date: 2026-10-16
+date: 2026-10-27
 paths:
   - cli/core/src/orchestration.rs
   - cli/core/src/runs.rs
@@ -14,6 +14,8 @@ paths:
   - cli/dirad/src/writer.rs
   - cli/dira/src/session_titles.rs
   - cli/dirad/src/state.rs
+  - cli/dirad/src/control.rs
+  - cli/dira/src/format.rs
 decisions: [D-0001, DIRASH-0027, DIRASH-0041, DIRASH-0042, DIRASH-0044]
 ---
 
@@ -65,6 +67,18 @@ links their children, and shows the whole thing as one run.
 - `dira sessions` groups runs into a tree. A run over at most one repo is
   folded and shows that repo. `--flat` gives the old one-row view. Titles come
   from `~/.claude/sessions/*.json` at render time and never leave the machine.
+  `--limit N` keeps the N newest top-level rows (a run counts as one); with
+  `--json` it keeps the N newest sessions. An AGE column shows time since
+  each session started.
+- An orchestrator with no repos and no listed children reads as `scratch
+  session` in `dira sessions`, `status --detailed` and `watch` (#181), and its
+  KIND reads as the session's own rather than `orch`. Display only: the role,
+  the rollup and the report's `orchestration` bucket are unchanged.
+- `status` returns `run_children` beside `active` (#182): sessions no longer
+  live that descend (by `parent_session`) from a listed session and had a
+  real signal in today's window. The session tables and the `watch` table lay
+  out `active` plus these, so a run keeps its children after they end. The
+  headline counts and the agent lanes stay on `active`.
 
 ## Interfaces & data
 
@@ -72,6 +86,11 @@ links their children, and shows the whole thing as one run.
   below the scratch root), `spawned` and `parent_session` (migration 0007).
 - `SessionView` gains `orchestrator`, `parent_session` and `repos`, all
   defaulted so an older daemon degrades to the flat view.
+- `SessionView` also carries `branch` (the ended rollup's `SessionBranch`
+  rule), `spec`, and `tokens { total, est_cost_usd }` — the session's
+  `token_usage` inside the listed window (#171). All defaulted. This is local
+  IPC (`sessions --json`, `status --json`), not the attestation contract.
+- `StatusView.run_children` is defaulted and omitted when empty.
 - Contract 1.6 `SessionRollup` gains `role`, `parentSession`, `repos` and
   `workspaceRef`. See attestation-sync.
 - From contract 1.7, `role`, `repos` and `workspaceRef` are authoritative on

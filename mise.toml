@@ -15,7 +15,7 @@ bun = "latest"
 "aqua:crate-ci/typos" = "1.51.1"
 "aqua:gitleaks/gitleaks" = "8.30.1"
 # Not in the aqua registry yet, so the github: backend, which Renovate also reads.
-"github:jdx/jactionlint" = "2.2.0"
+"github:jdx/jactionlint" = "2.4.0"
 
 # Turn the hk git hooks on for this clone after every `mise install`
 # (it runs even when nothing needed installing). CI skips it.

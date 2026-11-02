@@ -499,6 +499,12 @@
       "input": 2.0,
       "output": 10.0
     },
+    "gpt-6.1-terra": {
+      "cacheRead": 0.05,
+      "cacheWrite": 1.25,
+      "input": 1.0,
+      "output": 5.0
+    },
     "gpt-daybreak-blue-latest": {
       "cacheRead": 0.4,
       "cacheWrite": 5.0,

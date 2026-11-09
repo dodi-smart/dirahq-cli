@@ -19,3 +19,10 @@ paths = [
 # To allow one exact fake value instead of a whole file, add an allowlist with
 # `regexTarget = "match"` and the value in `regexes`, so a real secret in the same
 # file is still caught. Never allow-list a real credential.
+
+# The signing vector's sample meeting `seriesKey` (contract 2.1): SHA-256("foo"),
+# a public test value, not a credential.
+[[allowlists]]
+description = "signing-vector sample meeting seriesKey"
+regexTarget = "match"
+regexes = ['''2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae''']

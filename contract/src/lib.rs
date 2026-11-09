@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "2.0.0";
+pub const SCHEMA_VERSION: &str = "2.1.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -96,6 +96,10 @@ pub struct AttestationBatch {
     /// 2.0: per-day totals for reconciliation (see [`DayRollup`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub day_rollups: Vec<DayRollup>,
+    /// 2.1: meetings this device detected or the person confirmed (see
+    /// [`Meeting`]). Their time rides [`Interval`]s carrying `meetingId`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meetings: Vec<Meeting>,
 }
 
 /// 2.0: the build and platform that produced a batch.
@@ -323,6 +327,166 @@ pub struct Interval {
     pub activity: Option<String>,
     /// The session this interval was derived from.
     pub source_session: String,
+    /// 2.1: the [`Meeting`] this interval is a slice of; `activity` is then
+    /// `meeting`. The device has already decided, on its own timeline, which
+    /// seconds were meeting and which were work, so a reader sums intervals as
+    /// before and never adds meeting time twice (DIRASH-0063).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<String>,
+}
+
+/// 2.1: a meeting, detected from local device-in-use signals or confirmed by the
+/// person (DIRASH-0060, DIRASH-0062). Content-free by construction (D-0001):
+/// every field is a closed enum, a time, a count bucket, a boolean, a
+/// device-minted id, a reference to the workspace's own entities, or a keyed
+/// hash. There is nowhere for a title, attendee, address, domain or URL to go.
+///
+/// Upserted by `(deviceId, id)`; a higher `version` replaces a lower one, never
+/// the reverse. A retraction is a record with `state: retracted`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Meeting {
+    /// Minted by the daemon at detection; stable across confirm, reassign and retract.
+    pub id: String,
+    /// Monotonic per meeting.
+    pub version: u32,
+    pub started_at: String,
+    pub ended_at: String,
+    pub state: MeetingState,
+    /// The evidence family that decided the meeting.
+    pub source: MeetingSource,
+    pub confidence: MeetingConfidence,
+    pub provider_class: ProviderClass,
+    /// Which signals were seen, for the cloud's assurance display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<MeetingEvidence>,
+    /// Facts reduced from a matched calendar event, if one matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<CalendarFacts>,
+    /// Where the meeting's time belongs, if the device could tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<MeetingAttribution>,
+    /// Seconds of engaged work the device saw during this meeting. Reported for
+    /// the "engaged during meetings" view; never added to any total.
+    #[serde(default)]
+    pub engaged_during_meeting_seconds: u64,
+}
+
+/// 2.1: a meeting's lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingState {
+    /// Detected with high confidence and recorded.
+    Recorded,
+    /// Confirmed by the person (a suggestion they accepted, or a recorded meeting they kept).
+    Confirmed,
+    /// Withdrawn: its intervals are gone and it no longer counts.
+    Retracted,
+}
+
+/// 2.1: the evidence family that decided a meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingSource {
+    Device,
+    Calendar,
+    Presence,
+    User,
+}
+
+/// 2.1: how sure the device is. Low-confidence runs stay local suggestions and
+/// never cross the wire unconfirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingConfidence {
+    High,
+    Confirmed,
+}
+
+/// 2.1: the kind of call. Deliberately coarser than the device's app catalogue,
+/// so adding an app never changes the wire. Readers map an unknown value to `other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderClass {
+    Zoom,
+    Teams,
+    Slack,
+    Webex,
+    Meet,
+    Discord,
+    Facetime,
+    Chat,
+    Browser,
+    InPerson,
+    Other,
+}
+
+/// 2.1: a signal family that contributed to a meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingEvidence {
+    Capture,
+    Camera,
+    Output,
+    Window,
+    Process,
+    Calendar,
+    Presence,
+}
+
+/// 2.1: what survives of a matched calendar event after on-device reduction
+/// (DIRASH-0064). No title, attendee or domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarFacts {
+    pub attendee_bucket: AttendeeBucket,
+    pub recurring: bool,
+    /// Lowercase hex HMAC-SHA256(workspace salt, calendar UID): groups a recurring
+    /// series across a workspace's members, and reveals nothing about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_key: Option<String>,
+    /// Any attendee outside the person's own domains (decided on the device).
+    pub external: bool,
+}
+
+/// 2.1: attendee count, bucketed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttendeeBucket {
+    One,
+    Two,
+    ThreeToFive,
+    SixToTen,
+    ElevenPlus,
+}
+
+/// 2.1: where a meeting's time belongs, resolved on the device against the
+/// workspace's own directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingAttribution {
+    /// The workspace's project id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_ref: Option<String>,
+    /// The workspace's client id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
+    /// Only for `method: context`: the repo with engaged time around the meeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_canonical: Option<String>,
+    pub method: AttributionMethod,
+}
+
+/// 2.1: how a meeting was attributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionMethod {
+    User,
+    CalendarRule,
+    Domain,
+    Series,
+    /// A suggestion from nearby repo work; never billed unless policy allows.
+    Context,
 }
 
 /// Per-session rollup. Agent wall-clock sums freely; it is evidence, never billed.
@@ -1388,6 +1552,7 @@ mod tests {
                 client: None,
                 capture_health: None,
                 day_rollups: Vec::new(),
+                meetings: Vec::new(),
             },
             sig: "deadbeef".to_string(),
         };
@@ -1415,6 +1580,7 @@ mod tests {
             client: None,
             capture_health: None,
             day_rollups: Vec::new(),
+            meetings: Vec::new(),
         };
         let json = serde_json::to_string(&batch).unwrap();
         assert!(!json.contains("intervals"));
@@ -1785,6 +1951,8 @@ mod tests {
                     human_seconds: 1,
                     activity: Some("a".into()),
                     source_session: "ss".into(),
+                    // Populated so the content-token walk covers the 2.1 field.
+                    meeting_id: Some("m".into()),
                 }],
                 sessions: vec![SessionRollup {
                     session_id: "s".into(),
@@ -1900,6 +2068,31 @@ mod tests {
                     interval_count: 1,
                     interval_digest: "d".into(),
                     revision: 0,
+                }],
+                // Populated so the content-token walk covers the 2.1 fields.
+                meetings: vec![Meeting {
+                    id: "m".into(),
+                    version: 1,
+                    started_at: "s".into(),
+                    ended_at: "e".into(),
+                    state: MeetingState::Confirmed,
+                    source: MeetingSource::Device,
+                    confidence: MeetingConfidence::High,
+                    provider_class: ProviderClass::Zoom,
+                    evidence: vec![MeetingEvidence::Capture],
+                    calendar: Some(CalendarFacts {
+                        attendee_bucket: AttendeeBucket::ThreeToFive,
+                        recurring: true,
+                        series_key: Some("k".into()),
+                        external: true,
+                    }),
+                    attribution: Some(MeetingAttribution {
+                        project_ref: Some("p".into()),
+                        client_ref: Some("c".into()),
+                        repo_canonical: Some("r".into()),
+                        method: AttributionMethod::Domain,
+                    }),
+                    engaged_during_meeting_seconds: 1,
                 }],
             },
             sig: "sig".into(),

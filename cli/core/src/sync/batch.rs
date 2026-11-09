@@ -286,6 +286,7 @@ fn assemble_batch(
         client: None,
         capture_health: None,
         day_rollups: Vec::new(),
+        meetings: Vec::new(),
     }
 }
 
@@ -596,6 +597,8 @@ fn build_intervals_seeded(events: &[RawEvent], idle: Duration, seed: &[RawEvent]
             // None for agent work that carries no activity).
             activity: activities.get(&a.session_id).cloned().flatten(),
             source_session: a.session_id.clone(),
+            // Detected meetings are not wired into the batch yet (meetings P1/P2).
+            meeting_id: None,
         });
     }
 
@@ -1028,6 +1031,7 @@ pub fn build_lineage_resend_batches(
                 client: None,
                 capture_health: None,
                 day_rollups: Vec::new(),
+                meetings: Vec::new(),
             }
         })
         .collect()

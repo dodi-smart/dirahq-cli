@@ -143,48 +143,14 @@ pub async fn start(config: &Config) -> Result<()> {
     }
     let bin = locate_dirad();
     println!("starting {} ...", bin.display());
-    let mut cmd = Command::new(&bin);
-    cmd.stdin(std::process::Stdio::null());
     // A daemon that dies *before* `tracing` initialises — a config parse error, a
-    // missing DLL, a panic in startup — writes to stderr and nothing else. Nulling
-    // it meant those failures left no trace on any platform. Truncate per start so
-    // this stays bounded to one process's output.
-    match spawn_log(config) {
-        Some(f) => {
-            let dup = f.try_clone().ok();
-            cmd.stderr(std::process::Stdio::from(f));
-            match dup {
-                Some(d) => cmd.stdout(std::process::Stdio::from(d)),
-                None => cmd.stdout(std::process::Stdio::null()),
-            };
-        }
-        None => {
-            cmd.stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW (0x0800_0000): suppresses the console-flash that would
-        // otherwise briefly appear for this stdio-nulled child. NOT
-        // DETACHED_PROCESS (0x0000_0008) — the Win32 docs call the two mutually
-        // exclusive, and DETACHED_PROCESS is the one that actually conflicts here
-        // since it also detaches stdio, which this spawn already does explicitly.
-        // CREATE_NEW_PROCESS_GROUP (0x0000_0200): puts dirad in its own process
-        // group so a Ctrl-C/Ctrl-Break delivered to the parent console (e.g. the
-        // terminal `dira daemon start` was run from) doesn't propagate to it.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    // Never let the daemon inherit our own stdout pipe (see
-    // `dira_core::process::spawn_isolated`): a caller piping this command,
-    // like install.ps1, would otherwise wait for the daemon to exit.
-    let mut child = dira_core::process::spawn_isolated(&mut cmd)
-        .with_context(|| format!("failed to spawn {}", bin.display()))?;
+    // missing DLL, a panic in startup — writes to stderr and nothing else, so its
+    // output goes to a per-start log where one resolves. Windowless, its own
+    // process group, never holding our stdout (see
+    // `dira_core::process::spawn_background`).
+    let mut child =
+        dira_core::process::spawn_background(&mut Command::new(&bin), spawn_log(config), 0)
+            .with_context(|| format!("failed to spawn {}", bin.display()))?;
 
     // The pidfile is written only once the child has proven itself (below), never
     // here. Writing it up front meant a start that failed — the common case when

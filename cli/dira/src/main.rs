@@ -1131,6 +1131,9 @@ fn zavet_status_is_cwd_scoped(command: &Command) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything can spawn: no child may inherit our own stdout pipe
+    // (see `dira_core::process::disinherit_std_handles`).
+    dira_core::process::disinherit_std_handles();
     // Before anything prints: legacy Windows consoles need to be told to
     // interpret ANSI escapes, or every painted line leaks its SGR bytes.
     theme::enable_ansi();

@@ -51,6 +51,6 @@ name = "accounting"
 harness = false
 
 [target.'cfg(windows)'.dependencies]
-# `process::spawn_isolated` stops a long-lived child (dirad, the background
-# updater) from inheriting this process's own stdio pipes.
+# `process::disinherit_std_handles` stops a long-lived child (dirad, the
+# background updater) from inheriting this process's own stdio pipes.
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }

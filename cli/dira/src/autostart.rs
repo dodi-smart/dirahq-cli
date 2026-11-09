@@ -148,13 +148,7 @@ fn spawn_bare() {
     if !bin.exists() {
         return;
     }
-    let mut cmd = std::process::Command::new(bin);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    dira_core::process::detached(&mut cmd);
-    // The harness reads this hook's stdout; the daemon must not hold it open.
-    let _ = dira_core::process::spawn_isolated(&mut cmd);
+    let _ = dira_core::process::spawn_background(&mut std::process::Command::new(bin), None, 0);
 }
 
 #[cfg(test)]

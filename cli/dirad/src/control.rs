@@ -141,7 +141,11 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             cwd,
         } => log(state, duration_secs, project, note, activity, label, cwd).await,
         Request::Report { scope } => report_cmd(state, scope).await,
-        Request::IngestHook { harness, payload } => ingest_hook(state, harness, payload).await,
+        Request::IngestHook {
+            harness,
+            payload,
+            observed_at,
+        } => ingest_hook(state, harness, payload, observed_at).await,
         Request::Nuke => nuke(state).await,
         Request::DaemonInfo => daemon_info(state),
         Request::ResyncCursor { from } => resync_cursor(state, from).await,
@@ -294,7 +298,12 @@ async fn nuke(state: &AppState) -> Response {
 
 /// Normalize a forwarded harness hook and enqueue it on the same path as HTTP
 /// ingress. Acks immediately; enrichment + append happen in the writer task.
-async fn ingest_hook(state: &AppState, harness: String, payload: serde_json::Value) -> Response {
+async fn ingest_hook(
+    state: &AppState,
+    harness: String,
+    payload: serde_json::Value,
+    observed_at: Option<String>,
+) -> Response {
     let (norm, harness_kind) = match dira_sources::normalize_for(&harness, payload) {
         Some(pair) => pair,
         None => {
@@ -319,15 +328,14 @@ async fn ingest_hook(state: &AppState, harness: String, payload: serde_json::Val
         }
     }
 
-    let msg = EventMsg::Hook {
-        norm,
-        harness: harness_kind,
-        at: OffsetDateTime::now_utc(),
-    };
-    match state.tx.try_send(msg) {
-        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Response::Ok,
-        Err(_) => Response::Error {
-            message: "daemon shutting down".into(),
+    // A full queue spills to the spool instead of dropping the hook
+    // (DIRASH-0049). It used to answer `Ok` and discard it, so the shim recorded
+    // a success for an event that never landed.
+    let at = crate::spool::event_time(observed_at.as_deref());
+    match crate::spool::enqueue(state, &harness, norm, harness_kind, at) {
+        Ok(()) => Response::Ok,
+        Err(why) => Response::Error {
+            message: why.into(),
         },
     }
 }

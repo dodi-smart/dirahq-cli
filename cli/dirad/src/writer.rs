@@ -20,6 +20,7 @@ use std::panic::AssertUnwindSafe;
 use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc;
+#[cfg(test)]
 use ulid::Ulid;
 
 /// How long a NEGATIVE (`project: None`) resolution stays cached before it's
@@ -673,7 +674,7 @@ fn enrich(
     let branch = branch_dir.and_then(|dir| project::current_branch(std::path::Path::new(dir)));
 
     let ev = RawEvent {
-        id: Ulid::generate().to_string(),
+        id: dira_core::model::new_event_id(),
         at,
         session_id: norm.session_id,
         harness,
@@ -877,28 +878,71 @@ fn offset_key_for(session_id: &str, transcript_path: &str) -> String {
     }
 }
 
-/// Sibling `agent-*.jsonl` transcripts beside the session's own, oldest-first.
+/// The session's subagent `agent-*.jsonl` transcripts, sorted.
 ///
 /// Claude Code writes subagent turns to separate files that no hook ever names,
 /// so without this sweep their usage never enters the store on any platform —
 /// measured at 840 turns / 85M tokens / ~$158 in a single week on one machine.
-/// Directory reads are cheap and happen only at a turn boundary; each file
-/// carries its own watermark, so an unchanged sidecar costs one `metadata` call.
+///
+/// Two layouts:
+/// - current: `<project>/<session-id>/subagents/agent-*.jsonl`, beside the
+///   session's own `<project>/<session-id>.jsonl`. Only this session's files.
+///   The sweep used to look only in `<project>/`, so it never found these.
+/// - legacy: `agent-*.jsonl` directly in `<project>/`, shared by every session
+///   in the project. Each new session re-read all of them from offset 0 (the
+///   watermark is per session), one SQL statement per turn, inline in the
+///   writer. Only files modified within [`LEGACY_SIDECAR_WINDOW`] are swept
+///   now: an older one is finished, and its own session read it.
 fn subagent_transcripts(main: &str) -> Vec<String> {
-    let Some(dir) = std::path::Path::new(main).parent() else {
-        return Vec::new();
+    subagent_transcripts_at(main, std::time::SystemTime::now())
+}
+
+/// How recently a legacy-layout sidecar must have been written to be swept.
+const LEGACY_SIDECAR_WINDOW: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+fn subagent_transcripts_at(main: &str, now: std::time::SystemTime) -> Vec<String> {
+    let main = std::path::Path::new(main);
+    let agent_files = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        is_subagent_transcript(p)
+                            && p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut found: Vec<String> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            is_subagent_transcript(p) && p.extension().and_then(|x| x.to_str()) == Some("jsonl")
-        })
-        .filter_map(|p| p.to_str().map(str::to_string))
-        .collect();
+    let mut found: Vec<String> = Vec::new();
+    // Current layout: `<project>/<session-id>/subagents/`.
+    if let Some(stem) = main.file_stem() {
+        if let Some(dir) = main.parent() {
+            let sub = dir.join(stem).join("subagents");
+            found.extend(
+                agent_files(&sub)
+                    .into_iter()
+                    .filter_map(|p| p.to_str().map(str::to_string)),
+            );
+        }
+    }
+    // Legacy layout: recently written siblings only.
+    if let Some(dir) = main.parent() {
+        found.extend(
+            agent_files(dir)
+                .into_iter()
+                .filter(|p| {
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| now.duration_since(t).ok())
+                        .is_none_or(|age| age <= LEGACY_SIDECAR_WINDOW)
+                })
+                .filter_map(|p| p.to_str().map(str::to_string)),
+        );
+    }
     // Deterministic order so a capture sweep is reproducible.
     found.sort();
     found
@@ -1287,6 +1331,33 @@ mod tests {
             vec!["agent-aaa.jsonl", "agent-bbb.jsonl"],
             "only agent-*.jsonl siblings, sorted, never the main transcript"
         );
+    }
+
+    #[test]
+    fn subagent_discovery_finds_the_current_per_session_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("sess-1.jsonl");
+        std::fs::write(&main, "").unwrap();
+        let sub = dir.path().join("sess-1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-x.jsonl"), "").unwrap();
+        // Another session's subagents are never swept for this one.
+        let other = dir.path().join("sess-2/subagents");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent-y.jsonl"), "").unwrap();
+        let found = subagent_transcripts(main.to_str().unwrap());
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("sess-1/subagents/agent-x.jsonl"));
+    }
+
+    #[test]
+    fn subagent_discovery_skips_old_legacy_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("sess-1.jsonl");
+        std::fs::write(&main, "").unwrap();
+        std::fs::write(dir.path().join("agent-old.jsonl"), "").unwrap();
+        let later = std::time::SystemTime::now() + LEGACY_SIDECAR_WINDOW * 2;
+        assert!(subagent_transcripts_at(main.to_str().unwrap(), later).is_empty());
     }
 
     #[test]

@@ -9,8 +9,10 @@ paths:
   - cli/sources/src/
   - cli/dira/src/init.rs
   - cli/dira/src/headless.rs
+  - cli/dira/src/autostart.rs
+  - cli/dirad/src/spool.rs
   - contract/src/lib.rs
-decisions: [D-0001, DIRASH-0041, DIRASH-0047]
+decisions: [D-0001, DIRASH-0041, DIRASH-0047, DIRASH-0049]
 ---
 
 ## Overview
@@ -31,6 +33,18 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
   therefore opens no human-engaged interval, while its session, agent
   wall-clock, tools and tokens are captured as before (`prompts` reads 0).
   The capture probe never withholds. See DIRASH-0047.
+- A hook is stored or spooled, never dropped (DIRASH-0049).
+  - The shim stamps `observed_at` on every `IngestHook`.
+  - A delivery that fails (daemon down, busy, or timed out) is normalized in
+    the shim and written to `spool/` beside the database, one file per event.
+    The raw payload never touches disk.
+  - When nothing is listening, the shim asks the supervisor (logon task,
+    launchd, systemd --user) to start the daemon, or spawns it bare where
+    there is none. At most once per 30 s, never elevated, never in a debug
+    build.
+  - The daemon spills to the same spool when its ingest queue is full, and
+    replays the spool at startup and every 2–30 s while the queue has room,
+    keeping each event's original time.
 - Alias spelling lives ONLY in `canonical_harness_id()`. `dira init` and hook
   dispatch both resolve through it, so accepted spellings can never drift.
 - A source returns `None` for unknown events or malformed payloads; the daemon
@@ -98,6 +112,8 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
   been implemented as "never tell anyone", so a dead capture channel was
   indistinguishable from a healthy one for days. A **semantic** non-result
   (unknown harness, unaccounted event kind) stays silent everywhere. See D-0016.
+- Nothing answers an ingest `Ok` unless the event is queued or spooled
+  (`dirad::spool::enqueue` is the only path into the writer queue for a hook).
 - The contract `Harness` enum is the wire's source of truth; schema artifacts
   are regenerated, never hand-edited.
 

@@ -17,13 +17,14 @@ pub mod gemini;
 pub mod generic;
 pub mod grok;
 pub mod opencode;
+pub mod spool;
 
 use dira_contract::Harness;
 use dira_core::model::EventKind;
 
 /// A harness event after normalization, before the daemon enriches it with a
 /// resolved project, identity, timestamp, and id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Normalized {
     pub session_id: String,
     pub kind: EventKind,
@@ -53,7 +54,7 @@ pub struct Normalized {
 /// tool input/response never travels further than this crate (D-0001,
 /// DIRASH-0041). Nothing here is stored as-is: the daemon resolves `evidence`
 /// to a canonical repo ref and drops the rest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hints {
     /// The harness host's id for this session (`local_<uuid>`), forwarded by
     /// the hook shim under [`dira_core::orchestration::PAYLOAD_ENV_KEY`].
@@ -129,6 +130,11 @@ pub fn harness_id(h: Harness) -> &'static str {
         Harness::Generic => "generic",
         Harness::Manual => "manual",
     }
+}
+
+/// The [`Harness`] a hook id (or alias) belongs to, `None` for an unknown id.
+pub fn harness_for(id: &str) -> Option<Harness> {
+    source_for(id).map(|s| s.harness())
 }
 
 /// Resolve a harness id (with a few friendly aliases) to its source.

@@ -11,7 +11,7 @@ paths:
   - cli/dira/src/hook_health.rs
   - cli/dira/src/init.rs
   - cli/ipc/src/elevation.rs
-decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0018, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029, DIRASH-0033, DIRASH-0039]
+decisions: [D-0004, D-0006, D-0008, D-0009, D-0016, D-0018, D-0019, D-0020, D-0021, DIRASH-0022, DIRASH-0023, DIRASH-0029, DIRASH-0033, DIRASH-0039, DIRASH-0049]
 checks:
   - a stale hook.sh warns and names dira onboard :: cargo test -p dira --bin dira -- doctor::checks::tests::a_stale_hook_sh_warns_with_onboard_as_the_remedy
   - a present but unwired harness config warns :: cargo test -p dira --bin dira -- doctor::checks::tests::a_present_but_unwired_harness_config_warns
@@ -75,6 +75,14 @@ say whether a harness wired at both project and global scope double-delivers
 or yields (see Behavior below).
 
 ## Behavior
+
+- `capture.backlog` (DIRASH-0049) reports hooks waiting in the spool and sync
+  chunks the cloud kept rejecting that the daemon stepped past
+  (`sync_quarantine`).
+  - Spooled hooks with no daemon running: fail, remedy `dira daemon start`.
+  - Quarantined chunks: warn, remedy `dira device resync`.
+  - Spooled hooks while the daemon replays them: warn.
+  - `hook.breadcrumb` now says the failed hooks are kept in the spool, not lost.
 
 - Checks run in cause-first order: daemon reachability, then the daemon's own
   self-report, then the store, then hook wiring, then the cloud. A user reading

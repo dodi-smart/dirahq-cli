@@ -28,6 +28,8 @@ pub mod jitter;
 pub mod knowledge_sync;
 pub mod logfile;
 pub mod probe;
+pub mod quarantine;
+pub mod spool;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
@@ -427,6 +429,12 @@ pub async fn run() -> anyhow::Result<()> {
     }
     *control::lock_recover(&state.control_channel_warning) = control_warning;
 
+    // Accept on the control channel now, not after the background setup below.
+    // Hooks that arrived during that window used to wait on the single pending
+    // pipe instance, time out after 1-2 s and be dropped. The writer queue
+    // buffers them until the supervisor starts the writer a moment later.
+    serve_control(state.clone(), listener);
+
     // HTTP ingress (loopback only). Survivable: a conflict leaves the daemon up
     // and degraded, retrying in the background.
     let http_addr = format!("127.0.0.1:{}", state.config.http_port);
@@ -480,7 +488,8 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    serve_control(state.clone(), listener);
+    // Replay hooks spooled while this daemon was down, busy or full.
+    spool::spawn_drain(state.clone());
 
     // Block until shutdown. The accept loop runs detached in `serve_control`.
     wait_for_shutdown_signal(&state, &mut shutdown_signals).await;

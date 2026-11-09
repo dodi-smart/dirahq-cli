@@ -640,13 +640,63 @@ fn collect_blobs(root: &Path, head: &str, paths: &[String]) -> Vec<TouchedBlob> 
         .collect()
 }
 
-/// The current branch name (`git rev-parse --abbrev-ref HEAD`), or `None`. A
-/// detached HEAD yields `"HEAD"`, which we treat as no branch.
+/// The current branch name, or `None` for a detached HEAD or no repo.
+///
+/// Read straight from the checkout's `HEAD` file when it can be found, and
+/// only falls back to `git rev-parse --abbrev-ref HEAD` when it cannot. The
+/// writer asks this for every hook with a cwd, and a `git` spawn costs
+/// 50-200 ms on windows. That capped the writer at a few dozen events a
+/// second, so a busy session filled the ingest queue.
 pub fn current_branch(root: &Path) -> Option<String> {
+    if let Some(head) = read_head(root) {
+        return branch_from_head(&head);
+    }
     match git(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
         Some(b) if b == "HEAD" => None,
         other => other,
     }
+}
+
+/// `HEAD`'s contents for the checkout containing `dir`: walks up to the first
+/// `.git`, following a worktree/submodule `.git` file's `gitdir:` pointer.
+/// `None` when no `.git` is found or it cannot be read, so the caller falls
+/// back to `git`, which also honours `GIT_DIR` and friends.
+fn read_head(dir: &Path) -> Option<String> {
+    if std::env::var_os("GIT_DIR").is_some() {
+        return None;
+    }
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        let dot_git = d.join(".git");
+        if let Ok(meta) = std::fs::metadata(&dot_git) {
+            let git_dir = if meta.is_dir() {
+                dot_git
+            } else {
+                let text = std::fs::read_to_string(&dot_git).ok()?;
+                let target = text.trim().strip_prefix("gitdir:")?.trim();
+                let target = Path::new(target);
+                if target.is_absolute() {
+                    target.to_path_buf()
+                } else {
+                    d.join(target)
+                }
+            };
+            return std::fs::read_to_string(git_dir.join("HEAD")).ok();
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// The branch a `HEAD` file names: `ref: refs/heads/<name>` → `<name>`. A
+/// detached HEAD (a bare sha) is no branch.
+fn branch_from_head(head: &str) -> Option<String> {
+    head.trim()
+        .strip_prefix("ref:")
+        .map(str::trim)
+        .and_then(|r| r.strip_prefix("refs/heads/"))
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
 }
 
 /// The repo's default branch: `origin/HEAD`'s target (`git symbolic-ref
@@ -1871,5 +1921,53 @@ mod tests {
         let dir = temp_repo_dir("trailers-chunk-empty");
         assert!(commit_trailers_chunked(&dir, &[], 2).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod head_tests {
+    use super::*;
+
+    #[test]
+    fn branch_from_head_reads_refs_and_rejects_detached() {
+        assert_eq!(
+            branch_from_head("ref: refs/heads/feat/x\n").as_deref(),
+            Some("feat/x")
+        );
+        assert_eq!(
+            branch_from_head("4b825dc642cb6eb9a060e54bf8d69288fbee4904\n"),
+            None
+        );
+        assert_eq!(branch_from_head("ref: refs/remotes/origin/main"), None);
+    }
+
+    #[test]
+    fn read_head_follows_a_worktree_gitdir_file_from_a_subdirectory() {
+        let root = std::env::temp_dir().join(format!("dira-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let main_git = root.join("main/.git");
+        let wt_git = main_git.join("worktrees/wt");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(main_git.join("HEAD"), "ref: refs/heads/develop\n").unwrap();
+        std::fs::write(wt_git.join("HEAD"), "ref: refs/heads/fix/y\n").unwrap();
+        let wt = root.join("wt");
+        std::fs::create_dir_all(wt.join("src/deep")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+
+        assert_eq!(
+            read_head(&wt.join("src/deep"))
+                .as_deref()
+                .and_then(branch_from_head)
+                .as_deref(),
+            Some("fix/y")
+        );
+        assert_eq!(
+            read_head(&root.join("main"))
+                .as_deref()
+                .and_then(branch_from_head)
+                .as_deref(),
+            Some("develop")
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

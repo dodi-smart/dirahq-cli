@@ -1050,6 +1050,7 @@ async fn flush(
                     }
                 }
             }
+            crate::quarantine::clear_streak(&state.store).await;
             total_intervals += interval_count;
             total_sessions += session_count;
             last_body = body;
@@ -1065,7 +1066,57 @@ async fn flush(
         // Non-2xx: cursors for already-acked chunks stay advanced (a 429 included,
         // so a retry only re-sends the remainder), so the next flush re-chunks only
         // the remaining window.
-        return Err(ingest_error(resp).await);
+        let err = ingest_error(resp).await;
+        // A content rejection of this exact chunk, repeated, is stepped past
+        // instead of retried forever (DIRASH-0049). Auth, schema skew, 429 and
+        // 5xx never count: they are not about the chunk's bytes.
+        let content_rejection = matches!(err, SyncError::PayloadTooLarge(_))
+            || (matches!(err, SyncError::Fatal(_))
+                && status.is_client_error()
+                && status.as_u16() != 401
+                && status.as_u16() != 403);
+        if content_rejection && !epoch_reset {
+            let bounds = crate::quarantine::ChunkBounds {
+                event_cursor: cursor_event_id.clone(),
+                artifact_rowid: artifact_rowid_high,
+                token_rowid: token_rowid_high,
+            };
+            if crate::quarantine::note_rejection(&state.store, &bounds, &describe(&err))
+                .await
+                .is_some()
+            {
+                tracing::warn!(
+                    reason = %describe(&err),
+                    cursor = cursor_event_id.as_deref().unwrap_or(""),
+                    "sync: the cloud rejected this chunk {} times in a row; quarantined it and \
+                     moved past (see `dira doctor`)",
+                    crate::quarantine::THRESHOLD
+                );
+                if let Some(ev) = &cursor_event_id {
+                    state
+                        .store
+                        .meta_set(META_SYNC_CURSOR, ev)
+                        .await
+                        .map_err(|e| SyncError::Fatal(format!("advance cursor: {e}")))?;
+                }
+                if let Some(u) = artifact_rowid_high {
+                    state
+                        .store
+                        .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
+                        .await
+                        .map_err(|e| SyncError::Fatal(format!("advance artifacts cursor: {e}")))?;
+                }
+                if let Some(u) = token_rowid_high {
+                    state
+                        .store
+                        .meta_set(META_TOKEN_CURSOR, &u.to_string())
+                        .await
+                        .map_err(|e| SyncError::Fatal(format!("advance token cursor: {e}")))?;
+                }
+                continue;
+            }
+        }
+        return Err(err);
     }
 
     // 5. The advisory handshake (epoch + watermark) was already applied

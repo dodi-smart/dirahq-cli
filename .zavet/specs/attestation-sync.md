@@ -13,7 +13,7 @@ paths:
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046, DIRASH-0049]
 ---
 
 ## Overview
@@ -234,6 +234,16 @@ single flush window (issue #40).
   therefore evidence of one pathological record, not of backlog size, and
   gets its own `SyncError` + `payload_too_large` health kind so it is never
   mistaken for a retryable failure.
+- A chunk the cloud rejects for its content (413, or a 4xx other than
+  401/403) five times in a row is quarantined (DIRASH-0049). The event,
+  artifact and token cursors advance to that chunk's high-water marks, and its
+  bounds and reason are appended to the `sync_quarantine` meta list (newest
+  100 kept). Auth, schema skew, 429, 5xx and network errors never count.
+  Before this, one malformed row stopped the event cursor for good.
+- Event ids come from one process-wide monotonic ULID generator
+  (`dira_core::model::new_event_id`), so id order is mint order. A random
+  within-millisecond ULID could put an event behind the `(cursor, until]`
+  window and skip it forever.
 - `events.at`, `token_usage.at` and `artifacts.authored_at` are stored
   fixed-width UTC (`…SS.fffffffffZ`), so text order is time order
   (DIRASH-0043). Every `ORDER BY at` and every `at` bound (hydrate replay,

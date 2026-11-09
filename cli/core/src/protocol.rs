@@ -53,6 +53,11 @@ pub enum Request {
     IngestHook {
         harness: String,
         payload: serde_json::Value,
+        /// When the shim saw the hook (RFC 3339). The daemon stamps receipt time
+        /// when it is absent (older shims). Lets a hook delivered late keep its
+        /// real time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_at: Option<String>,
     },
     /// Wipe all local statistics (events + token usage) for a fresh start. Keeps
     /// device identity; resets the sync cursor and the live-session registry.

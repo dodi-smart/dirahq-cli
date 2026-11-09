@@ -23,6 +23,8 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
+# `autostart` asks launchd for `gui/<uid>/…` without spawning `id -u`.
+libc.workspace = true
 anyhow.workspace = true
 ulid.workspace = true
 ratatui.workspace = true

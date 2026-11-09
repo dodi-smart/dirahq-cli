@@ -35,7 +35,7 @@ pub const MAX_REPOS: usize = 32;
 
 /// Where a tool call says it worked: a directory to resolve through
 /// [`crate::project::resolve`], or a repo named outright (`gh -R`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Evidence {
     Path(PathBuf),
     Repo(String),

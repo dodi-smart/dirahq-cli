@@ -1,6 +1,7 @@
 //! `dira` — the thin CLI client. Talks to the resident `dirad` daemon over a
 //! Unix domain socket; holds no state of its own.
 
+mod autostart;
 mod client;
 mod cloud_init;
 mod config_cmd;
@@ -1825,14 +1826,56 @@ async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcom
     if dira_sources::canonical_harness_id(harness) == Some("claude") {
         dira_core::orchestration::inject_env_hints(&mut payload, dira_core::env::non_blank);
     }
+    // When the hook fired, so a late delivery (through the spool) keeps its
+    // real time.
+    let observed_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    // Normalized up front, so a failed delivery can be spooled as metadata
+    // only: the raw payload (prompt text, tool input) never touches disk.
+    let normalized = if probe {
+        None
+    } else {
+        dira_sources::normalize_for(harness, payload.clone()).map(|(n, _)| n)
+    };
     let owned = harness.to_string();
-    deliver_hook_payload(config, harness, probe, payload, move |payload| {
+    let at = observed_at.clone();
+    let outcome = deliver_hook_payload(config, harness, probe, payload, move |payload| {
         Request::IngestHook {
             harness: owned,
             payload,
+            observed_at: Some(at),
         }
     })
-    .await
+    .await;
+    if outcome == HookOutcome::Failed {
+        if let Some(event) = normalized {
+            spool_undelivered(config, harness, observed_at, event).await;
+        }
+    }
+    outcome
+}
+
+/// Keep a hook the daemon could not take (DIRASH-0049): write it to the spool,
+/// which the daemon drains when it is back, and, if nothing is listening, ask
+/// for the daemon to be started.
+async fn spool_undelivered(
+    config: &Config,
+    harness: &str,
+    observed_at: String,
+    event: dira_sources::Normalized,
+) {
+    let dir = dira_sources::spool::dir_for(&config.db_path);
+    let record = dira_sources::spool::Record::new(harness, observed_at, event);
+    match dira_sources::spool::write(&dir, &record) {
+        Ok(_) => hook_debug(format_args!(
+            "dira hook {harness}: spooled for later delivery"
+        )),
+        Err(e) => hook_debug(format_args!("dira hook {harness}: could not spool ({e})")),
+    }
+    if autostart::allowed() && autostart::is_down(config).await {
+        autostart::kick(config);
+    }
 }
 
 /// Forward a zavet guard event from stdin to the daemon.

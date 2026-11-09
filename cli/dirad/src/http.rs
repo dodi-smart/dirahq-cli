@@ -8,7 +8,7 @@
 //! through the [`dira_sources`] registry, so adding a harness needs no change
 //! here. `/hooks/claude` is just `:harness=claude`.
 
-use crate::state::{AppState, EventMsg};
+use crate::state::AppState;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -49,21 +49,17 @@ async fn hook(
         return StatusCode::OK;
     };
 
-    // Stamp arrival time here (cheap); enrichment happens in the writer.
-    let msg = EventMsg::Hook {
+    // Stamp arrival time here (cheap); enrichment happens in the writer. Never
+    // blocks the agent loop: a full queue spills to the spool (DIRASH-0049).
+    match crate::spool::enqueue(
+        &state,
+        &harness,
         norm,
-        harness: harness_kind,
-        at: OffsetDateTime::now_utc(),
-    };
-
-    // Non-blocking: if the queue is full we drop rather than stall the agent loop.
-    match state.tx.try_send(msg) {
+        harness_kind,
+        OffsetDateTime::now_utc(),
+    ) {
         Ok(()) => StatusCode::OK,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!("ingest queue full; dropped a hook event");
-            StatusCode::OK
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => StatusCode::SERVICE_UNAVAILABLE,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 

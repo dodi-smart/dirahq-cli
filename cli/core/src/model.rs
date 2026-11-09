@@ -205,3 +205,29 @@ impl EventKind {
         matches!(self, EventKind::PreTool)
     }
 }
+
+/// A new event id: a ULID from one process-wide **monotonic** generator.
+///
+/// `Ulid::generate()` is random within a millisecond, so two events appended in
+/// the same millisecond could land in id order opposite to their append order.
+/// The event sync cursor is "last id synced": an event whose id sorted below one
+/// already flushed was skipped forever (and later pruned as "already synced").
+/// A monotonic generator makes id order match mint order within this process.
+pub fn new_event_id() -> String {
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static GEN: OnceLock<Mutex<ulid::Generator>> = OnceLock::new();
+    let gen = GEN.get_or_init(|| Mutex::new(ulid::Generator::new()));
+    let mut g = gen.lock().unwrap_or_else(PoisonError::into_inner);
+    g.generate()
+        .unwrap_or_else(|_| ulid::Ulid::generate())
+        .to_string()
+}
+
+#[cfg(test)]
+mod event_id_tests {
+    #[test]
+    fn ids_are_strictly_increasing_in_a_tight_loop() {
+        let ids: Vec<String> = (0..10_000).map(|_| super::new_event_id()).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    }
+}

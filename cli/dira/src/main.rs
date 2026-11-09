@@ -1831,14 +1831,6 @@ async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcom
             }
         }
     }
-    // Probe mode always forwards: its synthetic `UserPromptSubmit` must land
-    // even when `dira doctor` runs inside a CI job (DIRASH-0023).
-    if !probe && headless::is_headless() && headless::is_human_signal(harness, &payload) {
-        hook_debug(format_args!(
-            "dira hook {harness}: withheld a human signal from a headless run"
-        ));
-        return HookOutcome::Withheld;
-    }
     let mut payload = payload;
     // Claude Desktop names each session's host id only in the environment of
     // its process tree, which only this shim can see — forward it so the
@@ -1846,54 +1838,105 @@ async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcom
     if dira_sources::canonical_harness_id(harness) == Some("claude") {
         dira_core::orchestration::inject_env_hints(&mut payload, dira_core::env::non_blank);
     }
+    // Normalize once, here (DIRASH-0049). Only the normalized record goes to
+    // the daemon or the spool; the raw payload (prompt text, tool input) never
+    // crosses the pipe or touches disk.
+    let Some((event, _)) = dira_sources::normalize_for(harness, payload) else {
+        // An unknown harness or a hook nothing accounts for: the daemon would
+        // have acknowledged it silently, so there is nothing to deliver.
+        hook_debug(format_args!(
+            "dira hook {harness}: not a hook dira accounts for; ignored"
+        ));
+        return HookOutcome::Delivered;
+    };
+    // Probe mode always forwards: its synthetic `UserPromptSubmit` must land
+    // even when `dira doctor` runs inside a CI job (DIRASH-0023).
+    if !probe && headless::is_headless() && event.kind.is_human_signal() {
+        hook_debug(format_args!(
+            "dira hook {harness}: withheld a human signal from a headless run"
+        ));
+        return HookOutcome::Withheld;
+    }
     // When the hook fired, so a late delivery (through the spool) keeps its
     // real time.
     let observed_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
-    // Normalized up front, so a failed delivery can be spooled as metadata
-    // only: the raw payload (prompt text, tool input) never touches disk.
-    let normalized = if probe {
-        None
-    } else {
-        dira_sources::normalize_for(harness, payload.clone()).map(|(n, _)| n)
+    let record = dira_sources::spool::Record::new(harness, observed_at, event);
+    deliver_record(config, harness, probe, record).await
+}
+
+/// Send one normalized hook record to the daemon (`Request::IngestRecord`).
+/// It is kept in the spool when the daemon cannot take it: unreachable, busy,
+/// timed out, or too old to know the request (the swap-before-restart moment of
+/// an update).
+async fn deliver_record(
+    config: &Config,
+    harness: &str,
+    probe: bool,
+    record: dira_sources::spool::Record,
+) -> HookOutcome {
+    let req = match serde_json::to_value(&record) {
+        Ok(record) => Request::IngestRecord { record },
+        Err(e) => return note_hook_failure(harness, probe, &format!("encode hook: {e}")),
     };
-    let owned = harness.to_string();
-    let at = observed_at.clone();
-    let outcome = deliver_hook_payload(config, harness, probe, payload, move |payload| {
-        Request::IngestHook {
-            harness: owned,
-            payload,
-            observed_at: Some(at),
-        }
-    })
+    let sent = tokio::time::timeout(
+        HOOK_TOTAL_BUDGET,
+        client::send_with_budget(&config.socket_path, &req, HOOK_CONNECT_BUDGET),
+    )
     .await;
-    if outcome == HookOutcome::Failed {
-        if let Some(event) = normalized {
-            spool_undelivered(config, harness, observed_at, event).await;
+    match sent {
+        Ok(Ok(dira_core::protocol::Response::Error { message }))
+            if client::is_daemon_too_old(&message) =>
+        {
+            if probe {
+                return note_hook_failure(harness, probe, &message);
+            }
+            spool_undelivered(config, harness, record, false).await;
+            HookOutcome::Delivered
+        }
+        // Any other answer is the daemon's: an `Error` there is a semantic
+        // non-result (an unadmitted probe id, say), not a transport failure.
+        Ok(Ok(_)) => {
+            if !probe {
+                hook_health::record_success();
+            }
+            HookOutcome::Delivered
+        }
+        Ok(Err(e)) => {
+            let outcome = note_hook_failure(harness, probe, &e.to_string());
+            if !probe {
+                spool_undelivered(config, harness, record, true).await;
+            }
+            outcome
+        }
+        Err(_) => {
+            let outcome = note_hook_failure(harness, probe, "timed out reaching dirad");
+            if !probe {
+                spool_undelivered(config, harness, record, true).await;
+            }
+            outcome
         }
     }
-    outcome
 }
 
 /// Keep a hook the daemon could not take (DIRASH-0049): write it to the spool,
-/// which the daemon drains when it is back, and, if nothing is listening, ask
-/// for the daemon to be started.
+/// which the daemon drains when it is back, and, if `kick` and nothing is
+/// listening, ask for the daemon to be started.
 async fn spool_undelivered(
     config: &Config,
     harness: &str,
-    observed_at: String,
-    event: dira_sources::Normalized,
+    record: dira_sources::spool::Record,
+    kick: bool,
 ) {
     let dir = dira_sources::spool::dir_for(&config.db_path);
-    let record = dira_sources::spool::Record::new(harness, observed_at, event);
     match dira_sources::spool::write(&dir, &record) {
         Ok(_) => hook_debug(format_args!(
             "dira hook {harness}: spooled for later delivery"
         )),
         Err(e) => hook_debug(format_args!("dira hook {harness}: could not spool ({e})")),
     }
-    if autostart::allowed() && autostart::is_down(config).await {
+    if kick && autostart::allowed() && autostart::is_down(config).await {
         autostart::kick(config);
     }
 }

@@ -81,9 +81,10 @@ A tmp-file-plus-rename needs no lock, and a reader never sees a torn record.
 
 ## Deviations from the 2026-11-09 plan (Phase 2)
 
-- The local pipe still carries the raw payload, as it did before. Only disk is protected.
-  Moving normalization fully into the shim needs a new request variant and an upgrade-skew
-  fallback, so it is left for later.
+- ~~The local pipe still carries the raw payload.~~ Resolved: the shim normalizes once and sends
+  `Request::IngestRecord`, the same record the spool holds. Raw content no longer crosses the
+  pipe either, and an older daemon's `bad request: unknown variant` makes the shim spool the
+  record.
 - The event sync cursor stays on `id`. The monotonic generator closes the skip for every id the
   writer mints, which is every hook. A rowid cursor is planned with contract 2.0 (Phase 5).
 - Writer insert batching and a separate token-sweep task are not done. The two spawns that made

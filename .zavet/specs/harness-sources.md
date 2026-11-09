@@ -34,7 +34,14 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
   wall-clock, tools and tokens are captured as before (`prompts` reads 0).
   The capture probe never withholds. See DIRASH-0047.
 - A hook is stored or spooled, never dropped (DIRASH-0049).
-  - The shim stamps `observed_at` on every `IngestHook`.
+  - The shim normalizes each hook once and sends the normalized record
+    (`Request::IngestRecord`, the spool's `Record` format) with its
+    `observed_at`. The raw payload never crosses the pipe. Live and spooled
+    hooks reach the writer through one path (`control::admit_and_enqueue` →
+    `spool::enqueue`), which is also where capture-probe admission lives. An
+    older daemon that answers `unknown variant` gets the record spooled
+    instead. The legacy `IngestHook` (raw payload) is still accepted from
+    older shims.
   - A delivery that fails (daemon down, busy, or timed out) is normalized in
     the shim and written to `spool/` beside the database, one file per event.
     The raw payload never touches disk.

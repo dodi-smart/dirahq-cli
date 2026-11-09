@@ -112,3 +112,40 @@ async fn an_old_shim_without_observed_at_still_lands_at_receipt_time() {
     assert_eq!(evs.len(), 1);
     assert!((OffsetDateTime::now_utc() - evs[0].at).whole_seconds() < 10);
 }
+
+#[tokio::test]
+async fn a_normalized_record_from_the_shim_lands_with_its_observed_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = daemon(dir.path()).await;
+    let observed = OffsetDateTime::now_utc() - time::Duration::seconds(90);
+    let record = Record::new(
+        "claude-code",
+        observed.format(&Rfc3339).unwrap(),
+        event("s-record", EventKind::UserPrompt),
+    );
+    let resp = dirad::control::dispatch(
+        &state,
+        dira_core::protocol::Request::IngestRecord {
+            record: serde_json::to_value(&record).unwrap(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, dira_core::protocol::Response::Ok),
+        "{resp:?}"
+    );
+    let evs = wait_for_events(&state, 1).await;
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].session_id, "s-record");
+    assert_eq!(evs[0].at.unix_timestamp(), observed.unix_timestamp());
+
+    // A record this daemon cannot read is refused, never half-ingested.
+    let bad = dirad::control::dispatch(
+        &state,
+        dira_core::protocol::Request::IngestRecord {
+            record: serde_json::json!({"v": 99, "harness": "claude"}),
+        },
+    )
+    .await;
+    assert!(matches!(bad, dira_core::protocol::Response::Error { .. }));
+}

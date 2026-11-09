@@ -105,6 +105,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0049 — A hook event is stored or spooled, never dropped, and the spool holds normalized metadata only (active)
 - DIRASH-0050 — Updates apply in the background by default; dirad schedules, the CLI performs (active)
 - DIRASH-0051 — The installers register the per-user service by default and hand off to dira onboard (active)
+- DIRASH-0052 — Contract 2.0: chained batches, day rollups and count-only session stats (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

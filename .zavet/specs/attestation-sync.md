@@ -12,8 +12,9 @@ paths:
   - cli/dirad/src/sync.rs
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
+  - cli/dirad/src/chain.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046, DIRASH-0049]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046, DIRASH-0049, DIRASH-0052]
 ---
 
 ## Overview
@@ -25,6 +26,16 @@ rollups keep their `prompts`/`branch`/wall-clock when a session outlives a
 single flush window (issue #40).
 
 ## Behavior
+
+- **Contract 2.0 hash chain (DIRASH-0052).**
+  - **Fields.** Every attestation batch, including lineage re-sends, carries
+    `seq`, `prevBatchHash` (SHA-256 of the previous acknowledged batch's JCS
+    payload, `""` at seq 0) and `chainEpoch`, plus `client`.
+  - **When.** The chain is stamped before signing and advances only on a 2xx,
+    so a retry is byte-identical and a quarantined chunk does not advance it.
+  - **Reset.** `nuke` and a cloud data-epoch reset start a new epoch at seq 0.
+  - **State.** Kept in `meta` as `batch_seq`, `batch_prev_hash` and
+    `chain_epoch`.
 
 - A flush reads events in `(META_SYNC_CURSOR, until]`, splits the window into
   chunks only at > idle breaks (never inside a billable interval), POSTs each

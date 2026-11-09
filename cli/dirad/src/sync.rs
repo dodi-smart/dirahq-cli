@@ -940,15 +940,20 @@ async fn flush(
     // reset. See the comment at the gate below for the full argument.
     let mut epoch_reset = false;
     let chunk_count = chunks.len();
+    // Contract 2.0 hash chain: stamped at send time, advanced on each ack.
+    let mut chain = crate::chain::Chain::load(&state.store).await;
     for chunk in chunks {
+        let mut batch = chunk.batch;
+        chain.stamp(&mut batch);
+        let batch_hash = crate::chain::hash(&batch).map_err(SyncError::Fatal)?;
         let sig = device_key
-            .sign_payload(&chunk.batch)
+            .sign_payload(&batch)
             .map_err(|e| SyncError::Fatal(format!("sign: {e}")))?;
         // Capture everything read after the POST up front, so the batch —
         // up to CHUNK_EVENTS worth of intervals/sessions/tokens/artifacts —
         // moves into the envelope instead of being deep-cloned per chunk.
-        let interval_count = chunk.batch.intervals.len();
-        let session_count = chunk.batch.sessions.len();
+        let interval_count = batch.intervals.len();
+        let session_count = batch.sessions.len();
         let cursor_event_id = chunk.cursor_event_id;
         let token_rowid_high = chunk.token_rowid_high;
         let artifact_rowid_high = chunk.artifact_rowid_high;
@@ -956,7 +961,7 @@ async fn flush(
         let envelope = Envelope {
             schema_version: SCHEMA_VERSION.to_string(),
             device_id: device_id.clone(),
-            payload: chunk.batch,
+            payload: batch,
             sig,
         };
         // Pace a long drain so it stays inside the cloud's ingest budget instead of
@@ -1013,6 +1018,10 @@ async fn flush(
             // re-transmission, exactly the tradeoff the pre-existing
             // single-shot version already accepted.
             if !epoch_reset {
+                chain
+                    .advance(&state.store, batch_hash)
+                    .await
+                    .map_err(SyncError::Fatal)?;
                 if let Some(ev) = &cursor_event_id {
                     state
                         .store
@@ -1317,8 +1326,11 @@ async fn resend_lineage(
                 &device_id,
                 now,
             );
+            let mut chain = crate::chain::Chain::load(&state.store).await;
             for batch in &mut batches {
                 stamp_runtime(&mut batch.sessions);
+                chain.stamp(batch);
+                let batch_hash = crate::chain::hash(batch).map_err(SyncError::Fatal)?;
                 let count = batch.sessions.len();
                 let sig = device_key
                     .sign_payload(batch)
@@ -1343,6 +1355,10 @@ async fn resend_lineage(
                 if !resp.status().is_success() {
                     return Err(ingest_error(resp).await);
                 }
+                chain
+                    .advance(&state.store, batch_hash)
+                    .await
+                    .map_err(SyncError::Fatal)?;
                 sent += count;
             }
             // Same pacing as a long flush drain (D-0020).
@@ -1457,6 +1473,9 @@ pub(crate) async fn note_data_epoch(state: &AppState, epoch: &str) -> Result<boo
                 .meta_set(META_LAST_EPOCH, epoch)
                 .await
                 .map_err(|e| format!("store epoch: {e}"))?;
+            // The cloud lost its log: start a new batch-chain epoch too
+            // (DIRASH-0052), so the re-sent history forms a fresh chain.
+            crate::chain::Chain::restart(&state.store).await?;
             for key in [
                 META_SYNC_CURSOR,
                 META_ARTIFACTS_CURSOR,
@@ -3559,6 +3578,7 @@ mod tests {
         ServerMeta {
             schema_version: max.into(),
             min_schema_version: min.into(),
+            accept_encodings: Vec::new(),
         }
     }
 

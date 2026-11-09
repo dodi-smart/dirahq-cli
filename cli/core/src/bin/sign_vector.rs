@@ -97,9 +97,70 @@ pub fn build_vector() -> serde_json::Value {
             // cross-language vector, not just tolerated.
             trigger: Some(dira_contract::SessionTrigger::Scheduled),
             trigger_name: Some("dodi-smart-triage-refresh".to_string()),
+            // Contract 2.0 fields, populated so the cloud verifier proves it
+            // canonicalizes them byte-identically.
+            stats: Some(dira_contract::SessionStats {
+                tool_calls: dira_contract::ToolCalls {
+                    read: 12,
+                    edit: 4,
+                    shell: 3,
+                    mcp: 1,
+                    ..Default::default()
+                },
+                files_touched: Some(5),
+                agent_lines_added: Some(120),
+                agent_lines_removed: Some(18),
+                subagents: 1,
+                compactions: None,
+                permission_prompts: 2,
+                approval_wait_seconds: 41,
+                test_runs: Some(dira_contract::TestRuns {
+                    passed: 2,
+                    failed: 1,
+                }),
+            }),
+            workspace_hint: Some("ws_01HZYX".into()),
         }],
         token_usage: vec![],
         artifacts: vec![],
+        seq: 7,
+        prev_batch_hash: "5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef".into(),
+        chain_epoch: 1,
+        client: Some(dira_contract::ClientInfo {
+            version: "2.0.0".into(),
+            channel: Some("stable".into()),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+        }),
+        capture_health: Some(dira_contract::CaptureHealth {
+            spooled: 3,
+            spilled: 1,
+            dropped: 0,
+            quarantined: 0,
+            hook_failures: None,
+        }),
+        day_rollups: vec![dira_contract::DayRollup {
+            day: "2026-11-09".into(),
+            repo_canonical: Some("github.com/acme/api".into()),
+            workspace_hint: Some("ws_01HZYX".into()),
+            human_seconds: 3600,
+            agent_wall_seconds: 5400,
+            sessions: 2,
+            prompts: 14,
+            commits: 3,
+            tokens: vec![dira_contract::DayTokens {
+                model: "claude-opus-5-5".into(),
+                input: 1200,
+                output: 3400,
+                cache_read: 90000,
+                cache_create: 5000,
+            }],
+            est_cost_usd: None,
+            interval_count: 4,
+            interval_digest: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                .into(),
+            revision: 0,
+        }],
     };
 
     let sig = key.sign_payload(&payload).expect("sign");

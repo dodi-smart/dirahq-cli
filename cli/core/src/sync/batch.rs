@@ -264,6 +264,8 @@ fn assemble_batch(
             workspace_ref: wire.workspace_ref,
             trigger: wire.trigger,
             trigger_name: wire.trigger_name,
+            stats: None,
+            workspace_hint: None,
         });
     }
 
@@ -278,6 +280,12 @@ fn assemble_batch(
         sessions,
         token_usage,
         artifacts,
+        seq: 0,
+        prev_batch_hash: String::new(),
+        chain_epoch: 0,
+        client: None,
+        capture_health: None,
+        day_rollups: Vec::new(),
     }
 }
 
@@ -474,7 +482,9 @@ fn build_artifacts(rows: &[ArtifactRow]) -> Vec<ArtifactRef> {
             session_change_id: r.session_change_id.clone(),
             touched_paths: r.touched_paths.clone(),
             blobs: r.blobs.clone(),
-            // author_name is intentionally local-only (PII) — not on the wire.
+            // author_name is intentionally local-only (PII) — not on the wire.,
+            lines_added: None,
+            lines_removed: None,
         })
         .collect()
 }
@@ -901,6 +911,8 @@ fn build_sessions(
                 workspace_ref: wire.workspace_ref,
                 trigger: wire.trigger,
                 trigger_name: wire.trigger_name,
+                stats: None,
+                workspace_hint: None,
             }
         })
         .collect()
@@ -1005,6 +1017,12 @@ pub fn build_lineage_resend_batches(
                 sessions: chunk.to_vec(),
                 token_usage: Vec::new(),
                 artifacts: Vec::new(),
+                seq: 0,
+                prev_batch_hash: String::new(),
+                chain_epoch: 0,
+                client: None,
+                capture_health: None,
+                day_rollups: Vec::new(),
             }
         })
         .collect()

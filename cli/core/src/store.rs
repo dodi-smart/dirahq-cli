@@ -783,7 +783,19 @@ impl Store {
         // For `token_usage` that would re-create the exact defect
         // `META_TOKEN_CURSOR` exists to fix, since `nuke` also clears the
         // `token_offset:%` watermarks above and thus guarantees a full re-import.
+        // A wipe starts a new batch-chain epoch at seq 0 (DIRASH-0052): the
+        // cloud keys a chain by (device, epoch), and restarting seq 0 in the
+        // old epoch would collide with batches it already holds.
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES (?1, '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(COALESCE(NULLIF(value, ''), '0') AS INTEGER) + 1",
+        )
+        .bind(crate::sync::META_CHAIN_EPOCH)
+        .execute(&mut *tx)
+        .await?;
         for key in [
+            crate::sync::META_BATCH_SEQ,
+            crate::sync::META_BATCH_PREV_HASH,
             crate::sync::META_SYNC_CURSOR,
             crate::sync::META_ARTIFACTS_CURSOR,
             crate::sync::META_TOKEN_CURSOR,

@@ -21,6 +21,7 @@
 pub mod autoupdate;
 pub mod billing;
 pub mod capture;
+pub mod chain;
 pub mod control;
 pub mod events;
 pub mod heartbeat;

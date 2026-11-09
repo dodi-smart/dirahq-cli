@@ -194,6 +194,10 @@ pub fn build_vector() -> serde_json::Value {
             }),
             engaged_during_meeting_seconds: 240,
         }],
+        windows: vec![dira_contract::BatchWindow {
+            started_at: "2026-06-27T09:00:00Z".into(),
+            ended_at: "2026-06-27T10:00:00Z".into(),
+        }],
     };
 
     let sig = key.sign_payload(&payload).expect("sign");

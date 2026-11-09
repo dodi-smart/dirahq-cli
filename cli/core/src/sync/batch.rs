@@ -287,6 +287,7 @@ fn assemble_batch(
         capture_health: None,
         day_rollups: Vec::new(),
         meetings: Vec::new(),
+        windows: Vec::new(),
     }
 }
 
@@ -1032,6 +1033,7 @@ pub fn build_lineage_resend_batches(
                 capture_health: None,
                 day_rollups: Vec::new(),
                 meetings: Vec::new(),
+                windows: Vec::new(),
             }
         })
         .collect()

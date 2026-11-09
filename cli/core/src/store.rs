@@ -6568,6 +6568,7 @@ mod v2_tests {
             human_seconds: secs,
             activity: None,
             source_session: "s".into(),
+            meeting_id: None,
         }
     }
 
@@ -6586,6 +6587,8 @@ mod v2_tests {
             token_usage: vec![],
             artifacts: vec![],
             day_rollups: vec![],
+            meetings: vec![],
+            windows: vec![],
         }
     }
 

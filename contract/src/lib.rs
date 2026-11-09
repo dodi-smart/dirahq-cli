@@ -100,6 +100,23 @@ pub struct AttestationBatch {
     /// [`Meeting`]). Their time rides [`Interval`]s carrying `meetingId`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub meetings: Vec<Meeting>,
+    /// 2.1: time ranges whose intervals this batch restates IN FULL for its
+    /// device. The cloud replaces the device's claims inside each window even
+    /// where the batch sends no interval, so re-decomposing a window down to
+    /// nothing (a retracted meeting with no work left) removes the stale claim
+    /// (D-0085). Empty means "only where my intervals land", as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<BatchWindow>,
+}
+
+/// 2.1: a range a batch restates in full (see [`AttestationBatch::windows`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchWindow {
+    /// RFC 3339, inclusive.
+    pub started_at: String,
+    /// RFC 3339, exclusive.
+    pub ended_at: String,
 }
 
 /// 2.0: the build and platform that produced a batch.
@@ -1553,6 +1570,7 @@ mod tests {
                 capture_health: None,
                 day_rollups: Vec::new(),
                 meetings: Vec::new(),
+                windows: Vec::new(),
             },
             sig: "deadbeef".to_string(),
         };
@@ -1581,6 +1599,7 @@ mod tests {
             capture_health: None,
             day_rollups: Vec::new(),
             meetings: Vec::new(),
+            windows: Vec::new(),
         };
         let json = serde_json::to_string(&batch).unwrap();
         assert!(!json.contains("intervals"));
@@ -2093,6 +2112,10 @@ mod tests {
                         method: AttributionMethod::Domain,
                     }),
                     engaged_during_meeting_seconds: 1,
+                }],
+                windows: vec![BatchWindow {
+                    started_at: "s".into(),
+                    ended_at: "e".into(),
                 }],
             },
             sig: "sig".into(),

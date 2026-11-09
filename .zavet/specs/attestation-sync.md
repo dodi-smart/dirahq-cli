@@ -241,7 +241,10 @@ single flush window (issue #40).
   either yet: `batch.rs` sets `meetingId: None` and sends no meetings until the
   daemon wiring lands. When it does, a meeting's time rides intervals the
   device has already overlaid with its work (DIRASH-0063), so a reader still
-  sums `humanSeconds` once.
+  sums `humanSeconds` once. 2.1 also adds `AttestationBatch.windows[]`: ranges
+  the batch restates in full for its device, so the cloud's per-device claims
+  (cloud D-0085) are replaced there even where no interval lands, e.g. a
+  retracted meeting with nothing left. The producer sends none yet.
 
 ## Invariants
 

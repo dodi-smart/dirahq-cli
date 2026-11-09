@@ -135,6 +135,7 @@ mod tests {
             artifacts: vec![],
             day_rollups: vec![],
             meetings: vec![],
+            windows: vec![],
         }
     }
 

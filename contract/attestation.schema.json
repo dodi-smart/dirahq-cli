@@ -248,6 +248,13 @@
           "items": {
             "$ref": "#/$defs/TokenUsage"
           }
+        },
+        "windows": {
+          "description": "2.1: time ranges whose intervals this batch restates IN FULL for its\ndevice. The cloud replaces the device's claims inside each window even\nwhere the batch sends no interval, so re-decomposing a window down to\nnothing (a retracted meeting with no work left) removes the stale claim\n(D-0085). Empty means \"only where my intervals land\", as before.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BatchWindow"
+          }
         }
       },
       "required": [
@@ -276,6 +283,24 @@
           "type": "string",
           "const": "context"
         }
+      ]
+    },
+    "BatchWindow": {
+      "description": "2.1: a range a batch restates in full (see [`AttestationBatch::windows`]).",
+      "type": "object",
+      "properties": {
+        "endedAt": {
+          "description": "RFC 3339, exclusive.",
+          "type": "string"
+        },
+        "startedAt": {
+          "description": "RFC 3339, inclusive.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "startedAt",
+        "endedAt"
       ]
     },
     "BlobRef": {

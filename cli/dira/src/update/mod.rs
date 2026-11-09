@@ -122,6 +122,12 @@ pub struct UpdateArgs {
     /// the human line. Errors become `"status": "error"` in that object, so
     /// stdout always parses.
     pub json: bool,
+    /// Background mode (`dirad` schedules it, DIRASH-0050): a no-op unless
+    /// auto-update is enabled and a strictly newer release is out on the
+    /// channel, never prompts, and one at a time.
+    pub auto: bool,
+    /// Swap back to the binaries the last successful update replaced.
+    pub rollback: bool,
 }
 
 /// A post-update step [`run`]'s success arm can take, as a value —
@@ -171,12 +177,56 @@ impl Drop for Workdir {
     }
 }
 
+/// The channel to resolve against: `--channel`, else the `update.channel`
+/// knob, else stable. In background mode only, an unset knob falls back to the
+/// channel of the installed version, so a prerelease install keeps following
+/// prereleases without anyone having set the knob. A hand-run `dira update`
+/// keeps the stable default and its downgrade refusal.
+fn effective_channel(
+    arg: Option<&str>,
+    knob: Option<&str>,
+    current: &str,
+    auto: bool,
+) -> Result<Channel> {
+    if let Some(raw) = arg {
+        return Channel::parse(raw);
+    }
+    if let Some(raw) = knob {
+        if let Ok(c) = Channel::parse(raw) {
+            return Ok(c);
+        }
+    }
+    let prerelease = semver::Version::parse(current).is_ok_and(|v| !v.pre.is_empty());
+    Ok(if auto && prerelease {
+        Channel::Prerelease
+    } else {
+        resolve::default_channel()
+    })
+}
+
 /// Run `dira update`.
 pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
-    let channel = match &args.channel {
-        Some(raw) => Channel::parse(raw)?,
-        None => resolve::default_channel(),
-    };
+    if args.rollback {
+        return run_rollback(config, &args).await;
+    }
+    if args.auto && !dira_core::config::auto_update_enabled(config) {
+        return Ok(());
+    }
+    let channel = effective_channel(
+        args.channel.as_deref(),
+        config.update.channel.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        args.auto,
+    )?;
+    // An explicit `--channel` on a real update is remembered, so background
+    // updates keep following it.
+    if !args.check && !args.auto {
+        if let Some(raw) = &args.channel {
+            if config.update.channel.as_deref() != Some(channel.label()) {
+                let _ = crate::config_cmd::set_quiet(config, "update.channel", raw);
+            }
+        }
+    }
 
     // `connect_timeout` bounds the TCP+TLS handshake; `read_timeout` bounds
     // the gap between successful body reads (an inactivity timeout — it
@@ -222,6 +272,14 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
     // `--version 0.3.5` runs must not escalate a notice about 0.4.0, which may
     // well install fine.
     let pinned = args.version.is_some();
+    let _auto_lock = if args.auto {
+        match AutoLock::acquire(&config.db_path) {
+            Some(lock) => Some(lock),
+            None => return Ok(()), // another background update is running
+        }
+    } else {
+        None
+    };
     let outcome = run_update(config, args, &http, channel).await;
     if !pinned {
         match &outcome {
@@ -254,6 +312,22 @@ async fn run_update(
     let resolved = resolve::resolve(http, &target, args.version.as_deref(), channel)
         .await
         .context("resolve release")?;
+
+    // Background mode acts only on a strictly newer release, and never on one
+    // a rollback put on the skip list. A plain `dira update` reinstalls the
+    // same version on purpose (it repairs a damaged install); this must not.
+    if args.auto {
+        if check_verdict(&resolved.version, env!("CARGO_PKG_VERSION")) != CheckVerdict::Available {
+            return Ok(());
+        }
+        if config.update.skip_version.as_deref() == Some(resolved.version.as_str()) {
+            println!(
+                "dira update --auto: {} is on the skip list",
+                resolved.version
+            );
+            return Ok(());
+        }
+    }
 
     // Refuse an implicit downgrade before anything is downloaded or swapped.
     // `--check` and the passive notice already decline to *offer* an older
@@ -317,7 +391,7 @@ async fn run_update(
     }
 
     if args.no_restart {
-        replace::cleanup_backups(&bin_dir);
+        replace::keep_previous(&bin_dir);
         println!("{}", no_restart_notice(&resolved.version, &bin_dir));
         return Ok(());
     }
@@ -327,7 +401,7 @@ async fn run_update(
     // polls for a healthy comeback and reports the version that answers.
     match daemon::restart(config).await {
         Ok(()) => {
-            replace::cleanup_backups(&bin_dir);
+            replace::keep_previous(&bin_dir);
             println!(
                 "dira + dirad updated to {} and the daemon restarted",
                 resolved.version
@@ -375,6 +449,62 @@ async fn run_update(
             )))
         }
     }
+}
+
+/// One background update at a time: an exclusive lock file beside the store.
+/// A lock older than [`AutoLock::STALE`] is taken over, so a crashed run never
+/// blocks updates for good.
+struct AutoLock(PathBuf);
+
+impl AutoLock {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    fn acquire(db_path: &Path) -> Option<Self> {
+        let path = db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+            .join("update.lock");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let stale = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .is_some_and(|age| age > Self::STALE);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .ok()
+            .map(|_| Self(path))
+    }
+}
+
+impl Drop for AutoLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `dira update --rollback`: swap the binaries the last successful update
+/// replaced back into place, restart the daemon, and put the version being
+/// rolled away from on the skip list so background updates do not re-apply it.
+async fn run_rollback(config: &Config, args: &UpdateArgs) -> Result<()> {
+    let guard = replace::discover_install(args.bin_dir.as_deref())?;
+    let bin_dir = guard_to_bin_dir(guard, args.force)?;
+    let from = env!("CARGO_PKG_VERSION");
+    replace::rollback_to_previous(&bin_dir)?;
+    let _ = crate::config_cmd::set_quiet(config, "update.skip_version", from);
+    println!("rolled dira + dirad back from {from}; background updates will skip {from}");
+    if args.no_restart {
+        return Ok(());
+    }
+    daemon::restart(config).await
 }
 
 /// The 90-second wall-clock budget [`cloud_refresh_after_update`] gives the
@@ -1165,5 +1295,38 @@ mod tests {
             lines.len()
         );
         assert!(lines.iter().all(|l| !l.contains(FALLBACK_MARKER)));
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_beats_knob_beats_installed_version() {
+        assert_eq!(
+            effective_channel(Some("stable"), Some("prerelease"), "1.0.0-develop.3", true).unwrap(),
+            Channel::Stable
+        );
+        assert_eq!(
+            effective_channel(None, Some("prerelease"), "1.0.0", false).unwrap(),
+            Channel::Prerelease
+        );
+        assert_eq!(
+            effective_channel(None, None, "0.12.0-develop.2", true).unwrap(),
+            Channel::Prerelease,
+            "a prerelease install follows prereleases in the background"
+        );
+        assert_eq!(
+            effective_channel(None, None, "0.12.0-develop.2", false).unwrap(),
+            Channel::Stable,
+            "a hand-run update keeps the stable default"
+        );
+        assert_eq!(
+            effective_channel(None, Some("nonsense"), "0.12.0", true).unwrap(),
+            Channel::Stable,
+            "a bad knob falls through rather than failing a background run"
+        );
+        assert!(effective_channel(Some("nightly"), None, "0.12.0", false).is_err());
     }
 }

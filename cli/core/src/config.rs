@@ -126,13 +126,27 @@ fn default_agent_max_span_seconds() -> u64 {
 /// after `status`/`version`/`daemon status` (plan §A5) — `dira update` itself
 /// is always an explicit, user-run command and never reads this knob. Env
 /// override: `DIRA_UPDATE__CHECK=true|false`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateKnobs {
     /// Whether the passive notice may run at all: `false` suppresses both
     /// the printed notice and the background cache refresh that keeps it
     /// warm (see `update/notice.rs`).
     #[serde(default = "default_true")]
     pub check: bool,
+    /// Whether updates are applied in the background (DIRASH-0050): `dirad`
+    /// schedules a detached `dira update --auto` every few hours. On by
+    /// default. `DIRA_DISABLE_AUTOUPDATE` and `CI` also turn it off.
+    #[serde(default = "default_true")]
+    pub auto: bool,
+    /// The release channel updates resolve against (`stable`, `prerelease`).
+    /// Unset: the channel of the installed version. Written by the installers
+    /// and by `dira update --channel`.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// A version auto-update must not install again, set by
+    /// `dira update --rollback` so a bad release is not re-applied.
+    #[serde(default)]
+    pub skip_version: Option<String>,
 }
 
 impl Default for UpdateKnobs {
@@ -141,8 +155,21 @@ impl Default for UpdateKnobs {
         // zero value), contradicting the field's own serde default — checking
         // is on out of the box, same as every pre-A5 config that lacks an
         // `[update]` table entirely.
-        Self { check: true }
+        Self {
+            check: true,
+            auto: true,
+            channel: None,
+            skip_version: None,
+        }
     }
+}
+
+/// Whether background auto-update may run in this process: the `update.auto`
+/// knob, and neither `DIRA_DISABLE_AUTOUPDATE` nor `CI` set. Shared by `dirad`
+/// (which schedules) and `dira update --auto` (which applies).
+pub fn auto_update_enabled(config: &Config) -> bool {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
+    config.update.auto && !set("DIRA_DISABLE_AUTOUPDATE") && !set("CI")
 }
 
 /// Daemon + CLI configuration.

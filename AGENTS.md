@@ -110,6 +110,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0047 — A headless run withholds human signals at the hook shim, and forwards everything else (active)
 - DIRASH-0048 — The Windows daemon is a windowless binary, registered per user by an XML logon task or a Run key, and started at once (active)
 - DIRASH-0049 — A hook event is stored or spooled, never dropped, and the spool holds normalized metadata only (active)
+- DIRASH-0050 — Updates apply in the background by default; dirad schedules, the CLI performs (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

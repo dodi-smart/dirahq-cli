@@ -11,9 +11,10 @@ paths:
   - cli/dira/src/update/**
   - cli/dira/src/cloud_init.rs
   - cli/dira/src/daemon.rs
+  - cli/dirad/src/autoupdate.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038, DIRASH-0048, DIRASH-0050]
 checks:
   - the post-update steps honour --no-zavet and --no-cloud :: cargo test -p dira --bin dira -- update::tests::post_update_steps_honour_no_zavet_and_no_cloud
   - refresh never creates artifacts and never lowers a pin :: cargo test -p dira --bin dira -- cloud_init::tests::refresh_never_creates_artifacts_and_never_downgrades
@@ -35,6 +36,26 @@ Releases as the only artifact source, and an in-binary updater that swaps
 both executables and restarts whatever is supervising the daemon.
 
 ## Behavior
+
+- **Background auto-update (DIRASH-0050).**
+  - **Schedule.** `dirad` spawns a detached, windowless `dira update --auto`
+    10 min after start, then every 6 h ± 30 min. Output goes to
+    `logs/update.log`, capped at 1 MiB.
+  - **Work.** The CLI does all of it through the ordinary update path. It acts
+    only on a strictly newer release that is not in `update.skip_version`,
+    under an `update.lock`, and is a no-op when `update.auto = false`,
+    `DIRA_DISABLE_AUTOUPDATE` or `CI` is set, in debug builds, and on dev
+    installs.
+  - **Surviving the restart.** The updater outlives the daemon it restarts:
+    its own process group on unix, `KillMode=process` in the systemd unit,
+    and `CREATE_BREAKAWAY_FROM_JOB` (with fallback) on windows.
+X
+  channel (a prerelease build follows prereleases). An explicit `--channel` is
+  persisted.
+- **Rollback.** After every successful update the replaced binaries are kept as
+  `.{name}.prev`. `dira update --rollback` swaps them back (rename-only),
+  restarts the daemon, and records the version it left in
+  `update.skip_version`. A rollback can itself be rolled back.
 
 - `install.sh` detects OS/arch, resolves a version, downloads the archive and
   its checksum, verifies sha256, then installs both binaries atomically. It

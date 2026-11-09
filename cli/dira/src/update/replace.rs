@@ -359,10 +359,6 @@ fn restore_from_backup(bin_dir: &Path, name: &str) -> Result<()> {
     )
 }
 
-fn cleanup_one_backup(bin_dir: &Path, name: &str) {
-    let _ = std::fs::remove_file(backup_path(bin_dir, name));
-}
-
 /// Back up, then atomically swap both binaries found in `extracted_dir` into
 /// `bin_dir` — `dirad` first, then `dira`. Dying between the two leaves the
 /// recoverable version-skew state `print_version` (main.rs) already warns
@@ -411,10 +407,51 @@ pub fn rollback(bin_dir: &Path) {
     let _ = restore_from_backup(bin_dir, dira_ipc::DIRA_BIN);
 }
 
-/// Delete both `.bak` hard links after a confirmed-good update.
-pub fn cleanup_backups(bin_dir: &Path) {
-    cleanup_one_backup(bin_dir, dira_ipc::DIRAD_BIN);
-    cleanup_one_backup(bin_dir, dira_ipc::DIRA_BIN);
+fn previous_path(bin_dir: &Path, name: &str) -> PathBuf {
+    bin_dir.join(format!(".{name}.prev"))
+}
+
+/// After a confirmed-good update, keep the pre-update binaries as
+/// `.{name}.prev` instead of deleting them, so `dira update --rollback` can
+/// return to them later (DIRASH-0050). A rename of the `.bak` hard link: no
+/// copy, and the running binaries are never opened for writing (D-0003).
+pub fn keep_previous(bin_dir: &Path) {
+    for name in [dira_ipc::DIRAD_BIN, dira_ipc::DIRA_BIN] {
+        let bak = backup_path(bin_dir, name);
+        if std::fs::symlink_metadata(&bak).is_ok() {
+            let prev = previous_path(bin_dir, name);
+            let _ = std::fs::remove_file(&prev);
+            if std::fs::rename(&bak, &prev).is_err() {
+                let _ = std::fs::remove_file(&bak);
+            }
+        }
+    }
+}
+
+/// Whether both previous binaries are kept.
+pub fn has_previous(bin_dir: &Path) -> bool {
+    [dira_ipc::DIRAD_BIN, dira_ipc::DIRA_BIN]
+        .iter()
+        .all(|n| std::fs::symlink_metadata(previous_path(bin_dir, n)).is_ok())
+}
+
+/// Swap the kept `.{name}.prev` binaries back into place, `dirad` first, using
+/// the same rename-only swap as an update (D-0003). The binaries being replaced
+/// become the new `.{name}.prev`, so a rollback can itself be undone.
+pub fn rollback_to_previous(bin_dir: &Path) -> Result<()> {
+    if !has_previous(bin_dir) {
+        anyhow::bail!(
+            "no previous version is kept in {} (one is kept after each successful update)",
+            bin_dir.display()
+        );
+    }
+    let unique = format!("rollback.{}", std::process::id());
+    for name in [dira_ipc::DIRAD_BIN, dira_ipc::DIRA_BIN] {
+        backup(bin_dir, name)?;
+        swap_in(&previous_path(bin_dir, name), bin_dir, name, &unique)?;
+    }
+    keep_previous(bin_dir);
+    Ok(())
 }
 
 /// Extract the version token from `dira --version` output.
@@ -752,9 +789,13 @@ mod tests {
         assert_eq!(std::fs::read(&dira_bak).unwrap(), b"old-dira");
         assert_eq!(std::fs::read(&dirad_bak).unwrap(), b"old-dirad");
 
-        cleanup_backups(&bin_dir);
+        keep_previous(&bin_dir);
         assert!(!dira_bak.exists());
         assert!(!dirad_bak.exists());
+        assert!(
+            has_previous(&bin_dir),
+            "the pre-update binaries are kept for --rollback"
+        );
     }
 
     #[test]
@@ -967,5 +1008,60 @@ mod tests {
             "must not have slept: took {:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod previous_tests {
+    use super::*;
+
+    fn write(dir: &Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+    }
+
+    fn read(dir: &Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).unwrap()
+    }
+
+    #[test]
+    fn keep_then_rollback_then_roll_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let new = dir.path().join("new");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        write(&bin, dira_ipc::DIRA_BIN, "v1");
+        write(&bin, dira_ipc::DIRAD_BIN, "d1");
+        write(&new, dira_ipc::DIRA_BIN, "v2");
+        write(&new, dira_ipc::DIRAD_BIN, "d2");
+
+        assert!(!has_previous(&bin));
+        swap_binaries(&bin, &new).unwrap();
+        keep_previous(&bin);
+        assert!(has_previous(&bin));
+        assert_eq!(read(&bin, dira_ipc::DIRA_BIN), "v2");
+
+        rollback_to_previous(&bin).unwrap();
+        assert_eq!(read(&bin, dira_ipc::DIRA_BIN), "v1");
+        assert_eq!(read(&bin, dira_ipc::DIRAD_BIN), "d1");
+
+        rollback_to_previous(&bin).unwrap();
+        assert_eq!(
+            read(&bin, dira_ipc::DIRA_BIN),
+            "v2",
+            "a rollback can be undone"
+        );
+    }
+
+    #[test]
+    fn rollback_without_a_kept_version_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(rollback_to_previous(dir.path()).is_err());
     }
 }

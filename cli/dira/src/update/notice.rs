@@ -971,12 +971,18 @@ mod tests {
     #[test]
     fn from_process_maps_the_config_knob() {
         let off = Config {
-            update: dira_core::config::UpdateKnobs { check: false },
+            update: dira_core::config::UpdateKnobs {
+                check: false,
+                ..Default::default()
+            },
             ..Config::default()
         };
         assert!(Env::from_process(&off).knob_off);
         let on = Config {
-            update: dira_core::config::UpdateKnobs { check: true },
+            update: dira_core::config::UpdateKnobs {
+                check: true,
+                ..Default::default()
+            },
             ..Config::default()
         };
         assert!(!Env::from_process(&on).knob_off);

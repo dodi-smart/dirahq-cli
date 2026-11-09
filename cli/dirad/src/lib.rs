@@ -18,6 +18,7 @@
 //! real daemon (bind a socket, drive `Ping`/`Status`) against the same code the
 //! binary runs.
 
+pub mod autoupdate;
 pub mod billing;
 pub mod capture;
 pub mod control;
@@ -490,6 +491,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Replay hooks spooled while this daemon was down, busy or full.
     spool::spawn_drain(state.clone());
+    // Keep the clock for background updates; the CLI does the work.
+    autoupdate::spawn(state.clone());
 
     // Block until shutdown. The accept loop runs detached in `serve_control`.
     wait_for_shutdown_signal(&state, &mut shutdown_signals).await;

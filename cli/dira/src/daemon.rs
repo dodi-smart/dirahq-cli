@@ -1063,7 +1063,7 @@ fn install_service(config: &Config) -> Result<Launch> {
         std::fs::create_dir_all(&dir)?;
         let unit_path = dir.join("dirad.service");
         let unit = format!(
-            "[Unit]\nDescription=Dira capture daemon\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={bin}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Dira capture daemon\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={bin}\nRestart=always\nRestartSec=3\n# Stopping the unit stops dirad only: the background updater it spawns\n# restarts this unit and must survive that (DIRASH-0050).\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
             bin = bin.display(),
         );
         std::fs::write(&unit_path, unit)?;

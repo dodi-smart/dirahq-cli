@@ -572,7 +572,12 @@ Examples:
   dira update --version 0.2.0       pin to (or downgrade to) an exact version
   dira update --no-restart          swap the binaries, leave the running daemon alone
   dira update --no-zavet            skip the post-update zavet plugin refresh
-  dira update --no-cloud            skip the post-update cloud wiring refresh"
+  dira update --no-cloud            skip the post-update cloud wiring refresh
+  dira update --rollback            go back to the version the last update replaced
+
+Updates also apply in the background: dirad checks every few hours and installs
+a newer release on your channel. Turn that off with `dira config set update.auto
+off` (or DIRA_DISABLE_AUTOUPDATE=1)."
     )]
     Update {
         /// Resolve only — report what's available, change nothing.
@@ -602,6 +607,14 @@ Examples:
         /// With --check: emit one JSON object on stdout instead of text.
         #[arg(long, requires = "check")]
         json: bool,
+        /// Go back to the version the last update replaced, and skip the
+        /// version you are leaving in background updates.
+        #[arg(long, conflicts_with_all = ["check", "version", "channel"])]
+        rollback: bool,
+        /// Background mode, run by dirad: only acts on a newer release when
+        /// auto-update is on.
+        #[arg(long, hide = true)]
+        auto: bool,
     },
     /// Zavet knowledge module: what the tracked time produced, and why.
     #[command(
@@ -1335,6 +1348,8 @@ async fn main() -> Result<()> {
             no_zavet,
             no_cloud,
             json,
+            rollback,
+            auto,
         } => {
             return update::run(
                 &config,
@@ -1348,6 +1363,8 @@ async fn main() -> Result<()> {
                     no_zavet: *no_zavet,
                     no_cloud: *no_cloud,
                     json: *json,
+                    rollback: *rollback,
+                    auto: *auto,
                 },
             )
             .await;

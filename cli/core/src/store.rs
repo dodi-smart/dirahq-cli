@@ -208,7 +208,7 @@ pub struct Store {
 }
 
 mod meetings;
-pub use meetings::{MeetingState, NewMeeting, StoredMeeting};
+pub use meetings::{wire_str, DetectionConfidence, MeetingState, NewMeeting, StoredMeeting};
 
 impl Store {
     /// Open (creating if needed) the store at `path`, enable WAL, and migrate.
@@ -444,6 +444,27 @@ impl Store {
                 .await?
             }
         };
+        rows.iter().map(row_to_event).collect()
+    }
+
+    /// Every stored event whose `at` lies in `[from, to)`, oldest first. The
+    /// by-time read a restatement needs (contract 2.1 `windows`): unlike a flush's
+    /// event-id slice, it sees events a spool replay inserted later with past
+    /// `at` values, so the window it restates is complete.
+    pub async fn events_in_at_range(
+        &self,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE at >= ?1 AND at < ?2 AND session_id NOT LIKE ?3 \
+             ORDER BY at ASC, id ASC",
+        )
+        .bind(StoredAt(from))
+        .bind(StoredAt(to))
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(row_to_event).collect()
     }
 
@@ -773,8 +794,12 @@ impl Store {
             "DELETE FROM day_tokens",
             "DELETE FROM day_commits",
             "DELETE FROM day_rollup_state",
-            // Meetings (0011): detected spans are local state too.
+            // Meetings (0011): detected spans are local state too, and the
+            // meeting sync cursor starts over with them. The change sequence's
+            // high-water mark (`meeting_seq`) is kept, so a new change is
+            // always past anything sync saw before.
             "DELETE FROM meetings",
+            "DELETE FROM meta WHERE key = 'meeting_cursor'",
         ] {
             sqlx::query(sql).execute(&mut *tx).await?;
         }
@@ -3567,18 +3592,44 @@ impl Store {
     ) -> Result<(), Error> {
         let mut tx = self.pool.begin().await?;
         let mut days: std::collections::BTreeSet<(String, String)> = Default::default();
+        let rfc3339 =
+            |t: &str| OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok();
+        // A batch that restates windows (contract 2.1, a meeting re-decompose)
+        // replaces this device's intervals inside them, possibly under new ids:
+        // drop the old rows first and mark their days dirty, or both would be
+        // summed into the next day rollup.
+        for w in &batch.windows {
+            let (Some(from), Some(to)) = (rfc3339(&w.started_at), rfc3339(&w.ended_at)) else {
+                continue;
+            };
+            let gone: Vec<(String, String)> = sqlx::query_as(
+                "SELECT DISTINCT day, repo FROM day_intervals WHERE started_at >= ?1 AND started_at < ?2",
+            )
+            .bind(StoredAt(from))
+            .bind(StoredAt(to))
+            .fetch_all(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM day_intervals WHERE started_at >= ?1 AND started_at < ?2")
+                .bind(StoredAt(from))
+                .bind(StoredAt(to))
+                .execute(&mut *tx)
+                .await?;
+            days.extend(gone);
+        }
         for i in &batch.intervals {
             let Some(day) = utc_day(&i.started_at) else {
                 continue;
             };
             let repo = i.repo_canonical.clone().unwrap_or_default();
             sqlx::query(
-                "INSERT OR REPLACE INTO day_intervals (id, day, repo, human_seconds) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO day_intervals (id, day, repo, human_seconds, started_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(&i.id)
             .bind(day)
             .bind(&repo)
             .bind(i.human_seconds as i64)
+            .bind(rfc3339(&i.started_at).map(StoredAt))
             .execute(&mut *tx)
             .await?;
             days.insert((day.to_string(), repo));
@@ -6635,6 +6686,49 @@ mod v2_tests {
             .unwrap();
         let again = store.pending_day_rollups(10).await.unwrap();
         assert_eq!((again[0].human_seconds, again[0].revision), (105, 1));
+    }
+
+    #[tokio::test]
+    async fn a_restated_window_replaces_its_intervals_in_the_day_rollup() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        // Flushed earlier: one 30-minute interval at 10:00 (see `interval`).
+        store
+            .record_acked_batch(&batch(vec![interval("work-1", &day, 1800)]))
+            .await
+            .unwrap();
+        let keys: Vec<_> = store
+            .pending_day_rollups(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.day, d.repo_canonical))
+            .collect();
+        store.mark_day_rollups_sent(&keys).await.unwrap();
+
+        // A meeting restatement over 09:55-10:35 re-decomposes the same minutes
+        // under new ids (work clipped around the meeting).
+        let mut restated = batch(vec![
+            interval("work-2", &day, 600),
+            Interval {
+                id: "meeting-slice".into(),
+                activity: Some("meeting".into()),
+                meeting_id: Some("m1".into()),
+                ..interval("x", &day, 1200)
+            },
+        ]);
+        restated.windows = vec![dira_contract::BatchWindow {
+            started_at: format!("{day}T09:55:00Z"),
+            ended_at: format!("{day}T10:35:00Z"),
+        }];
+        store.record_acked_batch(&restated).await.unwrap();
+
+        let d = &store.pending_day_rollups(10).await.unwrap()[0];
+        // The old id is gone, not summed next to the new ones.
+        assert_eq!(
+            (d.human_seconds, d.interval_count, d.revision),
+            (1800, 2, 1)
+        );
     }
 
     #[tokio::test]

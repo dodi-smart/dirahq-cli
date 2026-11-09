@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Bot-less meeting detection: OS device-in-use signals fused into meeting spans (metadata only)."
 
 [dependencies]
+dira-contract.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true

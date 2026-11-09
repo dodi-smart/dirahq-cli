@@ -10,7 +10,10 @@
 -- name, window title, calendar title or attendee. Times use the canonical
 -- fixed-width UTC form (DIRASH-0043). `version` is monotonic per meeting and
 -- `updated_seq` is the store-wide change cursor sync reads, so a confirmation
--- or retraction (an update, which no rowid cursor sees) is re-sent.
+-- or retraction (an update, which no rowid cursor sees) is re-sent. Its
+-- high-water mark lives in `meta` (`meeting_seq`) and never goes backwards, so
+-- an expired suggestion or a `nuke` can never make a new change reuse a number
+-- sync has already passed.
 CREATE TABLE IF NOT EXISTS meetings (
     id                              TEXT PRIMARY KEY,
     version                         INTEGER NOT NULL DEFAULT 1,
@@ -25,9 +28,15 @@ CREATE TABLE IF NOT EXISTS meetings (
     provider_class                  TEXT NOT NULL,
     evidence                        INTEGER NOT NULL DEFAULT 0,
     project                         TEXT,
-    engaged_during_meeting_seconds  INTEGER NOT NULL DEFAULT 0,
     created_at                      TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS meetings_started_idx ON meetings (started_at);
 CREATE INDEX IF NOT EXISTS meetings_seq_idx ON meetings (updated_seq);
+
+-- A restatement batch (one that declares `windows`) replaces this device's
+-- intervals inside each window, possibly under new ids. The day rollup's
+-- interval rows need their start to be found and dropped by window, or the
+-- old ids would still be summed next to the new ones.
+ALTER TABLE day_intervals ADD COLUMN started_at TEXT;
+CREATE INDEX IF NOT EXISTS day_intervals_started_idx ON day_intervals (started_at);

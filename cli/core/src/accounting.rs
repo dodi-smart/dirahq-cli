@@ -557,48 +557,6 @@ fn emit_remainder<W: Clone, M: Clone>(
     whole - kept
 }
 
-/// Split slices at UTC midnight, preserving each slice's credited seconds
-/// exactly: the part before midnight gets `floor(seconds × its share of the
-/// slice's duration)`, the part after gets the rest. Splitting never changes a
-/// total, per slot or overall. Boundaries are UTC days whatever offset the
-/// instants carry.
-pub fn split_at_midnight<W: Clone, M: Clone>(slices: &[Slice<W, M>]) -> Vec<Slice<W, M>> {
-    let mut out = Vec::with_capacity(slices.len());
-    for slice in slices {
-        let mut rest = slice.clone();
-        loop {
-            let utc = rest.start.to_offset(time::UtcOffset::UTC);
-            let next_midnight = utc.date().next_day().map(|d| d.midnight().assume_utc());
-            match next_midnight {
-                // `m > rest.start` always holds for the next UTC midnight; the
-                // guard keeps a bad clock from ever looping.
-                Some(m) if m > rest.start && m < rest.end => {
-                    let total = (rest.end - rest.start).whole_nanoseconds();
-                    let before = (m - rest.start).whole_nanoseconds();
-                    let secs_before = (i128::from(rest.seconds) * before / total) as i64;
-                    out.push(Slice {
-                        start: rest.start,
-                        end: m,
-                        slot: rest.slot.clone(),
-                        seconds: secs_before,
-                    });
-                    rest = Slice {
-                        start: m,
-                        end: rest.end,
-                        slot: rest.slot,
-                        seconds: rest.seconds - secs_before,
-                    };
-                }
-                _ => {
-                    out.push(rest);
-                    break;
-                }
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,7 +1080,6 @@ mod properties {
 mod overlay_tests {
     use super::*;
     use proptest::prelude::*;
-    use time::macros::datetime;
     use time::{Duration, OffsetDateTime};
 
     type O = Overlay<&'static str, &'static str>;
@@ -1364,44 +1321,6 @@ mod overlay_tests {
         let o = overlay(&gaps, &[m(10_600, 20_000)], meeting_wins);
         assert!(o.total_seconds() <= 19);
         assert_eq!(o.engaged_during_meeting_seconds, 0);
-    }
-
-    /// Reviewer probe: a negative offset used to loop forever.
-    #[test]
-    fn midnight_split_ignores_the_offset() {
-        let west = time::UtcOffset::from_hms(-5, 0, 0).unwrap();
-        let s = Slice::<&str, &str> {
-            start: datetime!(2026-11-09 01:00 UTC).to_offset(west),
-            end: datetime!(2026-11-09 03:00 UTC).to_offset(west),
-            slot: Slot::Work("P"),
-            seconds: 7200,
-        };
-        assert_eq!(split_at_midnight(&[s]).len(), 1);
-        let east = time::UtcOffset::from_hms(2, 0, 0).unwrap();
-        let s = Slice::<&str, &str> {
-            start: datetime!(2026-11-08 23:00 UTC).to_offset(east),
-            end: datetime!(2026-11-09 01:00 UTC).to_offset(east),
-            slot: Slot::Work("P"),
-            seconds: 7200,
-        };
-        let split = split_at_midnight(&[s]);
-        assert_eq!(
-            split.iter().map(|s| s.seconds).collect::<Vec<_>>(),
-            vec![3600, 3600]
-        );
-    }
-
-    #[test]
-    fn midnight_split_preserves_seconds() {
-        let day = 86_400;
-        let gaps = [gap(day - 100, day + 100, "P")];
-        let o = overlay::<_, &str>(&gaps, &[], meeting_wins);
-        let split = split_at_midnight(&o.slices);
-        assert_eq!(split.len(), 2);
-        assert_eq!(
-            (split[0].end, split[0].seconds, split[1].seconds),
-            (t(day), 100, 100)
-        );
     }
 
     // ---- properties ---------------------------------------------------------
@@ -1716,25 +1635,5 @@ mod overlay_tests {
             }
         }
 
-        /// Splitting at midnight keeps every slot's seconds and puts every piece
-        /// inside one UTC day, whatever offset the instants carry.
-        #[test]
-        fn midnight_split_keeps_totals(gaps in arb_gaps(), spans in arb_spans(), off_h in -12i8..=14) {
-            let off = time::UtcOffset::from_hms(off_h, 0, 0).unwrap();
-            let o = overlay(&gaps, &spans, mixed);
-            let shifted: Vec<_> = o
-                .slices
-                .iter()
-                .map(|s| Slice { start: s.start.to_offset(off), end: s.end.to_offset(off), slot: s.slot.clone(), seconds: s.seconds })
-                .collect();
-            let split = split_at_midnight(&shifted);
-            let after = Overlay { slices: split.clone(), engaged_during_meeting_seconds: 0 };
-            prop_assert_eq!(after.per_slot_seconds(), o.per_slot_seconds());
-            for s in &split {
-                prop_assert!(s.seconds >= 0 && s.end > s.start);
-                let (a, b) = (s.start.to_offset(time::UtcOffset::UTC), s.end.to_offset(time::UtcOffset::UTC));
-                prop_assert!(a.date() == b.date() || (b.time() == time::Time::MIDNIGHT && b.date() == a.date().next_day().unwrap()));
-            }
-        }
     }
 }

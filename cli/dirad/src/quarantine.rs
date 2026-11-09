@@ -52,8 +52,20 @@ pub async fn note_rejection(
     bounds: &ChunkBounds,
     reason: &str,
 ) -> Option<ChunkBounds> {
+    note_rejection_on(store, META_POISON, bounds, reason).await
+}
+
+/// [`note_rejection`] on its own streak key, so a producer with its own cursor
+/// (meeting restatements) is neither reset by the flush's successes nor resets
+/// them.
+pub async fn note_rejection_on(
+    store: &Store,
+    streak_key: &str,
+    bounds: &ChunkBounds,
+    reason: &str,
+) -> Option<ChunkBounds> {
     let prev: Option<Poison> = store
-        .meta_get(META_POISON)
+        .meta_get(streak_key)
         .await
         .ok()
         .flatten()
@@ -68,7 +80,7 @@ pub async fn note_rejection(
             count,
         };
         if let Ok(s) = serde_json::to_string(&p) {
-            let _ = store.meta_set(META_POISON, &s).await;
+            let _ = store.meta_set(streak_key, &s).await;
         }
         return None;
     }
@@ -87,7 +99,7 @@ pub async fn note_rejection(
     if let Ok(s) = serde_json::to_string(&list) {
         let _ = store.meta_set(META_QUARANTINE, &s).await;
     }
-    let _ = store.meta_set(META_POISON, "").await;
+    let _ = store.meta_set(streak_key, "").await;
     Some(bounds.clone())
 }
 

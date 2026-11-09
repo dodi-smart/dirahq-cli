@@ -10,11 +10,17 @@
 //! isolated end-to-end stack and tests), otherwise the OS adapter. OS adapters
 //! land per platform (P1); until one exists for this OS the module reports
 //! itself unavailable instead of guessing.
+//!
+//! `signal.sample()` runs on the async loop. That is fine for `Replay`. The OS
+//! adapters (CoreAudio, WASAPI, PipeWire) block, so when they land, sampling
+//! moves to `spawn_blocking` behind their notification gates (DIRASH-0061).
 
+use crate::heartbeat::fmt_rfc3339 as fmt;
 use crate::state::AppState;
+use dira_contract::MeetingSource;
 use dira_core::config::MeetingsMode;
 use dira_core::protocol::{MeetingAction, MeetingLiveView, MeetingRowView, MeetingsView, Response};
-use dira_core::store::{MeetingState, NewMeeting, StoredMeeting};
+use dira_core::store::{wire_str, DetectionConfidence, MeetingState, NewMeeting, StoredMeeting};
 use dira_meetings::{
     fuse::fuse, Catalog, Confidence, Emitted, MeetingSignal, Tracker, TrackerConfig,
 };
@@ -103,7 +109,7 @@ pub fn spawn(state: AppState) {
             store_all(&state, mode, done).await;
             set_live(|l| {
                 l.live = tracker.live().map(|live| MeetingLiveView {
-                    provider_class: live.wire.as_str().to_string(),
+                    provider_class: wire_str(&live.wire),
                     since: fmt(live.since),
                     confident: live.confidence == Confidence::High,
                 })
@@ -135,26 +141,25 @@ async fn store_all(state: &AppState, mode: MeetingsMode, done: Vec<Emitted>) {
             } else {
                 MeetingState::Suggested
             },
-            source: "device",
-            confidence: if high { "high" } else { "low" },
-            provider_class: e.wire.as_str(),
+            source: MeetingSource::Device,
+            confidence: if high {
+                DetectionConfidence::High
+            } else {
+                DetectionConfidence::Low
+            },
+            provider_class: e.wire,
             evidence: 0,
         };
         match state.store.insert_meeting(&meeting).await {
             Ok(id) => tracing::info!(
                 "meetings: {} {} meeting {id} ({}s)",
                 meeting.state.as_str(),
-                meeting.provider_class,
+                wire_str(&meeting.provider_class),
                 (e.end - e.start).whole_seconds()
             ),
             Err(e) => tracing::warn!("meetings: could not store a meeting: {e}"),
         }
     }
-}
-
-fn fmt(t: OffsetDateTime) -> String {
-    t.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
 }
 
 fn row(m: &StoredMeeting) -> MeetingRowView {
@@ -163,9 +168,40 @@ fn row(m: &StoredMeeting) -> MeetingRowView {
         started_at: fmt(m.started_at),
         ended_at: fmt(m.ended_at),
         state: m.state.as_str().to_string(),
-        provider_class: m.provider_class.clone(),
-        confidence: m.confidence.clone(),
+        provider_class: wire_str(&m.provider_class),
+        confidence: m.confidence.as_str().to_string(),
         project: m.project.clone(),
+    }
+}
+
+/// Recorded or confirmed meetings since `since` (all of them for `None`), for
+/// the local report's overlay (DIRASH-0063). Spans are clipped to the range,
+/// and to the days whose raw events are still kept: compacted days hold work
+/// that was never clipped around a meeting, so overlaying one there would count
+/// its minutes twice.
+pub async fn counted_since(
+    state: &AppState,
+    since: Option<OffsetDateTime>,
+) -> Vec<dira_core::sync::meetings::CountedMeeting> {
+    let now = OffsetDateTime::now_utc();
+    let retained = now - state.config.retention();
+    let from = since.unwrap_or(OffsetDateTime::UNIX_EPOCH).max(retained);
+    match state.store.meetings_between(from, now).await {
+        Ok(rows) => rows
+            .iter()
+            .filter(|m| m.state.counts())
+            .map(|m| dira_core::sync::meetings::CountedMeeting {
+                id: m.id.clone(),
+                started_at: m.started_at.max(from),
+                ended_at: m.ended_at.min(now),
+                project: m.project.clone(),
+            })
+            .filter(|m| m.ended_at > m.started_at)
+            .collect(),
+        Err(e) => {
+            tracing::warn!("meetings: could not read meetings for the report: {e}");
+            Vec::new()
+        }
     }
 }
 

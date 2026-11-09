@@ -29,6 +29,7 @@ pub mod http;
 pub mod jitter;
 pub mod knowledge_sync;
 pub mod logfile;
+pub mod meeting_sync;
 pub mod meetings;
 pub mod probe;
 pub mod quarantine;

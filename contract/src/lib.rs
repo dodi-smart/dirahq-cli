@@ -111,7 +111,11 @@ pub struct AttestationBatch {
     /// from an ordinary flush: a flush is an event-id slice, and spool replays
     /// insert events with past `at` values, so its time span overlaps minutes
     /// synced in earlier batches. Declaring that span would delete valid claims.
-    /// Readers ignore `windows` from a producer older than 2.1.
+    /// Readers ignore `windows` from a producer older than 2.1. A reader applies
+    /// each window to ALL of the device's claims, in every workspace, including
+    /// ones where this batch lands no interval: a meeting and the work around it
+    /// can route to different workspaces. Producers send meetings only to a
+    /// cloud that does so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<BatchWindow>,
 }

@@ -414,7 +414,7 @@ impl LineageResend {
 }
 
 /// One-line text for a [`SyncError`], for logs that do not own the error.
-fn describe(e: &SyncError) -> String {
+pub(crate) fn describe(e: &SyncError) -> String {
     match e {
         SyncError::Transient { message, .. } => message.clone(),
         SyncError::ReLinkRequired => "unknown_device".to_string(),
@@ -840,6 +840,12 @@ async fn flush(
     // backlog could never drain — `flush` returned `Nothing` and no later flush
     // reconsidered it.
     if events.is_empty() && artifact_rows.is_empty() && token_rows.is_empty() {
+        // Meeting changes ride their own restatements (a count, never a build),
+        // on their own backoff: they never fail or delay this flush.
+        if crate::meeting_sync::pending(state).await > 0 {
+            crate::meeting_sync::step_paced(state, device_key, client, &cloud_url, &device_id)
+                .await;
+        }
         return Ok(FlushOutcome::Nothing);
     }
 
@@ -899,6 +905,8 @@ async fn flush(
             .map_err(|e| SyncError::Fatal(format!("load session history: {e}")))?,
         _ => Vec::new(),
     };
+    // Work is clipped around counted meetings; their time rides restatements.
+    let meetings = crate::meeting_sync::counted_for_flush(state, &events, idle).await?;
     let mut chunks = dira_core::sync::build_chunked_batches(
         &events,
         &token_rows,
@@ -910,6 +918,7 @@ async fn flush(
         now,
         &seed,
         &history,
+        &meetings,
     );
 
     // Stamp the cloud runtime (contract 1.4) onto every rollup leaving this
@@ -1193,6 +1202,9 @@ async fn flush(
         cursor = until.as_deref().unwrap_or(""),
         "sync: flushed batch(es) to cloud"
     );
+    // Meeting changes after the event chunks (contract 2.1 restatements), on
+    // their own backoff: a failure there never fails this flush.
+    crate::meeting_sync::step_paced(state, device_key, client, &cloud_url, &device_id).await;
     Ok(FlushOutcome::Synced)
 }
 
@@ -2850,6 +2862,7 @@ mod tests {
             time::OffsetDateTime::now_utc(),
             &[], // no seed
             &[], // no history
+            &[], // no meetings
         );
         let unseeded_batch_id = unseeded[0].batch.batch_id.clone();
 

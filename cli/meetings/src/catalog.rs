@@ -33,58 +33,14 @@ pub enum HolderRole {
 
 /// The closed wire class (contract `providerClass`). Coarser than the catalogue,
 /// so a new app never forces a contract or cloud change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProviderClass {
-    Zoom,
-    Teams,
-    Slack,
-    Webex,
-    Meet,
-    Discord,
-    Facetime,
-    Chat,
-    Browser,
-    InPerson,
-    Other,
-}
+pub use dira_contract::ProviderClass;
 
-impl ProviderClass {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProviderClass::Zoom => "zoom",
-            ProviderClass::Teams => "teams",
-            ProviderClass::Slack => "slack",
-            ProviderClass::Webex => "webex",
-            ProviderClass::Meet => "meet",
-            ProviderClass::Discord => "discord",
-            ProviderClass::Facetime => "facetime",
-            ProviderClass::Chat => "chat",
-            ProviderClass::Browser => "browser",
-            ProviderClass::InPerson => "in_person",
-            ProviderClass::Other => "other",
-        }
-    }
-
-    fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "zoom" => ProviderClass::Zoom,
-            "teams" => ProviderClass::Teams,
-            "slack" => ProviderClass::Slack,
-            "webex" => ProviderClass::Webex,
-            "meet" => ProviderClass::Meet,
-            "discord" => ProviderClass::Discord,
-            "facetime" => ProviderClass::Facetime,
-            "chat" => ProviderClass::Chat,
-            "browser" => ProviderClass::Browser,
-            "in_person" => ProviderClass::InPerson,
-            "other" => ProviderClass::Other,
-            _ => return None,
-        })
-    }
+fn parse_wire(s: &str) -> Option<ProviderClass> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
 }
 
 /// A process as the fusion sees it: a catalogue class, never an identity.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Holder {
     /// Catalogue class (`"zoom"`), or `"deny"` / `"relay"` for those lists.
     pub class: &'static str,
@@ -145,7 +101,7 @@ impl Catalog {
                 other => return Err(CatalogError(format!("{class}: unknown kind {other:?}"))),
             };
             let wire_s = str_field(app, "wire")?;
-            let wire = ProviderClass::parse(&wire_s)
+            let wire = parse_wire(&wire_s)
                 .ok_or_else(|| CatalogError(format!("{class}: unknown wire class {wire_s:?}")))?;
             for (key, role) in [
                 ("ids", HolderRole::Call),

@@ -48,6 +48,29 @@ pub struct Normalized {
     /// Empty for every harness but Claude Code. Boxed: every hook rides the
     /// writer queue, and most carry no hints at all.
     pub hints: Box<Hints>,
+    /// Contract 2.0 counts derived from the tool input, which is then dropped
+    /// (DIRASH-0052). Default for every harness but Claude Code. `default` so
+    /// a spool record written before this field existed still reads. Boxed
+    /// like `hints`, to keep the writer queue's messages small.
+    #[serde(default)]
+    pub facts: Box<HookFacts>,
+}
+
+/// What a hook says about its session, as counts (DIRASH-0052): lines an
+/// edit/write tool added and removed, whether it was a context compaction, and
+/// a hash of the file a file tool touched. Never a path, a line or content.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookFacts {
+    #[serde(default)]
+    pub lines_added: u32,
+    #[serde(default)]
+    pub lines_removed: u32,
+    #[serde(default)]
+    pub compaction: bool,
+    /// 16 hex digits of an FNV-1a hash of the absolute path, for counting
+    /// distinct files without keeping their names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_hash: Option<String>,
 }
 
 /// What a hook says about orchestration, derived at normalization so the raw

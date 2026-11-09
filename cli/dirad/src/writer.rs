@@ -231,6 +231,29 @@ async fn process_message(
         }
         _ => None,
     };
+    // Contract 2.0 session facts (DIRASH-0052), recorded before coalescing so a
+    // tool call that is coalesced away still counts. Only the counts and the
+    // path hash reach the store; the tool input was dropped at normalization.
+    if let EventMsg::Hook { norm, .. } = &msg {
+        let f = &norm.facts;
+        if (f.lines_added > 0 || f.lines_removed > 0 || f.compaction || f.path_hash.is_some())
+            && !dira_core::model::is_probe_session(&norm.session_id)
+        {
+            if let Err(e) = state
+                .store
+                .record_hook_facts(
+                    &norm.session_id,
+                    f.lines_added,
+                    f.lines_removed,
+                    f.compaction,
+                    f.path_hash.as_deref(),
+                )
+                .await
+            {
+                tracing::debug!("recording session facts failed: {e}");
+            }
+        }
+    }
     let (mut ev, repo_dir) = match msg {
         EventMsg::Raw(ev) => {
             // Unchanged from before evidence existed: a raw event's own
@@ -1443,6 +1466,7 @@ mod tests {
                 evidence,
                 ..Default::default()
             }),
+            facts: Default::default(),
         }
     }
 

@@ -37,6 +37,7 @@ fn event(session: &str, kind: EventKind) -> Normalized {
         source: None,
         reason: None,
         hints: Box::default(),
+        facts: Default::default(),
     }
 }
 

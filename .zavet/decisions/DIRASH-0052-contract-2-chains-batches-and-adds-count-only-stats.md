@@ -68,14 +68,19 @@ Agreed with the cloud-redesign session on 2026-11-09:
   - **Filled now:**
     - the chain and `client`;
     - `captureHealth` (deltas since the last acknowledged report; per daemon
-      process, so a restart starts over);
-    - `stats` from the stored event log: tool calls by category, subagents
-      (`task` tools), permission prompts, approval wait capped at 30 min;
-    - zstd ingest bodies when `ServerMeta.acceptEncodings` lists `zstd` (pure
-      Rust `ruzstd`).
-  - **Not filled yet** (they need new capture and migration `0010`):
-    `filesTouched`, `agentLinesAdded`/`agentLinesRemoved`, `compactions`,
-    `testRuns`, `dayRollups`, `ArtifactRef.linesAdded`/`linesRemoved`,
-    `workspaceHint`.
-  - Chunk sizes are unchanged, so an uncompressed body still fits under the
-    cloud's body limit.
+      process);
+    - `stats` from the event log: tool calls by category, subagents,
+      permission prompts, approval wait capped at 30 min;
+    - for Claude Code sessions also `filesTouched`, `agentLinesAdded`/`Removed`
+      and `compactions`, counted at capture time from the tool input into
+      `session_facts`/`session_paths` (migration 0010; path hashes only);
+    - `dayRollups`, built from what acknowledged batches carried (the `day_*`
+      tables, 40-day window, at most 60 per batch, re-sent with `revision+1`
+      when a day changes);
+    - zstd bodies when the cloud advertises them.
+  - **Not filled:**
+    - `testRuns`: Claude Code's Bash result has no exit status, and scraping
+      output text was rejected;
+    - `ArtifactRef.linesAdded`/`linesRemoved`: needs a numstat at capture;
+    - `workspaceHint`: the device has no workspace id.
+  - Chunk sizes are unchanged.

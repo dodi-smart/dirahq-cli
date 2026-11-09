@@ -170,6 +170,7 @@ mod tests {
             source: None,
             reason: None,
             hints: Box::default(),
+            facts: Default::default(),
         }
     }
 
@@ -261,7 +262,8 @@ mod tests {
                     "transcript_path",
                     "source",
                     "reason",
-                    "hints"
+                    "hints",
+                    "facts"
                 ]
                 .contains(k),
                 "unexpected field {k}"

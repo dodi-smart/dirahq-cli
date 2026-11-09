@@ -45,6 +45,15 @@ single flush window (issue #40).
     capped at 30 min. Manual sessions carry none.
   - **zstd.** Ingest bodies are zstd only when the last `/api/v1/meta` listed
     it in `acceptEncodings`.
+  - **Claude Code session facts.** The writer records lines added/removed,
+    compactions and touched-file path hashes per session at capture time,
+    before coalescing (`session_facts`, `session_paths`, migration 0010). Sync
+    adds them to Claude Code rollups.
+  - **Day rollups.** Each acknowledged batch is recorded per UTC day and repo
+    in the `day_*` tables, keyed by wire id so re-sends replace themselves.
+    Changed days ride the next flush's first chunk as `dayRollups`; on ack
+    their revision advances. Days older than 40 days are pruned, and `nuke`
+    clears all of it.
 
 - A flush reads events in `(META_SYNC_CURSOR, until]`, splits the window into
   chunks only at > idle breaks (never inside a billable interval), POSTs each

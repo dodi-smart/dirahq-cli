@@ -945,12 +945,28 @@ async fn flush(
     // Capture health rides the first chunk; acknowledged once, then deltas.
     let (health, health_snapshot) = crate::spool::pending_health(&state.store).await;
     let mut health = Some((health, health_snapshot));
+    // Day rollups for days that changed since they were last sent ride the
+    // first chunk too (DIRASH-0052).
+    let mut day_rollups = Some(
+        state
+            .store
+            .pending_day_rollups(DAY_ROLLUPS_PER_BATCH)
+            .await
+            .unwrap_or_default(),
+    );
     for chunk in chunks {
         let mut batch = chunk.batch;
         let carried_health = health.take();
         if let Some((h, _)) = &carried_health {
             batch.capture_health = Some(h.clone());
         }
+        let carried_days = day_rollups.take().unwrap_or_default();
+        let day_keys: Vec<(String, Option<String>)> = carried_days
+            .iter()
+            .map(|d| (d.day.clone(), d.repo_canonical.clone()))
+            .collect();
+        batch.day_rollups = carried_days;
+        add_session_facts(&state.store, &mut batch.sessions).await;
         chain.stamp(&mut batch);
         let batch_hash = crate::chain::hash(&batch).map_err(SyncError::Fatal)?;
         let sig = device_key
@@ -1028,6 +1044,14 @@ async fn flush(
                     .map_err(SyncError::Fatal)?;
                 if let Some((_, snapshot)) = carried_health {
                     crate::spool::mark_reported(snapshot);
+                }
+                // Mark the sent days first, then record this chunk's own
+                // content, so a day this chunk changed is marked again.
+                if let Err(e) = state.store.mark_day_rollups_sent(&day_keys).await {
+                    tracing::debug!("mark day rollups sent: {e}");
+                }
+                if let Err(e) = state.store.record_acked_batch(&envelope.payload).await {
+                    tracing::debug!("record acked batch for day rollups: {e}");
                 }
                 if let Some(ev) = &cursor_event_id {
                     state
@@ -1568,6 +1592,36 @@ fn is_bad_signature(body: &str) -> bool {
 /// non-fatal: a missing `cloud_url`, an unreachable cloud, an old cloud without
 /// the endpoint, or an unparseable body all simply skip the check. Run once at
 /// daemon startup; sync/heartbeat are unaffected by its outcome.
+/// Most day rollups one batch carries; the rest follow in later flushes.
+const DAY_ROLLUPS_PER_BATCH: u32 = 60;
+
+/// Fill the 2.0 `stats` fields the event log cannot supply (files touched,
+/// agent lines, compactions) from the facts the writer recorded at capture
+/// time. Only Claude Code reports them, so other harnesses keep them omitted.
+async fn add_session_facts(
+    store: &dira_core::Store,
+    sessions: &mut [dira_contract::SessionRollup],
+) {
+    for s in sessions.iter_mut() {
+        if s.harness != dira_contract::Harness::ClaudeCode {
+            continue;
+        }
+        let Some(stats) = s.stats.as_mut() else {
+            continue;
+        };
+        let facts = store
+            .session_facts(&s.session_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        stats.files_touched = Some(facts.files_touched);
+        stats.agent_lines_added = Some(facts.lines_added);
+        stats.agent_lines_removed = Some(facts.lines_removed);
+        stats.compactions = Some(facts.compactions);
+    }
+}
+
 /// Whether the cloud's `ServerMeta.acceptEncodings` lists `zstd`, as of the
 /// last handshake. False until a handshake says otherwise.
 static CLOUD_ACCEPTS_ZSTD: std::sync::atomic::AtomicBool =

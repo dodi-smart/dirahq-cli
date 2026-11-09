@@ -74,6 +74,7 @@ pub fn normalize(hook: &GrokHook) -> Option<Normalized> {
         source: None,
         reason: None,
         hints: Default::default(),
+        facts: Default::default(),
     })
 }
 

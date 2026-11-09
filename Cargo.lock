@@ -1134,6 +1134,7 @@ dependencies = [
  "dira-contract",
  "dira-core",
  "dira-ipc",
+ "dira-meetings",
  "dira-sources",
  "fastrand",
  "futures",

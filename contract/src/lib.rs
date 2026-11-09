@@ -105,6 +105,13 @@ pub struct AttestationBatch {
     /// where the batch sends no interval, so re-decomposing a window down to
     /// nothing (a retracted meeting with no work left) removes the stale claim
     /// (D-0085). Empty means "only where my intervals land", as before.
+    ///
+    /// A window may only come from a builder that read EVERY stored event whose
+    /// `at` falls in it (a re-decompose by time, an explicit resync), never
+    /// from an ordinary flush: a flush is an event-id slice, and spool replays
+    /// insert events with past `at` values, so its time span overlaps minutes
+    /// synced in earlier batches. Declaring that span would delete valid claims.
+    /// Readers ignore `windows` from a producer older than 2.1.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<BatchWindow>,
 }

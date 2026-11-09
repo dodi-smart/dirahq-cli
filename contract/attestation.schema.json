@@ -250,7 +250,7 @@
           }
         },
         "windows": {
-          "description": "2.1: time ranges whose intervals this batch restates IN FULL for its\ndevice. The cloud replaces the device's claims inside each window even\nwhere the batch sends no interval, so re-decomposing a window down to\nnothing (a retracted meeting with no work left) removes the stale claim\n(D-0085). Empty means \"only where my intervals land\", as before.",
+          "description": "2.1: time ranges whose intervals this batch restates IN FULL for its\ndevice. The cloud replaces the device's claims inside each window even\nwhere the batch sends no interval, so re-decomposing a window down to\nnothing (a retracted meeting with no work left) removes the stale claim\n(D-0085). Empty means \"only where my intervals land\", as before.\n\nA window may only come from a builder that read EVERY stored event whose\n`at` falls in it (a re-decompose by time, an explicit resync), never\nfrom an ordinary flush: a flush is an event-id slice, and spool replays\ninsert events with past `at` values, so its time span overlaps minutes\nsynced in earlier batches. Declaring that span would delete valid claims.\nReaders ignore `windows` from a producer older than 2.1.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/BatchWindow"

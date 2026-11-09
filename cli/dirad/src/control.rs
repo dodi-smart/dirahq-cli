@@ -169,6 +169,12 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
         // why the ordering matters and `dispatch` doesn't touch `shutdown`
         // itself.
         Request::Shutdown => Response::Ok,
+        Request::Meetings => crate::meetings::view(state).await,
+        Request::MeetingAction {
+            id,
+            action,
+            project,
+        } => crate::meetings::act(state, &id, action, project).await,
         Request::CaptureProbe { phase } => match phase {
             dira_core::protocol::ProbePhase::Arm => crate::probe::arm(state).await,
             dira_core::protocol::ProbePhase::Verify {

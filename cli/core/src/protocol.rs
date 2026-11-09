@@ -176,6 +176,75 @@ pub enum Request {
     /// exactly the machine the bug is on. The spawning process must be
     /// `dira doctor`, running under the user's own ordinary token.
     CaptureProbe { phase: ProbePhase },
+    /// Meeting detection's live state, pending suggestions and recent meetings
+    /// (`dira meetings`, DIRASH-0060). Local control protocol only.
+    Meetings,
+    /// Confirm, dismiss, retract or assign a detected meeting.
+    MeetingAction {
+        id: String,
+        action: MeetingAction,
+        /// For `assign`: the project to file it under; `None` clears it.
+        #[serde(default)]
+        project: Option<String>,
+    },
+}
+
+/// What `dira meetings <verb>` does to one meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingAction {
+    /// Count a suggestion (or keep a recorded meeting) as meeting time.
+    Confirm,
+    /// Drop a suggestion; it never counts.
+    Dismiss,
+    /// Withdraw a recorded meeting; it stops counting and the cloud is told.
+    Retract,
+    /// File the meeting under a project.
+    Assign,
+}
+
+/// One meeting as `dira meetings` shows it: times and a closed provider class,
+/// never an app name or title (D-0001).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingRowView {
+    pub id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    /// `suggested`, `recorded`, `confirmed`, `dismissed` or `retracted`.
+    pub state: String,
+    pub provider_class: String,
+    /// `high` or `low`.
+    pub confidence: String,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// `Meetings`: the module's mode, what the detector sees now, and the rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingsView {
+    /// `off`, `suggest` or `auto`.
+    pub mode: String,
+    /// The sampling adapter (`replay`, `macos.coreaudio`, …), when one runs.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// Why no adapter runs although the module is on (e.g. no OS adapter yet).
+    #[serde(default)]
+    pub unavailable: Option<String>,
+    /// A meeting in progress: provider class, since (RFC 3339), and whether it is
+    /// already confident.
+    #[serde(default)]
+    pub live: Option<MeetingLiveView>,
+    #[serde(default)]
+    pub suggestions: Vec<MeetingRowView>,
+    #[serde(default)]
+    pub recent: Vec<MeetingRowView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingLiveView {
+    pub provider_class: String,
+    pub since: String,
+    pub confident: bool,
 }
 
 /// Which half of the capture probe a [`Request::CaptureProbe`] drives.
@@ -374,6 +443,8 @@ pub enum Response {
     /// Same new-variant skew posture as `ZavetSpec`, and harmless here: only a
     /// CLI new enough to send `CaptureProbe` can ever receive this.
     CaptureProbe(Box<CaptureProbeView>),
+    /// `Meetings`. Boxed like the other views; same new-variant skew posture.
+    Meetings(Box<MeetingsView>),
 }
 
 /// A live or recent session as shown by `status` / `sessions`.

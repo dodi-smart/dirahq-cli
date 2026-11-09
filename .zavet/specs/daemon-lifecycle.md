@@ -10,8 +10,9 @@ paths:
   - cli/dirad/src/control.rs
   - cli/dira/src/daemon.rs
   - cli/core/src/config.rs
+  - cli/core/src/process.rs
   - cli/ipc/**
-decisions: [D-0008, D-0009, D-0010, D-0016, D-0019]
+decisions: [D-0008, D-0009, D-0010, D-0016, D-0019, DIRASH-0048]
 ---
 
 ## Overview
@@ -82,6 +83,16 @@ the interactive user entirely. That was a silent, total capture outage.
   socket and pidfile, and starts a fresh daemon on the fixed path. If its pid
   cannot be determined, restart errors with manual instructions instead of
   starting a second daemon beside it.
+- `dirad` writes its own pidfile (`Config::pidfile_path`) right after binding
+  the control channel, and removes it on exit only if it still names this
+  process. A supervised daemon therefore has one too. `dira daemon stop` stops
+  each kind the way it expects: `launchctl unload` for launchd, `systemctl
+  --user stop` for systemd, and confirmed-exit `Shutdown`/`taskkill` for the
+  windows task and Run key (DIRASH-0048).
+- On windows `dirad` is a windows-subsystem binary: it never gets a console
+  window, and it attaches the parent's console only for `--version`. Every
+  child it spawns is created with `CREATE_NO_WINDOW`
+  (`dira_core::process`).
 - **No replacement daemon is started until the previous PROCESS is confirmed
   exited** (D-0019), on every windows restart path, bare and scheduled-task
   alike. The sequence is `Shutdown` → wait for process exit → `taskkill /F` →

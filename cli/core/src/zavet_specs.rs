@@ -32,7 +32,9 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -288,7 +290,8 @@ impl SpecRunner for SystemSpecRunner {
         args: &[&str],
         timeout: Duration,
     ) -> Result<String, RunError> {
-        let mut cmd = Command::new(bin);
+        // Runs inside `dirad` (no console on windows), so it must be windowless.
+        let mut cmd = crate::process::command(bin);
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::null())

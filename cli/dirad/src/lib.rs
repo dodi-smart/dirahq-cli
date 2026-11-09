@@ -389,6 +389,10 @@ pub async fn run() -> anyhow::Result<()> {
     let sock = config.socket_path.clone();
     let (listener, _socket_lock) = bind_control_socket(&sock).await?;
     tracing::info!(sock = %sock.display(), "control socket ready");
+    // Only now, holding the single-instance guard, does this process own the
+    // pidfile. A supervised daemon (launchd, systemd, the logon task, the Run
+    // key) had none before, so `dira daemon stop`/`restart` could not find it.
+    let _pidfile = PidfileGuard::write(config.pidfile_path());
 
     let store = Store::open(&config.db_path).await?;
     let (state, rx, sync_rx, knowledge_rx) = build_state(store, config).await?;
@@ -907,6 +911,34 @@ pub async fn resolve_bearer(store: &Store) -> anyhow::Result<String> {
     let token = Ulid::generate().to_string();
     store.meta_set("bearer", &token).await?;
     Ok(token)
+}
+
+/// The daemon's own pidfile, written after the control-channel bind and removed
+/// on the way out only if it still names this process (a replacement that bound
+/// after us owns it then).
+struct PidfileGuard(std::path::PathBuf);
+
+impl PidfileGuard {
+    fn write(path: std::path::PathBuf) -> Self {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&path, std::process::id().to_string()) {
+            tracing::warn!(path = %path.display(), "could not write the pidfile: {e}");
+        }
+        Self(path)
+    }
+}
+
+impl Drop for PidfileGuard {
+    fn drop(&mut self) {
+        let ours = std::fs::read_to_string(&self.0)
+            .map(|s| s.trim() == std::process::id().to_string())
+            .unwrap_or(false);
+        if ours {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 }
 
 #[cfg(test)]

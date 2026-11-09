@@ -34,6 +34,11 @@ fastrand.workspace = true
 futures.workspace = true
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# `dirad` is a windows-subsystem binary (DIRASH-0048). `AttachConsole` lets
+# `dirad --version` still print when run from a terminal.
+windows-sys = { workspace = true, features = ["Win32_System_Console"] }
+
 [dev-dependencies]
 # Throwaway dirs for `zavet`'s activation-probe and capture tests.
 tempfile.workspace = true

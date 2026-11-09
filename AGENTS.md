@@ -56,6 +56,9 @@ agent context at session start. Keep it short and non-negotiable.
 - Nothing enters `repo_dirs` unless the directory demonstrably belongs to the
   repo it is filed under, and `register_repo_dir` stays I/O-free.
   See DIRASH-0027.
+- A headless run (`DIRA_HEADLESS`, or `GITHUB_ACTIONS=true`) never reports a
+  human signal: the `dira hook` shim withholds those and forwards the rest.
+  Never infer presence from the cloud runtime id. See DIRASH-0047.
 
 ### Recorded decisions (read the file before changing guarded code; ask /zavet:why)
 
@@ -104,6 +107,8 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0044 — A scratch session is an orchestrator only when it coordinates (active)
 - DIRASH-0045 — A lineage rule change re-sends the ended rollups once, sessions only (active)
 - DIRASH-0046 — A scheduled-task slug may cross the wire as triggerName, only when its directory exists (active)
+- DIRASH-0047 — A headless run withholds human signals at the hook shim, and forwards everything else (active)
+- DIRASH-0048 — The Windows daemon is a windowless binary, registered per user by an XML logon task or a Run key, and started at once (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

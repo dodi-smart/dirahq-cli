@@ -342,11 +342,23 @@ both executables and restarts whatever is supervising the daemon.
   windows the updater uses the `zip` crate (target-gated dep). There is no
   guaranteed tar on constrained images, and the archive contents are
   restricted to the two expected binary names (zip-slip guard).
-- Daemon supervision spans launchd, systemd-user, a windows logon scheduled
-  task (`schtasks`, HKCU Run-key fallback), and pidfile. Windows stop is
-  graceful `Request::Shutdown` over the control pipe, escalating to
-  `taskkill /F`. Known gap: a logon task does not resupervise a crash
-  (RestartOnFailure task XML is the follow-up).
+- Daemon supervision spans launchd, systemd-user, a windows per-user logon
+  task, the HKCU Run key, and pidfile (DIRASH-0048).
+  - The task is registered from XML (`schtasks /Create /XML`, UTF-16 with a BOM).
+    It names the current user in the trigger and the principal (no admin),
+    starts on battery and keeps running when unplugged, has no execution time
+    limit, restarts on failure every minute, and is hidden.
+  - If the task cannot be registered, the Run key is written and `dirad` is
+    started at once.
+  - `Supervision::RunKey` is its own variant: restart stops the process and
+    spawns the replacement directly.
+  - `dirad` is a windows-subsystem binary, so neither path opens a console
+    window.
+  - Windows stop is graceful `Request::Shutdown` over the control pipe,
+    escalating to `taskkill /F`, with exit confirmed by `tasklist` (D-0019).
+    `dira daemon stop` and `uninstall` apply it to task- and Run-key-launched
+    daemons too, and `install` stops one before re-registering, so the new
+    binary is what starts.
 
 ## Invariants
 
@@ -442,8 +454,9 @@ both executables and restarts whatever is supervising the daemon.
 - Windows arm64 now builds and smokes natively on `windows-11-arm` (D-0014),
   closing the "ships untested" gap; the exes are still unsigned (Authenticode
   remains a follow-up. Unsigned logon-task daemons are prime AV
-  false-positive material), and the schtasks ONLOGON + HKCU-fallback path
-  still needs validation on a real Windows machine.
+  false-positive material), and the XML logon task + HKCU-fallback path
+  still needs validation on a real standard-user Windows account (Parallels
+  runbook, plan 2026-11-09 Phase 0).
 - The Windows binaries link the MSVC CRT **statically** (`.cargo/config.toml`,
   `-C target-feature=+crt-static`), so they need no VC++ Redistributable on the
   target host. This closes #60 and puts Windows on the same footing as the

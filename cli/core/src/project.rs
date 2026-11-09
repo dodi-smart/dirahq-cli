@@ -871,15 +871,7 @@ fn extract_count(line: &str, noun: &str) -> u64 {
 /// idle-ticker sweep, so an unflagged spawn is a visible window strobe in the
 /// user's session.
 fn git_command() -> Command {
-    #[allow(unused_mut)]
-    let mut cmd = Command::new("git");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd
+    crate::process::command("git")
 }
 
 /// Run a git command in `dir`, returning trimmed stdout on success — including

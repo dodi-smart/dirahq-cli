@@ -614,6 +614,34 @@ impl Config {
                 .unwrap_or_else(std::env::temp_dir)
         }
     }
+
+    /// The daemon's pidfile for this control endpoint. One definition shared by
+    /// `dirad`, which writes it itself right after binding the control channel,
+    /// and `dira daemon`, which reads it to stop or restart. Before `dirad` wrote
+    /// its own, only `dira daemon start` did, so a daemon launched by launchd,
+    /// systemd, the logon task or the Run key had none, and `dira daemon stop`
+    /// could not find it.
+    ///
+    /// unix: `dirad.pid` in [`Self::runtime_dir`], i.e. beside the socket (D-0008:
+    /// never a temp-dir anchor). windows: also under [`Self::runtime_dir`], because
+    /// a pipe path has no filesystem parent; the name carries the endpoint
+    /// identity there, so two isolated daemons never share one file.
+    pub fn pidfile_path(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            self.runtime_dir().join("dirad.pid")
+        }
+        #[cfg(windows)]
+        {
+            let stem = self
+                .socket_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("dira");
+            self.runtime_dir()
+                .join(format!("dirad-{}.pid", sanitize_ident(stem)))
+        }
+    }
 }
 
 /// XDG project dirs for `sh.dirahq.dira`. `None` only on exotic platforms.

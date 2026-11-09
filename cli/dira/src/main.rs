@@ -1244,7 +1244,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 DaemonAction::Install => daemon::install(&config).await,
-                DaemonAction::Uninstall => daemon::uninstall(&config),
+                DaemonAction::Uninstall => daemon::uninstall(&config).await,
                 DaemonAction::Restart => daemon::restart(&config).await,
             };
         }

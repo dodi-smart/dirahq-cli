@@ -15,6 +15,7 @@ pub mod identity;
 pub mod model;
 pub mod orchestration;
 pub mod pricing;
+pub mod process;
 pub mod project;
 pub mod protocol;
 pub mod report;

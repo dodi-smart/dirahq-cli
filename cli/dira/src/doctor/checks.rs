@@ -145,9 +145,10 @@ pub(crate) fn supervision(f: &Facts) -> Check {
     };
     let detail = json!({ "supervision": label });
     match &f.supervision {
-        Supervision::Launchd | Supervision::SystemdUser | Supervision::ScheduledTask => {
-            Check::ok(ID, label).detail(detail)
-        }
+        Supervision::Launchd
+        | Supervision::SystemdUser
+        | Supervision::ScheduledTask
+        | Supervision::RunKey => Check::ok(ID, label).detail(detail),
         Supervision::Pidfile(_) | Supervision::Socket(_) => Check::warn(
             ID,
             format!("{label} — nothing will restart it after a reboot"),

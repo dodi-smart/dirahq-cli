@@ -1105,6 +1105,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dira-meetings"
+version = "0.12.0-develop.2"
+dependencies = [
+ "proptest",
+ "time",
+ "toml_edit 0.25.17+spec-1.1.0",
+]
+
+[[package]]
 name = "dira-sources"
 version = "0.12.0-develop.2"
 dependencies = [

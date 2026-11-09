@@ -41,6 +41,31 @@ impl ZavetMode {
     }
 }
 
+/// Bot-less meeting detection (`[modules] meetings` in `config.toml`,
+/// DIRASH-0060). Default **Off**: no device is sampled and no adapter is
+/// constructed until the person opts in (its own consent prompt, DIRASH-0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MeetingsMode {
+    #[default]
+    Off,
+    /// Detect, but record nothing as meeting time without a confirmation.
+    Suggest,
+    /// Record high-confidence meetings; low-confidence ones are suggestions.
+    Auto,
+}
+
+impl MeetingsMode {
+    /// The knob value as spelled in `config.toml` (and echoed by status views).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MeetingsMode::Off => "off",
+            MeetingsMode::Suggest => "suggest",
+            MeetingsMode::Auto => "auto",
+        }
+    }
+}
+
 /// Optional per-machine module toggles (`[modules]` in `config.toml`).
 ///
 /// Engagement tracking is dira's core and has no toggle; modules listed here
@@ -50,6 +75,9 @@ pub struct Modules {
     /// The zavet knowledge module (guard events, trailer + decision capture).
     #[serde(default)]
     pub zavet: ZavetMode,
+    /// Bot-less meeting detection. Off unless the person opted in.
+    #[serde(default)]
+    pub meetings: MeetingsMode,
 }
 
 /// Consent tier for the knowledge sync channel (`[sync] knowledge` in
@@ -1011,6 +1039,7 @@ mod tests {
         // Absent [modules] table (every pre-zavet config) must resolve to
         // auto — dormant unless a repo carries .zavet/.
         assert_eq!(Config::default().modules.zavet, ZavetMode::Auto);
+        assert_eq!(Config::default().modules.meetings, MeetingsMode::Off);
         let c: Config = Figment::from(Serialized::defaults(Config::default()))
             .merge(Toml::string("idle_seconds = 120"))
             .extract()

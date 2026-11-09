@@ -207,6 +207,9 @@ pub struct Store {
     pool: SqlitePool,
 }
 
+mod meetings;
+pub use meetings::{MeetingState, NewMeeting, StoredMeeting};
+
 impl Store {
     /// Open (creating if needed) the store at `path`, enable WAL, and migrate.
     pub async fn open(path: &Path) -> Result<Self, Error> {
@@ -770,6 +773,8 @@ impl Store {
             "DELETE FROM day_tokens",
             "DELETE FROM day_commits",
             "DELETE FROM day_rollup_state",
+            // Meetings (0011): detected spans are local state too.
+            "DELETE FROM meetings",
         ] {
             sqlx::query(sql).execute(&mut *tx).await?;
         }

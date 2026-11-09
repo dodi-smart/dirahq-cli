@@ -15,7 +15,7 @@
 //! that daemon-side knobs only take effect after `dira daemon restart`.
 
 use anyhow::{anyhow, bail, Context, Result};
-use dira_core::{config::project_dirs, Config};
+use dira_core::Config;
 use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut};
 
@@ -173,9 +173,8 @@ pub(crate) fn knobs_after_help() -> String {
 
 /// The XDG path of the writable `config.toml`.
 fn config_path() -> Result<PathBuf> {
-    let dirs =
-        project_dirs().ok_or_else(|| anyhow!("could not resolve an XDG config directory"))?;
-    Ok(dirs.config_dir().join("config.toml"))
+    dira_core::config::config_file_path()
+        .ok_or_else(|| anyhow!("could not resolve an XDG config directory"))
 }
 
 /// `dira config path`.

@@ -492,8 +492,8 @@ impl Config {
     /// Load defaults, then `config.toml` (if present), then `DIRA_*` env vars.
     pub fn load() -> Result<Self, crate::Error> {
         let mut fig = Figment::from(Serialized::defaults(Config::default()));
-        if let Some(dirs) = project_dirs() {
-            fig = fig.merge(Toml::file(dirs.config_dir().join("config.toml")));
+        if let Some(path) = config_file_path() {
+            fig = fig.merge(Toml::file(path));
         }
         fig.merge(
             Env::prefixed("DIRA_").map(|k| k.as_str().to_lowercase().replace("__", ".").into()),
@@ -669,6 +669,20 @@ impl Config {
                 .join(format!("dirad-{}.pid", sanitize_ident(stem)))
         }
     }
+}
+
+/// The `config.toml` that [`Config::load`] reads and `dira config set` writes:
+/// `$DIRA_CONFIG_DIR/config.toml` when that is set, else the platform config
+/// dir. The override exists for isolated instances (a second daemon, an e2e
+/// run against a local cloud): together with `DIRA_SOCKET_PATH`,
+/// `DIRA_DB_PATH` and `DIRA_HTTP_PORT` it keeps every file such an instance
+/// touches out of the user's real install. `XDG_CONFIG_HOME` cannot do this on
+/// macOS, where the config dir derives from `Application Support`.
+pub fn config_file_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("DIRA_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir).join("config.toml"));
+    }
+    project_dirs().map(|d| d.config_dir().join("config.toml"))
 }
 
 /// XDG project dirs for `sh.dirahq.dira`. `None` only on exotic platforms.

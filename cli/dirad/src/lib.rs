@@ -843,6 +843,11 @@ pub async fn maintenance_sweep(
 ) -> SweepOutcome {
     let mut outcome = SweepOutcome::default();
 
+    // Contract 2.0 day-rollup state older than its 40-day window (DIRASH-0052).
+    if let Err(e) = state.store.prune_day_rollups().await {
+        tracing::debug!("day-rollup prune failed: {e}");
+    }
+
     // See the startup sweep in `run` for why this is hygiene rather than
     // containment.
     match state.store.delete_probe_events().await {

@@ -1075,6 +1075,7 @@ dependencies = [
  "ed25519-dalek",
  "figment",
  "getrandom 0.4.3",
+ "hex",
  "keyring",
  "keyring-core",
  "proptest",

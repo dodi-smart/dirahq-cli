@@ -3554,8 +3554,8 @@ impl Store {
 
     /// Record what an acknowledged batch carried, per UTC day and repo, and
     /// mark those days as changed so their `DayRollup` is (re-)sent. Keyed by
-    /// the wire ids, so a re-sent row replaces itself. Days older than 40 days
-    /// are pruned.
+    /// the wire ids, so a re-sent row replaces itself. Old days are pruned by
+    /// [`Self::prune_day_rollups`].
     pub async fn record_acked_batch(
         &self,
         batch: &dira_contract::AttestationBatch,
@@ -3645,6 +3645,15 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Drop day-rollup state older than 40 days. Run from the hourly
+    /// maintenance sweep, not per acknowledged batch.
+    pub async fn prune_day_rollups(&self) -> Result<u64, Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut removed = 0;
         for sql in [
             "DELETE FROM day_intervals WHERE day < date('now', '-40 days')",
             "DELETE FROM day_sessions WHERE day < date('now', '-40 days')",
@@ -3652,102 +3661,131 @@ impl Store {
             "DELETE FROM day_commits WHERE day < date('now', '-40 days')",
             "DELETE FROM day_rollup_state WHERE day < date('now', '-40 days')",
         ] {
-            sqlx::query(sql).execute(&mut *tx).await?;
+            removed += sqlx::query(sql).execute(&mut *tx).await?.rows_affected();
         }
         tx.commit().await?;
-        Ok(())
+        Ok(removed)
     }
 
     /// The `DayRollup`s of days that changed since they were last sent, oldest
-    /// first, at most `limit`.
+    /// first, at most `limit`. Four grouped reads over the same set of dirty
+    /// days, in one read transaction, whatever the number of days.
     pub async fn pending_day_rollups(
         &self,
         limit: u32,
     ) -> Result<Vec<dira_contract::DayRollup>, Error> {
         use sha2::{Digest, Sha256};
-        let keys = sqlx::query(
-            "SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1",
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            let day: String = k.get("day");
-            let repo: String = k.get("repo");
-            let revision: i64 = k.get("revision");
-            let ids: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT id, human_seconds FROM day_intervals WHERE day = ?1 AND repo = ?2 ORDER BY id",
-            )
-            .bind(&day)
-            .bind(&repo)
-            .fetch_all(&self.pool)
-            .await?;
-            let digest: String = Sha256::digest(
-                ids.iter()
-                    .map(|(id, _)| id.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    .as_bytes(),
-            )
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-            let (sessions, agent, prompts): (i64, Option<i64>, Option<i64>) = sqlx::query_as(
-                "SELECT COUNT(*), SUM(agent_wall_seconds), SUM(prompts) FROM day_sessions WHERE day = ?1 AND repo = ?2",
-            )
-            .bind(&day)
-            .bind(&repo)
-            .fetch_one(&self.pool)
-            .await?;
-            let (commits,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM day_commits WHERE day = ?1 AND repo = ?2")
-                    .bind(&day)
-                    .bind(&repo)
-                    .fetch_one(&self.pool)
-                    .await?;
-            let token_rows = sqlx::query(
-                "SELECT model, SUM(input) AS i, SUM(output) AS o, SUM(cache_read) AS cr,
-                        SUM(cache_create) AS cc, SUM(est_cost_usd) AS cost
-                 FROM day_tokens WHERE day = ?1 AND repo = ?2 GROUP BY model ORDER BY model",
-            )
-            .bind(&day)
-            .bind(&repo)
-            .fetch_all(&self.pool)
-            .await?;
-            let mut cost: Option<f64> = None;
-            let tokens = token_rows
-                .iter()
-                .map(|r| {
-                    if let Some(c) = r.get::<Option<f64>, _>("cost") {
-                        *cost.get_or_insert(0.0) += c;
-                    }
-                    dira_contract::DayTokens {
-                        model: r.get("model"),
-                        input: r.get::<i64, _>("i").max(0) as u64,
-                        output: r.get::<i64, _>("o").max(0) as u64,
-                        cache_read: r.get::<i64, _>("cr").max(0) as u64,
-                        cache_create: r.get::<i64, _>("cc").max(0) as u64,
-                    }
-                })
-                .collect();
-            out.push(dira_contract::DayRollup {
-                day,
-                repo_canonical: (!repo.is_empty()).then_some(repo),
-                workspace_hint: None,
-                human_seconds: ids.iter().map(|(_, s)| (*s).max(0) as u64).sum(),
-                agent_wall_seconds: agent.unwrap_or(0).max(0) as u64,
-                sessions: sessions.max(0) as u32,
-                prompts: prompts.unwrap_or(0).max(0) as u64,
-                commits: commits.max(0) as u32,
-                tokens,
-                est_cost_usd: cost,
-                interval_count: ids.len() as u32,
-                interval_digest: digest,
-                revision: revision.max(0) as u32,
-            });
+        use std::collections::BTreeMap;
+        type Key = (String, String);
+
+        #[derive(Default)]
+        struct Acc {
+            revision: i64,
+            ids: Vec<String>,
+            human: i64,
+            sessions: i64,
+            agent: i64,
+            prompts: i64,
+            commits: i64,
+            tokens: Vec<dira_contract::DayTokens>,
+            cost: Option<f64>,
         }
-        Ok(out)
+
+        // The dirty days this call reports: every read below starts with the
+        // same `k` CTE, so all four see the same set of days.
+        let limit = i64::from(limit);
+        let mut tx = self.pool.begin().await?;
+        let mut days: BTreeMap<Key, Acc> = BTreeMap::new();
+
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT day, repo, revision FROM k")
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?
+        {
+            days.entry((r.get("day"), r.get("repo"))).or_default().revision = r.get("revision");
+        }
+        if days.is_empty() {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT i.day, i.repo, i.id, i.human_seconds FROM day_intervals i \
+             JOIN k ON k.day = i.day AND k.repo = i.repo ORDER BY i.day, i.repo, i.id")
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            if let Some(a) = days.get_mut(&(r.get("day"), r.get("repo"))) {
+                a.ids.push(r.get("id"));
+                a.human += r.get::<i64, _>("human_seconds").max(0);
+            }
+        }
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT s.day, s.repo, COUNT(*) AS n, SUM(s.agent_wall_seconds) AS agent, \
+             SUM(s.prompts) AS prompts FROM day_sessions s \
+             JOIN k ON k.day = s.day AND k.repo = s.repo GROUP BY s.day, s.repo")
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            if let Some(a) = days.get_mut(&(r.get("day"), r.get("repo"))) {
+                a.sessions = r.get("n");
+                a.agent = r.get::<Option<i64>, _>("agent").unwrap_or(0);
+                a.prompts = r.get::<Option<i64>, _>("prompts").unwrap_or(0);
+            }
+        }
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT c.day, c.repo, COUNT(*) AS n FROM day_commits c \
+             JOIN k ON k.day = c.day AND k.repo = c.repo GROUP BY c.day, c.repo")
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            if let Some(a) = days.get_mut(&(r.get("day"), r.get("repo"))) {
+                a.commits = r.get("n");
+            }
+        }
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT t.day, t.repo, t.model, SUM(t.input) AS i, SUM(t.output) AS o, \
+             SUM(t.cache_read) AS cr, SUM(t.cache_create) AS cc, SUM(t.est_cost_usd) AS cost \
+             FROM day_tokens t JOIN k ON k.day = t.day AND k.repo = t.repo \
+             GROUP BY t.day, t.repo, t.model ORDER BY t.day, t.repo, t.model")
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            if let Some(a) = days.get_mut(&(r.get("day"), r.get("repo"))) {
+                if let Some(c) = r.get::<Option<f64>, _>("cost") {
+                    *a.cost.get_or_insert(0.0) += c;
+                }
+                a.tokens.push(dira_contract::DayTokens {
+                    model: r.get("model"),
+                    input: r.get::<i64, _>("i").max(0) as u64,
+                    output: r.get::<i64, _>("o").max(0) as u64,
+                    cache_read: r.get::<i64, _>("cr").max(0) as u64,
+                    cache_create: r.get::<i64, _>("cc").max(0) as u64,
+                });
+            }
+        }
+        tx.commit().await?;
+
+        Ok(days
+            .into_iter()
+            .map(|((day, repo), a)| {
+                let digest = Sha256::digest(a.ids.join("\n").as_bytes());
+                dira_contract::DayRollup {
+                    day,
+                    repo_canonical: (!repo.is_empty()).then_some(repo),
+                    workspace_hint: None,
+                    human_seconds: a.human as u64,
+                    agent_wall_seconds: a.agent.max(0) as u64,
+                    sessions: a.sessions.max(0) as u32,
+                    prompts: a.prompts.max(0) as u64,
+                    commits: a.commits.max(0) as u32,
+                    tokens: a.tokens,
+                    est_cost_usd: a.cost,
+                    interval_count: a.ids.len() as u32,
+                    interval_digest: hex::encode(digest),
+                    revision: a.revision.max(0) as u32,
+                }
+            })
+            .collect())
     }
 
     /// Record that these days' rollups were acknowledged: clear the change
@@ -3756,15 +3794,17 @@ impl Store {
         &self,
         keys: &[(String, Option<String>)],
     ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
         for (day, repo) in keys {
             sqlx::query(
                 "UPDATE day_rollup_state SET dirty = 0, revision = revision + 1 WHERE day = ?1 AND repo = ?2",
             )
             .bind(day)
             .bind(repo.clone().unwrap_or_default())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -6627,6 +6667,26 @@ mod v2_tests {
             .unwrap();
         let again = store.pending_day_rollups(10).await.unwrap();
         assert_eq!((again[0].human_seconds, again[0].revision), (105, 1));
+    }
+
+    #[tokio::test]
+    async fn prune_drops_only_days_past_the_window() {
+        let store = Store::open_in_memory().await.unwrap();
+        let old = (OffsetDateTime::now_utc() - time::Duration::days(60))
+            .date()
+            .to_string();
+        let day = today();
+        store
+            .record_acked_batch(&batch(vec![
+                interval("old", &old, 10),
+                interval("new", &day, 20),
+            ]))
+            .await
+            .unwrap();
+        assert!(store.prune_day_rollups().await.unwrap() > 0);
+        let pending = store.pending_day_rollups(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].day, day);
     }
 
     #[tokio::test]

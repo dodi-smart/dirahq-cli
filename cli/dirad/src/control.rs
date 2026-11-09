@@ -851,10 +851,7 @@ fn build_session_views(
                 label: s.label.clone(),
                 activity: s.activity.clone(),
                 note: s.note.clone(),
-                started_at: s
-                    .started_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default(),
+                started_at: fmt_ts(s.started_at),
                 human_seconds: human,
                 agent_seconds: agent,
                 idle: human_idle,
@@ -884,8 +881,7 @@ fn build_session_views(
 /// Format an instant as RFC3339 for the wire (empty string on the format error,
 /// which never happens for a valid `OffsetDateTime`).
 fn fmt_ts(t: OffsetDateTime) -> String {
-    t.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
+    crate::heartbeat::fmt_rfc3339(t)
 }
 
 /// Whether a session has any agent-activity evidence, and its agent wall-clock

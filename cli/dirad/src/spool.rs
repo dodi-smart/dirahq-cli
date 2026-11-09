@@ -123,7 +123,7 @@ fn spill(state: &AppState, harness_id: &str, norm: Normalized, at: OffsetDateTim
     if dira_core::model::is_probe_session(&norm.session_id) {
         return;
     }
-    let observed_at = at.format(&Rfc3339).unwrap_or_default();
+    let observed_at = crate::heartbeat::fmt_rfc3339(at);
     let dir = spool::dir_for(&state.config.db_path);
     match spool::write(&dir, &Record::new(harness_id, observed_at, norm)) {
         Ok(_) => {

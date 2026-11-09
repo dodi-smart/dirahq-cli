@@ -982,6 +982,12 @@ async fn flush(
         let token_rowid_high = chunk.token_rowid_high;
         let artifact_rowid_high = chunk.artifact_rowid_high;
         let is_last = chunk.is_last;
+        // Where this chunk moves the cursors, acknowledged or stepped past.
+        let bounds = crate::quarantine::ChunkBounds {
+            event_cursor: cursor_event_id.clone(),
+            artifact_rowid: artifact_rowid_high,
+            token_rowid: token_rowid_high,
+        };
         let envelope = Envelope {
             schema_version: SCHEMA_VERSION.to_string(),
             device_id: device_id.clone(),
@@ -1055,13 +1061,6 @@ async fn flush(
                 if let Err(e) = state.store.record_acked_batch(&envelope.payload).await {
                     tracing::debug!("record acked batch for day rollups: {e}");
                 }
-                if let Some(ev) = &cursor_event_id {
-                    state
-                        .store
-                        .meta_set(META_SYNC_CURSOR, ev)
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance cursor: {e}")))?;
-                }
                 // Row cursors advance on the chunk that CARRIED the rows, to the
                 // watermark that chunk covered — not on `is_last`, and never to
                 // the flush-wide snapshot bound. Gating these on the final chunk
@@ -1070,20 +1069,10 @@ async fn flush(
                 // ingest budget recorded nothing at all and restarted at row 1
                 // forever (#88), and any mid-drain restart cost the whole
                 // backlog the same way. See D-0020.
-                if let Some(u) = artifact_rowid_high {
-                    state
-                        .store
-                        .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance artifacts cursor: {e}")))?;
-                }
-                if let Some(u) = token_rowid_high {
-                    state
-                        .store
-                        .meta_set(META_TOKEN_CURSOR, &u.to_string())
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance token cursor: {e}")))?;
-                }
+                bounds
+                    .advance(&state.store)
+                    .await
+                    .map_err(SyncError::Fatal)?;
                 // Partial rollups are a live-registry snapshot, not a cursor over
                 // stored rows, so they stay on the final chunk. See D-0020.
                 if is_last && !partials.is_empty() {
@@ -1117,46 +1106,24 @@ async fn flush(
                 && status.is_client_error()
                 && status.as_u16() != 401
                 && status.as_u16() != 403);
-        if content_rejection && !epoch_reset {
-            let bounds = crate::quarantine::ChunkBounds {
-                event_cursor: cursor_event_id.clone(),
-                artifact_rowid: artifact_rowid_high,
-                token_rowid: token_rowid_high,
-            };
-            if crate::quarantine::note_rejection(&state.store, &bounds, &describe(&err))
+        if content_rejection
+            && !epoch_reset
+            && crate::quarantine::note_rejection(&state.store, &bounds, &describe(&err))
                 .await
                 .is_some()
-            {
-                tracing::warn!(
-                    reason = %describe(&err),
-                    cursor = cursor_event_id.as_deref().unwrap_or(""),
-                    "sync: the cloud rejected this chunk {} times in a row; quarantined it and \
-                     moved past (see `dira doctor`)",
-                    crate::quarantine::THRESHOLD
-                );
-                if let Some(ev) = &cursor_event_id {
-                    state
-                        .store
-                        .meta_set(META_SYNC_CURSOR, ev)
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance cursor: {e}")))?;
-                }
-                if let Some(u) = artifact_rowid_high {
-                    state
-                        .store
-                        .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance artifacts cursor: {e}")))?;
-                }
-                if let Some(u) = token_rowid_high {
-                    state
-                        .store
-                        .meta_set(META_TOKEN_CURSOR, &u.to_string())
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance token cursor: {e}")))?;
-                }
-                continue;
-            }
+        {
+            tracing::warn!(
+                reason = %describe(&err),
+                cursor = cursor_event_id.as_deref().unwrap_or(""),
+                "sync: the cloud rejected this chunk {} times in a row; quarantined it and \
+                 moved past (see `dira doctor`)",
+                crate::quarantine::THRESHOLD
+            );
+            bounds
+                .advance(&state.store)
+                .await
+                .map_err(SyncError::Fatal)?;
+            continue;
         }
         return Err(err);
     }

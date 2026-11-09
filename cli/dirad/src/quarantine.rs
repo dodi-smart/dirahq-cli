@@ -30,6 +30,35 @@ pub struct ChunkBounds {
     pub token_rowid: Option<i64>,
 }
 
+impl ChunkBounds {
+    /// Move the event, artifact and token cursors to this chunk's high-water
+    /// marks. The one place a flush advances them, whether the chunk was
+    /// acknowledged or stepped past (D-0020: per chunk, never the flush-wide
+    /// bound).
+    pub async fn advance(&self, store: &Store) -> Result<(), String> {
+        use dira_core::sync::{META_ARTIFACTS_CURSOR, META_SYNC_CURSOR, META_TOKEN_CURSOR};
+        if let Some(ev) = &self.event_cursor {
+            store
+                .meta_set(META_SYNC_CURSOR, ev)
+                .await
+                .map_err(|e| format!("advance cursor: {e}"))?;
+        }
+        if let Some(u) = self.artifact_rowid {
+            store
+                .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
+                .await
+                .map_err(|e| format!("advance artifacts cursor: {e}"))?;
+        }
+        if let Some(u) = self.token_rowid {
+            store
+                .meta_set(META_TOKEN_CURSOR, &u.to_string())
+                .await
+                .map_err(|e| format!("advance token cursor: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Poison {
     bounds: ChunkBounds,
@@ -74,9 +103,7 @@ pub async fn note_rejection(
     }
     let mut list = entries(store).await;
     list.push(Entry {
-        at: time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default(),
+        at: crate::heartbeat::fmt_rfc3339(time::OffsetDateTime::now_utc()),
         reason: reason.chars().take(500).collect(),
         bounds: bounds.clone(),
     });

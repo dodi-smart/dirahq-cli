@@ -708,7 +708,7 @@ enum FlushOutcome {
 
 /// Errors that distinguish "retry later" from "stop until a human acts".
 #[cfg_attr(test, derive(Debug))]
-enum SyncError {
+pub(crate) enum SyncError {
     /// Network / 5xx / 429 — leave the cursor, back off, the backstop will
     /// retry. `retry_after` carries the cloud's requested wait (from a 429's
     /// `Retry-After` header or typed body) when present; the run loop honors
@@ -1350,7 +1350,7 @@ async fn resend_lineage(
                 .await
                 .map_err(|e| SyncError::Fatal(format!("load session history: {e}")))?;
             let rollups = dira_core::sync::build_lineage_resend_rollups(&history, agent);
-            let mut batches = dira_core::sync::build_lineage_resend_batches(
+            let batches = dira_core::sync::build_lineage_resend_batches(
                 rollups,
                 &history,
                 LINEAGE_RULES_VERSION,
@@ -1358,35 +1358,15 @@ async fn resend_lineage(
                 now,
             );
             let mut chain = crate::chain::Chain::load(&state.store).await;
-            for batch in &mut batches {
+            for mut batch in batches {
                 stamp_runtime(&mut batch.sessions);
-                chain.stamp(batch);
-                let batch_hash = crate::chain::hash(batch).map_err(SyncError::Fatal)?;
                 let count = batch.sessions.len();
-                let sig = device_key
-                    .sign_payload(batch)
-                    .map_err(|e| SyncError::Fatal(format!("sign: {e}")))?;
-                let envelope = Envelope {
-                    schema_version: SCHEMA_VERSION.to_string(),
-                    device_id: device_id.clone(),
-                    payload: batch.clone(),
-                    sig,
-                };
                 last_post = Some(Instant::now());
-                let resp = ingest_body(client.post(&url).timeout(HTTP_TIMEOUT), &envelope)?
-                    .send()
-                    .await
-                    .map_err(|e| SyncError::Transient {
-                        message: format!("post lineage re-send: {e}"),
-                        retry_after: None,
-                    })?;
-                if !resp.status().is_success() {
-                    return Err(ingest_error(resp).await);
-                }
-                chain
-                    .advance(&state.store, batch_hash)
-                    .await
-                    .map_err(SyncError::Fatal)?;
+                post_chained(
+                    state, device_key, client, &url, &device_id, &mut chain, batch,
+                )
+                .await
+                .map_err(|(e, _)| e)?;
                 sent += count;
             }
             // Same pacing as a long flush drain (D-0020).
@@ -1592,6 +1572,65 @@ fn is_bad_signature(body: &str) -> bool {
 /// non-fatal: a missing `cloud_url`, an unreachable cloud, an old cloud without
 /// the endpoint, or an unparseable body all simply skip the check. Run once at
 /// daemon startup; sync/heartbeat are unaffected by its outcome.
+/// Send ONE attestation batch through the contract 2.0 path: stamp the chain
+/// and client, hash, sign, POST (zstd when the cloud takes it), and on a 2xx
+/// advance the chain and record the batch for day rollups. Returns the ack
+/// body.
+///
+/// For paths that send standalone batches (the lineage re-send, a meetings
+/// restatement). The main flush loop keeps its own copy because it also moves
+/// per-chunk cursors, capture health and quarantine on each chunk. On a
+/// non-2xx the error comes with the HTTP status, so a caller can tell a
+/// content rejection from a transient one. The chain is NOT advanced on any
+/// error.
+pub(crate) async fn post_chained(
+    state: &AppState,
+    device_key: &DeviceKey,
+    client: &reqwest::Client,
+    url: &str,
+    device_id: &str,
+    chain: &mut crate::chain::Chain,
+    mut batch: dira_contract::AttestationBatch,
+) -> Result<String, (SyncError, Option<reqwest::StatusCode>)> {
+    chain.stamp(&mut batch);
+    let batch_hash = crate::chain::hash(&batch).map_err(|e| (SyncError::Fatal(e), None))?;
+    let sig = device_key
+        .sign_payload(&batch)
+        .map_err(|e| (SyncError::Fatal(format!("sign: {e}")), None))?;
+    let envelope = Envelope {
+        schema_version: SCHEMA_VERSION.to_string(),
+        device_id: device_id.to_string(),
+        payload: batch,
+        sig,
+    };
+    let resp = ingest_body(client.post(url).timeout(HTTP_TIMEOUT), &envelope)
+        .map_err(|e| (e, None))?
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                SyncError::Transient {
+                    message: format!("post ingest: {e}"),
+                    retry_after: None,
+                },
+                None,
+            )
+        })?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err((ingest_error(resp).await, Some(status)));
+    }
+    let body = resp.text().await.unwrap_or_default();
+    chain
+        .advance(&state.store, batch_hash)
+        .await
+        .map_err(|e| (SyncError::Fatal(e), None))?;
+    if let Err(e) = state.store.record_acked_batch(&envelope.payload).await {
+        tracing::debug!("record acked batch for day rollups: {e}");
+    }
+    Ok(body)
+}
+
 /// Most day rollups one batch carries; the rest follow in later flushes.
 const DAY_ROLLUPS_PER_BATCH: u32 = 60;
 

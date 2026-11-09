@@ -696,6 +696,10 @@ do_uninstall() {
   fi
 
   rm -f "$dira_path" "$dirad_path"
+  # The rollback copies `dira update` keeps (.dira.prev) and any swap
+  # leftovers (.dira.old.<pid>, .dira.bak) are ours too.
+  rm -f "$bin_dir/.dira.prev" "$bin_dir/.dirad.prev" "$bin_dir/.dira.bak" "$bin_dir/.dirad.bak" \
+    "$bin_dir"/.dira.old.* "$bin_dir"/.dirad.old.* 2>/dev/null || true
   info "removed dira and dirad from $bin_dir"
 
   printf '\nConfig and data were NOT removed.\n' >&2
@@ -997,7 +1001,13 @@ main() {
 
   # 14b. remember the channel, so background updates follow it (DIRASH-0050).
   # Best effort: a pinned older binary may not know the knob.
-  "$bin_dir/dira" config set update.channel "$channel" >/dev/null 2>&1 || true
+  # A pinned prerelease (--version 1.2.0-develop.3) follows prereleases even
+  # though --channel defaulted to stable.
+  case "$version" in
+  *-*) remembered_channel=prerelease ;;
+  *) remembered_channel="$channel" ;;
+  esac
+  "$bin_dir/dira" config set update.channel "$remembered_channel" >/dev/null 2>&1 || true
 
   # 15. PATH hint + next steps. One command, because the previous three-line
   # block omitted `dira init` and so left anyone who followed it with a

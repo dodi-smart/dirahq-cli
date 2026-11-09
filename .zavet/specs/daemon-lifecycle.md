@@ -89,6 +89,17 @@ the interactive user entirely. That was a silent, total capture outage.
   each kind the way it expects: `launchctl unload` for launchd, `systemctl
   --user stop` for systemd, and confirmed-exit `Shutdown`/`taskkill` for the
   windows task and Run key (DIRASH-0048).
+- Long-lived children (`dirad` from `daemon start`, the hook shim's autostart,
+  the background updater) are spawned with `dira_core::process::spawn_isolated`.
+  On windows it clears the inherit flag on the parent's std handles for the
+  spawn, so the child never holds the caller's stdout pipe. Before this,
+  `install.ps1 | Out-Null` and a harness reading a hook's stdout hung for as
+  long as the daemon lived (reproduced in the VM run, 2026-11-10).
+- The registered service supervises only the default instance. An instance
+  on its own endpoint (`DIRA_SOCKET_PATH`) is never labelled as service-run,
+  and on windows its pidfile sits beside its own `DIRA_DB_PATH`.
+- `dira daemon install` waits up to 10 s for the daemon to answer and says
+  so; a slow start is reported, never an error.
 - On windows `dirad` is a windows-subsystem binary: it never gets a console
   window, and it attaches the parent's console only for `--version`. Every
   child it spawns is created with `CREATE_NO_WINDOW`

@@ -65,6 +65,15 @@ three traced back to these causes:
   time-limit and restart settings. They are the fix, not decoration.
 - Run-key installs must start the daemon now (`Launch::NeedsStart`). A Run-key restart spawns
   the replacement and never calls `schtasks`.
-- Not yet validated on a real standard account (`verified: false`): the Parallels runbook in
-  `docs/superpowers/plans/2026-11-09-cli-simplify-install-update.md` (Phase 0) is the
-  validation.
+- Start every long-lived child (`dirad`, the background updater) with
+  `dira_core::process::spawn_isolated`. On windows a child otherwise inherits the parent's own
+  stdout pipe and holds it open for its life. Whoever reads that pipe then hangs: `install.ps1`
+  piping `dira daemon install`, or a harness reading `dira hook`.
+- Validated on 2026-11-10 in a Windows 11 ARM64 VM (x64 build, filtered medium-integrity token):
+  - task registration without elevation;
+  - no console window on install, update, restart or a Run-key logon launch;
+  - Run-key restart, stop and uninstall;
+  - background update and rollback.
+
+  Not exercised: a real reboot and logon (the trigger was simulated with `schtasks /Run` and an
+  Explorer-style launch), and a non-admin account. So this stays `verified: false`.

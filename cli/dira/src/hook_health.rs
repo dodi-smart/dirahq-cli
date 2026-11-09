@@ -116,7 +116,7 @@ fn warning_for(h: &Health, now: i64) -> Option<String> {
     };
     Some(format!(
         "warning: {} {} hook(s) could not reach dirad (most recent {when}):\n  {}\n  \
-         captured activity is being lost right now — check `dira daemon status`.",
+         they are kept in the spool and replayed once dirad is back — check `dira daemon status`.",
         h.consecutive, h.harness, h.last_error
     ))
 }

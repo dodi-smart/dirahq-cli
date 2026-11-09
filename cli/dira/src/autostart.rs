@@ -153,7 +153,8 @@ fn spawn_bare() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     dira_core::process::detached(&mut cmd);
-    let _ = cmd.spawn();
+    // The harness reads this hook's stdout; the daemon must not hold it open.
+    let _ = dira_core::process::spawn_isolated(&mut cmd);
 }
 
 #[cfg(test)]

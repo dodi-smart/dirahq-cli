@@ -40,7 +40,8 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
     The raw payload never touches disk.
   - When nothing is listening, the shim asks the supervisor (logon task,
     launchd, systemd --user) to start the daemon, or spawns it bare where
-    there is none. At most once per 30 s, never elevated, never in a debug
+    there is none, through `spawn_isolated`, so the daemon never holds the
+    pipe the harness reads the hook's stdout from. At most once per 30 s, never elevated, never in a debug
     build.
   - The daemon spills to the same spool when its ingest queue is full, and
     replays the spool at startup and every 2–30 s while the queue has room,

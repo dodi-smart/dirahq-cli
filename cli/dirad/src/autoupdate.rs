@@ -124,13 +124,13 @@ fn spawn_breaking_away(cmd: &mut std::process::Command) -> std::io::Result<std::
             | dira_core::process::CREATE_NEW_PROCESS_GROUP
             | CREATE_BREAKAWAY_FROM_JOB,
     );
-    match cmd.spawn() {
+    match dira_core::process::spawn_isolated(cmd) {
         Ok(c) => Ok(c),
         Err(_) => {
             cmd.creation_flags(
                 dira_core::process::CREATE_NO_WINDOW | dira_core::process::CREATE_NEW_PROCESS_GROUP,
             );
-            cmd.spawn()
+            dira_core::process::spawn_isolated(cmd)
         }
     }
 }

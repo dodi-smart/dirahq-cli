@@ -889,6 +889,12 @@ function Uninstall-Dira {
     }
 
     Remove-Item -Path $diraExe, $diradExe -Force -ErrorAction SilentlyContinue
+    # The rollback copies `dira update` keeps (.dira.exe.prev) and any swap
+    # leftovers (.dira.exe.old.<pid>, .dira.exe.bak) are ours too. An .old file
+    # still locked by a running process is left for the next sweep.
+    Get-ChildItem -Path $BinDir -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\.dirad?\.exe\.(prev|bak|old\..+)$' } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     Write-Info "removed dira and dirad from $BinDir"
     Write-Info "`nConfig and data were NOT removed."
     Write-Info "To remove everything, reinstall dira and run 'dira nuke', or delete the config/data directories by hand -- see docs/install.md."
@@ -1126,7 +1132,10 @@ function Invoke-Main {
 
         # 14b. remember the channel, so background updates follow it
         # (DIRASH-0050). Best effort: a pinned older binary may not know the knob.
-        Invoke-BestEffort -Exe $installedDira -Arguments @('config', 'set', 'update.channel', $effectiveChannel) | Out-Null
+        # A pinned prerelease (-Version 1.2.0-develop.3) follows prereleases even
+        # though -Channel defaulted to stable.
+        $rememberedChannel = if ($release.Version -match '-') { 'prerelease' } else { $effectiveChannel }
+        Invoke-BestEffort -Exe $installedDira -Arguments @('config', 'set', 'update.channel', $rememberedChannel) | Out-Null
 
         # 16. one command to a working setup: with a console (and not elevated),
         # go straight into onboarding, which is safe to re-run. Otherwise say

@@ -180,8 +180,10 @@ pub async fn start(config: &Config) -> Result<()> {
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
 
-    let mut child = cmd
-        .spawn()
+    // Never let the daemon inherit our own stdout pipe (see
+    // `dira_core::process::spawn_isolated`): a caller piping this command,
+    // like install.ps1, would otherwise wait for the daemon to exit.
+    let mut child = dira_core::process::spawn_isolated(&mut cmd)
         .with_context(|| format!("failed to spawn {}", bin.display()))?;
 
     // The pidfile is written only once the child has proven itself (below), never
@@ -957,7 +959,20 @@ pub async fn install_with_supervision(config: &Config, supervision: Supervision)
     .await?;
     if install_service(config)? == Launch::NeedsStart {
         start(config).await?;
+        return Ok(());
     }
+    // The service manager starts it asynchronously (`schtasks /Run`,
+    // `launchctl load`, `systemctl restart`). Wait briefly so the installer's
+    // next step, or the user's next command, finds it answering; a slow start
+    // is reported, never an error.
+    for _ in 0..100 {
+        if is_up(config).await {
+            println!("dirad is running");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    println!("dirad has not answered yet; check `dira daemon status` in a moment");
     Ok(())
 }
 
@@ -1357,14 +1372,19 @@ fn uninstall_registration(config: &Config) -> Result<()> {
         // `/End` first so a task-launched dirad isn't left running headless
         // after its task disappears; both steps best-effort — an absent task
         // or key is success, not an error.
-        let _ = Command::new("schtasks")
-            .args(["/End", "/TN", "DiraDaemon"])
-            .status();
-        let task_gone = Command::new("schtasks")
-            .args(["/Delete", "/F", "/TN", "DiraDaemon"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // Quiet: an absent task is the common case after a Run-key install, and
+        // schtasks' own "cannot find the file" read like a failed uninstall.
+        let quiet = |args: &[&str]| {
+            dira_core::process::command("schtasks")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let _ = quiet(&["/End", "/TN", "DiraDaemon"]);
+        let task_gone = quiet(&["/Delete", "/F", "/TN", "DiraDaemon"]);
         let key_gone = delete_run_key();
         match (task_gone, key_gone) {
             (true, _) => println!("removed scheduled task DiraDaemon"),
@@ -1609,13 +1629,28 @@ pub async fn detect_supervision(config: &Config) -> Supervision {
     .await
 }
 
+/// Whether `socket` is the default control endpoint, the one the registered
+/// service runs. Pure, so it is tested without a service manager. (The unit
+/// tests of [`detect_supervision_with`] drive custom endpoints and treat them as
+/// the default instance.)
+fn is_default_endpoint(socket: &Path, default: &Path) -> bool {
+    socket == default
+}
+
 async fn detect_supervision_with(
     config: &Config,
     runner: &dyn Runner,
     os: Os,
     legacy_sock: &Path,
 ) -> Supervision {
-    if os == Os::Macos {
+    // The registered service (launchd agent, systemd unit, logon task, Run
+    // key) runs the DEFAULT instance. An isolated instance on its own control
+    // endpoint (`DIRA_SOCKET_PATH`) is never what it supervises, so labelling it
+    // "supervised by" the service was wrong, and acting on that label would
+    // restart the user's real daemon instead.
+    let default_instance =
+        cfg!(test) || is_default_endpoint(&config.socket_path, &Config::default().socket_path);
+    if default_instance && os == Os::Macos {
         if let Some(out) = runner.run("launchctl", &["list", "sh.dirahq.dirad"]) {
             if out.status.success() {
                 return Supervision::Launchd;
@@ -1623,7 +1658,7 @@ async fn detect_supervision_with(
         }
     }
 
-    if os == Os::Linux {
+    if default_instance && os == Os::Linux {
         if let Some(out) = runner.run("systemctl", &["--user", "is-active", "dirad.service"]) {
             if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "active" {
                 return Supervision::SystemdUser;
@@ -1631,7 +1666,7 @@ async fn detect_supervision_with(
         }
     }
 
-    if os == Os::Windows {
+    if default_instance && os == Os::Windows {
         if let Some(out) = runner.run("schtasks", &["/Query", "/TN", "DiraDaemon"]) {
             if out.status.success() {
                 return Supervision::ScheduledTask;
@@ -3560,5 +3595,20 @@ mod windows_task_tests {
         assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
         assert_eq!(&bytes[2..4], &[b'<', 0]);
         assert_eq!(bytes.len(), 2 + 2 * "<a>é</a>".encode_utf16().count());
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_default_endpoint_is_the_services_instance() {
+        let default = Config::default().socket_path;
+        assert!(is_default_endpoint(&default, &default));
+        assert!(!is_default_endpoint(
+            Path::new(r"\\.\pipe\dira-vmtest-iso"),
+            &default
+        ));
     }
 }

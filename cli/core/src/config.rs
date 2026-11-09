@@ -636,8 +636,16 @@ impl Config {
         }
         #[cfg(windows)]
         {
-            project_dirs()
-                .map(|d| d.data_dir().to_path_buf())
+            // The directory the database lives in: the project data dir by
+            // default, and an isolated instance's own dir under
+            // `DIRA_DB_PATH`. It used to be the project data dir always, so
+            // an isolated daemon's pidfile landed in the real install's
+            // data dir.
+            self.db_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(PathBuf::from)
+                .or_else(|| project_dirs().map(|d| d.data_dir().to_path_buf()))
                 .unwrap_or_else(std::env::temp_dir)
         }
     }

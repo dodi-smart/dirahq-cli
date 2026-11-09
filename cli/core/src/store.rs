@@ -690,6 +690,23 @@ impl Store {
     }
 
     /// Upsert a meta value.
+    /// Several `meta` writes in one transaction: all land or none do.
+    pub async fn meta_set_many(&self, pairs: &[(&str, &str)]) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        for (key, value) in pairs {
+            sqlx::query(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn meta_set(&self, key: &str, value: &str) -> Result<(), Error> {
         sqlx::query(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)

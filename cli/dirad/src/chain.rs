@@ -57,34 +57,32 @@ impl Chain {
         batch.client = Some(client_info());
     }
 
-    /// Record that the batch hashing to `hash` was acknowledged.
+    /// Record that the batch hashing to `hash` was acknowledged. The seq and
+    /// the hash are written in one transaction: a crash between two writes
+    /// would leave seq+1 with the old hash, and the next batch would read as a
+    /// fork.
     pub async fn advance(&mut self, store: &Store, hash: String) -> Result<(), String> {
+        let seq = (self.seq + 1).to_string();
+        store
+            .meta_set_many(&[(META_BATCH_SEQ, &seq), (META_BATCH_PREV_HASH, &hash)])
+            .await
+            .map_err(|e| format!("advance chain: {e}"))?;
         self.seq += 1;
         self.prev_hash = hash;
-        store
-            .meta_set(META_BATCH_SEQ, &self.seq.to_string())
-            .await
-            .map_err(|e| format!("advance chain seq: {e}"))?;
-        store
-            .meta_set(META_BATCH_PREV_HASH, &self.prev_hash)
-            .await
-            .map_err(|e| format!("advance chain hash: {e}"))
+        Ok(())
     }
 
     /// Start a new epoch at seq 0 (the cloud reset its data epoch).
     pub async fn restart(store: &Store) -> Result<(), String> {
         let epoch = Self::load(store).await.epoch + 1;
-        for (k, v) in [
-            (META_CHAIN_EPOCH, epoch.to_string()),
-            (META_BATCH_SEQ, String::new()),
-            (META_BATCH_PREV_HASH, String::new()),
-        ] {
-            store
-                .meta_set(k, &v)
-                .await
-                .map_err(|e| format!("restart chain: {e}"))?;
-        }
-        Ok(())
+        store
+            .meta_set_many(&[
+                (META_CHAIN_EPOCH, &epoch.to_string()),
+                (META_BATCH_SEQ, ""),
+                (META_BATCH_PREV_HASH, ""),
+            ])
+            .await
+            .map_err(|e| format!("restart chain: {e}"))
     }
 }
 

@@ -955,6 +955,13 @@ async fn flush(
             .unwrap_or_default(),
     );
     for chunk in chunks {
+        // A cloud data-epoch reset this flush restarted the chain and blanked
+        // the cursors: the remaining chunks go out again, freshly stamped, on
+        // the next flush. Sending them now would carry the old epoch's position
+        // and read as a fork.
+        if epoch_reset {
+            break;
+        }
         let mut batch = chunk.batch;
         let carried_health = health.take();
         if let Some((h, _)) = &carried_health {

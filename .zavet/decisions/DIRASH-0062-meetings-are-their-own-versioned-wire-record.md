@@ -1,5 +1,5 @@
 ---
-id: DIRASH-0050
+id: DIRASH-0062
 title: Meetings are their own versioned wire record; meeting time rides intervals with a meetingId
 status: proposed
 guards:
@@ -37,7 +37,7 @@ a retry would be acked as a duplicate and the confirmation lost. A versioned rec
 tombstones makes every change idempotent and orderable.
 
 Keeping the time in intervals means the cloud's read sites keep summing `intervals.humanSeconds`
-correctly (DIRASH-0051).
+correctly (DIRASH-0063).
 
 ## Rejected
 

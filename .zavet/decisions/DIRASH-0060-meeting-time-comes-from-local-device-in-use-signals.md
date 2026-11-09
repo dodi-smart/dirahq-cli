@@ -1,5 +1,5 @@
 ---
-id: DIRASH-0048
+id: DIRASH-0060
 title: Meeting time comes from local device-in-use signals, never a bot or call content
 status: proposed
 guards:
@@ -52,7 +52,7 @@ So nothing is billed unless independent signals agree, and the person is asked a
 - **Matching window or tab titles.** Titles are content, and reading them needs Screen Recording
   on macOS.
 - **The calendar as the always-on primary source.** It misses ad-hoc calls and records skipped
-  meetings. It stays optional (DIRASH-0052).
+  meetings. It stays optional (DIRASH-0064).
 - **Local idle or lock as a veto.** A listener touches nothing, so it would delete real meetings.
 
 ## Agent directives

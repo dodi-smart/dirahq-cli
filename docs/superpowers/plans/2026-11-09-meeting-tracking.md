@@ -91,12 +91,12 @@ dirahq-cli. The module ships `off` by default, and nothing crosses the wire.
 
 | # | Issue | Type | Areas |
 |---|---|---|---|
-| 1 | Land `.zavet/specs/meeting-capture.md` v3 from the branch spec plus P0 results plus this design. Record DIRASH-0048…0054 as `proposed` (renumber if taken). Add `area:meetings` to `.github/areas.yml` and the label list | Task | meetings, infra |
+| 1 | Land `.zavet/specs/meeting-capture.md` v3 from the branch spec plus P0 results plus this design. Record DIRASH-0060…0066 as `proposed` (renumber if taken). Add `area:meetings` to `.github/areas.yml` and the label list | Task | meetings, infra |
 | 2 | `cli/meetings` crate: `MeetingSignal`, `Reading`, `Sample`, `Holder`, catalogue loader (`data/apps.toml`), pure `fuse`, `tracker`, `eligible`, and the `fake` adapter. Fusion table and tracker unit tests run on any CI runner | Feature | meetings |
 | 3 | macOS adapter and gate: CoreAudio and CMIO listeners, per-process walk (14.2+), libproc scan with `CptHost`. Report `Unavailable` below 14.2, or when the keys are missing | Feature | meetings |
 | 4 | Windows adapter and gate: ConsentStore `RegNotifyChangeKeyValue`, WASAPI session notifications, Toolhelp scan with `CptService`, the stale-0 guard. Native Windows CI lane (`ci.yml`) | Feature | meetings |
 | 5 | Linux adapter and gate: `pw-dump --monitor` child (static musl, no libpipewire link), `pactl` fallback, inotify on `/dev/video*`, `/proc` scan | Feature | meetings |
-| 6 | Migration `0010_meetings.sql` (`meetings` with `version` + `updated_seq`, `meeting_suggestions`, `calendar_cache`), `StoredAt` times, retention prune, the "hold compaction for non-final meeting days" rule. Use the `new-migration` skill | Feature | store, meetings |
+| 6 | Migration `0011_meetings.sql` (`meetings` with `version` + `updated_seq`, `meeting_suggestions`, `calendar_cache`), `StoredAt` times, retention prune, the "hold compaction for non-final meeting days" rule. Use the `new-migration` skill | Feature | store, meetings |
 | 7 | `accounting::overlay` plus `Precedence`/`Slot`/`Slice`, the `LineKey` enum, and wiring into `report::build`/`build_merged`, compaction, `--project`, session views, `price_sessions` and the `watch` tail (design §2.4). All 16 property tests from design §2.5. **Have `accounting-reviewer` review the PR** | Feature | accounting |
 | 8 | `dirad/src/meetings.rs` task under the supervisor, with the watchdog mark. Control requests `MeetingsStatus/List/Confirm/Dismiss/Assign/Forget/Reload`. Detection suppressed while a manual `--activity meeting` session is live | Feature | daemon, meetings |
 | 9 | `dira meetings list/confirm/dismiss/assign/trace/export/forget`, the `dira status` line, and the doctor `meetings.*` checks (DIRASH-0022: absent evidence → `skip`) | Feature | commands, doctor |
@@ -135,7 +135,7 @@ are byte-identical, and so is `cargo test -p dira-core` for accounting.
 **Order.** cli#1 → cloud#4 → cloud#5/6 → cli#2/3 → cloud#7/8. Promotion follows the gate memory:
 CLI-develop, cloud-develop, cloud-main READY, CLI-main.
 
-**Decisions:** M3 (DIRASH-0050) and M4 (DIRASH-0051) move to `active`, with checks bound to the
+**Decisions:** M3 (DIRASH-0062) and M4 (DIRASH-0063) move to `active`, with checks bound to the
 overlay proptests and the denylist test.
 
 **Spec:** `attestation-sync` gains a meetings section.
@@ -161,7 +161,7 @@ overlay proptests and the denylist test.
 | 8 | Fetch and cache the directory and policy. Obey `capture: off` per workspace; `overlapPrecedence` is per user, and a meeting always wins across workspaces. `dira status` shows the effective policy; doctor gets `meetings.policy` | Feature | sync, meetings | **yes** (directory response type) |
 | 9 | Attribution methods `user`, `series`, `context` (calendar methods come in P4); `MeetingsAssign` pushes a new version | Feature | meetings |
 
-**Decision:** M7 (DIRASH-0054) moves to `active`.
+**Decision:** M7 (DIRASH-0066) moves to `active`.
 
 **Docs:** the GDPR posture, a DPIA template and a works-agreement checklist in the public docs
 (landing repo or `docs/`).
@@ -180,7 +180,7 @@ overlay proptests and the denylist test.
 
 **dirahq-cloud.** Calendar-rule and client-domain management UI; series memory written on assignment.
 
-**Decision:** M5 (DIRASH-0052) moves to `active`.
+**Decision:** M5 (DIRASH-0064) moves to `active`.
 
 ## P5: Labels channel (opt-in titles)
 
@@ -189,7 +189,7 @@ overlay proptests and the denylist test.
 | 1 | cli | `MeetingLabelsEnvelope` signed with the device key, its own route and channel, `meetings.labels` knob, `MEETINGS_LABELS_DISCLOSURE` prompt (DIRASH-0030 pattern), forget/erasure | Feature (contract) |
 | 2 | cloud | `meeting_labels` table behind `labels: allowed`, `content_not_allowed` otherwise; an opt-in "show titles on invoices" setting | Feature |
 
-**Decision:** M6 (DIRASH-0053) moves to `active`.
+**Decision:** M6 (DIRASH-0065) moves to `active`.
 
 **Out of scope:**
 

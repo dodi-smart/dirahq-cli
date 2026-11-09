@@ -1,5 +1,5 @@
 ---
-id: DIRASH-0054
+id: DIRASH-0066
 title: The daemon obeys the workspace meeting policy; admins can disable but never force capture on, and the user's opt-out always wins
 status: proposed
 guards:

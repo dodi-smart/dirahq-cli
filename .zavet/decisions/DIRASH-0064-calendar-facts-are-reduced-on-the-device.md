@@ -1,5 +1,5 @@
 ---
-id: DIRASH-0052
+id: DIRASH-0064
 title: Calendar facts are reduced on the device; attribution resolves locally; no titles, attendees or domains cross
 status: proposed
 guards:
@@ -32,7 +32,7 @@ What crosses the wire:
 - attribution resolved **on the device** against a workspace directory fetched from the cloud
   (`client_ref`/`project_ref`).
 
-Titles never ride this wire (see DIRASH-0053). A title hash is not used.
+Titles never ride this wire (see DIRASH-0065). A title hash is not used.
 
 ## Why
 

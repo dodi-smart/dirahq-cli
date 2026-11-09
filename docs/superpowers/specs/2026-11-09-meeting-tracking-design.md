@@ -211,7 +211,7 @@ session, or work routed to another workspace.
 ### 2.2 Model
 
 Meetings are **spans**: `[start, end)` with a meeting key. They live in a new local `meetings`
-table (migration `0010_meetings.sql`, times in the `StoredAt` form per DIRASH-0043), and each row
+table (migration `0011_meetings.sql`, times in the `StoredAt` form per DIRASH-0043), and each row
 has a monotonic `version`.
 
 Meetings are not synthetic `ManualTick` events. Ticks were rejected because:
@@ -506,6 +506,30 @@ channel", DIRASH-0030):
 
 ---
 
+### 3.5 Alignment with contract 2.0 (synced 2026-11-09)
+
+The main session's contract 2.0 notes (shared notes, `contract-2.0-cli.md`) and the cloud v2
+baseline (`origin/feat/cloud-v2`, `cloud/src/db/schema/facts.ts`) settle these points:
+
+- **Meetings land as a 2.x minor.** 2.0 reserves no untyped slot. `meetings: Vec<Meeting>` plus
+  `Interval.meetingId` arrive as additive optional fields in 2.x. The 1.9 fallback in §3.1 applies
+  only if detection ships before 2.0.
+- **Chained batches replace the batch-id fold.** 2.0 batches carry `seq`, `prevBatchHash` and
+  `chainEpoch`, and a retry resends the identical payload. A meeting change made after a payload
+  was built rides the *next* batch. So §2.3's "fold `(id, version)` into `batch_id_for_chunk`"
+  becomes "pending meeting changes trigger a flush". The version check in the cloud stays.
+- **`dayRollups.humanSeconds` is the overlaid figure.** It equals the sum of the interval slices
+  (§2.3), so meeting time is included once. A day touched by a late confirmation or retraction is
+  resent with `revision + 1`, which the 2.0 drift check already expects.
+- **`facts_daily` is keyed by repo and late-bound to project/client.** A meeting usually has no
+  repo. Meeting time therefore goes to its own `facts_daily_meetings`, keyed by (workspace, day,
+  user, project_id nullable, provider_class, source) and carrying `meeting_seconds`,
+  `meeting_external_seconds`, `meeting_count` and `engaged_during_meeting_seconds`. The meeting
+  slices in `facts_daily` count toward `engaged_seconds` with `repo_id` null and `harness = ""`, so
+  engaged totals stay complete. `focus_seconds` is derived at read time from `facts_hourly` and the
+  meeting slices, not stored.
+- **Local migrations.** Contract 2.0 takes `0010_v2.sql`, so meetings use `0011_meetings.sql`.
+
 ## 4. Calendar (phase 2)
 
 ### 4.1 Sources
@@ -783,7 +807,7 @@ time or org-API reconcile, is marketed in the EU.
 | Crate | `cli/meetings` |
 | Daemon | `dirad/src/meetings.rs` task; control requests `MeetingsStatus`, `MeetingsList`, `MeetingsConfirm{id}`, `MeetingsDismiss{id}`, `MeetingsAssign{id, project}`, `MeetingsForget{ids\|all}`, `MeetingsReload` |
 | CLI | `dira meetings [list\|confirm\|dismiss\|assign\|trace\|connect\|disconnect\|export\|forget]` |
-| Store | migration `0010_meetings.sql`: `meetings`, `meeting_suggestions`, `calendar_cache` (start, end, eligibility and domains only, pruned at +2 days), `meeting_sync` cursor in `meta` |
+| Store | migration `0011_meetings.sql`: `meetings`, `meeting_suggestions`, `calendar_cache` (start, end, eligibility and domains only, pruned at +2 days), `meeting_sync` cursor in `meta` |
 | Accounting | `accounting::overlay`, `Precedence`, `Slot`, `Slice`, `LineKey` enum |
 | Contract | `Meeting`, `CalendarFacts`, `Attribution` and their enums; `AttestationBatch.meetings`; `Interval.meetingId`; `MeetingLabelsEnvelope`; directory response type |
 | Cloud | `meetings`, `meeting_facts_daily`, `meeting_labels` tables; the directory route; the labels route; the `meetings` billing rule; the inbox; tiles; MCP metrics |
@@ -794,18 +818,18 @@ time or org-API reconcile, is marketed in the EU.
 ## 8. Proposed decisions
 
 These are drafted in `.zavet/decisions/` with `status: proposed`. Their numbers are provisional
-(DIRASH-0048 to DIRASH-0054 were free on 2026-11-09). They are renumbered if a parallel session
-lands first.
+(DIRASH-0060 to DIRASH-0066). Contract 2.0 took DIRASH-0052, so meetings start at 0060 to leave
+room for the parallel sessions. They are renumbered with `zavet renumber` if one lands there first.
 
 | # | Draft | Supersedes / relates |
 |---|---|---|
-| M1 | DIRASH-0048: Meeting time comes from local device-in-use signals, never a bot or call content | carries the branch's record forward; D-0001, DIRASH-0030 |
-| M2 | DIRASH-0049: Meeting detection is gated by OS notifications; the per-process walk runs only while a call is a candidate | D-0006 spirit (no foreground cost) |
-| M3 | DIRASH-0050: Meetings are their own versioned wire record; meeting time rides intervals with a `meetingId` | D-0020 (per-chunk acks), DIRASH-0035 |
-| M4 | DIRASH-0051: The meeting/work overlay is computed once, on the device; precedence is per user, and a meeting wins across workspaces | `accounting.rs` invariant, DIRASH-0041 |
-| M5 | DIRASH-0052: Calendar facts are reduced on the device; attribution resolves locally; no titles, attendees or domains cross | D-0001 |
-| M6 | DIRASH-0053: Meeting titles ride only their own consent-gated labels channel | D-0001, DIRASH-0030 |
-| M7 | DIRASH-0054: The daemon obeys the workspace meeting policy; admins can disable but never force on; the user's opt-out always wins | DIRASH-0029, DIRASH-0030 |
+| M1 | DIRASH-0060: Meeting time comes from local device-in-use signals, never a bot or call content | carries the branch's record forward; D-0001, DIRASH-0030 |
+| M2 | DIRASH-0061: Meeting detection is gated by OS notifications; the per-process walk runs only while a call is a candidate | D-0006 spirit (no foreground cost) |
+| M3 | DIRASH-0062: Meetings are their own versioned wire record; meeting time rides intervals with a `meetingId` | D-0020 (per-chunk acks), DIRASH-0035 |
+| M4 | DIRASH-0063: The meeting/work overlay is computed once, on the device; precedence is per user, and a meeting wins across workspaces | `accounting.rs` invariant, DIRASH-0041 |
+| M5 | DIRASH-0064: Calendar facts are reduced on the device; attribution resolves locally; no titles, attendees or domains cross | D-0001 |
+| M6 | DIRASH-0065: Meeting titles ride only their own consent-gated labels channel | D-0001, DIRASH-0030 |
+| M7 | DIRASH-0066: The daemon obeys the workspace meeting policy; admins can disable but never force on; the user's opt-out always wins | DIRASH-0029, DIRASH-0030 |
 
 ## 9. Existing bugs found during review
 

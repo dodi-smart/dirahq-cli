@@ -1,5 +1,5 @@
 ---
-id: DIRASH-0053
+id: DIRASH-0065
 title: Meeting titles ride only their own consent-gated labels channel, never the attestation wire
 status: proposed
 guards:

@@ -99,7 +99,7 @@ enum Command {
     /// Set this machine up end to end: harnesses, daemon service, cloud link, zavet.
     #[command(
         long_about = "\
-One command from a fresh install to actually capturing. Runs eight steps in
+One command from a fresh install to actually capturing. Runs these steps in
 dependency order, each idempotent and skippable, and is safe to re-run — a
 second run reports what is already done and picks up the rest.
 

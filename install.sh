@@ -113,7 +113,9 @@ FLAGS:
                             (default: ${XDG_BIN_HOME:-$HOME/.local/bin})
     --target <TRIPLE>       Override target-triple detection
     --daemon                Start dirad after installing
-    --service                Also install dirad as a launchd/systemd-user service
+    --service                Install dirad as a per-user login service (the default
+                              on a person's machine; forces it under CI/--no-interactive)
+    --no-service             Do not install the login service
     --no-daemon              Never start, restart, or install the daemon -- even if
                               one is already running
     --no-interactive          Never prompt, even on a terminal (implies the historical
@@ -136,6 +138,7 @@ ENVIRONMENT:
                                         (GH_TOKEN wins if both are set)
     DIRA_START_DAEMON                   Same as --daemon        (set to 1)
     DIRA_INSTALL_SERVICE                 Same as --service        (set to 1)
+    DIRA_NO_SERVICE                      Same as --no-service     (set to 1)
     DIRA_NO_INTERACTIVE                   Same as --no-interactive (set to 1)
     DIRA_ALLOW_ROOT                       Silence the "running as root" warning (set to 1)
     DIRA_DEBUG                             Verbose debug output on stderr (set to 1)
@@ -721,6 +724,8 @@ main() {
   [ "${DIRA_START_DAEMON:-0}" = "1" ] && start_daemon=1
   install_service=0
   [ "${DIRA_INSTALL_SERVICE:-0}" = "1" ] && install_service=1
+  no_service=0
+  [ "${DIRA_NO_SERVICE:-0}" = "1" ] && no_service=1
   allow_root=0
   [ "${DIRA_ALLOW_ROOT:-0}" = "1" ] && allow_root=1
   debug=0
@@ -784,6 +789,10 @@ main() {
       ;;
     --no-daemon)
       no_daemon=1
+      shift
+      ;;
+    --no-service)
+      no_service=1
       shift
       ;;
     --no-interactive)
@@ -954,12 +963,12 @@ main() {
     want_service=0
     if [ "$install_service" = "1" ]; then
       want_service=1
-    # Installing a launchd/systemd agent is a persistent system change, so it
-    # is still never done silently. But the old rationale for not asking --
-    # "curl | sh has no usable stdin" -- was only half true, and /dev/tty is
-    # exactly the escape hatch for it. Default yes on a terminal, no without
-    # one, so CI keeps the historical hands-off behaviour.
-    elif _confirm "Install dirad as a login service so it survives reboots?" yes no; then
+    # The per-user login service is the default on a person's machine, terminal
+    # or not: it needs no root, is fully undone by --uninstall, and without it
+    # capture silently stops at the next reboot. CI and --no-interactive keep
+    # the historical hands-off behaviour, so release smoke legs and scripted
+    # installs change nothing they did not ask for. See DIRASH-0051.
+    elif [ "$no_service" != "1" ] && [ "$no_interactive" != "1" ] && [ "${CI:-}" != "true" ]; then
       want_service=1
     fi
 
@@ -986,16 +995,30 @@ main() {
     fi
   fi
 
+  # 14b. remember the channel, so background updates follow it (DIRASH-0050).
+  # Best effort: a pinned older binary may not know the knob.
+  "$bin_dir/dira" config set update.channel "$channel" >/dev/null 2>&1 || true
+
   # 15. PATH hint + next steps. One command, because the previous three-line
   # block omitted `dira init` and so left anyone who followed it with a
   # running daemon that captured nothing. It also recommended `daemon start`,
   # which takes the control socket and blocks the `daemon install` above.
   _path_hint "$bin_dir"
-  cat <<EOF
+
+  # 16. one command to a working setup: with a terminal, go straight into
+  # onboarding (it prompts on /dev/tty and is safe to re-run). Without one,
+  # say what to run.
+  if [ "$no_interactive" != "1" ] && [ "${CI:-}" != "true" ] && (exec </dev/tty) 2>/dev/null; then
+    printf '\n'
+    info "starting onboarding (re-run any time with: dira onboard)"
+    "$bin_dir/dira" onboard </dev/tty || warn "onboarding did not finish -- run '$bin_dir/dira onboard' to continue"
+  else
+    cat <<EOF
 
 Next steps:
   $bin_dir/dira onboard     wire your harnesses, link this device, verify capture
 EOF
+  fi
 }
 
 main "$@"

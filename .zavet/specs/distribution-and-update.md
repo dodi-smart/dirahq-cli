@@ -49,9 +49,10 @@ both executables and restarts whatever is supervising the daemon.
   - **Surviving the restart.** The updater outlives the daemon it restarts:
     its own process group on unix, `KillMode=process` in the systemd unit,
     and `CREATE_BREAKAWAY_FROM_JOB` (with fallback) on windows.
-X
-  channel (a prerelease build follows prereleases). An explicit `--channel` is
-  persisted.
+- **Channel.** `--channel`, else `update.channel`, else stable. In background
+  mode only, an unset knob falls back to the installed version's channel, so a
+  prerelease install keeps following prereleases. An explicit `--channel` is
+  persisted. The installers write `update.channel` on every install.
 - **Rollback.** After every successful update the replaced binaries are kept as
   `.{name}.prev`. `dira update --rollback` swaps them back (rename-only),
   restarts the daemon, and records the version it left in
@@ -411,9 +412,11 @@ X
   (default `no`) is separately the answer to a bare Enter once a real prompt
   is shown. The two knobs are deliberately independent, not one shared
   fallback: a scripted `--uninstall` wants unattended runs to proceed
-  (`_confirm`'s own default call has `notty=yes`), while installing a
-  persistent service must never happen unattended (the service prompt is
-  `_confirm "..." yes no`, `notty=no`). Every call site is a single
+  (`_confirm`'s own default call has `notty=yes`), and the service
+  no longer prompts at all (DIRASH-0051): the per-user service is installed by
+  default, terminal or not, unless `--no-service`, `--no-daemon`,
+  `--no-interactive` or `CI=true`. With a terminal the installer then runs
+  `dira onboard` itself. Every call site is a single
   `_confirm` invocation; there is no second hand-rolled `/dev/tty` read
   anywhere in the script.
 - Checksum verification is mandatory and has no override flag. An

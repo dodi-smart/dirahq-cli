@@ -46,7 +46,8 @@ universal macOS binary and the statically-linked musl binaries make both unneces
 | `--bin-dir <DIR>` | `DIRA_BIN_DIR` | `${XDG_BIN_HOME:-$HOME/.local/bin}` |
 | `--target <TRIPLE>` | `DIRA_TARGET` | auto-detected (see the table above) |
 | `--daemon` | `DIRA_START_DAEMON=1` | off — start `dirad` after installing |
-| `--service` | `DIRA_INSTALL_SERVICE=1` | off — also run `dira daemon install` (launchd/systemd-user) |
+| `--service` | `DIRA_INSTALL_SERVICE=1` | on for a person's machine — forces the per-user service under `CI`/`--no-interactive` too |
+| `--no-service` | `DIRA_NO_SERVICE=1` | off — do not register the per-user login service |
 | `--no-daemon` | — | off — never start, restart, or install the daemon, even if one is already running |
 | `--no-interactive` | `DIRA_NO_INTERACTIVE=1` | off — never prompt, even on a terminal |
 | `--force` | — | off — overwrite a `just install` dev symlink; skip the `--uninstall` confirmation |
@@ -345,12 +346,16 @@ move backwards deliberately, or `--channel prerelease` to keep following prerele
 
 - **Do** verify a sha256 checksum before installing anything, unconditionally.
 - **Do not** edit any dotfile — PATH hints are printed, never applied.
-- **Do not** install a launchd/systemd-user service unless you pass `--service`, ask
-  `dira daemon install` directly, or **answer yes to the prompt**. On a terminal the
-  installer asks whether to register the service; with no terminal (CI, a pipe,
-  `--no-interactive`) it never asks and never installs one. The question is read from
-  `/dev/tty`, not stdin — under `curl … | sh` stdin is the script itself, which is why
-  the installer used to claim it could not ask at all.
+- **Do** register `dirad` as a **per-user** login service (a launchd agent, a systemd
+  `--user` unit, or a Windows logon task), so capture survives reboots. It needs no
+  `sudo` or Administrator and `--uninstall` removes it. Opt out with `--no-service`. It
+  is skipped under `CI=true` and `--no-interactive`, so scripted installs stay hands-off.
+- **Do** start `dira onboard` right away when there is a terminal, so one command gets
+  you to working capture. Without a terminal it prints the command instead.
+- **Do** record your channel (`update.channel`). From then on `dirad` installs newer
+  releases on that channel in the background. Turn that off with
+  `dira config set update.auto off` or `DIRA_DISABLE_AUTOUPDATE=1`, and go back with
+  `dira update --rollback`.
 - **Do not** phone home anywhere beyond GitHub (`api.github.com`, or your `DIRA_API_URL`
   override, plus the release-asset host) to resolve and download a release.
 - **Do not** touch config, local capture data, or the device's cloud link, ever — only

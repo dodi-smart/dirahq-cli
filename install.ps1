@@ -40,6 +40,9 @@
 .PARAMETER Service
     Also register dirad as a scheduled task (`dira daemon install`). Same as DIRA_INSTALL_SERVICE=1.
 
+.PARAMETER NoService
+    Do not register the per-user logon task. Same as DIRA_NO_SERVICE=1.
+
 .PARAMETER NoDaemon
     Never start, restart, or install the daemon -- even if one is already running.
 
@@ -107,6 +110,7 @@ param(
     [string]$Target = $env:DIRA_TARGET,
     [switch]$Daemon,
     [switch]$Service,
+    [switch]$NoService,
     [switch]$NoDaemon,
     [switch]$NoInteractive,
     [switch]$Force,
@@ -259,7 +263,9 @@ FLAGS:
                             (default: $env:USERPROFILE\.local\bin)
     -Target <TRIPLE>        Override target-triple detection
     -Daemon                  Start dirad after installing
-    -Service                  Also register dirad as a scheduled task (dira daemon install)
+    -Service                  Register dirad as a per-user logon task (the default on a
+                              person's machine; forces it under CI/-NoInteractive)
+    -NoService                Do not register the logon task
     -NoDaemon                  Never start, restart, or install the daemon -- even if
                                 one is already running
     -NoInteractive              Never prompt, even on a console
@@ -281,6 +287,7 @@ ENVIRONMENT:
                                              (GH_TOKEN wins if both are set)
     DIRA_START_DAEMON                        Same as -Daemon        (set to 1)
     DIRA_INSTALL_SERVICE                       Same as -Service        (set to 1)
+    DIRA_NO_SERVICE                            Same as -NoService      (set to 1)
     DIRA_NO_INTERACTIVE                          Same as -NoInteractive (set to 1)
     DIRA_DEBUG                                   Verbose debug output on stderr (set to 1)
 
@@ -900,6 +907,7 @@ function Invoke-Main {
         [string]$Target,
         [switch]$Daemon,
         [switch]$Service,
+        [switch]$NoService,
         [switch]$NoDaemon,
         [switch]$NoInteractive,
         [switch]$Force,
@@ -923,6 +931,8 @@ function Invoke-Main {
 
     $startDaemon = $Daemon.IsPresent -or ($env:DIRA_START_DAEMON -eq '1')
     $installService = $Service.IsPresent -or ($env:DIRA_INSTALL_SERVICE -eq '1')
+    $noService = $NoService.IsPresent -or ($env:DIRA_NO_SERVICE -eq '1')
+    $isCi = $env:CI -eq 'true'
     $noInteractive = $NoInteractive.IsPresent -or ($env:DIRA_NO_INTERACTIVE -eq '1')
     $script:DiraDebug = if ($env:DIRA_DEBUG -eq '1') { '1' } else { '0' }
 
@@ -1065,26 +1075,18 @@ function Invoke-Main {
             # for D-0009's single-instance control-pipe flock. Deciding first and
             # taking exactly one of the three arms below removes the race instead
             # of papering over it.
+            # The per-user logon task is the default on a person's machine, console
+            # or not: it needs no admin, is fully undone by -Uninstall, and without
+            # it capture silently stops at the next logon. CI and -NoInteractive
+            # keep the historical hands-off behaviour. This branch is reachable
+            # only when not elevated (the Administrator arm above never falls
+            # through here), so the task is never registered from an elevated
+            # shell. See DIRASH-0051.
             $wantService = $false
             if ($installService) {
                 $wantService = $true
-            } elseif (Test-CanPrompt -NoInteractive:$noInteractive) {
-                # Registering a scheduled task is a persistent system change, so it is
-                # still never done silently -- but "irm | iex has no usable stdin" was
-                # only half true. `iex` consumes the *downloaded script* as text; the
-                # console's own input is untouched, which is what Read-Host reads.
-                # No console (CI, a redirected pipe, -NoInteractive) keeps the
-                # historical hands-off behaviour exactly as it was.
-                #
-                # This branch is reachable only when not elevated: it is the
-                # `elseif` sibling of the Administrator arm above, not code that
-                # arm falls through into, and that arm never reaches here itself.
-                # Prompting to install a service from an elevated shell would offer
-                # to create exactly the broken setup that branch exists to prevent.
-                $answer = Read-Host 'Install dirad as a logon task so it survives reboots? [Y/n]'
-                if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^(y|yes)$') {
-                    $wantService = $true
-                }
+            } elseif (-not $noService -and -not $noInteractive -and -not $isCi) {
+                $wantService = $true
             }
 
             if ($wantService) {
@@ -1121,14 +1123,31 @@ function Invoke-Main {
         # that captured nothing. It also recommended `daemon start`, which takes the
         # control pipe and blocks the `daemon install` above.
         Add-UserPath -Dir $resolvedBinDir
-        Write-Info "`nNext steps:"
-        Write-Info "  $installedDira onboard     wire your harnesses, link this device, verify capture"
+
+        # 14b. remember the channel, so background updates follow it
+        # (DIRASH-0050). Best effort: a pinned older binary may not know the knob.
+        Invoke-BestEffort -Exe $installedDira -Arguments @('config', 'set', 'update.channel', $effectiveChannel) | Out-Null
+
+        # 16. one command to a working setup: with a console (and not elevated),
+        # go straight into onboarding, which is safe to re-run. Otherwise say
+        # what to run.
+        if (-not $elevated -and -not $isCi -and (Test-CanPrompt -NoInteractive:$noInteractive)) {
+            Write-Info "`nstarting onboarding (re-run any time with: dira onboard)"
+            try {
+                & $installedDira onboard
+            } catch {
+                Write-Warn "onboarding did not finish -- run '$installedDira onboard' to continue"
+            }
+        } else {
+            Write-Info "`nNext steps:"
+            Write-Info "  $installedDira onboard     wire your harnesses, link this device, verify capture"
+        }
     } finally {
         Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
-Invoke-Main -Version $Version -Channel $Channel -Prerelease:$Prerelease -BinDir $BinDir -Target $Target -Daemon:$Daemon -Service:$Service -NoDaemon:$NoDaemon -NoInteractive:$NoInteractive -Force:$Force -Uninstall:$Uninstall -Help:$Help
+Invoke-Main -Version $Version -Channel $Channel -Prerelease:$Prerelease -BinDir $BinDir -Target $Target -Daemon:$Daemon -Service:$Service -NoService:$NoService -NoDaemon:$NoDaemon -NoInteractive:$NoInteractive -Force:$Force -Uninstall:$Uninstall -Help:$Help
 # Make the contract stated at the top of this file literally true for every
 # caller: a run that reached here did not throw, so it succeeded, and it must
 # leave $LASTEXITCODE at 0 -- not merely "at 0 or untouched". `Invoke-BestEffort`

@@ -119,7 +119,7 @@ Other harnesses are wired the same way — `dira init <harness>`:
 | Harness | `dira init …` | How it's wired |
 |---|---|---|
 | Claude Code | `dira init` (default) | command hooks → `.claude/settings.json` |
-| Codex | `dira init codex` | prints `~/.codex/config.toml` `[[hooks.…]]` snippet to paste |
+| Codex | `dira init codex` | merges `[[hooks.…]]` tables into `~/.codex/config.toml` (`--print` to just print them) |
 | Gemini CLI | `dira init gemini` | command hooks → `~/.gemini/settings.json` |
 | Cursor | `dira init cursor` | command hooks → `~/.cursor/hooks.json` |
 | OpenCode | `dira init opencode` | forwarder plugin → `~/.config/opencode/plugin/dira.js` (HTTP) |

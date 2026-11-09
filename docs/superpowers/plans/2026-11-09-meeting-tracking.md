@@ -129,7 +129,7 @@ are byte-identical, and so is `cargo test -p dira-core` for accounting.
 | 4 | `just contract-pull`, Zod and types; ingest `meetings[]` with version-gated upsert and tombstones; `intervals.meeting_id` | Feature | waits on cli#1 merging to develop (staleness gate) |
 | 5 | Rebuild-delete across workspaces for meeting spans (`unpack.ts:497-553`); interval sign-offs re-keyed by containment (`unpack.ts:540-544`) | Feature | |
 | 6 | Unknown `providerClass`/`evidence` values mapped to `other`/ignored before the first enum extension | Task | |
-| 7 | Meeting columns in `facts_daily` and `meeting_facts_daily` (design §5.2): engaged as the **union** across devices, never a sum. Coordinate with the main session's schema v2 | Feature | depends on v2 |
+| 7 | `facts_daily_meetings` and `refreshMeetingFacts` next to `src/lib/facts/refresh.ts` (design §5.2); engaged-during-meeting across devices from `meetings` × intervals; meeting-vs-work precedence in the ingest trim (§2.3) | Feature | depends on the v2 union fix |
 | 8 | Self tiles (meeting load, focus vs meetings, fragmentation, review). The lab's `meetingSource` flips to `capture` | Feature | promote from `cloud/components/dira/lab/meetings/*` |
 
 **Order.** cli#1 → cloud#4 → cloud#5/6 → cli#2/3 → cloud#7/8. Promotion follows the gate memory:

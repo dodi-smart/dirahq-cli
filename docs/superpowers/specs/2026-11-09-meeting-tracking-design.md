@@ -334,9 +334,19 @@ by containment, so clipping an interval does not drop its sign-off.
 This depends on fixing today's compaction bug (§9).
 
 **Cross-device duplicates** (M4, M5). Two devices of one user can both send intervals that overlap
-in time: the same call seen on two laptops, or races between rebuilds. The cloud must never sum
-human seconds per user. In schema v2, `facts_daily` human seconds are the **measure of the union**
-of a user's intervals across devices. This is a requirement on the v2 read model (§5.2).
+in time, for example the same call seen on two laptops. The v2 cloud keeps a user's stored
+intervals **non-overlapping at ingest**, so a plain sum in `facts_daily` equals the union. This is
+the main session's fix on `feat/cloud-v2`, in its Phase 0:
+- intervals carry `device_id`;
+- a batch rebuilds only its own device's rows;
+- another device's overlapping rows are trimmed around the batch's spans, with `human_seconds`
+  prorated and floored.
+
+By default, trimming lets the later-arriving device win. **Proposed for meeting rows:** when a
+meeting interval and another device's work interval overlap, the overlap precedence decides the
+winner, not arrival order. Across workspaces the meeting wins; within a workspace,
+`overlapPrecedence` applies. This matches the device-side overlay. Engaged-during-meeting across
+devices is computed in `refreshMeetingFacts` from `meetings` × intervals.
 
 ### 2.4 Where the overlay applies
 
@@ -646,7 +656,7 @@ notes. Grain: (workspace, user, day, project).
 
 | Column | Definition |
 |---|---|
-| `engaged_seconds` | **measure of the union** of the user's intervals over all devices (never a raw sum; M4/M5) |
+| `engaged_seconds` | sum of the user's intervals, which equals the union because ingest keeps them non-overlapping (§2.3) |
 | `meeting_seconds` | the union of meeting-slice intervals |
 | `meeting_billable_seconds` | the portion billable under the policy (§5.3) |
 | `meeting_external_seconds` | meetings with `external = true` |

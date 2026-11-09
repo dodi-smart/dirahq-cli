@@ -2028,7 +2028,7 @@ mod tests {
     /// failure meant the epoch signal from an already-2xx'd earlier chunk was
     /// dropped for this flush attempt entirely).
     #[tokio::test]
-    async fn flush_applies_epoch_reset_from_an_earlier_chunk_even_when_a_later_chunk_fails() {
+    async fn flush_applies_epoch_reset_from_an_earlier_chunk_and_stops_there() {
         let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
         // Chunk 1/3: acks with a NEW epoch ⇒ must blank the cursor right away.
         cloud.push(
@@ -2094,27 +2094,32 @@ mod tests {
         }
 
         let key = DeviceKey::generate();
-        let err = flush(&state, &key, &state.http)
+        flush(&state, &key, &state.http)
             .await
-            .expect_err("chunk 3 fails with a 500");
-        assert!(
-            matches!(err, SyncError::Transient { .. }),
-            "chunk 3's 500 must classify as Transient"
-        );
+            .expect("the flush stops cleanly at the reset");
 
+        // Contract 2.0: the reset restarted the batch chain, so the remaining
+        // chunks would carry the old epoch's position and read as a fork. The
+        // flush stops at the reset; they go out freshly stamped next flush.
         assert_eq!(
             cloud.requests("/api/v1/ingest").len(),
-            3,
-            "all 3 chunks must have been sent — the reset doesn't cut the flush short"
+            1,
+            "nothing is posted after the chunk that reported the new epoch"
+        );
+        let chain = crate::chain::Chain::load(&state.store).await;
+        assert_eq!(
+            (chain.seq, chain.epoch),
+            (0, 1),
+            "a new chain epoch starts at seq 0"
         );
 
-        // The cursor must be BLANK (the epoch reset from chunk 1), not chunk 2's
-        // high-water mark — proving chunk 2's success did not silently undo it.
+        // The cursor must be BLANK (the epoch reset from chunk 1), and no later
+        // chunk got a chance to re-advance it.
         let cursor = state.store.meta_get(META_SYNC_CURSOR).await.unwrap();
         assert_eq!(
             cursor.as_deref(),
             Some(""),
-            "cursor must stay blanked by the epoch reset even though chunk 2 succeeded"
+            "cursor must stay blanked by the epoch reset"
         );
         let art_cursor = state.store.meta_get(META_ARTIFACTS_CURSOR).await.unwrap();
         assert_eq!(art_cursor.as_deref(), Some(""));

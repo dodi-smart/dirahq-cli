@@ -3552,6 +3552,44 @@ impl Store {
         }))
     }
 
+    /// [`Self::session_facts`] for many sessions in one query. Sessions with
+    /// nothing recorded are absent from the map.
+    pub async fn session_facts_many(
+        &self,
+        session_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, SessionFacts>, Error> {
+        let ids = serde_json::to_string(session_ids).unwrap_or_else(|_| "[]".into());
+        let rows = sqlx::query(
+            "WITH ids(session_id) AS (SELECT value FROM json_each(?1)) \
+             SELECT ids.session_id AS sid, f.lines_added AS la, f.lines_removed AS lr, \
+                    f.compactions AS cp, \
+                    (SELECT COUNT(*) FROM session_paths p WHERE p.session_id = ids.session_id) AS ft \
+             FROM ids LEFT JOIN session_facts f ON f.session_id = ids.session_id",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let n = |v: Option<i64>| v.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let la: Option<i64> = r.get("la");
+                let ft: i64 = r.get("ft");
+                (la.is_some() || ft > 0).then(|| {
+                    (
+                        r.get::<String, _>("sid"),
+                        SessionFacts {
+                            lines_added: n(la),
+                            lines_removed: n(r.get("lr")),
+                            compactions: n(r.get("cp")),
+                            files_touched: n(Some(ft)),
+                        },
+                    )
+                })
+            })
+            .collect())
+    }
+
     /// Record what an acknowledged batch carried, per UTC day and repo, and
     /// mark those days as changed so their `DayRollup` is (re-)sent. Keyed by
     /// the wire ids, so a re-sent row replaces itself. Old days are pruned by
@@ -6715,5 +6753,12 @@ mod v2_tests {
             ),
             (5, 1, 1, 2)
         );
+        let many = store.session_facts_many(&["s", "none"]).await.unwrap();
+        assert_eq!(
+            many.get("s"),
+            Some(&f),
+            "one query agrees with the single lookup"
+        );
+        assert!(!many.contains_key("none"));
     }
 }

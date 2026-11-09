@@ -91,28 +91,38 @@ impl Chain {
 /// Lowercase hex SHA-256 of the batch's RFC 8785 encoding: the
 /// `prevBatchHash` the next batch carries.
 pub fn hash(batch: &AttestationBatch) -> Result<String, String> {
-    let bytes = serde_jcs::to_vec(batch).map_err(|e| format!("canonicalize: {e}"))?;
-    Ok(Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    let bytes = dira_core::signing::canonical_bytes(batch).map_err(|e| e.to_string())?;
+    Ok(hash_canonical(&bytes))
 }
 
-/// This build and platform.
+/// [`hash`] over bytes already canonicalized for signing, so a sender encodes
+/// once and hashes and signs the same bytes.
+pub fn hash_canonical(canonical: &[u8]) -> String {
+    hex::encode(Sha256::digest(canonical))
+}
+
+/// This build and platform, read once per process. The channel comes from the
+/// config at the first batch; a later `update.channel` change shows from the
+/// next daemon start.
 pub fn client_info() -> ClientInfo {
-    let channel = dira_core::Config::load()
-        .ok()
-        .and_then(|c| c.update.channel)
-        .or_else(|| {
-            let pre = env!("CARGO_PKG_VERSION").contains('-');
-            Some(if pre { "prerelease" } else { "stable" }.to_string())
-        });
-    ClientInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        channel,
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-    }
+    static CLIENT: std::sync::OnceLock<ClientInfo> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let channel = dira_core::Config::load()
+                .ok()
+                .and_then(|c| c.update.channel)
+                .or_else(|| {
+                    let pre = env!("CARGO_PKG_VERSION").contains('-');
+                    Some(if pre { "prerelease" } else { "stable" }.to_string())
+                });
+            ClientInfo {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                channel,
+                os: std::env::consts::OS.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
+            }
+        })
+        .clone()
 }
 
 #[cfg(test)]

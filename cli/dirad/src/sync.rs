@@ -968,10 +968,11 @@ async fn flush(
         batch.day_rollups = carried_days;
         add_session_facts(&state.store, &mut batch.sessions).await;
         chain.stamp(&mut batch);
-        let batch_hash = crate::chain::hash(&batch).map_err(SyncError::Fatal)?;
-        let sig = device_key
-            .sign_payload(&batch)
-            .map_err(|e| SyncError::Fatal(format!("sign: {e}")))?;
+        // Canonicalize once: the chain hash and the signature cover the same bytes.
+        let canonical = dira_core::signing::canonical_bytes(&batch)
+            .map_err(|e| SyncError::Fatal(format!("canonicalize: {e}")))?;
+        let batch_hash = crate::chain::hash_canonical(&canonical);
+        let sig = device_key.sign_canonical(&canonical);
         // Capture everything read after the POST up front, so the batch —
         // up to CHUNK_EVENTS worth of intervals/sessions/tokens/artifacts —
         // moves into the envelope instead of being deep-cloned per chunk.
@@ -992,7 +993,8 @@ async fn flush(
         // round-trip counts toward the interval; skipped entirely for the ordinary
         // one- or two-chunk flush. See D-0020.
         let posted_at = Instant::now();
-        let resp = ingest_body(client.post(&url).timeout(HTTP_TIMEOUT), &envelope)?
+        let resp = ingest_body(client.post(&url).timeout(HTTP_TIMEOUT), &envelope)
+            .await?
             .send()
             .await
             .map_err(|e| SyncError::Transient {
@@ -1593,10 +1595,10 @@ pub(crate) async fn post_chained(
     mut batch: dira_contract::AttestationBatch,
 ) -> Result<String, (SyncError, Option<reqwest::StatusCode>)> {
     chain.stamp(&mut batch);
-    let batch_hash = crate::chain::hash(&batch).map_err(|e| (SyncError::Fatal(e), None))?;
-    let sig = device_key
-        .sign_payload(&batch)
-        .map_err(|e| (SyncError::Fatal(format!("sign: {e}")), None))?;
+    let canonical = dira_core::signing::canonical_bytes(&batch)
+        .map_err(|e| (SyncError::Fatal(format!("canonicalize: {e}")), None))?;
+    let batch_hash = crate::chain::hash_canonical(&canonical);
+    let sig = device_key.sign_canonical(&canonical);
     let envelope = Envelope {
         schema_version: SCHEMA_VERSION.to_string(),
         device_id: device_id.to_string(),
@@ -1604,6 +1606,7 @@ pub(crate) async fn post_chained(
         sig,
     };
     let resp = ingest_body(client.post(url).timeout(HTTP_TIMEOUT), &envelope)
+        .await
         .map_err(|e| (e, None))?
         .send()
         .await
@@ -1641,6 +1644,16 @@ async fn add_session_facts(
     store: &dira_core::Store,
     sessions: &mut [dira_contract::SessionRollup],
 ) {
+    let ids: Vec<&str> = sessions
+        .iter()
+        .filter(|s| s.harness == dira_contract::Harness::ClaudeCode && s.stats.is_some())
+        .map(|s| s.session_id.as_str())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    // One query for the whole chunk, not one per session.
+    let facts = store.session_facts_many(&ids).await.unwrap_or_default();
     for s in sessions.iter_mut() {
         if s.harness != dira_contract::Harness::ClaudeCode {
             continue;
@@ -1648,12 +1661,7 @@ async fn add_session_facts(
         let Some(stats) = s.stats.as_mut() else {
             continue;
         };
-        let facts = store
-            .session_facts(&s.session_id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let facts = facts.get(&s.session_id).cloned().unwrap_or_default();
         stats.files_touched = Some(facts.files_touched);
         stats.agent_lines_added = Some(facts.lines_added);
         stats.agent_lines_removed = Some(facts.lines_removed);
@@ -1669,7 +1677,7 @@ static CLOUD_ACCEPTS_ZSTD: std::sync::atomic::AtomicBool =
 /// An ingest body: zstd-compressed JSON when the cloud accepts it, else plain
 /// JSON. The signature covers the canonical payload, not these bytes, so the
 /// encoding never affects verification.
-fn ingest_body<T: serde::Serialize>(
+async fn ingest_body<T: serde::Serialize>(
     req: reqwest::RequestBuilder,
     envelope: &T,
 ) -> Result<reqwest::RequestBuilder, SyncError> {
@@ -1678,7 +1686,10 @@ fn ingest_body<T: serde::Serialize>(
     }
     let json = serde_json::to_vec(envelope)
         .map_err(|e| SyncError::Fatal(format!("serialize envelope: {e}")))?;
-    let body = compress_zstd(&json);
+    // A multi-megabyte batch takes real CPU to compress: off the async workers.
+    let body = tokio::task::spawn_blocking(move || compress_zstd(&json))
+        .await
+        .map_err(|e| SyncError::Fatal(format!("compress: {e}")))?;
     Ok(req
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::CONTENT_ENCODING, "zstd")

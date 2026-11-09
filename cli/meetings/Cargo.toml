@@ -8,6 +8,8 @@ publish.workspace = true
 description = "Bot-less meeting detection: OS device-in-use signals fused into meeting spans (metadata only)."
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 time.workspace = true
 toml_edit.workspace = true
 

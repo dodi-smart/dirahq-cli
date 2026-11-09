@@ -15,6 +15,7 @@
 
 pub mod catalog;
 pub mod fuse;
+pub mod replay;
 pub mod tracker;
 
 pub use catalog::{AppKind, Catalog, Holder, HolderRole, ProviderClass};
@@ -40,6 +41,16 @@ impl<T> Reading<T> {
             _ => None,
         }
     }
+}
+
+/// One device adapter: an OS sampler, or [`replay::Replay`] for scripted runs.
+/// `sample` is cheap, synchronous and side-effect free, and must never prompt
+/// for a permission (DIRASH-0060): a signal the OS will not give without one is
+/// reported `Unavailable`.
+pub trait MeetingSignal: Send {
+    /// Stable adapter id for `dira doctor` (`"macos.coreaudio"`, `"replay"`).
+    fn id(&self) -> &'static str;
+    fn sample(&mut self) -> Sample;
 }
 
 /// Everything one poll of an OS adapter observed, already reduced to catalogue

@@ -53,13 +53,15 @@ both executables and restarts whatever is supervising the daemon.
   mode only, an unset knob falls back to the installed version's channel, so a
   prerelease install keeps following prereleases. An explicit `--channel` is
   persisted. The installers write `update.channel` on every install.
-- **Installers record the channel.** They write `update.channel` on install,
-  and `prerelease` whenever the installed version carries a prerelease suffix,
-  even if `--channel` was left at its stable default. Uninstall also removes the
-  rollback copies (`.dira.prev`, `.dira.exe.prev`) and swap leftovers
-  (`.*.old.*`, `.*.bak`).
+- **Installers record a chosen channel.** They write `update.channel` only when
+  a channel was passed (`--channel`/`--prerelease`/`DIRA_CHANNEL`). Otherwise
+  background updates follow the installed version's own channel, so a pinned
+  prerelease keeps following prereleases. `dira update` keeps its backups and
+  the `--rollback` copy in one owned directory, `bin_dir/.dira-update/`.
+  Uninstall removes it, along with the `.old.<pid>` rename-aside files the
+  installers share with the updater (D-0003).
 - **Rollback.** After every successful update the replaced binaries are kept as
-  `.{name}.prev`. `dira update --rollback` swaps them back (rename-only),
+  `.dira-update/{name}.prev`. `dira update --rollback` swaps them back (rename-only),
   restarts the daemon, and records the version it left in
   `update.skip_version`. A rollback can itself be rolled back.
 

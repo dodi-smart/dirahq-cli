@@ -889,11 +889,13 @@ function Uninstall-Dira {
     }
 
     Remove-Item -Path $diraExe, $diradExe -Force -ErrorAction SilentlyContinue
-    # The rollback copies `dira update` keeps (.dira.exe.prev) and any swap
-    # leftovers (.dira.exe.old.<pid>, .dira.exe.bak) are ours too. An .old file
-    # still locked by a running process is left for the next sweep.
+    # `dira update` keeps its backups and the --rollback copy in one owned
+    # directory; the .old.<pid> rename-aside files are the swap convention this
+    # script shares with it (D-0003). An .old file still locked by a running
+    # process is left for the next sweep.
+    Remove-Item -Path (Join-Path $BinDir '.dira-update') -Recurse -Force -ErrorAction SilentlyContinue
     Get-ChildItem -Path $BinDir -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^\.dirad?\.exe\.(prev|bak|old\..+)$' } |
+        Where-Object { $_.Name -match '^\.dirad?\.exe\.old\..+$' } |
         Remove-Item -Force -ErrorAction SilentlyContinue
     Write-Info "removed dira and dirad from $BinDir"
     Write-Info "`nConfig and data were NOT removed."
@@ -918,7 +920,8 @@ function Invoke-Main {
         [switch]$NoInteractive,
         [switch]$Force,
         [switch]$Uninstall,
-        [switch]$Help
+        [switch]$Help,
+        [switch]$ChannelExplicit
     )
 
     if ($Help) {
@@ -1130,12 +1133,13 @@ function Invoke-Main {
         # control pipe and blocks the `daemon install` above.
         Add-UserPath -Dir $resolvedBinDir
 
-        # 14b. remember the channel, so background updates follow it
-        # (DIRASH-0050). Best effort: a pinned older binary may not know the knob.
-        # A pinned prerelease (-Version 1.2.0-develop.3) follows prereleases even
-        # though -Channel defaulted to stable.
-        $rememberedChannel = if ($release.Version -match '-') { 'prerelease' } else { $effectiveChannel }
-        Invoke-BestEffort -Exe $installedDira -Arguments @('config', 'set', 'update.channel', $rememberedChannel) | Out-Null
+        # 14b. remember a channel the user CHOSE, so background updates follow it
+        # (DIRASH-0050). Without one, background updates follow the installed
+        # version's own channel, so a pinned prerelease keeps following
+        # prereleases. Best effort: a pinned older binary may not know the knob.
+        if ($ChannelExplicit -or $Prerelease) {
+            Invoke-BestEffort -Exe $installedDira -Arguments @('config', 'set', 'update.channel', $effectiveChannel) | Out-Null
+        }
 
         # 16. one command to a working setup: with a console (and not elevated),
         # go straight into onboarding, which is safe to re-run. Otherwise say
@@ -1156,7 +1160,7 @@ function Invoke-Main {
     }
 }
 
-Invoke-Main -Version $Version -Channel $Channel -Prerelease:$Prerelease -BinDir $BinDir -Target $Target -Daemon:$Daemon -Service:$Service -NoService:$NoService -NoDaemon:$NoDaemon -NoInteractive:$NoInteractive -Force:$Force -Uninstall:$Uninstall -Help:$Help
+Invoke-Main -Version $Version -Channel $Channel -Prerelease:$Prerelease -BinDir $BinDir -Target $Target -Daemon:$Daemon -Service:$Service -NoService:$NoService -NoDaemon:$NoDaemon -NoInteractive:$NoInteractive -Force:$Force -Uninstall:$Uninstall -Help:$Help -ChannelExplicit:($PSBoundParameters.ContainsKey('Channel') -or [bool]$env:DIRA_CHANNEL)
 # Make the contract stated at the top of this file literally true for every
 # caller: a run that reached here did not throw, so it succeeded, and it must
 # leave $LASTEXITCODE at 0 -- not merely "at 0 or untouched". `Invoke-BestEffort`

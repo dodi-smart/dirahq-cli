@@ -28,6 +28,40 @@ pub static DRAINED: AtomicU64 = AtomicU64::new(0);
 /// its cap and the oldest records were dropped.
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// What the last acknowledged batch reported, so the next one sends deltas.
+static REPORTED: std::sync::Mutex<Option<(Counters, u64)>> = std::sync::Mutex::new(None);
+
+/// Capture health since the last acknowledged report (contract 2.0
+/// `captureHealth`), plus the snapshot to pass to [`mark_reported`] once the
+/// batch carrying it is acknowledged. Counters are per daemon process, so a
+/// restart starts the deltas over; quarantined chunks are read from `meta`.
+pub async fn pending_health(
+    store: &dira_core::Store,
+) -> (dira_contract::CaptureHealth, (Counters, u64)) {
+    let now = counters();
+    let quarantined = crate::quarantine::entries(store).await.len() as u64;
+    let (prev, prev_q) = REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or((Counters::default(), quarantined));
+    let health = dira_contract::CaptureHealth {
+        spooled: now.drained.saturating_sub(prev.drained),
+        spilled: now.spilled.saturating_sub(prev.spilled),
+        dropped: now.dropped.saturating_sub(prev.dropped),
+        quarantined: quarantined.saturating_sub(prev_q),
+        hook_failures: None,
+    };
+    (health, (now, quarantined))
+}
+
+/// Record that the batch carrying the health from [`pending_health`] was
+/// acknowledged.
+pub fn mark_reported(snapshot: (Counters, u64)) {
+    *REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+}
+
 /// A snapshot of the counters, for `status`/`doctor` and the batch health.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counters {

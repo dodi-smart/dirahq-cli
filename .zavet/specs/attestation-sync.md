@@ -36,6 +36,15 @@ single flush window (issue #40).
   - **Reset.** `nuke` and a cloud data-epoch reset start a new epoch at seq 0.
   - **State.** Kept in `meta` as `batch_seq`, `batch_prev_hash` and
     `chain_epoch`.
+- **Contract 2.0 producer fields.**
+  - **`captureHealth`.** The first chunk of each flush carries spool and
+    quarantine deltas since the last acknowledged report.
+  - **`stats`.** Session rollups carry `stats` derived from the event log:
+    tool calls by category (`dira_core::stats::tool_category`, MCP server
+    names never sent), subagents, permission prompts, and the approval wait
+    capped at 30 min. Manual sessions carry none.
+  - **zstd.** Ingest bodies are zstd only when the last `/api/v1/meta` listed
+    it in `acceptEncodings`.
 
 - A flush reads events in `(META_SYNC_CURSOR, until]`, splits the window into
   chunks only at > idle breaks (never inside a billable interval), POSTs each

@@ -942,8 +942,15 @@ async fn flush(
     let chunk_count = chunks.len();
     // Contract 2.0 hash chain: stamped at send time, advanced on each ack.
     let mut chain = crate::chain::Chain::load(&state.store).await;
+    // Capture health rides the first chunk; acknowledged once, then deltas.
+    let (health, health_snapshot) = crate::spool::pending_health(&state.store).await;
+    let mut health = Some((health, health_snapshot));
     for chunk in chunks {
         let mut batch = chunk.batch;
+        let carried_health = health.take();
+        if let Some((h, _)) = &carried_health {
+            batch.capture_health = Some(h.clone());
+        }
         chain.stamp(&mut batch);
         let batch_hash = crate::chain::hash(&batch).map_err(SyncError::Fatal)?;
         let sig = device_key
@@ -969,10 +976,7 @@ async fn flush(
         // round-trip counts toward the interval; skipped entirely for the ordinary
         // one- or two-chunk flush. See D-0020.
         let posted_at = Instant::now();
-        let resp = client
-            .post(&url)
-            .timeout(HTTP_TIMEOUT)
-            .json(&envelope)
+        let resp = ingest_body(client.post(&url).timeout(HTTP_TIMEOUT), &envelope)?
             .send()
             .await
             .map_err(|e| SyncError::Transient {
@@ -1022,6 +1026,9 @@ async fn flush(
                     .advance(&state.store, batch_hash)
                     .await
                     .map_err(SyncError::Fatal)?;
+                if let Some((_, snapshot)) = carried_health {
+                    crate::spool::mark_reported(snapshot);
+                }
                 if let Some(ev) = &cursor_event_id {
                     state
                         .store
@@ -1342,10 +1349,7 @@ async fn resend_lineage(
                     sig,
                 };
                 last_post = Some(Instant::now());
-                let resp = client
-                    .post(&url)
-                    .timeout(HTTP_TIMEOUT)
-                    .json(&envelope)
+                let resp = ingest_body(client.post(&url).timeout(HTTP_TIMEOUT), &envelope)?
                     .send()
                     .await
                     .map_err(|e| SyncError::Transient {
@@ -1564,6 +1568,34 @@ fn is_bad_signature(body: &str) -> bool {
 /// non-fatal: a missing `cloud_url`, an unreachable cloud, an old cloud without
 /// the endpoint, or an unparseable body all simply skip the check. Run once at
 /// daemon startup; sync/heartbeat are unaffected by its outcome.
+/// Whether the cloud's `ServerMeta.acceptEncodings` lists `zstd`, as of the
+/// last handshake. False until a handshake says otherwise.
+static CLOUD_ACCEPTS_ZSTD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// An ingest body: zstd-compressed JSON when the cloud accepts it, else plain
+/// JSON. The signature covers the canonical payload, not these bytes, so the
+/// encoding never affects verification.
+fn ingest_body<T: serde::Serialize>(
+    req: reqwest::RequestBuilder,
+    envelope: &T,
+) -> Result<reqwest::RequestBuilder, SyncError> {
+    if !CLOUD_ACCEPTS_ZSTD.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(req.json(envelope));
+    }
+    let json = serde_json::to_vec(envelope)
+        .map_err(|e| SyncError::Fatal(format!("serialize envelope: {e}")))?;
+    let body = compress_zstd(&json);
+    Ok(req
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::CONTENT_ENCODING, "zstd")
+        .body(body))
+}
+
+fn compress_zstd(json: &[u8]) -> Vec<u8> {
+    ruzstd::encoding::compress_to_vec(json, ruzstd::encoding::CompressionLevel::Fastest)
+}
+
 pub async fn check_schema_handshake(client: &reqwest::Client, cloud_url: Option<&str>) {
     let Some(cloud_url) = cloud_url else {
         return; // sync disabled — nothing to handshake with
@@ -1588,6 +1620,15 @@ pub async fn check_schema_handshake(client: &reqwest::Client, cloud_url: Option<
             return;
         }
     };
+    // Contract 2.0: compress ingest bodies only when the cloud says it can
+    // read them. An older cloud omits the field (an empty list), and gets
+    // uncompressed bodies.
+    CLOUD_ACCEPTS_ZSTD.store(
+        meta.accept_encodings
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("zstd")),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if !schema_version_in_range(SCHEMA_VERSION, &meta) {
         tracing::warn!(
             our_version = SCHEMA_VERSION,
@@ -3808,5 +3849,27 @@ mod tests {
         assert_eq!(out, ResendOutcome::Skipped);
         assert!(marker(&unlinked).await.is_none());
         assert!(cloud.requests(INGEST).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod zstd_tests {
+    #[test]
+    fn a_compressed_body_round_trips_and_shrinks_a_large_batch() {
+        let json = serde_json::to_vec(&serde_json::json!({
+            "payload": { "intervals": vec![serde_json::json!({"id": "01J", "humanSeconds": 60}); 500] }
+        }))
+        .unwrap();
+        let packed = super::compress_zstd(&json);
+        assert!(
+            packed.len() * 5 < json.len(),
+            "{} vs {}",
+            packed.len(),
+            json.len()
+        );
+        let mut out = Vec::new();
+        let mut dec = ruzstd::decoding::StreamingDecoder::new(packed.as_slice()).unwrap();
+        std::io::Read::read_to_end(&mut dec, &mut out).unwrap();
+        assert_eq!(out, json);
     }
 }

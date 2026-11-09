@@ -36,6 +36,7 @@ libc.workspace = true
 # Contract 2.0 batch hash chain: SHA-256 over the JCS payload (DIRASH-0052).
 sha2.workspace = true
 serde_jcs.workspace = true
+ruzstd.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # `dirad` is a windows-subsystem binary (DIRASH-0048). `AttachConsole` lets

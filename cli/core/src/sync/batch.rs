@@ -780,6 +780,8 @@ fn build_sessions(
         /// First non-null spec slug across the session's events.
         spec: Option<String>,
         lineage: crate::orchestration::SessionLineage,
+        /// Contract 2.0 counts (DIRASH-0052).
+        stats: crate::stats::StatsAcc,
     }
 
     // Sessions that END in THIS window's slice ONLY — never from `history` (see the
@@ -831,8 +833,10 @@ fn build_sessions(
                 label: e.label.clone(),
                 spec: e.spec.clone(),
                 lineage: Default::default(),
+                stats: Default::default(),
             });
         entry.lineage.observe(e);
+        entry.stats.observe(e);
         entry.event_times.push(crate::accounting::AgentSample {
             at: e.at,
             opens_span: e.kind.opens_agent_span(),
@@ -911,7 +915,8 @@ fn build_sessions(
                 workspace_ref: wire.workspace_ref,
                 trigger: wire.trigger,
                 trigger_name: wire.trigger_name,
-                stats: None,
+                // Manual sessions have no tools or permissions to count.
+                stats: (a.harness != Harness::Manual).then(|| a.stats.finish()),
                 workspace_hint: None,
             }
         })

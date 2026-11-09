@@ -65,6 +65,17 @@ Agreed with the cloud-redesign session on 2026-11-09:
 - Every new 2.x field is optional and omitted when unmeasured. Populate it in
   `wire_contract_carries_no_content_fields` and in the signing vector.
 - Producer status (`verified: false`):
-  - **Filled now:** the chain, `client`, `ServerMeta.acceptEncodings`.
-  - **Not filled yet:** `stats`, `dayRollups`, `captureHealth`, `linesAdded`/`linesRemoved`,
-    `workspaceHint`, and zstd request bodies.
+  - **Filled now:**
+    - the chain and `client`;
+    - `captureHealth` (deltas since the last acknowledged report; per daemon
+      process, so a restart starts over);
+    - `stats` from the stored event log: tool calls by category, subagents
+      (`task` tools), permission prompts, approval wait capped at 30 min;
+    - zstd ingest bodies when `ServerMeta.acceptEncodings` lists `zstd` (pure
+      Rust `ruzstd`).
+  - **Not filled yet** (they need new capture and migration `0010`):
+    `filesTouched`, `agentLinesAdded`/`agentLinesRemoved`, `compactions`,
+    `testRuns`, `dayRollups`, `ArtifactRef.linesAdded`/`linesRemoved`,
+    `workspaceHint`.
+  - Chunk sizes are unchanged, so an uncompressed body still fits under the
+    cloud's body limit.

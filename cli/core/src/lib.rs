@@ -22,6 +22,7 @@ pub mod report;
 pub mod runs;
 pub mod runtime;
 pub mod signing;
+pub mod stats;
 pub mod store;
 pub mod stored_at;
 pub mod sync;

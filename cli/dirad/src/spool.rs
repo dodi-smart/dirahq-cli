@@ -114,6 +114,9 @@ pub fn enqueue(
     }
 }
 
+/// The write stays inline on purpose. It is one small file that must be on disk
+/// before this daemon answers `Ok`; deferring it would let a crash lose an
+/// event the shim was told had landed.
 fn spill(state: &AppState, harness_id: &str, norm: Normalized, at: OffsetDateTime) {
     // A capture-probe row is admitted only live (DIRASH-0023); replaying one
     // later would fail admission anyway, so it is not worth keeping.
@@ -126,6 +129,7 @@ fn spill(state: &AppState, harness_id: &str, norm: Normalized, at: OffsetDateTim
         Ok(_) => {
             SPILLED.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("ingest queue full; spilled a hook to the spool");
+            WAKE.notify_one();
         }
         Err(e) => {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -134,15 +138,23 @@ fn spill(state: &AppState, harness_id: &str, norm: Normalized, at: OffsetDateTim
     }
 }
 
-/// How often the spool is checked when the last pass found nothing.
-const IDLE_INTERVAL: Duration = Duration::from_secs(30);
+/// Wakes the drain the moment the daemon spills, instead of waiting out an
+/// interval.
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The backstop between passes when the spool was empty. The drain is woken
+/// directly when this daemon spills; the backstop covers records the `dira
+/// hook` shim spooled while this daemon was up but busy or slow, which nothing
+/// else announces.
+const IDLE_INTERVAL: Duration = Duration::from_secs(300);
 /// How often while records are still waiting.
 const BUSY_INTERVAL: Duration = Duration::from_secs(2);
 /// Most records replayed per pass, so one pass never monopolises the writer.
 const PASS_LIMIT: usize = 2_000;
 
-/// Replay the spool forever: once right away, then on a short interval while
-/// records remain and a long one when it is empty.
+/// Replay the spool forever: once right away (records from while the daemon
+/// was down), then whenever a spill wakes it, every few seconds while records
+/// remain, and on the idle backstop.
 pub fn spawn_drain(state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -157,6 +169,7 @@ pub fn spawn_drain(state: AppState) {
             };
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
+                _ = WAKE.notified() => {}
                 _ = state.shutdown.notified() => return,
             }
         }
@@ -165,43 +178,51 @@ pub fn spawn_drain(state: AppState) {
 
 /// One drain pass. Returns `(replayed, still waiting)`.
 ///
-/// Replays only while the queue has room to spare, so live hooks always find
-/// space ahead of the backlog. A record is deleted only after the writer queue
-/// accepted it.
+/// The spool is listed once, trimmed from that list, and the first
+/// [`PASS_LIMIT`] records read, all on a blocking thread. Replays only while the
+/// queue has room to spare, so live hooks always find space ahead of the
+/// backlog. A record is deleted only after the writer queue accepted it.
 pub async fn drain_once(state: &AppState) -> (usize, usize) {
     let dir = spool::dir_for(&state.config.db_path);
     let dir_c = dir.clone();
-    let trimmed = tokio::task::spawn_blocking(move || spool::trim(&dir_c, spool::MAX_RECORDS))
-        .await
-        .unwrap_or(0);
+    let listed = tokio::task::spawn_blocking(move || {
+        let mut files = spool::list(&dir_c);
+        let trimmed = spool::trim(&mut files, spool::MAX_RECORDS);
+        let total = files.len();
+        let mut good = Vec::new();
+        for path in files.into_iter().take(PASS_LIMIT) {
+            match spool::read(&path) {
+                Ok(r) => good.push((path, r)),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), "unreadable spool record ({e}); quarantined");
+                    spool::quarantine(&dir_c, &path);
+                }
+            }
+        }
+        (trimmed, total, good)
+    })
+    .await;
+    let Ok((trimmed, total, records)) = listed else {
+        return (0, 0);
+    };
     if trimmed > 0 {
         DROPPED.fetch_add(trimmed as u64, Ordering::Relaxed);
         tracing::warn!(trimmed, "spool over its cap; dropped the oldest records");
     }
-    let dir_c = dir.clone();
-    let files = tokio::task::spawn_blocking(move || spool::list(&dir_c))
-        .await
-        .unwrap_or_default();
-    let total = files.len();
+
+    let mut done: Vec<std::path::PathBuf> = Vec::new();
+    let mut bad: Vec<std::path::PathBuf> = Vec::new();
     let mut replayed = 0;
-    for path in files.into_iter().take(PASS_LIMIT) {
+    for (path, record) in records {
         if state.tx.capacity() < state.tx.max_capacity() / 4 {
             break;
         }
-        let record = match spool::read(&path) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "unreadable spool record ({e}); quarantined");
-                spool::quarantine(&dir, &path);
-                continue;
-            }
-        };
         let Some(harness) = dira_sources::harness_for(&record.harness) else {
-            spool::quarantine(&dir, &path);
+            bad.push(path);
             continue;
         };
         if dira_core::model::is_probe_session(&record.event.session_id) {
-            let _ = std::fs::remove_file(&path);
+            done.push(path);
             continue;
         }
         let at = event_time(Some(&record.observed_at));
@@ -213,10 +234,19 @@ pub async fn drain_once(state: &AppState) -> (usize, usize) {
         if state.tx.send(msg).await.is_err() {
             break; // shutting down; the record stays for the next start
         }
-        let _ = std::fs::remove_file(&path);
+        done.push(path);
         DRAINED.fetch_add(1, Ordering::Relaxed);
         replayed += 1;
     }
+    let _ = tokio::task::spawn_blocking(move || {
+        for p in &done {
+            let _ = std::fs::remove_file(p);
+        }
+        for p in &bad {
+            spool::quarantine(&dir, p);
+        }
+    })
+    .await;
     (replayed, total - replayed)
 }
 

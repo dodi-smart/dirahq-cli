@@ -141,18 +141,19 @@ pub fn quarantine(dir: &Path, path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Drop the oldest records beyond `max`. Returns how many were dropped.
-pub fn trim(dir: &Path, max: usize) -> usize {
-    let files = list(dir);
+/// Drop the oldest records beyond `max` from an already-listed, oldest-first
+/// `files`, on disk and in the list. Returns how many were dropped.
+pub fn trim(files: &mut Vec<PathBuf>, max: usize) -> usize {
     if files.len() <= max {
         return 0;
     }
     let excess = files.len() - max;
-    files
+    let removed = files[..excess]
         .iter()
-        .take(excess)
         .filter(|p| std::fs::remove_file(p).is_ok())
-        .count()
+        .count();
+    files.drain(..excess);
+    removed
 }
 
 #[cfg(test)]
@@ -231,7 +232,9 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(trim(&dir, 2), 2);
+        let mut files = list(&dir);
+        assert_eq!(trim(&mut files, 2), 2);
+        assert_eq!(files.len(), 2);
         let left: Vec<String> = list(&dir)
             .iter()
             .map(|p| read(p).unwrap().event.session_id)

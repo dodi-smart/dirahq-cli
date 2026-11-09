@@ -26,8 +26,8 @@ Every hook either reaches the store or waits in the **spool**: one JSON file per
   `systemctl --user start`, else a bare windowless spawn. At most once per 30 s, never when
   elevated, never in a debug build.
 - **Daemon.** It spills to the same spool when its ingest queue is full, where it used to
-  answer `Ok` and discard the event. It replays the spool at startup and every 2–30 s, only
-  while the queue has room, keeping each event's original `observed_at`. The shim now sends
+  answer `Ok` and discard the event. It replays the spool at startup, the moment it spills, every 2 s while
+  records remain and on a 5-minute backstop, only while the queue has room, keeping each event's original `observed_at`. The shim now sends
   `observed_at` with every hook.
 - **Content.** A spool record holds only the normalized event (`dira_sources::Normalized`),
   never the raw harness payload.

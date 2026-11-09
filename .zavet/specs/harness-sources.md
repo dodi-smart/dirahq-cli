@@ -51,7 +51,8 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
     pipe the harness reads the hook's stdout from. At most once per 30 s, never elevated, never in a debug
     build.
   - The daemon spills to the same spool when its ingest queue is full, and
-    replays the spool at startup and every 2–30 s while the queue has room,
+    replays the spool at startup, the moment it spills, every 2 s while records
+    remain and on a 5-minute backstop, while the queue has room,
     keeping each event's original time.
 - Alias spelling lives ONLY in `canonical_harness_id()`. `dira init` and hook
   dispatch both resolve through it, so accepted spellings can never drift.

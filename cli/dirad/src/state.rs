@@ -25,6 +25,9 @@ pub enum EventMsg {
         norm: dira_sources::Normalized,
         harness: Harness,
         at: OffsetDateTime,
+        /// Replayed from the spool: counted in `spool::IN_FLIGHT` until the
+        /// writer has finished with it.
+        spooled: bool,
     },
     /// A fully-formed event (manual commands resolve their own project off the hot path).
     Raw(Box<RawEvent>),

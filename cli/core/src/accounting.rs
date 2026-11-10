@@ -36,19 +36,9 @@ pub struct Signal {
     pub project: Option<String>,
 }
 
-/// A counted, non-overlapping slice of de-duplicated human time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CountedGap {
-    pub start: OffsetDateTime,
-    pub end: OffsetDateTime,
-    pub project: Option<String>,
-}
-
-impl CountedGap {
-    pub fn seconds(&self) -> i64 {
-        (self.end - self.start).whole_seconds()
-    }
-}
+/// A counted, non-overlapping slice of de-duplicated human time, keyed by its
+/// canonical project ref (`None` for unresolved work).
+pub type CountedGap = KeyedGap<Option<String>>;
 
 /// Compute the de-duplicated, idle-trimmed human-time gaps from a set of signals
 /// drawn from any number of concurrent sessions.
@@ -61,13 +51,6 @@ pub fn counted_gaps(signals: &[Signal], idle: Duration) -> Vec<CountedGap> {
     let keyed: Vec<(OffsetDateTime, Option<String>)> =
         signals.iter().map(|s| (s.at, s.project.clone())).collect();
     counted_gaps_keyed(&keyed, idle)
-        .into_iter()
-        .map(|g| CountedGap {
-            start: g.start,
-            end: g.end,
-            project: g.key,
-        })
-        .collect()
 }
 
 /// Total de-duplicated human seconds across all projects.

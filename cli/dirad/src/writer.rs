@@ -136,6 +136,7 @@ pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capt
             EventMsg::Raw(ev) => (ev.kind, ev.session_id.clone()),
             EventMsg::Hook { norm, .. } => (norm.kind, norm.session_id.clone()),
         };
+        let spooled = matches!(msg, EventMsg::Hook { spooled: true, .. });
 
         let outcome = AssertUnwindSafe(process_message(
             &state,
@@ -151,6 +152,10 @@ pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capt
         ))
         .catch_unwind()
         .await;
+        // Written (or dropped by a panic): no longer on its way.
+        if spooled {
+            crate::spool::finished_spooled();
+        }
 
         if let Err(panic) = outcome {
             state.progress.mark_writer_panic();
@@ -261,7 +266,9 @@ async fn process_message(
             let dir = ev.project.as_ref().and(ev.cwd.clone());
             (*ev, dir)
         }
-        EventMsg::Hook { norm, harness, at } => enrich(norm, harness, at, cache),
+        EventMsg::Hook {
+            norm, harness, at, ..
+        } => enrich(norm, harness, at, cache),
     };
     if ev.lineage.host_session.is_some() && ev.lineage.parent_session.is_none() {
         ev.lineage.parent_session = resolve_parent(state, &ev, &mut cache.parents).await;
@@ -356,7 +363,7 @@ async fn process_message(
     // then would delete a real session whose activity arrives a moment later.
     if ev.kind == EventKind::SessionEnd
         && crate::control::lock_recover(&state.sessions).is_degenerate(&ev.session_id)
-        && !dira_sources::spool::has_records(&dira_sources::spool::dir_for(&state.config.db_path))
+        && !crate::spool::pending(&state.config.db_path)
     {
         match state.store.delete_session_events(&ev.session_id).await {
             Ok(deleted) => {

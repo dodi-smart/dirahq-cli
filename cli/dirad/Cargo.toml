@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 dira-core.workspace = true
+dira-meetings.workspace = true
 dira-sources.workspace = true
 dira-contract.workspace = true
 dira-ipc.workspace = true

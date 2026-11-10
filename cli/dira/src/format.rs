@@ -86,6 +86,12 @@ pub fn status_tree_sessions(
 /// The PROJECT cell for a report line: the orchestration bucket is named as
 /// such, never folded into `(unresolved)`.
 pub fn report_line_label(p: &dira_core::report::ProjectReport) -> String {
+    if p.meeting {
+        return match &p.project {
+            Some(_) => format!("meetings · {}", project_label(&p.project)),
+            None => "meetings".to_string(),
+        };
+    }
     if p.orchestration {
         ORCHESTRATION_LABEL.to_string()
     } else {

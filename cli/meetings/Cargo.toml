@@ -1,0 +1,18 @@
+[package]
+name = "dira-meetings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Bot-less meeting detection: OS device-in-use signals fused into meeting spans (metadata only)."
+
+[dependencies]
+dira-contract.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

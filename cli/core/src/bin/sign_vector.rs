@@ -57,6 +57,8 @@ pub fn build_vector() -> serde_json::Value {
             human_seconds: 2700,
             activity: Some("среща".to_string()),
             source_session: "01SESSION000000000000000000".to_string(),
+            // 2.1, populated so the cloud verifier canonicalizes it byte-identically.
+            meeting_id: Some("01MEETING000000000000000000".to_string()),
         }],
         sessions: vec![SessionRollup {
             session_id: "01SESSION000000000000000000".to_string(),
@@ -163,6 +165,41 @@ pub fn build_vector() -> serde_json::Value {
             interval_digest: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                 .into(),
             revision: 0,
+        }],
+        // Contract 2.1 fields, populated so the cloud verifier proves it
+        // canonicalizes them byte-identically.
+        meetings: vec![dira_contract::Meeting {
+            id: "01MEETING000000000000000000".into(),
+            version: 2,
+            started_at: "2026-06-27T09:00:00Z".into(),
+            ended_at: "2026-06-27T09:45:00Z".into(),
+            state: dira_contract::MeetingState::Confirmed,
+            source: dira_contract::MeetingSource::Device,
+            confidence: dira_contract::MeetingConfidence::High,
+            provider_class: dira_contract::ProviderClass::Teams,
+            evidence: vec![
+                dira_contract::MeetingEvidence::Capture,
+                dira_contract::MeetingEvidence::Output,
+            ],
+            calendar: Some(dira_contract::CalendarFacts {
+                attendee_bucket: dira_contract::AttendeeBucket::ThreeToFive,
+                recurring: true,
+                series_key: Some(
+                    "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".into(),
+                ),
+                external: true,
+            }),
+            attribution: Some(dira_contract::MeetingAttribution {
+                project_ref: Some("prj_01HZYX".into()),
+                client_ref: None,
+                repo_canonical: None,
+                method: dira_contract::AttributionMethod::Series,
+            }),
+            engaged_during_meeting_seconds: 240,
+        }],
+        windows: vec![dira_contract::BatchWindow {
+            started_at: "2026-06-27T09:00:00Z".into(),
+            ended_at: "2026-06-27T10:00:00Z".into(),
         }],
     };
 

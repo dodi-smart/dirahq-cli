@@ -19,6 +19,10 @@ pub struct ProjectReport {
     /// (DIRASH-0041). Only ever set on a `project: None` line.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub orchestration: bool,
+    /// Meeting time (DIRASH-0063): a detected or confirmed meeting's seconds,
+    /// filed under its project. Agent time is never on a meeting line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub meeting: bool,
 }
 
 /// A report line's key: the project, and whether a repo-less line is the
@@ -40,6 +44,19 @@ pub struct Report {
 /// because a gap that means "the human walked away" means "the agent is running a
 /// build" — see [`accounting::AgentPolicy`].
 pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy) -> Report {
+    build_with_meetings(events, &[], idle, agent)
+}
+
+/// [`build`], with the counted (recorded or confirmed) meetings overlaid on the
+/// de-duplicated human time (`accounting::overlay`, `MeetingWins`): every
+/// second is either work on its project line or meeting time on a meeting line,
+/// never both. Agent time is untouched. With no meetings, this is [`build`].
+pub fn build_with_meetings(
+    events: &[RawEvent],
+    meetings: &[crate::sync::meetings::CountedMeeting],
+    idle: Duration,
+    agent: accounting::AgentPolicy,
+) -> Report {
     // Sessions whose lineage makes them orchestrators — the same rule the
     // rollup and the live registry fold. Their repo-less time is the
     // orchestration bucket, not "unresolved".
@@ -70,7 +87,41 @@ pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy
         .filter(|e| e.kind.is_human_signal())
         .map(|e| (e.at, key(&e.project, &e.session_id)))
         .collect();
-    let human_by_project = accounting::per_key_seconds(&signals, idle);
+    let mut meeting_by_project: BTreeMap<Option<String>, i64> = BTreeMap::new();
+    let human_by_project = if meetings.is_empty() {
+        accounting::per_key_seconds(&signals, idle)
+    } else {
+        // The same total order as the sync producer, keyed by position, so the
+        // report and the wire give an overlap to the same meeting.
+        let mut ordered: Vec<&crate::sync::meetings::CountedMeeting> = meetings.iter().collect();
+        ordered.sort_by(|a, b| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
+        let spans: Vec<accounting::MeetingSpan<usize>> = ordered
+            .iter()
+            .enumerate()
+            .map(|(k, m)| accounting::MeetingSpan {
+                start: m.started_at,
+                end: m.ended_at,
+                key: k,
+            })
+            .collect();
+        let overlaid = accounting::overlay(
+            &accounting::counted_gaps_keyed(&signals, idle),
+            &spans,
+            |_, _| accounting::Precedence::MeetingWins,
+        );
+        let mut work: BTreeMap<LineKey, i64> = BTreeMap::new();
+        for (slot, secs) in overlaid.per_slot_seconds() {
+            match slot {
+                accounting::Slot::Work(k) => *work.entry(k).or_insert(0) += secs,
+                accounting::Slot::Meeting(k) => {
+                    *meeting_by_project
+                        .entry(ordered[k].project.clone())
+                        .or_insert(0) += secs
+                }
+            }
+        }
+        work
+    };
 
     // --- agent wall-clock: clamped active time per session, summed freely ---
     // The wall-clock is the clamped active span over each session's own event
@@ -129,15 +180,27 @@ pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy
     keys.sort();
     keys.dedup();
 
-    let projects: Vec<ProjectReport> = keys
+    let mut projects: Vec<ProjectReport> = keys
         .into_iter()
         .map(|k| ProjectReport {
             human_seconds: human_by_project.get(&k).copied().unwrap_or(0),
             agent_wall_seconds: agent_by_project.get(&k).copied().unwrap_or(0),
             orchestration: k.1,
             project: k.0,
+            meeting: false,
         })
         .collect();
+    projects.extend(
+        meeting_by_project
+            .into_iter()
+            .map(|(project, secs)| ProjectReport {
+                project,
+                human_seconds: secs,
+                agent_wall_seconds: 0,
+                orchestration: false,
+                meeting: true,
+            }),
+    );
 
     Report {
         total_human_seconds: projects.iter().map(|p| p.human_seconds).sum(),
@@ -164,18 +227,21 @@ pub fn build(events: &[RawEvent], idle: Duration, agent: accounting::AgentPolicy
 /// distinct session count captured in those rollups, added to the live count.
 pub fn build_merged(
     events: &[RawEvent],
+    meetings: &[crate::sync::meetings::CountedMeeting],
     idle: Duration,
     agent: accounting::AgentPolicy,
     rollups: &[RollupLine],
     rollup_sessions: usize,
 ) -> Report {
-    let mut report = build(events, idle, agent);
+    let mut report = build_with_meetings(events, meetings, idle, agent);
     if rollups.is_empty() {
         return report;
     }
 
-    let mut by_project: BTreeMap<LineKey, ProjectReport> = report
-        .projects
+    // Meeting lines stay as they are: compacted rollups predate meetings.
+    let (meeting_lines, work_lines): (Vec<ProjectReport>, Vec<ProjectReport>) =
+        report.projects.into_iter().partition(|p| p.meeting);
+    let mut by_project: BTreeMap<LineKey, ProjectReport> = work_lines
         .into_iter()
         .map(|p| ((p.project.clone(), p.orchestration), p))
         .collect();
@@ -189,12 +255,14 @@ pub fn build_merged(
                 human_seconds: 0,
                 agent_wall_seconds: 0,
                 orchestration: false,
+                meeting: false,
             });
         entry.human_seconds += line.human_seconds;
         entry.agent_wall_seconds += line.agent_wall_seconds;
     }
 
-    let projects: Vec<ProjectReport> = by_project.into_values().collect();
+    let mut projects: Vec<ProjectReport> = by_project.into_values().collect();
+    projects.extend(meeting_lines);
     report.total_human_seconds = projects.iter().map(|p| p.human_seconds).sum();
     report.total_agent_seconds = projects.iter().map(|p| p.agent_wall_seconds).sum();
     report.session_count += rollup_sessions;
@@ -427,6 +495,7 @@ mod tests {
         let rollup_sessions = store.rollup_session_count(None).await.unwrap();
         let merged = build_merged(
             &survivors,
+            &[],
             idle,
             accounting::AgentPolicy::default(),
             &rollups,
@@ -437,5 +506,51 @@ mod tests {
         assert_eq!(merged.total_agent_seconds, raw_report.total_agent_seconds);
         assert_eq!(merged.session_count, raw_report.session_count);
         assert_eq!(merged.projects, raw_report.projects);
+    }
+
+    #[test]
+    fn a_meeting_takes_its_minutes_from_work_and_the_total_counts_once() {
+        // Prompts every 60 s for 10 minutes on `acme`; a meeting over minutes 3-7.
+        let events: Vec<RawEvent> = (0..=10)
+            .map(|k| ev("s1", k * 60, EventKind::UserPrompt, "acme"))
+            .collect();
+        let base = OffsetDateTime::UNIX_EPOCH;
+        let meeting = crate::sync::meetings::CountedMeeting {
+            id: "m1".into(),
+            started_at: base + Duration::minutes(3),
+            ended_at: base + Duration::minutes(7),
+            project: Some("acme".into()),
+        };
+        let plain = build(
+            &events,
+            Duration::minutes(5),
+            accounting::AgentPolicy::default(),
+        );
+        let with = build_with_meetings(
+            &events,
+            &[meeting],
+            Duration::minutes(5),
+            accounting::AgentPolicy::default(),
+        );
+        assert_eq!(plain.total_human_seconds, 600);
+        assert_eq!(with.total_human_seconds, 600);
+        let line = |meeting: bool| {
+            with.projects
+                .iter()
+                .find(|p| p.meeting == meeting)
+                .unwrap()
+                .human_seconds
+        };
+        assert_eq!((line(false), line(true)), (360, 240));
+        // No meetings: identical to the plain report.
+        assert_eq!(
+            build_with_meetings(
+                &events,
+                &[],
+                Duration::minutes(5),
+                accounting::AgentPolicy::default()
+            ),
+            plain
+        );
     }
 }

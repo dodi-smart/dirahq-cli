@@ -113,6 +113,13 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0050 — Updates apply in the background by default; dirad schedules, the CLI performs (active)
 - DIRASH-0051 — The installers register the per-user service by default and hand off to dira onboard (active)
 - DIRASH-0052 — Contract 2.0: chained batches, day rollups and count-only session stats (active)
+- DIRASH-0060 — Meeting time comes from local device-in-use signals, never a bot or call content (proposed)
+- DIRASH-0061 — Meeting detection is gated by OS notifications; the per-process walk runs only while a call is a candidate (proposed)
+- DIRASH-0062 — Meetings are their own versioned wire record; meeting time rides intervals with a meetingId (proposed)
+- DIRASH-0063 — The meeting/work overlay is computed once, on the device; precedence is per user and a meeting wins across workspaces (proposed)
+- DIRASH-0064 — Calendar facts are reduced on the device; attribution resolves locally; no titles, attendees or domains cross (proposed)
+- DIRASH-0065 — Meeting titles ride only their own consent-gated labels channel, never the attestation wire (proposed)
+- DIRASH-0066 — The daemon obeys the workspace meeting policy; admins can disable but never force capture on, and the user's opt-out always wins (proposed)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

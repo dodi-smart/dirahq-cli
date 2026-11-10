@@ -1,0 +1,161 @@
+# Meeting-app catalogue: process identity -> local class, kind and wire class.
+#
+# Data, not code (DIRASH-0060): adding a call app is an edit here, never a code
+# change, and never a wire change: `wire` folds every app into the small closed
+# `ProviderClass` enum.
+#
+# PROVISIONAL. Ids come from the 2026-10-22 research (meeting-capture spec, branch
+# docs/meeting-capture-design) and are marked there as verified or reported.
+# Every id is spot-checked on a real machine in the P0 validation spike
+# (`defaults read /Applications/X.app/Contents/Info CFBundleIdentifier`, the
+# helper that actually holds input, Windows exe names) before the module ships.
+#
+# Matching: an adapter offers every identity it knows for a process (macOS
+# bundle id, executable file name, Flatpak app id). An entry matches when one of
+# its `ids` is a case-insensitive PREFIX of one of them, because the process
+# that holds the mic is often a helper (`com.hnc.Discord.helper.Renderer`).
+# The longest matching prefix wins across all entries.
+#
+# kind:
+#   platform        a meeting product: a held mic is enough
+#   messaging       a chat app that also calls: needs corroboration (voice notes)
+#   browser         any website can open a mic: duplex audio only
+#   off_by_default  probably not a work meeting; listed so doctor can say "ignored"
+#
+# call_only: processes that exist only while a meeting is live (strongest D).
+
+version = 1
+
+[[app]]
+class = "zoom"
+kind = "platform"
+wire = "zoom"
+ids = ["us.zoom.", "zoom.exe", "zoom", "aomhost64.exe"]
+call_only = ["cpthost", "cptservice.exe", "us.zoom.cpthost"]
+
+[[app]]
+class = "teams"
+kind = "platform"
+wire = "teams"
+ids = ["com.microsoft.teams", "ms-teams.exe", "msteams_8wekyb3d8bbwe", "msteams"]
+
+[[app]]
+class = "webex"
+kind = "platform"
+wire = "webex"
+ids = ["cisco-systems.spark", "com.cisco.webexmeetingsapp", "ciscocollabhost.exe", "webexhost.exe"]
+
+[[app]]
+class = "facetime"
+kind = "platform"
+wire = "facetime"
+ids = ["com.apple.facetime", "com.apple.avconferenced"]
+
+[[app]]
+class = "tuple"
+kind = "platform"
+wire = "other"
+ids = ["app.tuple.app"]
+
+[[app]]
+class = "slack"
+kind = "messaging"
+wire = "slack"
+ids = ["com.tinyspeck.slackmacgap", "slack.exe", "com.slack.slack", "slack"]
+
+[[app]]
+class = "discord"
+kind = "messaging"
+wire = "discord"
+ids = ["com.hnc.discord", "discord.exe", "com.discordapp.discord", "discord"]
+
+[[app]]
+class = "telegram"
+kind = "messaging"
+wire = "chat"
+ids = ["ru.keepcoder.telegram", "com.tdesktop.telegram", "telegram.exe", "org.telegram.desktop"]
+
+[[app]]
+class = "whatsapp"
+kind = "messaging"
+wire = "chat"
+ids = ["net.whatsapp.whatsapp", "whatsapp.exe"]
+
+[[app]]
+class = "signal"
+kind = "messaging"
+wire = "chat"
+ids = ["org.whispersystems.signal-desktop", "signal.exe", "org.signal.signal"]
+
+[[app]]
+class = "chrome"
+kind = "browser"
+wire = "browser"
+ids = ["com.google.chrome", "chrome.exe", "google-chrome", "chrome", "chromium"]
+
+[[app]]
+class = "edge"
+kind = "browser"
+wire = "browser"
+ids = ["com.microsoft.edgemac", "msedge.exe", "microsoft-edge"]
+
+[[app]]
+class = "firefox"
+kind = "browser"
+wire = "browser"
+ids = ["org.mozilla.firefox", "firefox.exe", "firefox"]
+
+[[app]]
+class = "brave"
+kind = "browser"
+wire = "browser"
+ids = ["com.brave.browser", "brave.exe", "brave"]
+
+[[app]]
+class = "arc"
+kind = "browser"
+wire = "browser"
+ids = ["company.thebrowser.browser"]
+
+[[app]]
+class = "mumble"
+kind = "off_by_default"
+wire = "other"
+ids = ["net.sourceforge.mumble", "mumble.exe", "mumble"]
+
+[[app]]
+class = "teamspeak"
+kind = "off_by_default"
+wire = "other"
+ids = ["com.teamspeak", "ts3client", "teamspeak"]
+
+# A mic holder on this list is never evidence of a call: dictation, recorders,
+# assistants and note-takers consume a call, they do not prove one.
+[deny]
+ids = [
+  "com.superduper.superwhisper", "superwhisper",
+  "com.electron.wispr-flow", "wispr flow",
+  "com.goodsnooze.macwhisper",
+  "com.prakashjoshipax.voiceink",
+  "com.apple.voicememos",
+  "com.apple.siri", "com.apple.assistantd",
+  "com.apple.systempreferences", "com.apple.systemsettings",
+  "com.loom.desktop", "loom.exe",
+  "com.obsproject.obs-studio", "obs64.exe", "obs",
+  "com.timpler.screenstudio",
+  "com.granola.app", "granola",
+  "com.fathom.video",
+  "com.raycast.macos",
+]
+
+# Relays sit between the physical mic and the call app (noise cancelling,
+# virtual devices). Alone they never start a meeting.
+[relay]
+ids = [
+  "ai.krisp.krispmac", "krisp.exe",
+  "nvidia broadcast", "nvidia broadcast.exe",
+  "voicemod.exe", "net.voicemod",
+  "com.rogueamoeba.loopback",
+  "existential.audio.blackhole",
+  "com.elgato.wavelink", "wavelink.exe",
+]

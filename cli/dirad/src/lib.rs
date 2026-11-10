@@ -29,6 +29,8 @@ pub mod http;
 pub mod jitter;
 pub mod knowledge_sync;
 pub mod logfile;
+pub mod meeting_sync;
+pub mod meetings;
 pub mod probe;
 pub mod quarantine;
 pub mod spool;
@@ -494,6 +496,8 @@ pub async fn run() -> anyhow::Result<()> {
     spool::spawn_drain(state.clone());
     // Keep the clock for background updates; the CLI does the work.
     autoupdate::spawn(state.clone());
+    // Bot-less meeting detection, only when the person opted in (DIRASH-0060).
+    meetings::spawn(state.clone());
 
     // Block until shutdown. The accept loop runs detached in `serve_control`.
     wait_for_shutdown_signal(&state, &mut shutdown_signals).await;

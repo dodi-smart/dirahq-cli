@@ -29,7 +29,7 @@ mod zavet_install;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
-use dira_core::protocol::{ReportScope, Request, Response, StopSelector};
+use dira_core::protocol::{MeetingAction, ReportScope, Request, Response, StopSelector};
 use dira_core::Config;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -645,6 +645,35 @@ Examples:
         #[command(subcommand)]
         action: ZavetAction,
     },
+    /// Bot-less meeting detection: what it sees, and suggestions to review.
+    #[command(after_help = "\
+dira reads which app holds your microphone, camera or speakers, never audio,
+video, screen content, window titles or calendar entries. Turn it on with
+`dira config set modules.meetings suggest` (confirm each) or `auto` (record
+sure ones), then `dira daemon stop && dira daemon start`.
+
+Examples:
+  dira meetings                          live state, suggestions, last 7 days
+  dira meetings confirm 01J...           count a suggestion as meeting time
+  dira meetings dismiss 01J...           drop a suggestion
+  dira meetings retract 01J...           withdraw a recorded meeting
+  dira meetings assign 01J... github.com/acme/api")]
+    Meetings {
+        #[command(subcommand)]
+        action: Option<MeetingsCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeetingsCmd {
+    /// Count a suggestion (or keep a recorded meeting) as meeting time.
+    Confirm { id: String },
+    /// Drop a suggestion; it never counts.
+    Dismiss { id: String },
+    /// Withdraw a recorded meeting; it stops counting.
+    Retract { id: String },
+    /// File a meeting under a project (omit the project to clear it).
+    Assign { id: String, project: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -1120,6 +1149,14 @@ fn daemon_skew_hint(message: &str) -> Option<String> {
 /// reporting this checkout's adapter staleness under it would be a plain lie.
 /// Pure, so the suppression rule is pinned by a test rather than by reading the
 /// dispatch site.
+fn meeting_action(id: String, action: MeetingAction, project: Option<String>) -> Request {
+    Request::MeetingAction {
+        id,
+        action,
+        project,
+    }
+}
+
 fn zavet_status_is_cwd_scoped(command: &Command) -> bool {
     matches!(
         command,
@@ -1579,6 +1616,15 @@ async fn main() -> Result<()> {
             // handled client-side above
             ZavetAction::Emit => unreachable!(),
             ZavetAction::Install { .. } => unreachable!(),
+        },
+        Command::Meetings { action } => match action {
+            None => Request::Meetings,
+            Some(MeetingsCmd::Confirm { id }) => meeting_action(id, MeetingAction::Confirm, None),
+            Some(MeetingsCmd::Dismiss { id }) => meeting_action(id, MeetingAction::Dismiss, None),
+            Some(MeetingsCmd::Retract { id }) => meeting_action(id, MeetingAction::Retract, None),
+            Some(MeetingsCmd::Assign { id, project }) => {
+                meeting_action(id, MeetingAction::Assign, project)
+            }
         },
         // already handled above
         Command::Status { .. }

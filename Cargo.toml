@@ -4,6 +4,7 @@ members = [
     "contract",
     "cli/core",
     "cli/sources",
+    "cli/meetings",
     "cli/ipc",
     "cli/dirad",
     "cli/dira",
@@ -140,6 +141,7 @@ fastrand = "2"
 dira-contract = { path = "contract" }
 dira-core = { path = "cli/core" }
 dira-sources = { path = "cli/sources" }
+dira-meetings = { path = "cli/meetings" }
 # UDS (unix) / named-pipe (windows) transport + shared length-prefixed-JSON framing;
 # the only framing implementation in the workspace — both dira and dirad go through it.
 dira-ipc = { path = "cli/ipc" }

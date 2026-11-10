@@ -142,6 +142,17 @@
         "sha"
       ]
     },
+    "AttendeeBucket": {
+      "description": "2.1: attendee count, bucketed.",
+      "type": "string",
+      "enum": [
+        "one",
+        "two",
+        "three_to_five",
+        "six_to_ten",
+        "eleven_plus"
+      ]
+    },
     "AttestationBatch": {
       "description": "The unit of sync: a collection of settled facts captured locally.\n\nIdempotent by `batchId`; append-only — corrections are *new* batches that\nsupersede, never mutations of a synced one.",
       "type": "object",
@@ -207,6 +218,13 @@
             "$ref": "#/$defs/Interval"
           }
         },
+        "meetings": {
+          "description": "2.1: meetings this device detected or the person confirmed (see\n[`Meeting`]). Their time rides [`Interval`]s carrying `meetingId`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Meeting"
+          }
+        },
         "prevBatchHash": {
           "description": "2.0: lowercase hex SHA-256 of the RFC 8785 (JCS) encoding of the\nprevious acknowledged batch's payload in this epoch; `\"\"` at `seq` 0.\nMakes a device's history tamper-evident: a dropped, altered or\nreordered batch breaks the chain the cloud recomputes.",
           "type": "string"
@@ -230,6 +248,13 @@
           "items": {
             "$ref": "#/$defs/TokenUsage"
           }
+        },
+        "windows": {
+          "description": "2.1: time ranges whose intervals this batch restates IN FULL for its\ndevice. The cloud replaces the device's claims inside each window even\nwhere the batch sends no interval, so re-decomposing a window down to\nnothing (a retracted meeting with no work left) removes the stale claim\n(D-0085). Empty means \"only where my intervals land\", as before.\n\nA window may only come from a builder that read EVERY stored event whose\n`at` falls in it (a re-decompose by time, an explicit resync), never\nfrom an ordinary flush: a flush is an event-id slice, and spool replays\ninsert events with past `at` values, so its time span overlaps minutes\nsynced in earlier batches. Declaring that span would delete valid claims.\nReaders ignore `windows` from a producer older than 2.1. A reader applies\neach window to ALL of the device's claims, in every workspace, including\nones where this batch lands no interval: a meeting and the work around it\ncan route to different workspaces. Producers send meetings only to a\ncloud that does so.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BatchWindow"
+          }
         }
       },
       "required": [
@@ -239,6 +264,43 @@
         "seq",
         "prevBatchHash",
         "chainEpoch"
+      ]
+    },
+    "AttributionMethod": {
+      "description": "2.1: how a meeting was attributed.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "user",
+            "calendar_rule",
+            "domain",
+            "series"
+          ]
+        },
+        {
+          "description": "A suggestion from nearby repo work; never billed unless policy allows.",
+          "type": "string",
+          "const": "context"
+        }
+      ]
+    },
+    "BatchWindow": {
+      "description": "2.1: a range a batch restates in full (see [`AttestationBatch::windows`]).",
+      "type": "object",
+      "properties": {
+        "endedAt": {
+          "description": "RFC 3339, exclusive.",
+          "type": "string"
+        },
+        "startedAt": {
+          "description": "RFC 3339, inclusive.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "startedAt",
+        "endedAt"
       ]
     },
     "BlobRef": {
@@ -257,6 +319,34 @@
       "required": [
         "path",
         "blob"
+      ]
+    },
+    "CalendarFacts": {
+      "description": "2.1: what survives of a matched calendar event after on-device reduction\n(DIRASH-0064). No title, attendee or domain.",
+      "type": "object",
+      "properties": {
+        "attendeeBucket": {
+          "$ref": "#/$defs/AttendeeBucket"
+        },
+        "external": {
+          "description": "Any attendee outside the person's own domains (decided on the device).",
+          "type": "boolean"
+        },
+        "recurring": {
+          "type": "boolean"
+        },
+        "seriesKey": {
+          "description": "Lowercase hex HMAC-SHA256(workspace salt, calendar UID): groups a recurring\nseries across a workspace's members, and reveals nothing about it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attendeeBucket",
+        "recurring",
+        "external"
       ]
     },
     "CaptureHealth": {
@@ -499,6 +589,13 @@
           "description": "`git config user.email` of the person the work is attributed to.",
           "type": "string"
         },
+        "meetingId": {
+          "description": "2.1: the [`Meeting`] this interval is a slice of; `activity` is then\n`meeting`. The device has already decided, on its own timeline, which\nseconds were meeting and which were work, so a reader sums intervals as\nbefore and never adds meeting time twice (DIRASH-0063).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "repoCanonical": {
           "description": "Canonical repo ref, e.g. `github.com/acme/api`. `None` for unresolved dirs.",
           "type": [
@@ -521,6 +618,188 @@
         "endedAt",
         "humanSeconds",
         "sourceSession"
+      ]
+    },
+    "Meeting": {
+      "description": "2.1: a meeting, detected from local device-in-use signals or confirmed by the\nperson (DIRASH-0060, DIRASH-0062). Content-free by construction (D-0001):\nevery field is a closed enum, a time, a count bucket, a boolean, a\ndevice-minted id, a reference to the workspace's own entities, or a keyed\nhash. There is nowhere for a title, attendee, address, domain or URL to go.\n\nUpserted by `(deviceId, id)`; a higher `version` replaces a lower one, never\nthe reverse. A retraction is a record with `state: retracted`.",
+      "type": "object",
+      "properties": {
+        "attribution": {
+          "description": "Where the meeting's time belongs, if the device could tell.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MeetingAttribution"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "calendar": {
+          "description": "Facts reduced from a matched calendar event, if one matched.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CalendarFacts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confidence": {
+          "$ref": "#/$defs/MeetingConfidence"
+        },
+        "endedAt": {
+          "type": "string"
+        },
+        "engagedDuringMeetingSeconds": {
+          "description": "Seconds of engaged work the device saw during this meeting. Reported for\nthe \"engaged during meetings\" view; never added to any total.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "evidence": {
+          "description": "Which signals were seen, for the cloud's assurance display.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MeetingEvidence"
+          }
+        },
+        "id": {
+          "description": "Minted by the daemon at detection; stable across confirm, reassign and retract.",
+          "type": "string"
+        },
+        "providerClass": {
+          "$ref": "#/$defs/ProviderClass"
+        },
+        "source": {
+          "description": "The evidence family that decided the meeting.",
+          "$ref": "#/$defs/MeetingSource"
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/MeetingState"
+        },
+        "version": {
+          "description": "Monotonic per meeting.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "startedAt",
+        "endedAt",
+        "state",
+        "source",
+        "confidence",
+        "providerClass"
+      ]
+    },
+    "MeetingAttribution": {
+      "description": "2.1: where a meeting's time belongs, resolved on the device against the\nworkspace's own directory.",
+      "type": "object",
+      "properties": {
+        "clientRef": {
+          "description": "The workspace's client id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "$ref": "#/$defs/AttributionMethod"
+        },
+        "projectRef": {
+          "description": "The workspace's project id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repoCanonical": {
+          "description": "Only for `method: context`: the repo with engaged time around the meeting.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "method"
+      ]
+    },
+    "MeetingConfidence": {
+      "description": "2.1: how sure the device is. Low-confidence runs stay local suggestions and\nnever cross the wire unconfirmed.",
+      "type": "string",
+      "enum": [
+        "high",
+        "confirmed"
+      ]
+    },
+    "MeetingEvidence": {
+      "description": "2.1: a signal family that contributed to a meeting.",
+      "type": "string",
+      "enum": [
+        "capture",
+        "camera",
+        "output",
+        "window",
+        "process",
+        "calendar",
+        "presence"
+      ]
+    },
+    "MeetingSource": {
+      "description": "2.1: the evidence family that decided a meeting.",
+      "type": "string",
+      "enum": [
+        "device",
+        "calendar",
+        "presence",
+        "user"
+      ]
+    },
+    "MeetingState": {
+      "description": "2.1: a meeting's lifecycle.",
+      "oneOf": [
+        {
+          "description": "Detected with high confidence and recorded.",
+          "type": "string",
+          "const": "recorded"
+        },
+        {
+          "description": "Confirmed by the person (a suggestion they accepted, or a recorded meeting they kept).",
+          "type": "string",
+          "const": "confirmed"
+        },
+        {
+          "description": "Withdrawn: its intervals are gone and it no longer counts.",
+          "type": "string",
+          "const": "retracted"
+        }
+      ]
+    },
+    "ProviderClass": {
+      "description": "2.1: the kind of call. Deliberately coarser than the device's app catalogue,\nso adding an app never changes the wire. Readers map an unknown value to `other`.",
+      "type": "string",
+      "enum": [
+        "zoom",
+        "teams",
+        "slack",
+        "webex",
+        "meet",
+        "discord",
+        "facetime",
+        "chat",
+        "browser",
+        "in_person",
+        "other"
       ]
     },
     "SessionKind": {

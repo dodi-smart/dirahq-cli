@@ -1,10 +1,10 @@
 ---
 title: Attestation sync and session rollups
-version: 11
+version: 12
 origin: session
 verified: false
 confidence: high
-date: 2026-10-16
+date: 2026-11-09
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
@@ -233,6 +233,18 @@ single flush window (issue #40).
   omits them clears nothing. A trigger seen by the live registry counts as a
   lineage change, so a partial ships it. `LINEAGE_RULES_VERSION` is unchanged:
   past events carry no trigger, so there is nothing to re-send.
+- Contract 2.1 (proposed, meetings) adds `AttestationBatch.meetings[]` and an
+  optional `Interval.meetingId`. A `Meeting` is content-free (closed enums,
+  times, buckets, booleans, ids, workspace refs, an HMAC series key) and is
+  upserted by `(deviceId, id)` with a monotonic `version`; a retraction is a
+  record with `state: retracted` (DIRASH-0062). The producer does not emit
+  either yet: `batch.rs` sets `meetingId: None` and sends no meetings until the
+  daemon wiring lands. When it does, a meeting's time rides intervals the
+  device has already overlaid with its work (DIRASH-0063), so a reader still
+  sums `humanSeconds` once. 2.1 also adds `AttestationBatch.windows[]`: ranges
+  the batch restates in full for its device, so the cloud's per-device claims
+  (cloud D-0085) are replaced there even where no interval lands, e.g. a
+  retracted meeting with nothing left. The producer sends none yet.
 
 ## Invariants
 

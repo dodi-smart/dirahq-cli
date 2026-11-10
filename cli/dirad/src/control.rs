@@ -170,6 +170,12 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
         // why the ordering matters and `dispatch` doesn't touch `shutdown`
         // itself.
         Request::Shutdown => Response::Ok,
+        Request::Meetings => crate::meetings::view(state).await,
+        Request::MeetingAction {
+            id,
+            action,
+            project,
+        } => crate::meetings::act(state, &id, action, project).await,
         Request::CaptureProbe { phase } => match phase {
             dira_core::protocol::ProbePhase::Arm => crate::probe::arm(state).await,
             dira_core::protocol::ProbePhase::Verify {
@@ -193,8 +199,14 @@ async fn resync_cursor(state: &AppState, from: Option<String>) -> Response {
         };
     }
     // A full rewind also re-sends artifacts and token usage (both ride their own
-    // rowid cursors, so rewinding the event cursor alone would leave them put).
+    // rowid cursors, so rewinding the event cursor alone would leave them put),
+    // and meetings: the re-sent work is clipped around them, so they must follow.
     if from.is_none() {
+        if let Err(e) = state.store.meta_set("meeting_cursor", "0").await {
+            return Response::Error {
+                message: format!("resync failed (reset meeting cursor): {e}"),
+            };
+        }
         if let Err(e) = state.store.meta_set(META_ARTIFACTS_CURSOR, "").await {
             return Response::Error {
                 message: format!("resync failed (reset artifacts cursor): {e}"),
@@ -603,7 +615,13 @@ async fn status(state: &AppState) -> Response {
         .events_since(Some(since))
         .await
         .unwrap_or_default();
-    let today = report::build(&events, state.config.idle(), state.config.agent_policy());
+    let meetings = crate::meetings::counted_since(state, Some(since)).await;
+    let today = report::build_with_meetings(
+        &events,
+        &meetings,
+        state.config.idle(),
+        state.config.agent_policy(),
+    );
     let session_tokens = state
         .store
         .token_totals_by_session_since(since)
@@ -784,13 +802,25 @@ async fn report_cmd(state: &AppState, scope: ReportScope) -> Response {
         .await
         .unwrap_or(0);
 
-    Response::Report(report::build_merged(
+    // Every meeting is overlaid, and only then are meeting lines filtered, so a
+    // project's minutes inside an unassigned meeting read as meeting time here
+    // exactly as in the full report and on the cloud.
+    let meetings = crate::meetings::counted_since(state, since).await;
+    let mut report = report::build_merged(
         &events,
+        &meetings,
         state.config.idle(),
         state.config.agent_policy(),
         &rollups,
         rollup_sessions,
-    ))
+    );
+    if let Some(p) = &project_filter {
+        report
+            .projects
+            .retain(|l| !l.meeting || l.project.as_deref() == Some(p.as_str()));
+        report.total_human_seconds = report.projects.iter().map(|l| l.human_seconds).sum();
+    }
+    Response::Report(report)
 }
 
 /// Build the views for `live`, with each session's token use inside the

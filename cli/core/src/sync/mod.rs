@@ -8,6 +8,7 @@ pub mod drift;
 pub mod handshake;
 pub mod health;
 pub mod knowledge;
+pub mod meetings;
 pub mod ratelimit;
 
 pub use batch::{

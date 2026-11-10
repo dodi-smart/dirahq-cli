@@ -142,6 +142,8 @@ mod tests {
             token_usage: vec![],
             artifacts: vec![],
             day_rollups: vec![],
+            meetings: vec![],
+            windows: vec![],
         }
     }
 

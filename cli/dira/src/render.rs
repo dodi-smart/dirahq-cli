@@ -315,6 +315,73 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
             eprintln!("unexpected capture-probe response outside `dira doctor --probe`");
             false
         }
+        Response::Meetings(v) => {
+            print_meetings(v);
+            true
+        }
+    }
+}
+
+/// `dira meetings`: mode, what the detector sees, suggestions, recent meetings.
+/// Times and a provider class only; there is no title or app name to show.
+fn print_meetings(v: &dira_core::protocol::MeetingsView) {
+    let faint = |s: &str| theme::paint(s, Role::Faint);
+    let hm = |t: &str| t.get(11..16).unwrap_or(t).to_string();
+    let day = |t: &str| t.get(..10).unwrap_or(t).to_string();
+    let mut head = format!("meetings  {}", v.mode);
+    if let Some(a) = &v.adapter {
+        head.push_str(&format!(" {} {a}", dot_glyph()));
+    }
+    println!("{head}");
+    if v.mode == "off" {
+        println!("{}", faint("  off: nothing is sampled. Turn on with `dira config set modules.meetings suggest`."));
+        return;
+    }
+    if let Some(why) = &v.unavailable {
+        println!("{}", faint(&format!("  unavailable: {why}")));
+    }
+    match &v.live {
+        Some(l) => println!(
+            "  in a meeting ({}, {}, since {})",
+            l.provider_class,
+            if l.confident { "sure" } else { "not sure yet" },
+            hm(&l.since)
+        ),
+        None if v.unavailable.is_none() => println!("{}", faint("  no meeting right now")),
+        None => {}
+    }
+    let line = |m: &dira_core::protocol::MeetingRowView| {
+        let project = m
+            .project
+            .as_deref()
+            .map(|p| format!("  {p}"))
+            .unwrap_or_default();
+        format!(
+            "  {}  {} {}-{}  {:<9} {:<9} {}{project}",
+            m.id,
+            day(&m.started_at),
+            hm(&m.started_at),
+            hm(&m.ended_at),
+            m.provider_class,
+            m.state,
+            m.confidence
+        )
+    };
+    println!();
+    println!("{}", theme::paint("SUGGESTIONS", Role::Muted));
+    if v.suggestions.is_empty() {
+        println!("{}", faint("  none to review"));
+    }
+    for m in &v.suggestions {
+        println!("{}", line(m));
+    }
+    println!();
+    println!("{}", theme::paint("LAST 7 DAYS", Role::Muted));
+    if v.recent.is_empty() {
+        println!("{}", faint("  no meetings recorded"));
+    }
+    for m in &v.recent {
+        println!("{}", line(m));
     }
 }
 

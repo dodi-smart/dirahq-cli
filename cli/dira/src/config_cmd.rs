@@ -105,6 +105,14 @@ const KNOBS: &[Knob] = &[
         kind: Kind::Enum(&["auto", "on", "off"]),
         help: "zavet knowledge module: auto (active when a repo has .zavet/), on, off",
     },
+    // Meeting detection reads which app holds the mic, camera or speakers. It
+    // is consent-bearing like `sync.knowledge`, so it must be settable for
+    // `dira onboard`'s own prompt to be honest (DIRASH-0030).
+    Knob {
+        key: "modules.meetings",
+        kind: Kind::Enum(&["off", "suggest", "auto"]),
+        help: "bot-less meeting detection: off, suggest (confirm each), auto (record sure ones)",
+    },
     // The knowledge channel's consent tier. Unlike every other knob here this
     // one governs whether *content* — decision and spec bodies, trailer
     // values, check commands, framework requirement/task text — leaves the machine, so it is worth being
@@ -658,6 +666,7 @@ mod tests {
         let original = "# my config\nidle_seconds = 300\n";
         let mut doc: DocumentMut = original.parse().unwrap();
         assign(&mut doc, "modules.zavet", value("on"));
+        assign(&mut doc, "modules.meetings", value("suggest"));
         let out = doc.to_string();
         assert!(out.contains("# my config"));
         assert!(out.contains("idle_seconds = 300"));
@@ -671,6 +680,10 @@ mod tests {
                 .extract()
                 .unwrap();
         assert_eq!(cfg.modules.zavet, dira_core::config::ZavetMode::On);
+        assert_eq!(
+            cfg.modules.meetings,
+            dira_core::config::MeetingsMode::Suggest
+        );
     }
 
     #[test]

@@ -350,8 +350,13 @@ async fn process_message(
     // normal path. `ManualStop` is deliberately not a trigger — a manual session is
     // an explicit `dira start`, and `ManualStop` is itself a human signal, so it
     // could never be degenerate anyway.
+    //
+    // Not while the spool holds records: a live `SessionEnd` can overtake the
+    // same session's spooled prompt or tool events (DIRASH-0049), and pruning
+    // then would delete a real session whose activity arrives a moment later.
     if ev.kind == EventKind::SessionEnd
         && crate::control::lock_recover(&state.sessions).is_degenerate(&ev.session_id)
+        && !dira_sources::spool::has_records(&dira_sources::spool::dir_for(&state.config.db_path))
     {
         match state.store.delete_session_events(&ev.session_id).await {
             Ok(deleted) => {

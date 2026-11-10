@@ -117,6 +117,21 @@ pub fn list(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Whether any complete record is waiting, without listing them all.
+pub fn has_records(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| {
+        entries.any(|e| {
+            e.ok().is_some_and(|e| {
+                let p = e.path();
+                p.extension().is_some_and(|x| x == "json")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| !n.starts_with('.'))
+            })
+        })
+    })
+}
+
 /// Read one record. `Err` for unreadable, malformed or unknown-version files.
 pub fn read(path: &Path) -> Result<Record, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;

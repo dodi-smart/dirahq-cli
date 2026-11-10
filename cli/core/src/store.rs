@@ -3627,11 +3627,11 @@ impl Store {
             // them, so this session's stored intervals that overlap the new one
             // are replaced, and their days re-sent.
             let replaced = sqlx::query(
-                "DELETE FROM day_intervals WHERE id != ?1 AND session_id = ?2 \
-                 AND started_at < ?3 AND ended_at > ?4 RETURNING day, repo",
+                "DELETE FROM day_intervals WHERE id != ?1 \
+                 AND julianday(started_at) < julianday(?2) \
+                 AND julianday(ended_at) > julianday(?3) RETURNING day, repo",
             )
             .bind(&i.id)
-            .bind(&i.source_session)
             .bind(&i.ended_at)
             .bind(&i.started_at)
             .fetch_all(&mut *tx)
@@ -6794,6 +6794,48 @@ mod v2_tests {
             .unwrap();
         let d = &store.pending_day_rollups(10).await.unwrap()[0];
         assert_eq!((d.human_seconds, d.interval_count), (240, 2));
+    }
+
+    #[tokio::test]
+    async fn sub_second_spans_are_compared_as_times_not_text() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        // As text, "…04:00.1Z" sorts after "…04:00.12Z": the stored interval
+        // would read as overlapping the next one and be deleted.
+        store
+            .record_acked_batch(&batch(vec![span("a", &day, "10:00:00", "10:04:00.1", 240)]))
+            .await
+            .unwrap();
+        store
+            .record_acked_batch(&batch(vec![span(
+                "b",
+                &day,
+                "10:04:00.12",
+                "10:06:00",
+                120,
+            )]))
+            .await
+            .unwrap();
+        let d = &store.pending_day_rollups(10).await.unwrap()[0];
+        assert_eq!((d.human_seconds, d.interval_count), (360, 2));
+    }
+
+    #[tokio::test]
+    async fn an_overlap_from_another_session_also_replaces_the_stale_interval() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        store
+            .record_acked_batch(&batch(vec![span("x", &day, "10:00:00", "10:04:00", 240)]))
+            .await
+            .unwrap();
+        // Human time is de-duplicated across sessions, so a re-derived interval
+        // from another session overlapping a stored one means the stored one is
+        // stale.
+        let mut late = span("y", &day, "10:00:00", "10:04:00", 240);
+        late.source_session = "other".into();
+        store.record_acked_batch(&batch(vec![late])).await.unwrap();
+        let d = &store.pending_day_rollups(10).await.unwrap()[0];
+        assert_eq!((d.human_seconds, d.interval_count), (240, 1));
     }
 
     #[tokio::test]

@@ -343,11 +343,6 @@ fn ingest_record(state: &AppState, record: serde_json::Value) -> Response {
             message: format!("unknown harness: {}", rec.harness),
         };
     };
-    // Delivered twice (the shim timed out after this daemon had queued it,
-    // and spooled it too): acknowledge, store once.
-    if crate::spool::already_queued(&rec.id) {
-        return Response::Ok;
-    }
     let at = crate::spool::event_time(Some(&rec.observed_at));
     admit_and_enqueue(state, &rec.harness, &rec.id, rec.event, harness_kind, at)
 }

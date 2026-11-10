@@ -1,3 +1,24 @@
+## [0.12.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.11.0...v0.12.0) (2026-11-10)
+
+### ✨ Features
+
+* **cli:** bot-less meeting detection, accounting overlay and contract 2.1 ([#222](https://github.com/dodi-smart/dirahq-cli/issues/222)) ([dc65f8e](https://github.com/dodi-smart/dirahq-cli/commit/dc65f8e932dc8e48ad2e5e175e517714dbb8c702))
+* **cli:** per-session branch/spec/tokens, ended run children, scratch-session label and report/sessions polish ([6e6d1db](https://github.com/dodi-smart/dirahq-cli/commit/6e6d1db1799749713e81dec70401e938f43fbf5a)), references [#171](https://github.com/dodi-smart/dirahq-cli/issues/171) [#182](https://github.com/dodi-smart/dirahq-cli/issues/182) [#181](https://github.com/dodi-smart/dirahq-cli/issues/181)
+* **cli:** transparent install and update, zero event loss, Windows fixes and wire contract 2.0 ([#221](https://github.com/dodi-smart/dirahq-cli/issues/221)) ([da00113](https://github.com/dodi-smart/dirahq-cli/commit/da001139086ba90597087179261b37c92b99acb3))
+* **cli:** unix socket permission advice, doctor token backlog and --json for version, daemon/device status, update --check ([97f6ad3](https://github.com/dodi-smart/dirahq-cli/commit/97f6ad3c07a05ee1a488180d89f2b03eb2c00d19))
+
+### 🐛 Bug Fixes
+
+* **cli:** never count a headless CI run's prompts as human engaged time ([1f5a859](https://github.com/dodi-smart/dirahq-cli/commit/1f5a859e4628b3cdf1f3192feb9010dd60c86f5d))
+* **cli:** never let a committed dira hook command exit 2 when its script is missing ([1fbe8ea](https://github.com/dodi-smart/dirahq-cli/commit/1fbe8ea161eef1869fd540b000120fdbd08ea49b))
+* **cli:** refresh model pricing from models.dev ([f393042](https://github.com/dodi-smart/dirahq-cli/commit/f393042202e63e18496579e6594180bfa97143e5))
+* **cli:** refresh model pricing from models.dev ([0e814eb](https://github.com/dodi-smart/dirahq-cli/commit/0e814eb7e4481553202f6a2975ca866cf3954034))
+* **cli:** sum token usage into daily rollups and compact only whole utc days ([deed7ce](https://github.com/dodi-smart/dirahq-cli/commit/deed7ce96e1b3c19856e0b8ab3e30c5f5e3e6a5b)), references [#216](https://github.com/dodi-smart/dirahq-cli/issues/216)
+
+### ♻️ Code Refactoring
+
+* **cli:** fold duplicated session, token and daemon-state logic into shared helpers ([b9b992e](https://github.com/dodi-smart/dirahq-cli/commit/b9b992e2ac39e16eaaccd8de3e9c1dda67004704)), references [#217](https://github.com/dodi-smart/dirahq-cli/issues/217)
+
 ## [0.11.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.10.1...v0.11.0) (2026-10-20)
 
 ### ✨ Features

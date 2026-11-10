@@ -270,7 +270,8 @@ billed from tokens.
    total: the part a span covers gets `floor`, and the rest gets the remainder. Cutting a gap
    therefore never loses seconds to truncation.
 8. **Window and day splits** (M1). The overlay runs on unclipped gaps and spans, padded by `±idle`
-   around the requested window. Slices are split at UTC midnight only after the overlay.
+   around the requested window. Slices are split at UTC midnight only after the overlay. (Amended by DIRASH-0067:
+   wire restatement slices are not split at midnight, matching flush intervals.)
    Clipping first double-counts a gap that crosses midnight inside a meeting.
 
 With no spans, the output equals today's gaps as `Work`. This is the **regression gate**:

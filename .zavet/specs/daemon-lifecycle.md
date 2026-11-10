@@ -10,8 +10,9 @@ paths:
   - cli/dirad/src/control.rs
   - cli/dira/src/daemon.rs
   - cli/core/src/config.rs
+  - cli/core/src/process.rs
   - cli/ipc/**
-decisions: [D-0008, D-0009, D-0010, D-0016, D-0019]
+decisions: [D-0008, D-0009, D-0010, D-0016, D-0019, DIRASH-0048]
 ---
 
 ## Overview
@@ -82,6 +83,30 @@ the interactive user entirely. That was a silent, total capture outage.
   socket and pidfile, and starts a fresh daemon on the fixed path. If its pid
   cannot be determined, restart errors with manual instructions instead of
   starting a second daemon beside it.
+- `dirad` writes its own pidfile (`Config::pidfile_path`) right after binding
+  the control channel, and removes it on exit only if it still names this
+  process. A supervised daemon therefore has one too. `dira daemon stop` stops
+  each kind the way it expects: `launchctl unload` for launchd, `systemctl
+  --user stop` for systemd, and confirmed-exit `Shutdown`/`taskkill` for the
+  windows task and Run key (DIRASH-0048).
+- Long-lived children (`dirad` from `daemon start`, the hook shim's autostart,
+  the background updater, the update-check refresh) go through
+  `dira_core::process::spawn_background`: stdin null, output to a log or null,
+  windowless, in their own process group. Both `main`s first call
+  `disinherit_std_handles`, which clears the inherit flag on the process's own
+  std handles once. Before this, `install.ps1 | Out-Null` and a harness reading
+  a hook's stdout hung for as long as the daemon lived (reproduced in the VM
+  run, 2026-11-10). `Stdio::inherit()` children are unaffected: Rust hands them
+  a fresh inheritable duplicate.
+- The registered service supervises only the default instance. An instance
+  on its own endpoint (`DIRA_SOCKET_PATH`) is never labelled as service-run,
+  and on windows its pidfile sits beside its own `DIRA_DB_PATH`.
+- `dira daemon install` waits up to 10 s for the daemon to answer and says
+  so; a slow start is reported, never an error.
+- On windows `dirad` is a windows-subsystem binary: it never gets a console
+  window, and it attaches the parent's console only for `--version`. Every
+  child it spawns is created with `CREATE_NO_WINDOW`
+  (`dira_core::process`).
 - **No replacement daemon is started until the previous PROCESS is confirmed
   exited** (D-0019), on every windows restart path, bare and scheduled-task
   alike. The sequence is `Shutdown` → wait for process exit → `taskkill /F` →

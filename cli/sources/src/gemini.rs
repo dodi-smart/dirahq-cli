@@ -68,6 +68,7 @@ pub fn normalize(hook: &GeminiHook) -> Option<Normalized> {
         source: None,
         reason: None,
         hints: Default::default(),
+        facts: Default::default(),
     })
 }
 

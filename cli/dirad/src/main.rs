@@ -3,14 +3,34 @@
 //! All the wiring lives in the [`dirad`] library crate so integration tests can
 //! stand up the same daemon; this binary just initializes tracing and calls
 //! [`dirad::run`].
+//!
+//! On windows this is a windows-subsystem binary (DIRASH-0048). A console binary
+//! launched by Task Scheduler or the Run key gets a console window of its own,
+//! which stayed open and empty for as long as the daemon ran (every logon, and
+//! after every `dira update`), and closing it shut the daemon down. A
+//! windows-subsystem process never gets one. It logs to a file anyway.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() -> anyhow::Result<()> {
+    // Children (git, plugin scripts, the background updater) must not hold
+    // whatever handles this process was started with.
+    dira_core::process::disinherit_std_handles();
     // The daemon takes no real CLI args, but answer `--version`/`-V` directly so
     // it can be inspected the same way as `dira` (e.g. by a service script).
     if std::env::args()
         .skip(1)
         .any(|a| a == "--version" || a == "-V")
     {
+        // A windows-subsystem process starts with no console. Borrow the
+        // terminal's, only on this path: attaching on a normal start would tie
+        // the daemon to whatever console launched it, and closing that console
+        // would then stop the daemon.
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
         println!(
             "dirad {} (schema {})",
             env!("CARGO_PKG_VERSION"),

@@ -20,6 +20,7 @@ use std::panic::AssertUnwindSafe;
 use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc;
+#[cfg(test)]
 use ulid::Ulid;
 
 /// How long a NEGATIVE (`project: None`) resolution stays cached before it's
@@ -135,6 +136,7 @@ pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capt
             EventMsg::Raw(ev) => (ev.kind, ev.session_id.clone()),
             EventMsg::Hook { norm, .. } => (norm.kind, norm.session_id.clone()),
         };
+        let spooled = matches!(msg, EventMsg::Hook { spooled: true, .. });
 
         let outcome = AssertUnwindSafe(process_message(
             &state,
@@ -150,6 +152,10 @@ pub async fn writer_with(mut rx: mpsc::Receiver<EventMsg>, state: AppState, capt
         ))
         .catch_unwind()
         .await;
+        // Written (or dropped by a panic): no longer on its way.
+        if spooled {
+            crate::spool::finished_spooled();
+        }
 
         if let Err(panic) = outcome {
             state.progress.mark_writer_panic();
@@ -230,6 +236,29 @@ async fn process_message(
         }
         _ => None,
     };
+    // Contract 2.0 session facts (DIRASH-0052), recorded before coalescing so a
+    // tool call that is coalesced away still counts. Only the counts and the
+    // path hash reach the store; the tool input was dropped at normalization.
+    if let EventMsg::Hook { norm, .. } = &msg {
+        let f = &norm.facts;
+        if (f.lines_added > 0 || f.lines_removed > 0 || f.compaction || f.path_hash.is_some())
+            && !dira_core::model::is_probe_session(&norm.session_id)
+        {
+            if let Err(e) = state
+                .store
+                .record_hook_facts(
+                    &norm.session_id,
+                    f.lines_added,
+                    f.lines_removed,
+                    f.compaction,
+                    f.path_hash.as_deref(),
+                )
+                .await
+            {
+                tracing::debug!("recording session facts failed: {e}");
+            }
+        }
+    }
     let (mut ev, repo_dir) = match msg {
         EventMsg::Raw(ev) => {
             // Unchanged from before evidence existed: a raw event's own
@@ -237,7 +266,9 @@ async fn process_message(
             let dir = ev.project.as_ref().and(ev.cwd.clone());
             (*ev, dir)
         }
-        EventMsg::Hook { norm, harness, at } => enrich(norm, harness, at, cache),
+        EventMsg::Hook {
+            norm, harness, at, ..
+        } => enrich(norm, harness, at, cache),
     };
     if ev.lineage.host_session.is_some() && ev.lineage.parent_session.is_none() {
         ev.lineage.parent_session = resolve_parent(state, &ev, &mut cache.parents).await;
@@ -326,8 +357,13 @@ async fn process_message(
     // normal path. `ManualStop` is deliberately not a trigger — a manual session is
     // an explicit `dira start`, and `ManualStop` is itself a human signal, so it
     // could never be degenerate anyway.
+    //
+    // Not while the spool holds records: a live `SessionEnd` can overtake the
+    // same session's spooled prompt or tool events (DIRASH-0049), and pruning
+    // then would delete a real session whose activity arrives a moment later.
     if ev.kind == EventKind::SessionEnd
         && crate::control::lock_recover(&state.sessions).is_degenerate(&ev.session_id)
+        && !crate::spool::pending(&state.config.db_path)
     {
         match state.store.delete_session_events(&ev.session_id).await {
             Ok(deleted) => {
@@ -673,7 +709,7 @@ fn enrich(
     let branch = branch_dir.and_then(|dir| project::current_branch(std::path::Path::new(dir)));
 
     let ev = RawEvent {
-        id: Ulid::generate().to_string(),
+        id: dira_core::model::new_event_id(),
         at,
         session_id: norm.session_id,
         harness,
@@ -866,6 +902,19 @@ async fn transcript_fingerprint(file: &mut tokio::fs::File, len: u64) -> Option<
 
 fn offset_key_for(session_id: &str, transcript_path: &str) -> String {
     let path = std::path::Path::new(transcript_path);
+    // A legacy-layout sidecar sits directly in the project dir, shared by every
+    // session there, so its watermark is keyed by the FILE: each one is read
+    // once overall instead of from offset 0 by every new session. The current
+    // layout (`<session>/subagents/`) belongs to one session and stays keyed
+    // by it.
+    let in_session_dir = path
+        .parent()
+        .and_then(|d| d.file_name())
+        .is_some_and(|n| n == "subagents");
+    if is_subagent_transcript(path) && !in_session_dir {
+        let h = dira_core::sync::fnv1a_bytes(transcript_path.as_bytes(), 0xcbf2_9ce4_8422_2325);
+        return format!("token_offset:sidecar:{h:016x}");
+    }
     if is_subagent_transcript(path) {
         let stem = path
             .file_stem()
@@ -877,28 +926,57 @@ fn offset_key_for(session_id: &str, transcript_path: &str) -> String {
     }
 }
 
-/// Sibling `agent-*.jsonl` transcripts beside the session's own, oldest-first.
+/// The session's subagent `agent-*.jsonl` transcripts, sorted.
 ///
 /// Claude Code writes subagent turns to separate files that no hook ever names,
 /// so without this sweep their usage never enters the store on any platform —
 /// measured at 840 turns / 85M tokens / ~$158 in a single week on one machine.
-/// Directory reads are cheap and happen only at a turn boundary; each file
-/// carries its own watermark, so an unchanged sidecar costs one `metadata` call.
+///
+/// Two layouts:
+/// - current: `<project>/<session-id>/subagents/agent-*.jsonl`, beside the
+///   session's own `<project>/<session-id>.jsonl`. Only this session's files.
+///   The sweep used to look only in `<project>/`, so it never found these.
+/// - legacy: `agent-*.jsonl` directly in `<project>/`, shared by every session
+///   in the project. Their watermarks are keyed by file ([`offset_key_for`]),
+///   so an unchanged one costs one `metadata` call no matter how many sessions
+///   sweep it. Keyed by session, every new session used to re-read all of them
+///   from offset 0.
 fn subagent_transcripts(main: &str) -> Vec<String> {
-    let Some(dir) = std::path::Path::new(main).parent() else {
-        return Vec::new();
+    let main = std::path::Path::new(main);
+    let agent_files = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        is_subagent_transcript(p)
+                            && p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut found: Vec<String> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            is_subagent_transcript(p) && p.extension().and_then(|x| x.to_str()) == Some("jsonl")
-        })
-        .filter_map(|p| p.to_str().map(str::to_string))
-        .collect();
+    let mut found: Vec<String> = Vec::new();
+    // Current layout: `<project>/<session-id>/subagents/`.
+    if let Some(stem) = main.file_stem() {
+        if let Some(dir) = main.parent() {
+            let sub = dir.join(stem).join("subagents");
+            found.extend(
+                agent_files(&sub)
+                    .into_iter()
+                    .filter_map(|p| p.to_str().map(str::to_string)),
+            );
+        }
+    }
+    // Legacy layout: siblings in the project dir.
+    if let Some(dir) = main.parent() {
+        found.extend(
+            agent_files(dir)
+                .into_iter()
+                .filter_map(|p| p.to_str().map(str::to_string)),
+        );
+    }
     // Deterministic order so a capture sweep is reproducible.
     found.sort();
     found
@@ -1251,7 +1329,8 @@ mod tests {
         // The session's own transcript keeps the legacy key, so upgrading does not
         // orphan existing watermarks and re-read multi-megabyte transcripts.
         assert_eq!(main, "token_offset:sess-1");
-        assert_eq!(side, "token_offset:sess-1:agent-abc");
+        // A legacy sibling is keyed by file (see `offset_key_for`).
+        assert!(side.starts_with("token_offset:sidecar:"));
         // Two different sidecars are also distinct from each other.
         assert_ne!(side, offset_key_for("sess-1", "/p/agent-def.jsonl"));
         // `nuke` clears these with `LIKE 'token_offset:%'` — both forms match.
@@ -1286,6 +1365,46 @@ mod tests {
             names,
             vec!["agent-aaa.jsonl", "agent-bbb.jsonl"],
             "only agent-*.jsonl siblings, sorted, never the main transcript"
+        );
+    }
+
+    #[test]
+    fn subagent_discovery_finds_the_current_per_session_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("sess-1.jsonl");
+        std::fs::write(&main, "").unwrap();
+        let sub = dir.path().join("sess-1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-x.jsonl"), "").unwrap();
+        // Another session's subagents are never swept for this one.
+        let other = dir.path().join("sess-2/subagents");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent-y.jsonl"), "").unwrap();
+        let found = subagent_transcripts(main.to_str().unwrap());
+        assert_eq!(found.len(), 1);
+        // Component-wise, so the check holds with backslash separators on Windows.
+        let expected = std::path::Path::new("sess-1")
+            .join("subagents")
+            .join("agent-x.jsonl");
+        assert!(std::path::Path::new(&found[0]).ends_with(&expected));
+    }
+
+    #[test]
+    fn a_legacy_sidecar_has_one_watermark_shared_by_every_session() {
+        let legacy = "/p/agent-abc.jsonl";
+        assert_eq!(
+            offset_key_for("sess-1", legacy),
+            offset_key_for("sess-2", legacy),
+            "read once overall, not once per session"
+        );
+        assert_ne!(
+            offset_key_for("sess-1", legacy),
+            offset_key_for("sess-1", "/p/agent-def.jsonl")
+        );
+        // The current layout belongs to one session and stays keyed by it.
+        assert_eq!(
+            offset_key_for("sess-1", "/p/sess-1/subagents/agent-x.jsonl"),
+            "token_offset:sess-1:agent-x"
         );
     }
 
@@ -1372,6 +1491,7 @@ mod tests {
                 evidence,
                 ..Default::default()
             }),
+            facts: Default::default(),
         }
     }
 
@@ -1957,7 +2077,7 @@ mod tests {
         );
         assert!(state
             .store
-            .meta_get("token_offset:sess-1:agent-aaa")
+            .meta_get(&offset_key_for("sess-1", side.to_str().unwrap()))
             .await
             .unwrap()
             .is_some());

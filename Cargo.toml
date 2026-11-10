@@ -107,6 +107,9 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 keyring = { version = "4", features = ["v1"] }
 keyring-core = "1"
 serde_jcs = "0.2"
+# Contract 2.0 ingest bodies are zstd when the cloud advertises it (DIRASH-0052).
+# Pure Rust, so no extra C toolchain on the musl and windows-arm64 legs.
+ruzstd = "0.9"
 base64 = "0.23"
 
 # Config + ids + logging

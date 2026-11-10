@@ -12,8 +12,9 @@ paths:
   - cli/dirad/src/sync.rs
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
+  - cli/dirad/src/chain.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046, DIRASH-0049, DIRASH-0052]
 ---
 
 ## Overview
@@ -25,6 +26,34 @@ rollups keep their `prompts`/`branch`/wall-clock when a session outlives a
 single flush window (issue #40).
 
 ## Behavior
+
+- **Contract 2.0 hash chain (DIRASH-0052).**
+  - **Fields.** Every attestation batch, including lineage re-sends, carries
+    `seq`, `prevBatchHash` (SHA-256 of the previous acknowledged batch's JCS
+    payload, `""` at seq 0) and `chainEpoch`, plus `client`.
+  - **When.** The chain is stamped before signing and advances only on a 2xx,
+    so a retry is byte-identical and a quarantined chunk does not advance it.
+  - **Reset.** `nuke` and a cloud data-epoch reset start a new epoch at seq 0.
+  - **State.** Kept in `meta` as `batch_seq`, `batch_prev_hash` and
+    `chain_epoch`.
+- **Contract 2.0 producer fields.**
+  - **`captureHealth`.** The first chunk of each flush carries spool and
+    quarantine deltas since the last acknowledged report.
+  - **`stats`.** Session rollups carry `stats` derived from the event log:
+    tool calls by category (`dira_core::stats::tool_category`, MCP server
+    names never sent), subagents, permission prompts, and the approval wait
+    capped at 30 min. Manual sessions carry none.
+  - **zstd.** Ingest bodies are zstd only when the last `/api/v1/meta` listed
+    it in `acceptEncodings`.
+  - **Claude Code session facts.** The writer records lines added/removed,
+    compactions and touched-file path hashes per session at capture time,
+    before coalescing (`session_facts`, `session_paths`, migration 0010). Sync
+    adds them to Claude Code rollups.
+  - **Day rollups.** Each acknowledged batch is recorded per UTC day and repo
+    in the `day_*` tables, keyed by wire id so re-sends replace themselves.
+    Changed days ride the next flush's first chunk as `dayRollups`; on ack
+    their revision advances. Days older than 40 days are pruned, and `nuke`
+    clears all of it.
 
 - A flush reads events in `(META_SYNC_CURSOR, until]`, splits the window into
   chunks only at > idle breaks (never inside a billable interval), POSTs each
@@ -234,6 +263,16 @@ single flush window (issue #40).
   therefore evidence of one pathological record, not of backlog size, and
   gets its own `SyncError` + `payload_too_large` health kind so it is never
   mistaken for a retryable failure.
+- A chunk the cloud rejects for its content (413, or a 4xx other than
+  401/403) five times in a row is quarantined (DIRASH-0049). The event,
+  artifact and token cursors advance to that chunk's high-water marks, and its
+  bounds and reason are appended to the `sync_quarantine` meta list (newest
+  100 kept). Auth, schema skew, 429, 5xx and network errors never count.
+  Before this, one malformed row stopped the event cursor for good.
+- Event ids come from one process-wide monotonic ULID generator
+  (`dira_core::model::new_event_id`), so id order is mint order. A random
+  within-millisecond ULID could put an event behind the `(cursor, until]`
+  window and skip it forever.
 - `events.at`, `token_usage.at` and `artifacts.authored_at` are stored
   fixed-width UTC (`…SS.fffffffffZ`), so text order is time order
   (DIRASH-0043). Every `ORDER BY at` and every `at` bound (hydrate replay,

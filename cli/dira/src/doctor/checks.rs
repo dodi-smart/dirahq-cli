@@ -145,9 +145,10 @@ pub(crate) fn supervision(f: &Facts) -> Check {
     };
     let detail = json!({ "supervision": label });
     match &f.supervision {
-        Supervision::Launchd | Supervision::SystemdUser | Supervision::ScheduledTask => {
-            Check::ok(ID, label).detail(detail)
-        }
+        Supervision::Launchd
+        | Supervision::SystemdUser
+        | Supervision::ScheduledTask
+        | Supervision::RunKey => Check::ok(ID, label).detail(detail),
         Supervision::Pidfile(_) | Supervision::Socket(_) => Check::warn(
             ID,
             format!("{label} — nothing will restart it after a reboot"),
@@ -606,7 +607,7 @@ pub(crate) fn breadcrumb(h: Option<&Health>) -> Check {
     Check::fail(
         ID,
         format!(
-            "{} {} hook(s) could not reach dirad — captured activity is being lost",
+            "{} {} hook(s) could not reach dirad — they are kept in the spool until it is back",
             h.consecutive, h.harness
         ),
     )
@@ -617,6 +618,38 @@ pub(crate) fn breadcrumb(h: Option<&Health>) -> Check {
         "last_error": h.last_error,
         "last_error_at": h.last_error_at,
     }))
+}
+
+/// Hooks waiting in the spool, and chunks sync stepped past (DIRASH-0049).
+///
+/// A non-empty spool with a running daemon is a backlog being replayed, so a
+/// warning. With no daemon it is capture that will not land until one starts,
+/// so a failure. Quarantined chunks were rejected by the cloud and skipped:
+/// their data is local only until a resync.
+pub(crate) fn capture_backlog(spooled: usize, quarantined: usize, daemon_up: bool) -> Check {
+    const ID: &str = "capture.backlog";
+    let detail = json!({ "spooled": spooled, "quarantined": quarantined });
+    if spooled > 0 && !daemon_up {
+        return Check::fail(
+            ID,
+            format!("{spooled} hook(s) are spooled and nothing is running to replay them"),
+        )
+        .remedy("dira daemon start")
+        .detail(detail);
+    }
+    if quarantined > 0 {
+        return Check::warn(
+            ID,
+            format!("{quarantined} sync chunk(s) were rejected by the cloud and skipped"),
+        )
+        .remedy("dira device resync")
+        .detail(detail);
+    }
+    if spooled > 0 {
+        return Check::warn(ID, format!("{spooled} spooled hook(s) are being replayed"))
+            .detail(detail);
+    }
+    Check::ok(ID, "no spooled hooks, no skipped sync chunks").detail(detail)
 }
 
 /// Does the invoking directory resolve to a project ref?
@@ -693,7 +726,9 @@ pub(crate) fn sync_health(d: &DeviceProbe) -> Check {
         Some(line) => Check::warn(ID, line)
             .remedy(match h.last_error_kind.as_deref() {
                 Some("signature_rejected") => "dira device rotate-key",
-                Some("unauthorized") | Some("device_unknown") => "dira device link",
+                Some("unauthorized") | Some("unknown_device") | Some("device_unknown") => {
+                    "dira device link"
+                }
                 _ => "dira device resync  (and `dira status` for the reason)",
             })
             .detail(json!({
@@ -1280,6 +1315,8 @@ pub(crate) mod tests {
             update: super::super::UpdateFacts::default(),
             cloud: cloud_facts_plain(),
             spec_sources: SpecSourceFacts::default(),
+            spooled: 0,
+            quarantined: 0,
         }
     }
 
@@ -1296,6 +1333,14 @@ pub(crate) mod tests {
     }
 
     // --- project.resolves (#111) -------------------------------------------
+
+    #[test]
+    fn capture_backlog_fails_only_when_nothing_will_replay_the_spool() {
+        assert_eq!(capture_backlog(0, 0, true).level, Level::Ok);
+        assert_eq!(capture_backlog(3, 0, true).level, Level::Warn);
+        assert_eq!(capture_backlog(3, 0, false).level, Level::Fail);
+        assert_eq!(capture_backlog(0, 2, true).level, Level::Warn);
+    }
 
     fn facts_with_project(p: Result<String, dira_core::project::ProjectMiss>) -> Facts {
         Facts {
@@ -1799,6 +1844,7 @@ pub(crate) mod tests {
         for (kind, want) in [
             ("signature_rejected", "dira device rotate-key"),
             ("unauthorized", "dira device link"),
+            ("unknown_device", "dira device link"),
             ("device_unknown", "dira device link"),
             (
                 "network",

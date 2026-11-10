@@ -100,6 +100,14 @@
       "description": "The cloud's advertised contract-version range, from `GET /api/v1/meta`.\n\nLets the daemon perform a best-effort startup handshake: if our\n[`SCHEMA_VERSION`] falls outside `[min_schema_version, schema_version]`, the\ndaemon logs a clear warning (non-fatal). Evolution is additive within a major,\nso a mismatch is usually a heads-up, not a hard stop.",
       "type": "object",
       "properties": {
+        "acceptEncodings": {
+          "description": "2.0: request-body encodings ingest accepts besides identity, e.g.\n`[\"zstd\"]`. Absent (an older cloud) means none: the producer then sends\nan uncompressed body rather than fail.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "minSchemaVersion": {
           "description": "The oldest contract version the cloud still accepts, e.g. `\"1.0.0\"`.",
           "type": "string",

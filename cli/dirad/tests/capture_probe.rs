@@ -43,6 +43,7 @@ async fn send_hook(state: &AppState, session_id: &str) -> Response {
         Request::IngestHook {
             harness: "claude".into(),
             payload: probe_hook_payload(session_id, "/tmp"),
+            observed_at: None,
         },
     )
     .await

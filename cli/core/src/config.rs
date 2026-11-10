@@ -126,13 +126,27 @@ fn default_agent_max_span_seconds() -> u64 {
 /// after `status`/`version`/`daemon status` (plan §A5) — `dira update` itself
 /// is always an explicit, user-run command and never reads this knob. Env
 /// override: `DIRA_UPDATE__CHECK=true|false`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateKnobs {
     /// Whether the passive notice may run at all: `false` suppresses both
     /// the printed notice and the background cache refresh that keeps it
     /// warm (see `update/notice.rs`).
     #[serde(default = "default_true")]
     pub check: bool,
+    /// Whether updates are applied in the background (DIRASH-0050): `dirad`
+    /// schedules a detached `dira update --auto` every few hours. On by
+    /// default. `DIRA_DISABLE_AUTOUPDATE` and `CI` also turn it off.
+    #[serde(default = "default_true")]
+    pub auto: bool,
+    /// The release channel updates resolve against (`stable`, `prerelease`).
+    /// Unset: the channel of the installed version. Written by the installers
+    /// and by `dira update --channel`.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// A version auto-update must not install again, set by
+    /// `dira update --rollback` so a bad release is not re-applied.
+    #[serde(default)]
+    pub skip_version: Option<String>,
 }
 
 impl Default for UpdateKnobs {
@@ -141,8 +155,21 @@ impl Default for UpdateKnobs {
         // zero value), contradicting the field's own serde default — checking
         // is on out of the box, same as every pre-A5 config that lacks an
         // `[update]` table entirely.
-        Self { check: true }
+        Self {
+            check: true,
+            auto: true,
+            channel: None,
+            skip_version: None,
+        }
     }
+}
+
+/// Whether background auto-update may run in this process: the `update.auto`
+/// knob, and neither `DIRA_DISABLE_AUTOUPDATE` nor `CI` set. Shared by `dirad`
+/// (which schedules) and `dira update --auto` (which applies).
+pub fn auto_update_enabled(config: &Config) -> bool {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
+    config.update.auto && !set("DIRA_DISABLE_AUTOUPDATE") && !set("CI")
 }
 
 /// Daemon + CLI configuration.
@@ -465,8 +492,8 @@ impl Config {
     /// Load defaults, then `config.toml` (if present), then `DIRA_*` env vars.
     pub fn load() -> Result<Self, crate::Error> {
         let mut fig = Figment::from(Serialized::defaults(Config::default()));
-        if let Some(dirs) = project_dirs() {
-            fig = fig.merge(Toml::file(dirs.config_dir().join("config.toml")));
+        if let Some(path) = config_file_path() {
+            fig = fig.merge(Toml::file(path));
         }
         fig.merge(
             Env::prefixed("DIRA_").map(|k| k.as_str().to_lowercase().replace("__", ".").into()),
@@ -609,11 +636,61 @@ impl Config {
         }
         #[cfg(windows)]
         {
-            project_dirs()
-                .map(|d| d.data_dir().to_path_buf())
+            // The directory the database lives in: the project data dir by
+            // default, and an isolated instance's own dir under
+            // `DIRA_DB_PATH`. It used to be the project data dir always, so
+            // an isolated daemon's pidfile landed in the real install's
+            // data dir.
+            self.db_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(PathBuf::from)
+                .or_else(|| project_dirs().map(|d| d.data_dir().to_path_buf()))
                 .unwrap_or_else(std::env::temp_dir)
         }
     }
+
+    /// The daemon's pidfile for this control endpoint. One definition shared by
+    /// `dirad`, which writes it itself right after binding the control channel,
+    /// and `dira daemon`, which reads it to stop or restart. Before `dirad` wrote
+    /// its own, only `dira daemon start` did, so a daemon launched by launchd,
+    /// systemd, the logon task or the Run key had none, and `dira daemon stop`
+    /// could not find it.
+    ///
+    /// unix: `dirad.pid` in [`Self::runtime_dir`], i.e. beside the socket (D-0008:
+    /// never a temp-dir anchor). windows: also under [`Self::runtime_dir`], because
+    /// a pipe path has no filesystem parent; the name carries the endpoint
+    /// identity there, so two isolated daemons never share one file.
+    pub fn pidfile_path(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            self.runtime_dir().join("dirad.pid")
+        }
+        #[cfg(windows)]
+        {
+            let stem = self
+                .socket_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("dira");
+            self.runtime_dir()
+                .join(format!("dirad-{}.pid", sanitize_ident(stem)))
+        }
+    }
+}
+
+/// The `config.toml` that [`Config::load`] reads and `dira config set` writes:
+/// `$DIRA_CONFIG_DIR/config.toml` when that is set, else the platform config
+/// dir. The override exists for isolated instances (a second daemon, an e2e
+/// run against a local cloud): together with `DIRA_SOCKET_PATH`,
+/// `DIRA_DB_PATH` and `DIRA_HTTP_PORT` it keeps every file such an instance
+/// touches out of the user's real install. `XDG_CONFIG_HOME` cannot do this on
+/// macOS, where the config dir derives from `Application Support`.
+pub fn config_file_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("DIRA_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir).join("config.toml"));
+    }
+    project_dirs().map(|d| d.config_dir().join("config.toml"))
 }
 
 /// XDG project dirs for `sh.dirahq.dira`. `None` only on exotic platforms.

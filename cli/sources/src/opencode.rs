@@ -58,6 +58,7 @@ pub fn normalize(hook: &OpenCodeHook) -> Option<Normalized> {
         source: None,
         reason: None,
         hints: Default::default(),
+        facts: Default::default(),
     })
 }
 

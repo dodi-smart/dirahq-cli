@@ -12,7 +12,7 @@ paths:
   - install.sh
   - install.ps1
   - docs/getting-started.md
-decisions: [D-0001, D-0004, D-0007, D-0009, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0030, DIRASH-0038, DIRASH-0039, DIRASH-0040]
+decisions: [D-0001, D-0004, D-0007, D-0009, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0030, DIRASH-0038, DIRASH-0039, DIRASH-0040, DIRASH-0051]
 checks:
   - cloud:repo step decision logic :: cargo test -p dira --bin dira -- onboard::steps::tests::cloud_repo
   - end-to-end: wires the repo and a second run is a no-op :: cargo test -p dira --test onboard_e2e yes_wires_the_repo_for_cloud_agents_and_a_second_run_is_a_noop
@@ -36,7 +36,20 @@ what happened.
 
 ## Behavior
 
-Detection (step 1, in `detect::run`) plus seven steps that each return a
+- **Installer handoff (DIRASH-0051).**
+  - `install.sh`/`install.ps1` register the per-user service by default,
+    terminal or not. They skip it for `--no-service`, `--no-daemon`,
+    `--no-interactive`, `CI=true`, or an elevated PowerShell.
+  - Every install records `update.channel`.
+  - With a terminal the installer runs `dira onboard` itself. Without one it
+    prints the command.
+- **Codex** is wired like the other harnesses: `dira init codex` merges its
+  `[[hooks.<Event>]]` tables into `~/.codex/config.toml` (or
+  `$CODEX_HOME/config.toml`) with `toml_edit`, idempotently, keeping the
+  user's own content and refusing an unparseable file. It is no longer an
+  open item to paste by hand.
+
+Detection (step 1, in `detect::run`) plus the steps below, each returning a
 `StepOutcome`: `Done`, `AlreadyDone`, `Skipped(reason)` or `Failed(err)`.
 None of them abort the run, in the dependency order `mod::run` calls them:
 
@@ -55,7 +68,7 @@ None of them abort the run, in the dependency order `mod::run` calls them:
 working directory's repo, unlike every other step, which acts on the
 machine), so they stay adjacent rather than interleaved with machine-scoped
 steps; knowledge stays last regardless (see "Knowledge consent" below), since
-its value must be on disk before the daemon's next start. After all seven,
+its value must be on disk before the daemon's next start. After all of them,
 `run()` prints a closing summary (one line per `StepOutcome`) and an
 open-items block. **Neither is a step**:
 neither returns a `StepOutcome` nor appears in the `results` vec the summary

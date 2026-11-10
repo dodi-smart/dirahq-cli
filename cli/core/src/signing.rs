@@ -72,11 +72,22 @@ impl DeviceKey {
 
     /// Sign a payload over its canonical-JSON encoding; returns a base64 signature.
     pub fn sign_payload<T: Serialize>(&self, payload: &T) -> Result<String, Error> {
-        let canonical =
-            serde_jcs::to_vec(payload).map_err(|e| Error::Crypto(format!("canonicalize: {e}")))?;
-        let sig = self.signing.sign(&canonical);
-        Ok(B64.encode(sig.to_bytes()))
+        Ok(self.sign_canonical(&canonical_bytes(payload)?))
     }
+
+    /// Sign bytes that are already the RFC 8785 encoding of a payload (from
+    /// [`canonical_bytes`]). Lets a caller that also hashes the payload (the
+    /// contract 2.0 batch chain) canonicalize once and sign and hash the same
+    /// bytes.
+    pub fn sign_canonical(&self, canonical: &[u8]) -> String {
+        B64.encode(self.signing.sign(canonical).to_bytes())
+    }
+}
+
+/// The RFC 8785 (JCS) encoding of `payload`: the exact bytes every signature
+/// here covers.
+pub fn canonical_bytes<T: Serialize>(payload: &T) -> Result<Vec<u8>, Error> {
+    serde_jcs::to_vec(payload).map_err(|e| Error::Crypto(format!("canonicalize: {e}")))
 }
 
 /// Verify a base64 signature over a payload against a base64 public key. Uses

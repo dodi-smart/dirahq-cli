@@ -16,7 +16,8 @@ Windows uses `irm https://dirahq.sh/install.ps1 | iex`; see [install.md](install
 
 ## What `dira onboard` does
 
-Seven steps, in dependency order. Each one is idempotent and skippable, and the whole
+It detects what the machine already has, then runs the steps below in dependency order.
+Each one is idempotent and skippable, and the whole
 command is safe to re-run — a second run reports what is already done and picks up the
 rest. There is no state file: every step re-derives its own status from the machine,
 which is the only version that cannot go stale.
@@ -25,7 +26,7 @@ which is the only version that cannot go stale.
 |---|---|
 | **detect** | Finds which harnesses, daemon, and repo this machine already has |
 | **harnesses** | Wires every detected harness in one pass, at user scope |
-| **daemon** | Registers `dirad` with launchd / systemd --user / a scheduled task |
+| **daemon** | Registers `dirad` as a per-user service (launchd / systemd --user / a logon task); no admin needed |
 | **device** | Links this device to the cloud — skippable |
 | **zavet** | Installs the knowledge plugin, scaffolds this repo's `.zavet/` |
 | **cloud** | Commits portable hooks + a pinned bootstrap so cloud agents (Claude Code on the web, Cursor cloud) capture this repo too |

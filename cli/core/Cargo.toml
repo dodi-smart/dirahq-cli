@@ -27,6 +27,9 @@ directories.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 serde_jcs.workspace = true
+# Contract 2.0 day-rollup interval digests (DIRASH-0052).
+sha2.workspace = true
+hex.workspace = true
 base64.workspace = true
 keyring.workspace = true
 # `httpclient::builder()` — the one place device→cloud reqwest clients are
@@ -47,3 +50,8 @@ criterion.workspace = true
 [[bench]]
 name = "accounting"
 harness = false
+
+[target.'cfg(windows)'.dependencies]
+# `process::disinherit_std_handles` stops a long-lived child (dirad, the
+# background updater) from inheriting this process's own stdio pipes.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }

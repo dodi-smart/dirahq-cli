@@ -11,9 +11,10 @@ paths:
   - cli/dira/src/update/**
   - cli/dira/src/cloud_init.rs
   - cli/dira/src/daemon.rs
+  - cli/dirad/src/autoupdate.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038, DIRASH-0048, DIRASH-0050]
 checks:
   - the post-update steps honour --no-zavet and --no-cloud :: cargo test -p dira --bin dira -- update::tests::post_update_steps_honour_no_zavet_and_no_cloud
   - refresh never creates artifacts and never lowers a pin :: cargo test -p dira --bin dira -- cloud_init::tests::refresh_never_creates_artifacts_and_never_downgrades
@@ -35,6 +36,34 @@ Releases as the only artifact source, and an in-binary updater that swaps
 both executables and restarts whatever is supervising the daemon.
 
 ## Behavior
+
+- **Background auto-update (DIRASH-0050).**
+  - **Schedule.** `dirad` spawns a detached, windowless `dira update --auto`
+    10 min after start, then every 6 h ± 30 min. Output goes to
+    `logs/update.log`, capped at 1 MiB.
+  - **Work.** The CLI does all of it through the ordinary update path. It acts
+    only on a strictly newer release that is not in `update.skip_version`,
+    under an `update.lock`, and is a no-op when `update.auto = false`,
+    `DIRA_DISABLE_AUTOUPDATE` or `CI` is set, in debug builds, and on dev
+    installs.
+  - **Surviving the restart.** The updater outlives the daemon it restarts:
+    its own process group on unix, `KillMode=process` in the systemd unit,
+    and `CREATE_BREAKAWAY_FROM_JOB` (with fallback) on windows.
+- **Channel.** `--channel`, else `update.channel`, else stable. In background
+  mode only, an unset knob falls back to the installed version's channel, so a
+  prerelease install keeps following prereleases. An explicit `--channel` is
+  persisted. The installers write `update.channel` on every install.
+- **Installers record a chosen channel.** They write `update.channel` only when
+  a channel was passed (`--channel`/`--prerelease`/`DIRA_CHANNEL`). Otherwise
+  background updates follow the installed version's own channel, so a pinned
+  prerelease keeps following prereleases. `dira update` keeps its backups and
+  the `--rollback` copy in one owned directory, `bin_dir/.dira-update/`.
+  Uninstall removes it, along with the `.old.<pid>` rename-aside files the
+  installers share with the updater (D-0003).
+- **Rollback.** After every successful update the replaced binaries are kept as
+  `.dira-update/{name}.prev`. `dira update --rollback` swaps them back (rename-only),
+  restarts the daemon, and records the version it left in
+  `update.skip_version`. A rollback can itself be rolled back.
 
 - `install.sh` detects OS/arch, resolves a version, downloads the archive and
   its checksum, verifies sha256, then installs both binaries atomically. It
@@ -342,11 +371,23 @@ both executables and restarts whatever is supervising the daemon.
   windows the updater uses the `zip` crate (target-gated dep). There is no
   guaranteed tar on constrained images, and the archive contents are
   restricted to the two expected binary names (zip-slip guard).
-- Daemon supervision spans launchd, systemd-user, a windows logon scheduled
-  task (`schtasks`, HKCU Run-key fallback), and pidfile. Windows stop is
-  graceful `Request::Shutdown` over the control pipe, escalating to
-  `taskkill /F`. Known gap: a logon task does not resupervise a crash
-  (RestartOnFailure task XML is the follow-up).
+- Daemon supervision spans launchd, systemd-user, a windows per-user logon
+  task, the HKCU Run key, and pidfile (DIRASH-0048).
+  - The task is registered from XML (`schtasks /Create /XML`, UTF-16 with a BOM).
+    It names the current user in the trigger and the principal (no admin),
+    starts on battery and keeps running when unplugged, has no execution time
+    limit, restarts on failure every minute, and is hidden.
+  - If the task cannot be registered, the Run key is written and `dirad` is
+    started at once.
+  - `Supervision::RunKey` is its own variant: restart stops the process and
+    spawns the replacement directly.
+  - `dirad` is a windows-subsystem binary, so neither path opens a console
+    window.
+  - Windows stop is graceful `Request::Shutdown` over the control pipe,
+    escalating to `taskkill /F`, with exit confirmed by `tasklist` (D-0019).
+    `dira daemon stop` and `uninstall` apply it to task- and Run-key-launched
+    daemons too, and `install` stops one before re-registering, so the new
+    binary is what starts.
 
 ## Invariants
 
@@ -378,9 +419,11 @@ both executables and restarts whatever is supervising the daemon.
   (default `no`) is separately the answer to a bare Enter once a real prompt
   is shown. The two knobs are deliberately independent, not one shared
   fallback: a scripted `--uninstall` wants unattended runs to proceed
-  (`_confirm`'s own default call has `notty=yes`), while installing a
-  persistent service must never happen unattended (the service prompt is
-  `_confirm "..." yes no`, `notty=no`). Every call site is a single
+  (`_confirm`'s own default call has `notty=yes`), and the service
+  no longer prompts at all (DIRASH-0051): the per-user service is installed by
+  default, terminal or not, unless `--no-service`, `--no-daemon`,
+  `--no-interactive` or `CI=true`. With a terminal the installer then runs
+  `dira onboard` itself. Every call site is a single
   `_confirm` invocation; there is no second hand-rolled `/dev/tty` read
   anywhere in the script.
 - Checksum verification is mandatory and has no override flag. An
@@ -442,8 +485,9 @@ both executables and restarts whatever is supervising the daemon.
 - Windows arm64 now builds and smokes natively on `windows-11-arm` (D-0014),
   closing the "ships untested" gap; the exes are still unsigned (Authenticode
   remains a follow-up. Unsigned logon-task daemons are prime AV
-  false-positive material), and the schtasks ONLOGON + HKCU-fallback path
-  still needs validation on a real Windows machine.
+  false-positive material), and the XML logon task + HKCU-fallback path
+  still needs validation on a real standard-user Windows account (Parallels
+  runbook, plan 2026-11-09 Phase 0).
 - The Windows binaries link the MSVC CRT **statically** (`.cargo/config.toml`,
   `-C target-feature=+crt-static`), so they need no VC++ Redistributable on the
   target host. This closes #60 and puts Windows on the same footing as the

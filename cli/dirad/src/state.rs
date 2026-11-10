@@ -25,6 +25,9 @@ pub enum EventMsg {
         norm: dira_sources::Normalized,
         harness: Harness,
         at: OffsetDateTime,
+        /// Replayed from the spool: counted in `spool::IN_FLIGHT` until the
+        /// writer has finished with it.
+        spooled: bool,
     },
     /// A fully-formed event (manual commands resolve their own project off the hot path).
     Raw(Box<RawEvent>),
@@ -606,6 +609,14 @@ impl SessionRegistry {
             });
         let had_project = entry.project.is_some();
         let lineage_changed = entry.lineage.observe(ev);
+        // A hook replayed from the spool (DIRASH-0049) can be older than what
+        // this session already folded. It still counts (a prompt, a project,
+        // lineage) but it must not move time backwards: crediting it as a
+        // gap from a later event, then crediting the next live event again
+        // from it, double-counts agent time; and it must never reopen a session
+        // a later event ended. The synced rollups are rebuilt from the store in
+        // `at` order, so they see it in place.
+        let late = entry.last_active_at.is_some_and(|t| ev.at < t);
 
         // Sticky, and set before anything else can early-return: the first real
         // signal promotes the session out of "lifecycle noise" for good (issue #74).
@@ -619,15 +630,16 @@ impl SessionRegistry {
         // A gap opened by a `PreTool` is a tool call in flight and is credited in
         // full; any other gap is clamped. Neither is discarded — dropping
         // over-idle gaps is what used to zero a whole two-hour build.
-        if let Some(prev) = entry.last_active_at {
-            entry.active_seconds +=
-                accounting::agent_gap_seconds(ev.at - prev, entry.last_opens_span, self.agent)
-                    as u64;
+        if !late {
+            if let Some(prev) = entry.last_active_at {
+                entry.active_seconds +=
+                    accounting::agent_gap_seconds(ev.at - prev, entry.last_opens_span, self.agent)
+                        as u64;
+            }
+            entry.last_active_at = Some(ev.at);
+            entry.last_opens_span = ev.kind.opens_agent_span();
+            entry.last_event_at = ev.at;
         }
-        entry.last_active_at = Some(ev.at);
-        entry.last_opens_span = ev.kind.opens_agent_span();
-
-        entry.last_event_at = ev.at;
         if entry.project.is_none() && ev.project.is_some() {
             entry.project = ev.project.clone();
         }
@@ -657,7 +669,7 @@ impl SessionRegistry {
         if matches!(ev.kind, EventKind::UserPrompt) {
             entry.prompts += 1;
         }
-        if ev.kind.is_human_signal() {
+        if ev.kind.is_human_signal() && !late {
             entry.last_human_signal_at = Some(ev.at);
             entry.last_signal_at = Some(ev.at);
         }
@@ -666,7 +678,9 @@ impl SessionRegistry {
         // resume, or a tool/prompt) reactivates it. Claude Code emits SessionEnd
         // on compaction mid-conversation, so a long session would otherwise vanish
         // from `active` even while it keeps working.
-        entry.ended = matches!(ev.kind, EventKind::SessionEnd | EventKind::ManualStop);
+        if !late {
+            entry.ended = matches!(ev.kind, EventKind::SessionEnd | EventKind::ManualStop);
+        }
 
         // Engaged gap — de-duplicated across ALL sessions and attributed to the
         // session that *opens* the gap (the v1 opening-signal policy, identical to
@@ -676,7 +690,7 @@ impl SessionRegistry {
         // for the gap it opens, instead of reading 0 because it has no *second* signal
         // of its own. Done in a fresh borrow so we can credit a different session than
         // the one this event belongs to.
-        if ev.kind.is_human_signal() {
+        if ev.kind.is_human_signal() && self.last_human_signal_at.is_none_or(|t| ev.at >= t) {
             let prev = self.last_human_signal_at;
             let opener = self.last_human_signal_session.clone();
             if let (Some(prev_at), Some(opener)) = (prev, opener) {
@@ -1740,5 +1754,32 @@ mod tests {
         let replayed = replay.sessions.get("s1").expect("session present");
         assert_eq!(replayed.prompts, s1.prompts);
         assert_eq!(replayed.branch, s1.branch);
+    }
+
+    #[test]
+    fn a_late_event_neither_double_credits_nor_reopens_an_ended_session() {
+        let mut reg = SessionRegistry::default();
+        for (kind, secs) in [
+            (EventKind::PreTool, 0),
+            (EventKind::PostTool, 240),
+            // Replayed from the spool: older than what was already folded.
+            (EventKind::PostTool, 60),
+            (EventKind::PostTool, 300),
+        ] {
+            reg.observe(&ev_at("s1", kind, None, secs), IDLE);
+        }
+        let credited = reg.sessions["s1"].active_seconds;
+        assert!(
+            credited <= 300,
+            "a late event must not re-credit a gap: {credited}"
+        );
+
+        reg.observe(&ev_at("s1", EventKind::SessionEnd, None, 400), IDLE);
+        reg.observe(&ev_at("s1", EventKind::UserPrompt, None, 350), IDLE);
+        assert!(
+            reg.sessions["s1"].ended,
+            "a late event never reopens an ended session"
+        );
+        assert_eq!(reg.sessions["s1"].prompts, 1, "but it still counts");
     }
 }

@@ -15,7 +15,7 @@
 //! that daemon-side knobs only take effect after `dira daemon restart`.
 
 use anyhow::{anyhow, bail, Context, Result};
-use dira_core::{config::project_dirs, Config};
+use dira_core::Config;
 use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut};
 
@@ -132,6 +132,21 @@ const KNOBS: &[Knob] = &[
         kind: Kind::Enum(&["on", "off"]),
         help: "passive update-available notice after status/version/daemon status: on, off",
     },
+    Knob {
+        key: "update.auto",
+        kind: Kind::Enum(&["on", "off"]),
+        help: "apply updates in the background (dirad schedules them): on, off",
+    },
+    Knob {
+        key: "update.channel",
+        kind: Kind::Enum(&["stable", "prerelease"]),
+        help: "release channel updates follow: stable, prerelease",
+    },
+    Knob {
+        key: "update.skip_version",
+        kind: Kind::Str,
+        help: "a version auto-update must not install (set by `dira update --rollback`)",
+    },
 ];
 
 fn knob(key: &str) -> Option<&'static Knob> {
@@ -158,9 +173,8 @@ pub(crate) fn knobs_after_help() -> String {
 
 /// The XDG path of the writable `config.toml`.
 fn config_path() -> Result<PathBuf> {
-    let dirs =
-        project_dirs().ok_or_else(|| anyhow!("could not resolve an XDG config directory"))?;
-    Ok(dirs.config_dir().join("config.toml"))
+    dira_core::config::config_file_path()
+        .ok_or_else(|| anyhow!("could not resolve an XDG config directory"))
 }
 
 /// `dira config path`.
@@ -218,7 +232,7 @@ fn render_json_scalar(v: &serde_json::Value) -> String {
 /// "on"/"off" like the enum knobs do, so `get` echoes the same words rather
 /// than leaking the wire representation.
 fn render_scalar(key: &str, v: &serde_json::Value) -> String {
-    if key == "update.check" {
+    if key == "update.check" || key == "update.auto" {
         if let Some(b) = v.as_bool() {
             return if b { "on" } else { "off" }.to_string();
         }
@@ -341,10 +355,10 @@ fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_ed
         // knobs) onto the real `bool` `Config.update.check` field — a real
         // TOML boolean, not the string "on"/"off", since that's what
         // `UpdateKnobs` deserializes.
-        "update.check" => match raw.trim().to_ascii_lowercase().as_str() {
+        "update.check" | "update.auto" => match raw.trim().to_ascii_lowercase().as_str() {
             "on" => Ok(value(true)),
             "off" => Ok(value(false)),
-            _ => bail!("update.check must be one of: on, off (got `{raw}`)"),
+            _ => bail!("{} must be one of: on, off (got `{raw}`)", knob.key),
         },
         key => match knob.kind {
             Kind::U64 => {

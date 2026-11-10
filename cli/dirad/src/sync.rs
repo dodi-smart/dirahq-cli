@@ -708,7 +708,7 @@ enum FlushOutcome {
 
 /// Errors that distinguish "retry later" from "stop until a human acts".
 #[cfg_attr(test, derive(Debug))]
-enum SyncError {
+pub(crate) enum SyncError {
     /// Network / 5xx / 429 — leave the cursor, back off, the backstop will
     /// retry. `retry_after` carries the cloud's requested wait (from a 429's
     /// `Retry-After` header or typed body) when present; the run loop honors
@@ -840,6 +840,12 @@ async fn flush(
     // backlog could never drain — `flush` returned `Nothing` and no later flush
     // reconsidered it.
     if events.is_empty() && artifact_rows.is_empty() && token_rows.is_empty() {
+        // Day rollups still waiting (the last flush's changes, or days a late
+        // event re-opened) go out on their own instead of waiting for new
+        // activity to carry them.
+        if send_pending_day_rollups(state, device_key, client, &cloud_url, &device_id).await? {
+            return Ok(FlushOutcome::Synced);
+        }
         return Ok(FlushOutcome::Nothing);
     }
 
@@ -940,23 +946,65 @@ async fn flush(
     // reset. See the comment at the gate below for the full argument.
     let mut epoch_reset = false;
     let chunk_count = chunks.len();
+    // Contract 2.0 hash chain: stamped at send time, advanced on each ack.
+    let mut chain = crate::chain::Chain::load(&state.store).await;
+    // Capture health rides the first chunk; acknowledged once, then deltas.
+    let (health, health_snapshot) = crate::spool::pending_health(&state.store).await;
+    let mut health = Some((health, health_snapshot));
+    // Day rollups for days that changed since they were last sent ride the
+    // first chunk too (DIRASH-0052).
+    let mut day_rollups = Some(
+        state
+            .store
+            .pending_day_rollups(DAY_ROLLUPS_PER_BATCH)
+            .await
+            .unwrap_or_default(),
+    );
     for chunk in chunks {
-        let sig = device_key
-            .sign_payload(&chunk.batch)
-            .map_err(|e| SyncError::Fatal(format!("sign: {e}")))?;
+        // A cloud data-epoch reset this flush restarted the chain and blanked
+        // the cursors: the remaining chunks go out again, freshly stamped, on
+        // the next flush. Sending them now would carry the old epoch's position
+        // and read as a fork.
+        if epoch_reset {
+            break;
+        }
+        let mut batch = chunk.batch;
+        let carried_health = health.take();
+        if let Some((h, _)) = &carried_health {
+            batch.capture_health = Some(h.clone());
+        }
+        let carried_days = day_rollups.take().unwrap_or_default();
+        let day_keys: Vec<(String, Option<String>)> = carried_days
+            .iter()
+            .map(|d| (d.day.clone(), d.repo_canonical.clone()))
+            .collect();
+        batch.day_rollups = carried_days;
+        add_session_facts(&state.store, &mut batch.sessions).await;
+        chain.stamp(&mut batch);
+        // Canonicalize once: the chain hash and the signature cover the same bytes.
+        let canonical = dira_core::signing::canonical_bytes(&batch)
+            .map_err(|e| SyncError::Fatal(format!("canonicalize: {e}")))?;
+        let batch_hash = crate::chain::hash_canonical(&canonical);
+        let sig = device_key.sign_canonical(&canonical);
         // Capture everything read after the POST up front, so the batch —
         // up to CHUNK_EVENTS worth of intervals/sessions/tokens/artifacts —
         // moves into the envelope instead of being deep-cloned per chunk.
-        let interval_count = chunk.batch.intervals.len();
-        let session_count = chunk.batch.sessions.len();
+        let interval_count = batch.intervals.len();
+        let session_count = batch.sessions.len();
         let cursor_event_id = chunk.cursor_event_id;
         let token_rowid_high = chunk.token_rowid_high;
         let artifact_rowid_high = chunk.artifact_rowid_high;
         let is_last = chunk.is_last;
+        // Where this chunk moves the cursors, acknowledged or stepped past.
+        let bounds = crate::quarantine::ChunkBounds {
+            event_cursor: cursor_event_id.clone(),
+            artifact_rowid: artifact_rowid_high,
+            token_rowid: token_rowid_high,
+        };
         let envelope = Envelope {
             schema_version: SCHEMA_VERSION.to_string(),
             device_id: device_id.clone(),
-            payload: chunk.batch,
+            payload: batch,
             sig,
         };
         // Pace a long drain so it stays inside the cloud's ingest budget instead of
@@ -964,10 +1012,8 @@ async fn flush(
         // round-trip counts toward the interval; skipped entirely for the ordinary
         // one- or two-chunk flush. See D-0020.
         let posted_at = Instant::now();
-        let resp = client
-            .post(&url)
-            .timeout(HTTP_TIMEOUT)
-            .json(&envelope)
+        let resp = ingest_body(client.post(&url).timeout(HTTP_TIMEOUT), &envelope)
+            .await?
             .send()
             .await
             .map_err(|e| SyncError::Transient {
@@ -1013,12 +1059,20 @@ async fn flush(
             // re-transmission, exactly the tradeoff the pre-existing
             // single-shot version already accepted.
             if !epoch_reset {
-                if let Some(ev) = &cursor_event_id {
-                    state
-                        .store
-                        .meta_set(META_SYNC_CURSOR, ev)
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance cursor: {e}")))?;
+                chain
+                    .advance(&state.store, batch_hash)
+                    .await
+                    .map_err(SyncError::Fatal)?;
+                if let Some((_, snapshot)) = carried_health {
+                    crate::spool::mark_reported(snapshot);
+                }
+                // Mark the sent days first, then record this chunk's own
+                // content, so a day this chunk changed is marked again.
+                if let Err(e) = state.store.mark_day_rollups_sent(&day_keys).await {
+                    tracing::debug!("mark day rollups sent: {e}");
+                }
+                if let Err(e) = state.store.record_acked_batch(&envelope.payload).await {
+                    tracing::debug!("record acked batch for day rollups: {e}");
                 }
                 // Row cursors advance on the chunk that CARRIED the rows, to the
                 // watermark that chunk covered — not on `is_last`, and never to
@@ -1028,20 +1082,10 @@ async fn flush(
                 // ingest budget recorded nothing at all and restarted at row 1
                 // forever (#88), and any mid-drain restart cost the whole
                 // backlog the same way. See D-0020.
-                if let Some(u) = artifact_rowid_high {
-                    state
-                        .store
-                        .meta_set(META_ARTIFACTS_CURSOR, &u.to_string())
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance artifacts cursor: {e}")))?;
-                }
-                if let Some(u) = token_rowid_high {
-                    state
-                        .store
-                        .meta_set(META_TOKEN_CURSOR, &u.to_string())
-                        .await
-                        .map_err(|e| SyncError::Fatal(format!("advance token cursor: {e}")))?;
-                }
+                bounds
+                    .advance(&state.store)
+                    .await
+                    .map_err(SyncError::Fatal)?;
                 // Partial rollups are a live-registry snapshot, not a cursor over
                 // stored rows, so they stay on the final chunk. See D-0020.
                 if is_last && !partials.is_empty() {
@@ -1050,6 +1094,7 @@ async fn flush(
                     }
                 }
             }
+            crate::quarantine::clear_streak(&state.store).await;
             total_intervals += interval_count;
             total_sessions += session_count;
             last_body = body;
@@ -1065,7 +1110,35 @@ async fn flush(
         // Non-2xx: cursors for already-acked chunks stay advanced (a 429 included,
         // so a retry only re-sends the remainder), so the next flush re-chunks only
         // the remaining window.
-        return Err(ingest_error(resp).await);
+        let err = ingest_error(resp).await;
+        // A content rejection of this exact chunk, repeated, is stepped past
+        // instead of retried forever (DIRASH-0049). Auth, schema skew, 429 and
+        // 5xx never count: they are not about the chunk's bytes.
+        let content_rejection = matches!(err, SyncError::PayloadTooLarge(_))
+            || (matches!(err, SyncError::Fatal(_))
+                && status.is_client_error()
+                && status.as_u16() != 401
+                && status.as_u16() != 403);
+        if content_rejection
+            && !epoch_reset
+            && crate::quarantine::note_rejection(&state.store, &bounds, &describe(&err))
+                .await
+                .is_some()
+        {
+            tracing::warn!(
+                reason = %describe(&err),
+                cursor = cursor_event_id.as_deref().unwrap_or(""),
+                "sync: the cloud rejected this chunk {} times in a row; quarantined it and \
+                 moved past (see `dira doctor`)",
+                crate::quarantine::THRESHOLD
+            );
+            bounds
+                .advance(&state.store)
+                .await
+                .map_err(SyncError::Fatal)?;
+            continue;
+        }
+        return Err(err);
     }
 
     // 5. The advisory handshake (epoch + watermark) was already applied
@@ -1259,39 +1332,23 @@ async fn resend_lineage(
                 .await
                 .map_err(|e| SyncError::Fatal(format!("load session history: {e}")))?;
             let rollups = dira_core::sync::build_lineage_resend_rollups(&history, agent);
-            let mut batches = dira_core::sync::build_lineage_resend_batches(
+            let batches = dira_core::sync::build_lineage_resend_batches(
                 rollups,
                 &history,
                 LINEAGE_RULES_VERSION,
                 &device_id,
                 now,
             );
-            for batch in &mut batches {
+            let mut chain = crate::chain::Chain::load(&state.store).await;
+            for mut batch in batches {
                 stamp_runtime(&mut batch.sessions);
                 let count = batch.sessions.len();
-                let sig = device_key
-                    .sign_payload(batch)
-                    .map_err(|e| SyncError::Fatal(format!("sign: {e}")))?;
-                let envelope = Envelope {
-                    schema_version: SCHEMA_VERSION.to_string(),
-                    device_id: device_id.clone(),
-                    payload: batch.clone(),
-                    sig,
-                };
                 last_post = Some(Instant::now());
-                let resp = client
-                    .post(&url)
-                    .timeout(HTTP_TIMEOUT)
-                    .json(&envelope)
-                    .send()
-                    .await
-                    .map_err(|e| SyncError::Transient {
-                        message: format!("post lineage re-send: {e}"),
-                        retry_after: None,
-                    })?;
-                if !resp.status().is_success() {
-                    return Err(ingest_error(resp).await);
-                }
+                post_chained(
+                    state, device_key, client, &url, &device_id, &mut chain, batch,
+                )
+                .await
+                .map_err(|(e, _)| e)?;
                 sent += count;
             }
             // Same pacing as a long flush drain (D-0020).
@@ -1406,6 +1463,9 @@ pub(crate) async fn note_data_epoch(state: &AppState, epoch: &str) -> Result<boo
                 .meta_set(META_LAST_EPOCH, epoch)
                 .await
                 .map_err(|e| format!("store epoch: {e}"))?;
+            // The cloud lost its log: start a new batch-chain epoch too
+            // (DIRASH-0052), so the re-sent history forms a fresh chain.
+            crate::chain::Chain::restart(&state.store).await?;
             for key in [
                 META_SYNC_CURSOR,
                 META_ARTIFACTS_CURSOR,
@@ -1494,6 +1554,186 @@ fn is_bad_signature(body: &str) -> bool {
 /// non-fatal: a missing `cloud_url`, an unreachable cloud, an old cloud without
 /// the endpoint, or an unparseable body all simply skip the check. Run once at
 /// daemon startup; sync/heartbeat are unaffected by its outcome.
+/// Send ONE attestation batch through the contract 2.0 path: stamp the chain
+/// and client, hash, sign, POST (zstd when the cloud takes it), and on a 2xx
+/// advance the chain and record the batch for day rollups. Returns the ack
+/// body.
+///
+/// For paths that send standalone batches (the lineage re-send, a meetings
+/// restatement). The main flush loop keeps its own copy because it also moves
+/// per-chunk cursors, capture health and quarantine on each chunk. On a
+/// non-2xx the error comes with the HTTP status, so a caller can tell a
+/// content rejection from a transient one. The chain is NOT advanced on any
+/// error.
+pub(crate) async fn post_chained(
+    state: &AppState,
+    device_key: &DeviceKey,
+    client: &reqwest::Client,
+    url: &str,
+    device_id: &str,
+    chain: &mut crate::chain::Chain,
+    mut batch: dira_contract::AttestationBatch,
+) -> Result<String, (SyncError, Option<reqwest::StatusCode>)> {
+    chain.stamp(&mut batch);
+    let canonical = dira_core::signing::canonical_bytes(&batch)
+        .map_err(|e| (SyncError::Fatal(format!("canonicalize: {e}")), None))?;
+    let batch_hash = crate::chain::hash_canonical(&canonical);
+    let sig = device_key.sign_canonical(&canonical);
+    let envelope = Envelope {
+        schema_version: SCHEMA_VERSION.to_string(),
+        device_id: device_id.to_string(),
+        payload: batch,
+        sig,
+    };
+    let resp = ingest_body(client.post(url).timeout(HTTP_TIMEOUT), &envelope)
+        .await
+        .map_err(|e| (e, None))?
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                SyncError::Transient {
+                    message: format!("post ingest: {e}"),
+                    retry_after: None,
+                },
+                None,
+            )
+        })?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err((ingest_error(resp).await, Some(status)));
+    }
+    let body = resp.text().await.unwrap_or_default();
+    chain
+        .advance(&state.store, batch_hash)
+        .await
+        .map_err(|e| (SyncError::Fatal(e), None))?;
+    if let Err(e) = state.store.record_acked_batch(&envelope.payload).await {
+        tracing::debug!("record acked batch for day rollups: {e}");
+    }
+    Ok(body)
+}
+
+/// Send pending day rollups in a batch of their own (nothing else to carry them).
+/// `true` when one was sent.
+async fn send_pending_day_rollups(
+    state: &AppState,
+    device_key: &DeviceKey,
+    client: &reqwest::Client,
+    cloud_url: &str,
+    device_id: &str,
+) -> Result<bool, SyncError> {
+    if !state.store.has_pending_day_rollups().await.unwrap_or(false) {
+        return Ok(false);
+    }
+    let rollups = state
+        .store
+        .pending_day_rollups(DAY_ROLLUPS_PER_BATCH)
+        .await
+        .map_err(|e| SyncError::Fatal(format!("read day rollups: {e}")))?;
+    if rollups.is_empty() {
+        return Ok(false);
+    }
+    let keys: Vec<(String, Option<String>)> = rollups
+        .iter()
+        .map(|d| (d.day.clone(), d.repo_canonical.clone()))
+        .collect();
+    let batch = dira_contract::AttestationBatch {
+        batch_id: ulid::Ulid::generate().to_string(),
+        device_id: device_id.to_string(),
+        generated_at: crate::heartbeat::fmt_rfc3339(time::OffsetDateTime::now_utc()),
+        seq: 0,
+        prev_batch_hash: String::new(),
+        chain_epoch: 0,
+        client: None,
+        capture_health: None,
+        intervals: vec![],
+        sessions: vec![],
+        token_usage: vec![],
+        artifacts: vec![],
+        day_rollups: rollups,
+    };
+    let url = format!("{}/api/v1/ingest", cloud_url.trim_end_matches('/'));
+    let mut chain = crate::chain::Chain::load(&state.store).await;
+    post_chained(
+        state, device_key, client, &url, device_id, &mut chain, batch,
+    )
+    .await
+    .map_err(|(e, _)| e)?;
+    state
+        .store
+        .mark_day_rollups_sent(&keys)
+        .await
+        .map_err(|e| SyncError::Fatal(format!("mark day rollups: {e}")))?;
+    Ok(true)
+}
+
+/// Most day rollups one batch carries; the rest follow in later flushes.
+const DAY_ROLLUPS_PER_BATCH: u32 = 60;
+
+/// Fill the 2.0 `stats` fields the event log cannot supply (files touched,
+/// agent lines, compactions) from the facts the writer recorded at capture
+/// time. Only Claude Code reports them, so other harnesses keep them omitted.
+async fn add_session_facts(
+    store: &dira_core::Store,
+    sessions: &mut [dira_contract::SessionRollup],
+) {
+    let ids: Vec<&str> = sessions
+        .iter()
+        .filter(|s| s.harness == dira_contract::Harness::ClaudeCode && s.stats.is_some())
+        .map(|s| s.session_id.as_str())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    // One query for the whole chunk, not one per session.
+    let facts = store.session_facts_many(&ids).await.unwrap_or_default();
+    for s in sessions.iter_mut() {
+        if s.harness != dira_contract::Harness::ClaudeCode {
+            continue;
+        }
+        let Some(stats) = s.stats.as_mut() else {
+            continue;
+        };
+        let facts = facts.get(&s.session_id).cloned().unwrap_or_default();
+        stats.files_touched = Some(facts.files_touched);
+        stats.agent_lines_added = Some(facts.lines_added);
+        stats.agent_lines_removed = Some(facts.lines_removed);
+        stats.compactions = Some(facts.compactions);
+    }
+}
+
+/// Whether the cloud's `ServerMeta.acceptEncodings` lists `zstd`, as of the
+/// last handshake. False until a handshake says otherwise.
+static CLOUD_ACCEPTS_ZSTD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// An ingest body: zstd-compressed JSON when the cloud accepts it, else plain
+/// JSON. The signature covers the canonical payload, not these bytes, so the
+/// encoding never affects verification.
+async fn ingest_body<T: serde::Serialize>(
+    req: reqwest::RequestBuilder,
+    envelope: &T,
+) -> Result<reqwest::RequestBuilder, SyncError> {
+    if !CLOUD_ACCEPTS_ZSTD.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(req.json(envelope));
+    }
+    let json = serde_json::to_vec(envelope)
+        .map_err(|e| SyncError::Fatal(format!("serialize envelope: {e}")))?;
+    // A multi-megabyte batch takes real CPU to compress: off the async workers.
+    let body = tokio::task::spawn_blocking(move || compress_zstd(&json))
+        .await
+        .map_err(|e| SyncError::Fatal(format!("compress: {e}")))?;
+    Ok(req
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::CONTENT_ENCODING, "zstd")
+        .body(body))
+}
+
+fn compress_zstd(json: &[u8]) -> Vec<u8> {
+    ruzstd::encoding::compress_to_vec(json, ruzstd::encoding::CompressionLevel::Fastest)
+}
+
 pub async fn check_schema_handshake(client: &reqwest::Client, cloud_url: Option<&str>) {
     let Some(cloud_url) = cloud_url else {
         return; // sync disabled — nothing to handshake with
@@ -1518,6 +1758,15 @@ pub async fn check_schema_handshake(client: &reqwest::Client, cloud_url: Option<
             return;
         }
     };
+    // Contract 2.0: compress ingest bodies only when the cloud says it can
+    // read them. An older cloud omits the field (an empty list), and gets
+    // uncompressed bodies.
+    CLOUD_ACCEPTS_ZSTD.store(
+        meta.accept_encodings
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("zstd")),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if !schema_version_in_range(SCHEMA_VERSION, &meta) {
         tracing::warn!(
             our_version = SCHEMA_VERSION,
@@ -1839,7 +2088,7 @@ mod tests {
     /// failure meant the epoch signal from an already-2xx'd earlier chunk was
     /// dropped for this flush attempt entirely).
     #[tokio::test]
-    async fn flush_applies_epoch_reset_from_an_earlier_chunk_even_when_a_later_chunk_fails() {
+    async fn flush_applies_epoch_reset_from_an_earlier_chunk_and_stops_there() {
         let cloud = MockCloud::start(&["/api/v1/ingest"]).await;
         // Chunk 1/3: acks with a NEW epoch ⇒ must blank the cursor right away.
         cloud.push(
@@ -1905,27 +2154,32 @@ mod tests {
         }
 
         let key = DeviceKey::generate();
-        let err = flush(&state, &key, &state.http)
+        flush(&state, &key, &state.http)
             .await
-            .expect_err("chunk 3 fails with a 500");
-        assert!(
-            matches!(err, SyncError::Transient { .. }),
-            "chunk 3's 500 must classify as Transient"
-        );
+            .expect("the flush stops cleanly at the reset");
 
+        // Contract 2.0: the reset restarted the batch chain, so the remaining
+        // chunks would carry the old epoch's position and read as a fork. The
+        // flush stops at the reset; they go out freshly stamped next flush.
         assert_eq!(
             cloud.requests("/api/v1/ingest").len(),
-            3,
-            "all 3 chunks must have been sent — the reset doesn't cut the flush short"
+            1,
+            "nothing is posted after the chunk that reported the new epoch"
+        );
+        let chain = crate::chain::Chain::load(&state.store).await;
+        assert_eq!(
+            (chain.seq, chain.epoch),
+            (0, 1),
+            "a new chain epoch starts at seq 0"
         );
 
-        // The cursor must be BLANK (the epoch reset from chunk 1), not chunk 2's
-        // high-water mark — proving chunk 2's success did not silently undo it.
+        // The cursor must be BLANK (the epoch reset from chunk 1), and no later
+        // chunk got a chance to re-advance it.
         let cursor = state.store.meta_get(META_SYNC_CURSOR).await.unwrap();
         assert_eq!(
             cursor.as_deref(),
             Some(""),
-            "cursor must stay blanked by the epoch reset even though chunk 2 succeeded"
+            "cursor must stay blanked by the epoch reset"
         );
         let art_cursor = state.store.meta_get(META_ARTIFACTS_CURSOR).await.unwrap();
         assert_eq!(art_cursor.as_deref(), Some(""));
@@ -2056,13 +2310,23 @@ mod tests {
             "the ack must advance the token cursor to the snapshot bound"
         );
 
-        // Drained: a second flush has nothing left to send.
+        // The next flush carries only the day rollup the token row changed
+        // (rollups trail the batch that changed them by one flush), never the
+        // token row again; after that the device is drained.
+        let _ = flush(&state, &key, &state.http).await.unwrap();
+        let reqs = cloud.requests("/api/v1/ingest");
+        assert!(
+            reqs[before + 1..]
+                .iter()
+                .all(|r| !r.contains("turn-backdated")),
+            "an already-shipped token row must not re-send"
+        );
         assert!(
             matches!(
                 flush(&state, &key, &state.http).await.unwrap(),
                 FlushOutcome::Nothing
             ),
-            "an already-shipped token row must not re-send"
+            "drained: nothing left to send"
         );
     }
 
@@ -3508,6 +3772,7 @@ mod tests {
         ServerMeta {
             schema_version: max.into(),
             min_schema_version: min.into(),
+            accept_encodings: Vec::new(),
         }
     }
 
@@ -3737,5 +4002,27 @@ mod tests {
         assert_eq!(out, ResendOutcome::Skipped);
         assert!(marker(&unlinked).await.is_none());
         assert!(cloud.requests(INGEST).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod zstd_tests {
+    #[test]
+    fn a_compressed_body_round_trips_and_shrinks_a_large_batch() {
+        let json = serde_json::to_vec(&serde_json::json!({
+            "payload": { "intervals": vec![serde_json::json!({"id": "01J", "humanSeconds": 60}); 500] }
+        }))
+        .unwrap();
+        let packed = super::compress_zstd(&json);
+        assert!(
+            packed.len() * 5 < json.len(),
+            "{} vs {}",
+            packed.len(),
+            json.len()
+        );
+        let mut out = Vec::new();
+        let mut dec = ruzstd::decoding::StreamingDecoder::new(packed.as_slice()).unwrap();
+        std::io::Read::read_to_end(&mut dec, &mut out).unwrap();
+        assert_eq!(out, json);
     }
 }

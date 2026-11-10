@@ -17,13 +17,14 @@ pub mod gemini;
 pub mod generic;
 pub mod grok;
 pub mod opencode;
+pub mod spool;
 
 use dira_contract::Harness;
 use dira_core::model::EventKind;
 
 /// A harness event after normalization, before the daemon enriches it with a
 /// resolved project, identity, timestamp, and id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Normalized {
     pub session_id: String,
     pub kind: EventKind,
@@ -47,13 +48,36 @@ pub struct Normalized {
     /// Empty for every harness but Claude Code. Boxed: every hook rides the
     /// writer queue, and most carry no hints at all.
     pub hints: Box<Hints>,
+    /// Contract 2.0 counts derived from the tool input, which is then dropped
+    /// (DIRASH-0052). Default for every harness but Claude Code. `default` so
+    /// a spool record written before this field existed still reads. Boxed
+    /// like `hints`, to keep the writer queue's messages small.
+    #[serde(default)]
+    pub facts: Box<HookFacts>,
+}
+
+/// What a hook says about its session, as counts (DIRASH-0052): lines an
+/// edit/write tool added and removed, whether it was a context compaction, and
+/// a hash of the file a file tool touched. Never a path, a line or content.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookFacts {
+    #[serde(default)]
+    pub lines_added: u32,
+    #[serde(default)]
+    pub lines_removed: u32,
+    #[serde(default)]
+    pub compaction: bool,
+    /// 16 hex digits of an FNV-1a hash of the absolute path, for counting
+    /// distinct files without keeping their names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_hash: Option<String>,
 }
 
 /// What a hook says about orchestration, derived at normalization so the raw
 /// tool input/response never travels further than this crate (D-0001,
 /// DIRASH-0041). Nothing here is stored as-is: the daemon resolves `evidence`
 /// to a canonical repo ref and drops the rest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hints {
     /// The harness host's id for this session (`local_<uuid>`), forwarded by
     /// the hook shim under [`dira_core::orchestration::PAYLOAD_ENV_KEY`].
@@ -129,6 +153,11 @@ pub fn harness_id(h: Harness) -> &'static str {
         Harness::Generic => "generic",
         Harness::Manual => "manual",
     }
+}
+
+/// The [`Harness`] a hook id (or alias) belongs to, `None` for an unknown id.
+pub fn harness_for(id: &str) -> Option<Harness> {
+    source_for(id).map(|s| s.harness())
 }
 
 /// Resolve a harness id (with a few friendly aliases) to its source.

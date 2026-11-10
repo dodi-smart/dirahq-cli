@@ -53,7 +53,19 @@ pub enum Request {
     IngestHook {
         harness: String,
         payload: serde_json::Value,
+        /// When the shim saw the hook (RFC 3339). The daemon stamps receipt time
+        /// when it is absent (older shims). Lets a hook delivered late keep its
+        /// real time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_at: Option<String>,
     },
+    /// A hook the `dira hook` shim already normalized: a
+    /// `dira_sources::spool::Record` as JSON, the same record the spool holds
+    /// (DIRASH-0049). The raw harness payload never crosses the pipe, and live
+    /// and spooled hooks take one ingress path. An older daemon answers
+    /// `bad request: unknown variant`, and the shim then spools the record for
+    /// the restarted daemon to drain.
+    IngestRecord { record: serde_json::Value },
     /// Wipe all local statistics (events + token usage) for a fresh start. Keeps
     /// device identity; resets the sync cursor and the live-session registry.
     Nuke,

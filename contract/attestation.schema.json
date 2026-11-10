@@ -84,6 +84,23 @@
         "kind": {
           "$ref": "#/$defs/ArtifactKind"
         },
+        "linesAdded": {
+          "description": "2.0: lines the commit added and removed (`git diff --numstat`), counts\nonly. With the session's `agentLinesAdded` the cloud can estimate how\nmuch of a commit the agent wrote, and must label it an estimate.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "linesRemoved": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
         "repoCanonical": {
           "type": [
             "string",
@@ -140,6 +157,41 @@
           "description": "ULID; the idempotency key for ingest.",
           "type": "string"
         },
+        "captureHealth": {
+          "description": "2.0: capture-health counters since the previous acknowledged batch, so\nthe cloud can show when a device lost or delayed events. Optional.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CaptureHealth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "chainEpoch": {
+          "description": "2.0: increments when the chain restarts (a local wipe, a re-link, a key\nrotation). The cloud treats `(deviceId, chainEpoch)` as one chain.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "client": {
+          "description": "2.0: the build and platform that produced the batch. Optional.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dayRollups": {
+          "description": "2.0: per-day totals for reconciliation (see [`DayRollup`]).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DayRollup"
+          }
+        },
         "deviceId": {
           "description": "ULID of the producing device (matches the envelope).",
           "type": "string"
@@ -154,6 +206,16 @@
           "items": {
             "$ref": "#/$defs/Interval"
           }
+        },
+        "prevBatchHash": {
+          "description": "2.0: lowercase hex SHA-256 of the RFC 8785 (JCS) encoding of the\nprevious acknowledged batch's payload in this epoch; `\"\"` at `seq` 0.\nMakes a device's history tamper-evident: a dropped, altered or\nreordered batch breaks the chain the cloud recomputes.",
+          "type": "string"
+        },
+        "seq": {
+          "description": "2.0: this batch's position in the device's chain, starting at 0 for each\n[`Self::chain_epoch`]. It advances only when a batch is acknowledged, so a\nretry re-sends the same `seq` (and the same payload, deduplicated by\n`batchId`).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         },
         "sessions": {
           "description": "Per-session rollups (agent wall-clock, harness, repo).",
@@ -173,7 +235,10 @@
       "required": [
         "batchId",
         "deviceId",
-        "generatedAt"
+        "generatedAt",
+        "seq",
+        "prevBatchHash",
+        "chainEpoch"
       ]
     },
     "BlobRef": {
@@ -192,6 +257,204 @@
       "required": [
         "path",
         "blob"
+      ]
+    },
+    "CaptureHealth": {
+      "description": "2.0: capture-health counters, each a count since the previous acknowledged\nbatch (DIRASH-0049). All zero is the healthy case.",
+      "type": "object",
+      "properties": {
+        "dropped": {
+          "description": "Hooks lost for good (the spool was unwritable or over its cap).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "hookFailures": {
+          "description": "Hook deliveries the shim recorded as failed, when the device knows.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "quarantined": {
+          "description": "Sync chunks the cloud rejected repeatedly that the device skipped.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "spilled": {
+          "description": "Of those, hooks the daemon itself spilled because its queue was full.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "spooled": {
+          "description": "Hooks that reached the store late, through the on-disk spool (the hook\nshim could not reach the daemon, or the daemon's queue was full).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        }
+      }
+    },
+    "ClientInfo": {
+      "description": "2.0: the build and platform that produced a batch.",
+      "type": "object",
+      "properties": {
+        "arch": {
+          "description": "`aarch64`, `x86_64`, ...",
+          "type": "string"
+        },
+        "channel": {
+          "description": "The update channel the device follows (`stable`, `prerelease`), when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "os": {
+          "description": "`macos`, `linux` or `windows`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "The `dirad` version, e.g. `\"0.13.0\"`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "os",
+        "arch"
+      ]
+    },
+    "DayRollup": {
+      "description": "2.0: one device's totals for one UTC day and repo, sent so the cloud can\nreconcile its own daily facts and flag drift. A reconciliation check, not a\ndisplay source: display buckets come from intervals in the viewer's time\nzone. Re-sent with a higher `revision` whenever late data changes the day.",
+      "type": "object",
+      "properties": {
+        "agentWallSeconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "commits": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "day": {
+          "description": "UTC calendar day, `YYYY-MM-DD`.",
+          "type": "string"
+        },
+        "estCostUsd": {
+          "description": "Estimated USD cost from the bundled pricing table. A label, never billed.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "humanSeconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "intervalCount": {
+          "description": "How many intervals the device holds for this day and repo.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "intervalDigest": {
+          "description": "Lowercase hex SHA-256 of the sorted interval ids joined by `\\n`.",
+          "type": "string"
+        },
+        "prompts": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "repoCanonical": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "Starts at 0; incremented each time the day's totals change.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sessions": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tokens": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DayTokens"
+          }
+        },
+        "workspaceHint": {
+          "description": "The cloud workspace the repo is pinned to, when the device knows it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "day",
+        "humanSeconds",
+        "agentWallSeconds",
+        "sessions",
+        "prompts",
+        "commits",
+        "intervalCount",
+        "intervalDigest",
+        "revision"
+      ]
+    },
+    "DayTokens": {
+      "description": "2.0: token totals for one model within a [`DayRollup`].",
+      "type": "object",
+      "properties": {
+        "cacheCreate": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cacheRead": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "input": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string"
+        },
+        "output": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "model",
+        "input",
+        "output",
+        "cacheRead",
+        "cacheCreate"
       ]
     },
     "Harness": {
@@ -402,6 +665,17 @@
         "startedAt": {
           "type": "string"
         },
+        "stats": {
+          "description": "2.0: what happened in the session, as counts (see [`SessionStats`]).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "trigger": {
           "description": "What started this session when it was a trigger rather than a person\n(see [`SessionTrigger`]). Absent means \"not started by a trigger, or\nunknown\". A trigger is never retracted: a newer rollup that omits it\ndoes not clear one an earlier rollup sent.\nOptional + omitted-when-absent so pre-1.8 payloads stay byte-identical.",
           "anyOf": [
@@ -415,6 +689,13 @@
         },
         "triggerName": {
           "description": "The slug of the Claude Desktop scheduled task that started this session\n(`dodi-smart-triage-refresh`), only ever set alongside\n`trigger = scheduled`. The producer sends it only when it names an\nexisting directory under `~/.claude/scheduled-tasks/`, so it matches\n`[a-z0-9][a-z0-9_-]*` and is at most 64 chars. It is a user-chosen\nidentifier like a branch name, never prompt text, a task description,\na schedule or SKILL.md content (DIRASH-0046, an exception to D-0001\nscoped to this verified identifier).\nOptional + omitted-when-absent so pre-1.8 payloads stay byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceHint": {
+          "description": "2.0: the cloud workspace the session's repo is pinned to, when the\ndevice knows it (the repo's committed cloud pin). A routing hint the\ncloud validates, never trusts; unrelated to the lineage `workspaceRef`.",
           "type": [
             "string",
             "null"
@@ -437,6 +718,85 @@
         "agentWallSeconds"
       ]
     },
+    "SessionStats": {
+      "description": "2.0: counts describing what happened in a session. Counts only (D-0001):\ntool categories, not tool names or arguments; numbers of lines and files,\nnever their content or paths. A field the producer did not measure is\nomitted, never zero-filled.",
+      "type": "object",
+      "properties": {
+        "agentLinesAdded": {
+          "description": "Lines the agent's edit/write tools added and removed (counted by the\nproducer from the tool input, which never leaves the device).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "agentLinesRemoved": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "approvalWaitSeconds": {
+          "description": "Seconds between a permission request and the next activity in the session.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "compactions": {
+          "description": "Context compactions.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "filesTouched": {
+          "description": "Distinct files the agent's tools read or wrote.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "permissionPrompts": {
+          "description": "Times the harness asked the person for permission.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "subagents": {
+          "description": "Subagents the session started.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "testRuns": {
+          "description": "Test runs the agent started through its shell tool, by outcome. Best\neffort: classified from the command's leading words and its exit status.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestRuns"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "toolCalls": {
+          "$ref": "#/$defs/ToolCalls"
+        }
+      },
+      "required": [
+        "toolCalls"
+      ]
+    },
     "SessionTrigger": {
       "description": "What started a session when it was not a person. Absent for an interactive\nsession, and for one whose origin is unknown.",
       "oneOf": [
@@ -445,6 +805,26 @@
           "type": "string",
           "const": "scheduled"
         }
+      ]
+    },
+    "TestRuns": {
+      "description": "2.0: test runs by outcome.",
+      "type": "object",
+      "properties": {
+        "failed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "passed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "passed",
+        "failed"
       ]
     },
     "TokenUsage": {
@@ -508,6 +888,66 @@
         "cacheCreate",
         "at"
       ]
+    },
+    "ToolCalls": {
+      "description": "2.0: tool calls by category. A tool the producer cannot place is `other`;\nMCP tools count as `mcp` without naming the server.",
+      "type": "object",
+      "properties": {
+        "edit": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "mcp": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "other": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "read": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "search": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "shell": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "task": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "web": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "write": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        }
+      }
     }
   }
 }

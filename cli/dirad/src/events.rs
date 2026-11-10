@@ -9,13 +9,12 @@
 use dira_contract::Harness;
 use dira_core::model::{EventKind, RawEvent};
 use time::{Duration, OffsetDateTime};
-use ulid::Ulid;
 
 /// Tick spacing for materialized manual intervals (must be < idle threshold).
 pub const TICK_SECS: i64 = 60;
 
 fn new_id() -> String {
-    Ulid::generate().to_string()
+    dira_core::model::new_event_id()
 }
 
 /// Short, user-facing handle for a session id (its ULID tail).

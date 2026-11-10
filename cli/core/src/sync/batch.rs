@@ -264,6 +264,8 @@ fn assemble_batch(
             workspace_ref: wire.workspace_ref,
             trigger: wire.trigger,
             trigger_name: wire.trigger_name,
+            stats: None,
+            workspace_hint: None,
         });
     }
 
@@ -278,6 +280,12 @@ fn assemble_batch(
         sessions,
         token_usage,
         artifacts,
+        seq: 0,
+        prev_batch_hash: String::new(),
+        chain_epoch: 0,
+        client: None,
+        capture_health: None,
+        day_rollups: Vec::new(),
     }
 }
 
@@ -348,15 +356,30 @@ fn chunk_ranges(events: &[RawEvent], idle: Duration, min_chunk: usize) -> Vec<(u
         return ranges;
     }
     let min_chunk = min_chunk.max(1);
+    // Events come in id (arrival) order, not `at` order: a hook replayed from
+    // the spool (DIRASH-0049) arrives late with its original, older `at`. So a
+    // cut is taken only where EVERY event before it is more than `idle` earlier
+    // than EVERY event after it: the running max `at` of the prefix against the
+    // min `at` of the suffix. Comparing adjacent events let a late one fake a
+    // break and split a counted gap across chunks (only chunk 0 is seeded, so
+    // the gap was lost). For in-order events this is exactly the old rule, so
+    // boundaries (and batch ids) are unchanged.
+    let n = events.len();
+    let mut suffix_min = vec![events[n - 1].at; n];
+    for i in (0..n - 1).rev() {
+        suffix_min[i] = suffix_min[i + 1].min(events[i].at);
+    }
+    let mut prefix_max = events[0].at;
     let mut start = 0usize;
-    for i in 1..events.len() {
-        let big_break = events[i].at - events[i - 1].at > idle;
+    for i in 1..n {
+        let big_break = suffix_min[i] - prefix_max > idle;
         if i - start >= min_chunk && big_break {
             ranges.push((start, i - 1));
             start = i;
         }
+        prefix_max = prefix_max.max(events[i].at);
     }
-    ranges.push((start, events.len() - 1));
+    ranges.push((start, n - 1));
     ranges
 }
 
@@ -474,7 +497,9 @@ fn build_artifacts(rows: &[ArtifactRow]) -> Vec<ArtifactRef> {
             session_change_id: r.session_change_id.clone(),
             touched_paths: r.touched_paths.clone(),
             blobs: r.blobs.clone(),
-            // author_name is intentionally local-only (PII) — not on the wire.
+            // author_name is intentionally local-only (PII) — not on the wire.,
+            lines_added: None,
+            lines_removed: None,
         })
         .collect()
 }
@@ -770,6 +795,8 @@ fn build_sessions(
         /// First non-null spec slug across the session's events.
         spec: Option<String>,
         lineage: crate::orchestration::SessionLineage,
+        /// Contract 2.0 counts (DIRASH-0052).
+        stats: crate::stats::StatsAcc,
     }
 
     // Sessions that END in THIS window's slice ONLY — never from `history` (see the
@@ -821,8 +848,10 @@ fn build_sessions(
                 label: e.label.clone(),
                 spec: e.spec.clone(),
                 lineage: Default::default(),
+                stats: Default::default(),
             });
         entry.lineage.observe(e);
+        entry.stats.observe(e);
         entry.event_times.push(crate::accounting::AgentSample {
             at: e.at,
             opens_span: e.kind.opens_agent_span(),
@@ -901,6 +930,9 @@ fn build_sessions(
                 workspace_ref: wire.workspace_ref,
                 trigger: wire.trigger,
                 trigger_name: wire.trigger_name,
+                // Manual sessions have no tools or permissions to count.
+                stats: (a.harness != Harness::Manual).then(|| a.stats.finish()),
+                workspace_hint: None,
             }
         })
         .collect()
@@ -1005,6 +1037,12 @@ pub fn build_lineage_resend_batches(
                 sessions: chunk.to_vec(),
                 token_usage: Vec::new(),
                 artifacts: Vec::new(),
+                seq: 0,
+                prev_batch_hash: String::new(),
+                chain_epoch: 0,
+                client: None,
+                capture_health: None,
+                day_rollups: Vec::new(),
             }
         })
         .collect()
@@ -2564,5 +2602,55 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].sessions.len(), CHUNK_RESEND_SESSIONS);
         assert_eq!(batches[1].sessions.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod late_event_chunk_tests {
+    use super::*;
+    use crate::model::EventKind;
+    use dira_contract::Harness;
+
+    fn ev(id: &str, secs: i64) -> RawEvent {
+        RawEvent {
+            id: id.into(),
+            at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs),
+            session_id: "s".into(),
+            harness: Harness::ClaudeCode,
+            kind: EventKind::UserPrompt,
+            cwd: None,
+            project: None,
+            identity_email: None,
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+            spec: None,
+            lineage: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_late_event_never_fakes_a_break_between_two_close_signals() {
+        // Arrival order: x@0, A@10000, late@500 (replayed from the spool), B@10180.
+        // A and B are 180 s apart, inside the 300 s idle window: one counted gap.
+        let events = [ev("1", 0), ev("2", 10_000), ev("3", 500), ev("4", 10_180)];
+        let ranges = chunk_ranges(&events, Duration::seconds(300), 1);
+        let chunk_of = |i: usize| ranges.iter().position(|&(a, b)| a <= i && i <= b);
+        assert_eq!(
+            chunk_of(1),
+            chunk_of(3),
+            "A and B stay in one chunk: {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn in_order_events_cut_exactly_as_before() {
+        let events = [ev("1", 0), ev("2", 100), ev("3", 1000), ev("4", 1100)];
+        assert_eq!(
+            chunk_ranges(&events, Duration::seconds(300), 1),
+            vec![(0, 1), (2, 3)]
+        );
     }
 }

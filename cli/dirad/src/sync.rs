@@ -2310,13 +2310,23 @@ mod tests {
             "the ack must advance the token cursor to the snapshot bound"
         );
 
-        // Drained: a second flush has nothing left to send.
+        // The next flush carries only the day rollup the token row changed
+        // (rollups trail the batch that changed them by one flush), never the
+        // token row again; after that the device is drained.
+        let _ = flush(&state, &key, &state.http).await.unwrap();
+        let reqs = cloud.requests("/api/v1/ingest");
+        assert!(
+            reqs[before + 1..]
+                .iter()
+                .all(|r| !r.contains("turn-backdated")),
+            "an already-shipped token row must not re-send"
+        );
         assert!(
             matches!(
                 flush(&state, &key, &state.http).await.unwrap(),
                 FlushOutcome::Nothing
             ),
-            "an already-shipped token row must not re-send"
+            "drained: nothing left to send"
         );
     }
 

@@ -42,6 +42,12 @@ pub struct Record {
     /// When the hook fired (RFC 3339), so a late delivery keeps its real time.
     pub observed_at: String,
     pub event: Normalized,
+    /// Unique per hook, minted by the shim. The daemon drops a record whose id
+    /// it already queued: a hook the shim gave up on after the daemon had in
+    /// fact taken it is also spooled, and must not be stored twice. Empty in
+    /// records from before this field, which are never deduplicated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 impl Record {
@@ -53,8 +59,23 @@ impl Record {
                 .to_string(),
             observed_at,
             event,
+            id: new_id(),
         }
     }
+}
+
+/// A record id unique across hook processes: nanoseconds, pid and a
+/// per-process counter.
+fn new_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{nanos:x}-{:x}-{:x}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The spool directory for a store at `db_path`: `spool/` beside the database.
@@ -281,7 +302,8 @@ mod tests {
                     "source",
                     "reason",
                     "hints",
-                    "facts"
+                    "facts",
+                    "id"
                 ]
                 .contains(k),
                 "unexpected field {k}"

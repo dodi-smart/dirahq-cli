@@ -94,19 +94,69 @@ pub fn event_time(observed_at: Option<&str>) -> OffsetDateTime {
         .unwrap_or(now)
 }
 
+/// Ids of hook records recently queued to the writer, so a record that
+/// arrives twice (live after the shim timed out, then from the spool) is
+/// stored once. Bounded; a daemon restart forgets it, which only reopens that
+/// rare window.
+struct Seen {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+const SEEN_CAP: usize = 65_536;
+
+/// Whether a record with this id was already queued. Empty ids never are.
+pub fn already_queued(id: &str) -> bool {
+    !id.is_empty()
+        && SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|s| s.set.contains(id))
+}
+
+/// Remember that a record with this id reached the writer queue. Called only
+/// once it is queued, never when it is spilled: the spilled copy must replay.
+fn mark_queued(id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let mut guard = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seen = guard.get_or_insert_with(|| Seen {
+        set: Default::default(),
+        order: Default::default(),
+    });
+    if seen.set.insert(id.to_string()) {
+        seen.order.push_back(id.to_string());
+        if seen.order.len() > SEEN_CAP {
+            if let Some(old) = seen.order.pop_front() {
+                seen.set.remove(&old);
+            }
+        }
+    }
+}
+
 /// Queue a normalized hook for the writer, spilling it to the spool when the
-/// queue is full. `Err` only when the daemon is shutting down.
+/// queue is full. `hook_id` is the shim's record id, or `""`. `Err` only when
+/// the daemon is shutting down.
 pub fn enqueue(
     state: &AppState,
     harness_id: &str,
+    hook_id: &str,
     norm: Normalized,
     harness: Harness,
     at: OffsetDateTime,
 ) -> Result<(), &'static str> {
     match state.tx.try_send(EventMsg::Hook { norm, harness, at }) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            mark_queued(hook_id);
+            Ok(())
+        }
         Err(tokio::sync::mpsc::error::TrySendError::Full(EventMsg::Hook { norm, at, .. })) => {
-            spill(state, harness_id, norm, at);
+            spill(state, harness_id, hook_id, norm, at);
             Ok(())
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
@@ -117,7 +167,7 @@ pub fn enqueue(
 /// The write stays inline on purpose. It is one small file that must be on disk
 /// before this daemon answers `Ok`; deferring it would let a crash lose an
 /// event the shim was told had landed.
-fn spill(state: &AppState, harness_id: &str, norm: Normalized, at: OffsetDateTime) {
+fn spill(state: &AppState, harness_id: &str, hook_id: &str, norm: Normalized, at: OffsetDateTime) {
     // A capture-probe row is admitted only live (DIRASH-0023); replaying one
     // later would fail admission anyway, so it is not worth keeping.
     if dira_core::model::is_probe_session(&norm.session_id) {
@@ -125,7 +175,11 @@ fn spill(state: &AppState, harness_id: &str, norm: Normalized, at: OffsetDateTim
     }
     let observed_at = crate::heartbeat::fmt_rfc3339(at);
     let dir = spool::dir_for(&state.config.db_path);
-    match spool::write(&dir, &Record::new(harness_id, observed_at, norm)) {
+    let mut record = Record::new(harness_id, observed_at, norm);
+    if !hook_id.is_empty() {
+        record.id = hook_id.to_string();
+    }
+    match spool::write(&dir, &record) {
         Ok(_) => {
             SPILLED.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("ingest queue full; spilled a hook to the spool");
@@ -221,11 +275,14 @@ pub async fn drain_once(state: &AppState) -> (usize, usize) {
             bad.push(path);
             continue;
         };
-        if dira_core::model::is_probe_session(&record.event.session_id) {
+        if dira_core::model::is_probe_session(&record.event.session_id)
+            || already_queued(&record.id)
+        {
             done.push(path);
             continue;
         }
         let at = event_time(Some(&record.observed_at));
+        let id = record.id;
         let msg = EventMsg::Hook {
             norm: record.event,
             harness,
@@ -234,6 +291,7 @@ pub async fn drain_once(state: &AppState) -> (usize, usize) {
         if state.tx.send(msg).await.is_err() {
             break; // shutting down; the record stays for the next start
         }
+        mark_queued(&id);
         done.push(path);
         DRAINED.fetch_add(1, Ordering::Relaxed);
         replayed += 1;

@@ -320,7 +320,7 @@ async fn ingest_hook(
     };
 
     let at = crate::spool::event_time(observed_at.as_deref());
-    admit_and_enqueue(state, &harness, norm, harness_kind, at)
+    admit_and_enqueue(state, &harness, "", norm, harness_kind, at)
 }
 
 /// Ingest a hook the shim already normalized (`Request::IngestRecord`).
@@ -343,8 +343,13 @@ fn ingest_record(state: &AppState, record: serde_json::Value) -> Response {
             message: format!("unknown harness: {}", rec.harness),
         };
     };
+    // Delivered twice (the shim timed out after this daemon had queued it,
+    // and spooled it too): acknowledge, store once.
+    if crate::spool::already_queued(&rec.id) {
+        return Response::Ok;
+    }
     let at = crate::spool::event_time(Some(&rec.observed_at));
-    admit_and_enqueue(state, &rec.harness, rec.event, harness_kind, at)
+    admit_and_enqueue(state, &rec.harness, &rec.id, rec.event, harness_kind, at)
 }
 
 /// The one live ingress for a normalized hook, whichever request carried it:
@@ -352,6 +357,7 @@ fn ingest_record(state: &AppState, record: serde_json::Value) -> Response {
 fn admit_and_enqueue(
     state: &AppState,
     harness_id: &str,
+    hook_id: &str,
     norm: dira_sources::Normalized,
     harness_kind: dira_contract::Harness,
     at: OffsetDateTime,
@@ -369,7 +375,7 @@ fn admit_and_enqueue(
     // A full queue spills to the spool instead of dropping the hook
     // (DIRASH-0049). It used to answer `Ok` and discard it, so the shim recorded
     // a success for an event that never landed.
-    match crate::spool::enqueue(state, harness_id, norm, harness_kind, at) {
+    match crate::spool::enqueue(state, harness_id, hook_id, norm, harness_kind, at) {
         Ok(()) => Response::Ok,
         Err(why) => Response::Error {
             message: why.into(),

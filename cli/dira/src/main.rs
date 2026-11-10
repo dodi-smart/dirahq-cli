@@ -1886,8 +1886,10 @@ async fn deliver_record(
     )
     .await;
     match sent {
+        // An older daemon that does not know the request, or one shutting down
+        // (a restart): it did not take the hook, so keep it for the next one.
         Ok(Ok(dira_core::protocol::Response::Error { message }))
-            if client::is_daemon_too_old(&message) =>
+            if client::is_daemon_too_old(&message) || message.contains("shutting down") =>
         {
             if probe {
                 return note_hook_failure(harness, probe, &message);

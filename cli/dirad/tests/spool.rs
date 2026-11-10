@@ -149,3 +149,44 @@ async fn a_normalized_record_from_the_shim_lands_with_its_observed_time() {
     .await;
     assert!(matches!(bad, dira_core::protocol::Response::Error { .. }));
 }
+
+#[tokio::test]
+async fn a_hook_delivered_live_and_also_spooled_is_stored_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = daemon(dir.path()).await;
+    let record = Record::new(
+        "claude",
+        OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
+        event("s-dup", EventKind::UserPrompt),
+    );
+    // The daemon took it live, but the shim timed out and spooled it as well.
+    let resp = dirad::control::dispatch(
+        &state,
+        dira_core::protocol::Request::IngestRecord {
+            record: serde_json::to_value(&record).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(resp, dira_core::protocol::Response::Ok));
+    spool::write(&spool::dir_for(&dir.path().join("dira.db")), &record).unwrap();
+    let (replayed, _) = dirad::spool::drain_once(&state).await;
+    assert_eq!(replayed, 0, "the spooled copy is recognised and dropped");
+
+    // A second live delivery of the same record is acknowledged, not stored.
+    let again = dirad::control::dispatch(
+        &state,
+        dira_core::protocol::Request::IngestRecord {
+            record: serde_json::to_value(&record).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(again, dira_core::protocol::Response::Ok));
+    let evs = wait_for_events(&state, 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let evs = if evs.len() == 1 {
+        state.store.events_since(None).await.unwrap()
+    } else {
+        evs
+    };
+    assert_eq!(evs.len(), 1, "stored exactly once");
+}

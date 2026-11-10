@@ -54,6 +54,7 @@ async fn hook(
     match crate::spool::enqueue(
         &state,
         &harness,
+        "",
         norm,
         harness_kind,
         OffsetDateTime::now_utc(),

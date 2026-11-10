@@ -1781,6 +1781,13 @@ pub async fn check_schema_handshake(client: &reqwest::Client, cloud_url: Option<
             .any(|e| e.eq_ignore_ascii_case("zstd")),
         std::sync::atomic::Ordering::Relaxed,
     );
+    // Contract 2.1: meeting restatements go only to a cloud that applies their
+    // windows in every workspace (see `meeting_sync`).
+    crate::meeting_sync::set_cloud_restates_windows(
+        meta.capabilities
+            .iter()
+            .any(|c| c == dira_contract::CAPABILITY_RESTATEMENT_WINDOWS),
+    );
     if !schema_version_in_range(SCHEMA_VERSION, &meta) {
         tracing::warn!(
             our_version = SCHEMA_VERSION,
@@ -3788,6 +3795,7 @@ mod tests {
             schema_version: max.into(),
             min_schema_version: min.into(),
             accept_encodings: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 

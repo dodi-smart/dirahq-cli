@@ -170,20 +170,26 @@ pub fn dominant_identity(events: &[RawEvent]) -> String {
 /// `windows`). `events` must be EVERY stored event with `at` in
 /// `[window.start - idle, window.end + idle)`, read by time; `counted` the
 /// recorded or confirmed meetings overlapping that padded range; `records` the
-/// changed meeting records this batch reports. Everything is content-derived,
-/// so a retry rebuilds the identical batch.
+/// changed meeting records this batch reports. A meeting slice takes the
+/// events' most common identity, else `fallback_identity` (a range with no
+/// events at all). Everything is content-derived, so a retry rebuilds the
+/// identical batch.
+#[allow(clippy::too_many_arguments)]
 pub fn build_meeting_restatement(
     events: &[RawEvent],
     window: (OffsetDateTime, OffsetDateTime),
     counted: &[CountedMeeting],
     mut records: Vec<Meeting>,
     device_id: &str,
+    fallback_identity: &str,
     idle: Duration,
     now: OffsetDateTime,
 ) -> AttestationBatch {
     let work = super::batch::build_intervals_seeded(events, idle, &[]);
-    let (mut intervals, engaged) =
-        overlay_intervals(&work, counted, true, &dominant_identity(events));
+    let identity = Some(dominant_identity(events))
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| fallback_identity.to_string());
+    let (mut intervals, engaged) = overlay_intervals(&work, counted, true, &identity);
     // Send what touches the window; the padding only gives gaps their context.
     intervals.retain(|iv| match (parse(&iv.started_at), parse(&iv.ended_at)) {
         (Some(s), Some(e)) => s < window.1 && e > window.0,
@@ -201,20 +207,12 @@ pub fn build_meeting_restatement(
 
     // Content id: the restated interval ids, each record's (id, version), and the
     // window, stamped with the window's end so ids sort by time like ULIDs.
-    let versions: Vec<String> = records
-        .iter()
-        .map(|r| format!("{}@{}", r.id, r.version))
-        .collect();
+    let versions = versions(&records);
     let mut parts: Vec<&str> = intervals.iter().map(|iv| iv.id.as_str()).collect();
     parts.extend(versions.iter().map(String::as_str));
     parts.push(&windows[0].started_at);
     parts.push(&windows[0].ended_at);
-    let lo = super::batch::fnv1a(&parts, 0xcbf29ce484222325);
-    let hi = super::batch::fnv1a(&parts, 0x100000001b3);
-    let content = ((hi as u128) << 64) | lo as u128;
-    let ts = (window.1.unix_timestamp_nanos() / 1_000_000).max(0) as u128;
-    let batch_id = Ulid::from(((ts & ((1u128 << 48) - 1)) << 80) | (content & ((1u128 << 80) - 1)))
-        .to_string();
+    let batch_id = content_batch_id(&parts, window.1);
 
     AttestationBatch {
         batch_id,
@@ -233,6 +231,181 @@ pub fn build_meeting_restatement(
         meetings: records,
         windows,
     }
+}
+
+/// A batch carrying changed meeting `records` alone: no intervals and no
+/// `windows`, so it restates no time. For a range the device can no longer
+/// rebuild (its raw events were compacted): a window there would delete the
+/// claims the cloud holds for it (accounting review M3). `range_end` stamps the
+/// content-derived id, as a restatement's window end does.
+pub fn build_meeting_records(
+    mut records: Vec<Meeting>,
+    device_id: &str,
+    range_end: OffsetDateTime,
+    now: OffsetDateTime,
+) -> AttestationBatch {
+    records.sort_by(|a, b| a.id.cmp(&b.id));
+    let versions = versions(&records);
+    let mut parts: Vec<&str> = vec!["records-only"];
+    parts.extend(versions.iter().map(String::as_str));
+    let batch_id = content_batch_id(&parts, range_end);
+    AttestationBatch {
+        batch_id,
+        device_id: device_id.to_string(),
+        generated_at: fmt(now),
+        seq: 0,
+        prev_batch_hash: String::new(),
+        chain_epoch: 0,
+        client: None,
+        capture_health: None,
+        intervals: vec![],
+        sessions: vec![],
+        token_usage: vec![],
+        artifacts: vec![],
+        day_rollups: vec![],
+        meetings: records,
+        windows: vec![],
+    }
+}
+
+/// One piece of a clipped interval: `(id, start ms, end ms, human seconds)`.
+pub type ClippedPiece = (String, i64, i64, u64);
+
+/// What a restatement leaves of one interval this device already sent: its
+/// parts outside `region` (sorted, disjoint, half-open unix-ms ranges). This
+/// mirrors the cloud's `clipClaim` (cloud D-0087) exactly, so the day rollup
+/// this device signs keeps matching the claims the cloud holds:
+///
+/// - parts shorter than a second are dropped;
+/// - human seconds are prorated by wall-clock share, each part floored, and
+///   the floor of the retained total kept, the remainder going to the longest
+///   part (the first, on a tie);
+/// - the longest part keeps `id`, the others are `<id>~<end ms>`.
+pub fn clip_outside(
+    id: &str,
+    start_ms: i64,
+    end_ms: i64,
+    human_seconds: u64,
+    region: &[(i64, i64)],
+) -> Vec<ClippedPiece> {
+    const MIN_PIECE_MS: i64 = 1000;
+    let wall = end_ms - start_ms;
+    if wall <= 0 {
+        return vec![];
+    }
+    let mut parts: Vec<(i64, i64)> = Vec::new();
+    let mut cursor = start_ms;
+    for &(a, b) in region {
+        if b <= cursor {
+            continue;
+        }
+        if a >= end_ms {
+            break;
+        }
+        if a > cursor {
+            parts.push((cursor, a));
+        }
+        cursor = cursor.max(b);
+        if cursor >= end_ms {
+            break;
+        }
+    }
+    if cursor < end_ms {
+        parts.push((cursor, end_ms));
+    }
+    parts.retain(|(x, y)| y - x >= MIN_PIECE_MS);
+    if parts.is_empty() {
+        return vec![];
+    }
+    let human = human_seconds as i128;
+    let wall = wall as i128;
+    if parts.len() == 1 && parts[0] == (start_ms, end_ms) {
+        return vec![(id.to_string(), start_ms, end_ms, human_seconds)];
+    }
+    let retained: i128 = parts.iter().map(|(x, y)| (y - x) as i128).sum();
+    let kept = human * retained / wall;
+    let mut longest = 0;
+    for (k, (x, y)) in parts.iter().enumerate() {
+        if y - x > parts[longest].1 - parts[longest].0 {
+            longest = k;
+        }
+    }
+    let mut secs: Vec<i128> = parts
+        .iter()
+        .map(|(x, y)| human * (y - x) as i128 / wall)
+        .collect();
+    let floor_sum: i128 = secs.iter().sum();
+    secs[longest] += kept - floor_sum;
+    parts
+        .iter()
+        .enumerate()
+        .map(|(k, &(x, y))| {
+            let pid = if k == longest {
+                id.to_string()
+            } else {
+                format!("{id}~{y}")
+            };
+            (pid, x, y, secs[k].max(0) as u64)
+        })
+        .collect()
+}
+
+/// Unix milliseconds, floored, as the cloud reads an RFC 3339 instant.
+pub fn unix_ms(t: OffsetDateTime) -> i64 {
+    t.unix_timestamp_nanos().div_euclid(1_000_000) as i64
+}
+
+/// Merge half-open ms ranges into sorted, disjoint spans (extending on overlap
+/// or abut), as the cloud's `mergeSpans` does.
+pub fn merge_ms(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.retain(|(s, e)| e > s);
+    ranges.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
+/// The range a windowed batch restates for this device: its `windows` plus its
+/// intervals' spans, merged, in unix ms (cloud `restatedRegion`). Empty when
+/// the batch declares no window.
+pub fn restated_region(batch: &AttestationBatch) -> Vec<(i64, i64)> {
+    if batch.windows.is_empty() {
+        return vec![];
+    }
+    let spans = batch
+        .windows
+        .iter()
+        .map(|w| (w.started_at.as_str(), w.ended_at.as_str()))
+        .chain(
+            batch
+                .intervals
+                .iter()
+                .map(|i| (i.started_at.as_str(), i.ended_at.as_str())),
+        )
+        .filter_map(|(s, e)| Some((unix_ms(parse(s)?), unix_ms(parse(e)?))))
+        .collect();
+    merge_ms(spans)
+}
+
+fn versions(records: &[Meeting]) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| format!("{}@{}", r.id, r.version))
+        .collect()
+}
+
+/// A ULID whose time part is `stamp` and whose randomness is a hash of `parts`.
+fn content_batch_id(parts: &[&str], stamp: OffsetDateTime) -> String {
+    let lo = super::batch::fnv1a(parts, 0xcbf29ce484222325);
+    let hi = super::batch::fnv1a(parts, 0x100000001b3);
+    let content = ((hi as u128) << 64) | lo as u128;
+    let ts = (stamp.unix_timestamp_nanos() / 1_000_000).max(0) as u128;
+    Ulid::from(((ts & ((1u128 << 48) - 1)) << 80) | (content & ((1u128 << 80) - 1))).to_string()
 }
 
 #[cfg(test)]
@@ -340,6 +513,7 @@ mod tests {
                 &meetings,
                 vec![record("m1", v)],
                 "dev",
+                "",
                 IDLE,
                 now,
             )
@@ -390,6 +564,7 @@ mod tests {
             &[],
             vec![r],
             "dev",
+            "",
             IDLE,
             datetime!(2026-11-06 11:00 UTC),
         );
@@ -400,5 +575,129 @@ mod tests {
             .iter()
             .any(|i| i.started_at.as_str() < "2026-11-06T10:20:00Z"
                 && i.ended_at.as_str() > "2026-11-06T10:10:00Z"));
+    }
+
+    #[test]
+    fn a_meeting_with_no_events_around_it_takes_the_fallback_identity() {
+        let (_, meetings) = fixture();
+        let window = (
+            datetime!(2026-11-06 10:05 UTC),
+            datetime!(2026-11-06 10:25 UTC),
+        );
+        let b = build_meeting_restatement(
+            &[],
+            window,
+            &meetings,
+            vec![record("m1", 1)],
+            "dev",
+            "fallback@example.com",
+            IDLE,
+            datetime!(2026-11-06 11:00 UTC),
+        );
+        assert_eq!(b.intervals.len(), 1);
+        assert_eq!(b.intervals[0].identity_email, "fallback@example.com");
+    }
+
+    #[test]
+    fn a_records_only_batch_restates_no_time_and_is_deterministic() {
+        let end = datetime!(2026-11-06 10:25 UTC);
+        let now = datetime!(2026-11-06 11:00 UTC);
+        let b = build_meeting_records(vec![record("m1", 2)], "dev", end, now);
+        assert!(b.intervals.is_empty() && b.windows.is_empty());
+        assert_eq!(b.meetings.len(), 1);
+        assert_eq!(
+            b.batch_id,
+            build_meeting_records(vec![record("m1", 2)], "dev", end, now).batch_id
+        );
+        assert_ne!(
+            b.batch_id,
+            build_meeting_records(vec![record("m1", 3)], "dev", end, now).batch_id
+        );
+    }
+
+    // The same cases as the cloud's `clipClaim` tests (claims.test.ts), so the
+    // two sides stay byte-for-byte equal.
+    const T0: i64 = 1_793_959_200_000; // 2026-11-06T10:00:00Z
+    const fn at(min: i64) -> i64 {
+        T0 + min * 60_000
+    }
+
+    #[test]
+    fn clip_matches_the_cloud_cases() {
+        // Inside the region: gone.
+        assert!(clip_outside("w", at(5), at(25), 1200, &[(at(0), at(30))]).is_empty());
+        // Straddling an edge: the outside part, prorated and floored.
+        assert_eq!(
+            clip_outside("w", at(-30), at(20), 2999, &[(at(-5), at(35))]),
+            vec![("w".to_string(), at(-30), at(-5), 1499)]
+        );
+        // Around the region: two parts, the longest keeps the id.
+        assert_eq!(
+            clip_outside("w", at(-60), at(60), 7200, &[(at(0), at(30))]),
+            vec![
+                ("w".to_string(), at(-60), at(0), 3600),
+                (format!("w~{}", at(60)), at(30), at(60), 1800),
+            ]
+        );
+        // Outside every range: whole.
+        assert_eq!(
+            clip_outside(
+                "w",
+                at(40),
+                at(50),
+                600,
+                &[(at(0), at(30)), (at(60), at(90))]
+            ),
+            vec![("w".to_string(), at(40), at(50), 600)]
+        );
+    }
+
+    #[test]
+    fn a_clip_never_keeps_more_than_claimed_nor_anything_inside() {
+        let mut seed: u64 = 7;
+        let mut next = move |n: i64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as i64).rem_euclid(n)
+        };
+        for _ in 0..5000 {
+            let s = at(next(120));
+            let e = s + 1 + next(90 * 60_000);
+            let human = next(6000) as u64;
+            let a = at(next(180) - 30);
+            let region = [(a, a + 1 + next(60 * 60_000))];
+            let kept = clip_outside("c", s, e, human, &region);
+            assert!(kept.iter().map(|p| p.3).sum::<u64>() <= human);
+            for (_, x, y, _) in &kept {
+                assert!(*x >= s && *y <= e && y - x >= 1000);
+                assert!(*y <= region[0].0 || *x >= region[0].1);
+            }
+        }
+    }
+
+    #[test]
+    fn the_region_is_the_windows_plus_the_intervals() {
+        let (events, meetings) = fixture();
+        let b = build_meeting_restatement(
+            &events,
+            (
+                datetime!(2026-11-06 10:05 UTC),
+                datetime!(2026-11-06 10:25 UTC),
+            ),
+            &meetings,
+            vec![record("m1", 1)],
+            "dev",
+            "",
+            IDLE,
+            datetime!(2026-11-06 11:00 UTC),
+        );
+        let region = restated_region(&b);
+        assert_eq!(region.len(), 1);
+        assert!(region[0].0 <= unix_ms(datetime!(2026-11-06 10:05 UTC)));
+        assert!(region[0].1 >= unix_ms(datetime!(2026-11-06 10:25 UTC)));
+        let mut flush = b.clone();
+        flush.windows.clear();
+        assert!(restated_region(&flush).is_empty());
     }
 }

@@ -1,10 +1,10 @@
 ---
 title: Attestation sync and session rollups
-version: 12
+version: 13
 origin: session
 verified: false
 confidence: high
-date: 2026-11-09
+date: 2026-11-10
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
@@ -14,7 +14,7 @@ paths:
   - cli/dirad/src/writer.rs
   - cli/dirad/src/chain.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046, DIRASH-0049, DIRASH-0052]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046, DIRASH-0049, DIRASH-0052, DIRASH-0062, DIRASH-0063, DIRASH-0067]
 ---
 
 ## Overview
@@ -233,18 +233,24 @@ single flush window (issue #40).
   omits them clears nothing. A trigger seen by the live registry counts as a
   lineage change, so a partial ships it. `LINEAGE_RULES_VERSION` is unchanged:
   past events carry no trigger, so there is nothing to re-send.
-- Contract 2.1 (proposed, meetings) adds `AttestationBatch.meetings[]` and an
+- Contract 2.1 (meetings) adds `AttestationBatch.meetings[]` and an
   optional `Interval.meetingId`. A `Meeting` is content-free (closed enums,
   times, buckets, booleans, ids, workspace refs, an HMAC series key) and is
   upserted by `(deviceId, id)` with a monotonic `version`; a retraction is a
-  record with `state: retracted` (DIRASH-0062). The producer does not emit
-  either yet: `batch.rs` sets `meetingId: None` and sends no meetings until the
-  daemon wiring lands. When it does, a meeting's time rides intervals the
-  device has already overlaid with its work (DIRASH-0063), so a reader still
-  sums `humanSeconds` once. 2.1 also adds `AttestationBatch.windows[]`: ranges
-  the batch restates in full for its device, so the cloud's per-device claims
-  (cloud D-0085) are replaced there even where no interval lands, e.g. a
-  retracted meeting with nothing left. The producer sends none yet.
+  record with `state: retracted` (DIRASH-0062). A meeting's time rides
+  intervals the device has already overlaid with its work (DIRASH-0063), so a
+  reader still sums `humanSeconds` once. Flushes clip their work around the
+  counted meetings and send no meeting slice; every meeting change is sent as a
+  restatement (`dirad/src/meeting_sync.rs`) once its padded read has settled
+  (meeting end plus `2 × idle_seconds`). 2.1 also adds
+  `AttestationBatch.windows[]`: ranges the batch restates in full for its
+  device. The cloud clips the device's claims in the region (windows plus the
+  batch's intervals) in every workspace (cloud D-0087), and the acked-batch
+  ledger (`day_intervals`) clips the same way (`clip_outside`), so signed day
+  rollups keep matching the claims. A change whose read reaches a compacted
+  day sends its records alone, with no window (DIRASH-0067). Sync is on
+  when meetings exist and the cloud's meta lists the `restatement-windows`
+  capability; there is no env gate.
 
 ## Invariants
 

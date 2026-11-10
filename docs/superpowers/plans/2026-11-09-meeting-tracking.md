@@ -226,21 +226,20 @@ Both need their own design and legal review.
 
 ## Status (2026-11-10)
 
-On `feat/meetings` (dodi-smart/dirahq-cli#222):
-- detection, the local store, `dira meetings` and the `dira report` overlay are live behind
-  `modules.meetings` (default off);
-- the producer (flush clipping plus restatement batches) is built but gated by
-  `DIRA_MEETINGS_SYNC` (default off), so the wire is unchanged.
+Detection, the local store, `dira meetings` and the `dira report` overlay are live behind
+`modules.meetings` (default off). Meeting sync (flush clipping plus restatement batches) is on
+when meetings exist and the cloud advertises the `restatement-windows` capability; the
+`DIRA_MEETINGS_SYNC` gate is removed (DIRASH-0067).
 
-`accounting-reviewer` signed off on merging with the gate off. Conditions for turning it on:
-1. **Cloud `windows[]`.** The cloud applies `windows[]` to all of the device's claims in every
-   workspace (review H1). Without that, a restatement's meeting slice and the work around it can
-   route to different workspaces and bill the same minutes twice.
-2. **Padded range before retained events.** Don't declare `windows` when the padded range reaches
-   back past retained events (M3). This also applies to a full resync.
-3. **Fallback identity.** Use a fallback identity instead of an empty `identityEmail` on a
-   meeting slice with no nearby events (L2).
-4. **Day rollups.** Delete `day_intervals` by window overlap, not by window start (L3).
-5. **Midnight.** Decide whether restatement slices are split at UTC midnight (spec §2.2 rule 8 and
-   property 11), or amend the spec. `split_at_midnight` was removed because nothing called it.
-
+The `accounting-reviewer` conditions for turning sync on, and where each landed:
+1. **Cloud `windows[]` (H1).** Done in dodi-smart/dirahq-cloud#310, closing #303 (cloud D-0087): the cloud
+   clips the device's claims in the restated region in every workspace, in one transaction.
+2. **Padded range before retained events (M3).** Done: compaction keeps the read range of any
+   unsent change, and a change whose read still reaches a compacted day (or a day past the
+   40-day ledger) sends its records alone, with no window.
+3. **Fallback identity (L2).** Done: a meeting slice with no nearby event takes the identity of
+   the latest event before the read's end.
+4. **Day rollups (L3).** Done earlier (delete by overlap); now the ledger clips exactly like the
+   cloud (`clip_outside`), so day rollups keep matching the claims.
+5. **Midnight.** Decided: restatement slices are not split at UTC midnight. Flush intervals are
+   not split either, and the cloud and the day ledger both file a row on its start day.

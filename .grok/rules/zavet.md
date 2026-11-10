@@ -113,6 +113,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0064 — Calendar facts are reduced on the device; attribution resolves locally; no titles, attendees or domains cross (proposed)
 - DIRASH-0065 — Meeting titles ride only their own consent-gated labels channel, never the attestation wire (proposed)
 - DIRASH-0066 — The daemon obeys the workspace meeting policy; admins can disable but never force capture on, and the user's opt-out always wins (proposed)
+- DIRASH-0067 — Meeting restatements sync when the cloud advertises restatement windows, and the day ledger clips like the cloud (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

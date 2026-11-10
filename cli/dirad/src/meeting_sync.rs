@@ -1,26 +1,54 @@
-//! Send meeting changes as restatement batches (contract 2.1, DIRASH-0063).
+//! Send meeting changes as restatement batches (contract 2.1, DIRASH-0063,
+//! DIRASH-0067).
 //!
-//! **Gated off.** Nothing here runs unless `DIRA_MEETINGS_SYNC` is set (the
-//! isolated end-to-end stack). The cloud replaces a device's claims only where
-//! a batch's intervals land, per workspace, and does not honour `windows` yet.
-//! Until it applies `windows` to every workspace, a restatement could leave a
-//! stale claim in another workspace and bill a minute twice (accounting
-//! review H1). With the gate off, flushes do not clip work around meetings
-//! either, so the wire is exactly what it was before meetings, and meetings
-//! stay local (`dira meetings`, `dira report`).
+//! On whenever there are meetings AND the cloud advertises
+//! [`dira_contract::CAPABILITY_RESTATEMENT_WINDOWS`] in `GET /api/v1/meta`:
+//! it applies `windows` to the device's claims in EVERY workspace
+//! (dodi-smart/dirahq-cloud#310, cloud D-0087), so a restatement whose meeting
+//! and surrounding work route to different workspaces leaves no stale claim
+//! behind (accounting review H1). An older cloud replaces claims per workspace
+//! and would bill a restated minute twice, so against one nothing here runs:
+//! flushes are not clipped, no restatement is sent, and changes wait. While the
+//! capability is missing, the step re-reads the meta at most hourly, so a cloud
+//! deploy turns sync on without a daemon restart. The capability is also the
+//! kill switch: a cloud that drops it turns sync off.
 //!
-//! When on: the flush's event chunks never carry a meeting's time (a meeting
-//! has no events). Every change to a meeting (recorded, confirmed, retracted,
-//! reassigned) triggers a restatement:
+//! Meetings only exist once `modules.meetings` has been on. Turning the module
+//! off stops detection, not sync: a meeting already on the cloud keeps flushes
+//! clipping around it, and a later change to it (a retraction) still goes out.
+//! Stopping sync there would let a flush re-send work over a meeting the cloud
+//! still bills.
+//!
+//! A flush's event chunks never carry a meeting's time (a meeting has no
+//! events), and flushes clip their work around the counted meetings. Every
+//! change to a meeting (recorded, confirmed, retracted, reassigned) triggers a
+//! restatement:
 //!
 //! 1. read every stored event in the meeting's padded range BY TIME;
 //! 2. rebuild that range (`dira_core::sync::meetings`);
 //! 3. send it with the range as `windows` and the changed records, through
 //!    `post_chained`.
 //!
-//! A group is restated only once its range has settled (`now` past its end
-//! plus idle), so a retry after a lost ack re-sends identical bytes. The
-//! meeting cursor (`meeting_cursor`) moves only over a fully acknowledged
+//! A group is restated only once its range has settled: `now` past the end of
+//! the event read, which is the meetings' end plus `2 × idle_seconds` (10 min
+//! by default). The wait is tied to `idle_seconds` on purpose: the overlay pads
+//! the window by idle so its edge gaps have context, and events may still land
+//! anywhere in that read until it has passed. Settling sooner would change the
+//! bytes of a retry. A retry after a lost ack therefore re-sends identical
+//! bytes.
+//!
+//! A range that reaches back into compacted days (raw events pruned), or past
+//! the 40-day day ledger, is never restated: the rebuild would see no work
+//! there and the window would delete claims the cloud rightly holds
+//! (accounting review M3), or sign a day rollup the cloud cannot match. Such a
+//! change sends its records alone, with no intervals and no window. To keep
+//! that rare, compaction never prunes the padded range of a change still
+//! waiting to be sent ([`compaction_floor`]), so only a change made after its
+//! days were compacted (an edit to a meeting older than retention) goes out
+//! records-only. A retraction sent that way leaves the meeting's slices billed
+//! on the cloud (DIRASH-0067).
+//!
+//! The meeting cursor (`meeting_cursor`) moves only over a fully acknowledged
 //! prefix of changes. Rejections keep their own streak, and the step runs on
 //! its own backoff: it never fails or delays a flush.
 
@@ -31,7 +59,7 @@ use dira_contract::{
 };
 use dira_core::signing::DeviceKey;
 use dira_core::store::{DetectionConfidence, MeetingState, StoredMeeting};
-use dira_core::sync::meetings::{build_meeting_restatement, CountedMeeting};
+use dira_core::sync::meetings::{build_meeting_records, build_meeting_restatement, CountedMeeting};
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
@@ -39,16 +67,47 @@ use time::{Duration, OffsetDateTime};
 const META_MEETING_CURSOR: &str = "meeting_cursor";
 const META_MEETING_STREAK: &str = "meeting_poison";
 
-/// Whether meetings ride the wire at all (see the module doc).
-pub(crate) fn enabled() -> bool {
-    std::env::var("DIRA_MEETINGS_SYNC")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
-        .unwrap_or(false)
+/// Whether the cloud advertised [`dira_contract::CAPABILITY_RESTATEMENT_WINDOWS`]
+/// at the last meta handshake. False until one says so.
+static CLOUD_RESTATES_WINDOWS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When the step last re-read the cloud's meta while the capability was missing.
+static LAST_CAPABILITY_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How often a step re-reads the meta while the capability is missing.
+const CAPABILITY_RECHECK: StdDuration = StdDuration::from_secs(3600);
+
+/// Record the handshake's answer (`sync::check_schema_handshake`).
+pub(crate) fn set_cloud_restates_windows(on: bool) {
+    CLOUD_RESTATES_WINDOWS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether meetings ride the wire: the cloud applies windows everywhere.
+pub(crate) fn cloud_restates_windows() -> bool {
+    CLOUD_RESTATES_WINDOWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Raw events this far back may no longer be summed into the device's day
+/// ledger (`Store::prune_day_rollups` keeps 40 days); a restatement that far
+/// back would sign a rollup the cloud cannot match. One day of margin.
+const LEDGER_DAYS: i64 = 39;
+
+/// The earliest instant compaction must keep raw events for: the padded read
+/// start of the oldest meeting change not yet sent. `None` when nothing waits,
+/// or when the cloud cannot take restatements (holding compaction for a cloud
+/// that may never advertise would grow the event log without bound).
+pub(crate) async fn compaction_floor(state: &AppState, idle: Duration) -> Option<OffsetDateTime> {
+    if !cloud_restates_windows() {
+        return None;
+    }
+    let after = cursor(state).await;
+    let changed = state.store.meetings_changed_after(after).await.ok()?;
+    changed
+        .iter()
+        .map(|m| m.started_at)
+        .min()
+        .map(|t| t - idle - idle)
 }
 
 async fn cursor(state: &AppState) -> i64 {
@@ -63,10 +122,9 @@ async fn cursor(state: &AppState) -> i64 {
 }
 
 /// How many meeting changes are waiting: the flush gate's cheap check.
+/// Counted whatever the cloud can take, so an idle flush still reaches
+/// [`step_paced`], which re-reads the meta while the capability is missing.
 pub(crate) async fn pending(state: &AppState) -> i64 {
-    if !enabled() {
-        return 0;
-    }
     let after = cursor(state).await;
     state
         .store
@@ -108,7 +166,7 @@ pub(crate) async fn counted_for_flush(
     events: &[dira_core::model::RawEvent],
     idle: Duration,
 ) -> Result<Vec<CountedMeeting>, SyncError> {
-    if !enabled() {
+    if !cloud_restates_windows() {
         return Ok(Vec::new());
     }
     let (Some(lo), Some(hi)) = (
@@ -200,8 +258,24 @@ pub(crate) async fn step_paced(
     cloud_url: &str,
     device_id: &str,
 ) {
-    if !enabled() {
-        return;
+    if !cloud_restates_windows() {
+        let due = LAST_CAPABILITY_CHECK
+            .lock()
+            .ok()
+            .map(|mut g| {
+                let due = g.is_none_or(|t| t.elapsed() >= CAPABILITY_RECHECK);
+                if due {
+                    *g = Some(Instant::now());
+                }
+                due
+            })
+            .unwrap_or(false);
+        if due {
+            crate::sync::check_schema_handshake(client, Some(cloud_url)).await;
+        }
+        if !cloud_restates_windows() {
+            return;
+        }
     }
     let backing_off = NOT_BEFORE
         .lock()
@@ -284,21 +358,39 @@ async fn step(
             // be re-sent on every flush until this one settles (at most 2·idle).
             break;
         }
-        let events = state
+        let compacted = state
             .store
-            .events_in_at_range(lo - idle, hi + idle)
+            .compacted_since(lo - idle)
             .await
-            .map_err(|e| SyncError::Fatal(format!("read events by time: {e}")))?;
-        let counted_meetings = counted_between(state, lo - idle, hi + idle).await?;
-        let batch = build_meeting_restatement(
-            &events,
-            (lo, hi),
-            &counted_meetings,
-            records,
-            device_id,
-            idle,
-            now,
-        );
+            .map_err(|e| SyncError::Fatal(format!("read compaction state: {e}")))?;
+        let batch = if compacted || lo - idle < now - Duration::days(LEDGER_DAYS) {
+            // The raw events are gone: restating would delete what the cloud
+            // rightly holds (see the module doc). Report the records only.
+            build_meeting_records(records, device_id, hi, now)
+        } else {
+            let events = state
+                .store
+                .events_in_at_range(lo - idle, hi + idle)
+                .await
+                .map_err(|e| SyncError::Fatal(format!("read events by time: {e}")))?;
+            let counted_meetings = counted_between(state, lo - idle, hi + idle).await?;
+            let fallback = state
+                .store
+                .latest_identity_email(hi + idle)
+                .await
+                .map_err(|e| SyncError::Fatal(format!("read identity: {e}")))?
+                .unwrap_or_default();
+            build_meeting_restatement(
+                &events,
+                (lo, hi),
+                &counted_meetings,
+                records,
+                device_id,
+                &fallback,
+                idle,
+                now,
+            )
+        };
         match post_chained(
             state, device_key, client, &url, device_id, &mut chain, batch,
         )
@@ -467,12 +559,5 @@ mod tests {
             Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
         ));
         assert!(!content_rejection(&fatal(), None));
-    }
-
-    #[test]
-    fn the_gate_is_off_by_default() {
-        if std::env::var_os("DIRA_MEETINGS_SYNC").is_none() {
-            assert!(!enabled());
-        }
     }
 }

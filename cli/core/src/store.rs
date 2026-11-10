@@ -468,6 +468,43 @@ impl Store {
         rows.iter().map(row_to_event).collect()
     }
 
+    /// Whether raw events at or after `t` may already be compacted away: some
+    /// UTC day from `t`'s on has a `session_rollup_daily` row. Compaction works
+    /// in whole UTC days and writes those rows for the days it prunes, so a
+    /// by-time read from `t` is complete only when this is false.
+    pub async fn compacted_since(&self, t: OffsetDateTime) -> Result<bool, Error> {
+        let day = t
+            .to_offset(time::UtcOffset::UTC)
+            .date()
+            .format(&time::macros::format_description!("[year]-[month]-[day]"))
+            .map_err(|e| Error::Time(format!("format day: {e}")))?;
+        Ok(
+            sqlx::query("SELECT 1 FROM session_rollup_daily WHERE day >= ?1 LIMIT 1")
+                .bind(day)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some(),
+        )
+    }
+
+    /// The identity on the latest event before `before` that carries one: the
+    /// fallback for a meeting slice with no event around it. Bounded by time so
+    /// a retry of a settled restatement picks the same one.
+    pub async fn latest_identity_email(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Option<String>, Error> {
+        Ok(sqlx::query(
+            "SELECT identity_email FROM events WHERE at < ?1 AND identity_email IS NOT NULL \
+             AND identity_email != '' AND session_id NOT LIKE ?2 ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(StoredAt(before))
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|r| r.get("identity_email")))
+    }
+
     /// All retained events for `session_ids` with `id <= until`, per session ordered
     /// by `at`. Used by the daemon to rebuild an *ended* session's rollup from its
     /// full retained history rather than the current sync window (issue #40): the
@@ -3648,23 +3685,90 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let mut days: std::collections::BTreeSet<(String, String)> = Default::default();
         // A batch that restates windows (contract 2.1, a meeting re-decompose)
-        // replaces this device's intervals inside them, possibly under new ids:
-        // drop every stored row that OVERLAPS a window (a neighbour starting just
-        // before it too) and mark their days dirty, or both would be summed into
-        // the next day rollup. Compared as instants, like the replace below:
-        // RFC 3339 text with fractional seconds does not sort as time.
-        for w in &batch.windows {
-            let gone = sqlx::query(
-                "DELETE FROM day_intervals \
+        // replaces this device's intervals inside its region (the windows plus
+        // its intervals' spans), possibly under new ids. Exactly as the cloud
+        // clips the device's claims (cloud D-0087): every stored row
+        // overlapping the region is dropped and its parts outside the region
+        // put back, prorated and renamed by `clip_outside`, and their days
+        // marked dirty. Clipping the same way keeps the day rollup equal to the
+        // cloud's claims; a whole-row delete would sign less than the cloud
+        // holds. Candidates are found as instants (RFC 3339 text with fractional
+        // seconds does not sort as time), then tested in unix ms like the cloud.
+        let region = crate::sync::meetings::restated_region(batch);
+        if let (Some(first), Some(last)) = (region.first(), region.last()) {
+            let rfc = |ms: i64| {
+                OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000)
+                    .ok()
+                    .and_then(|t| t.format(&Rfc3339).ok())
+            };
+            let (Some(lo), Some(hi)) = (rfc(first.0), rfc(last.1)) else {
+                return Err(Error::Time("restated region out of range".into()));
+            };
+            let candidates = sqlx::query(
+                "SELECT id, day, repo, human_seconds, session_id, started_at, ended_at \
+                 FROM day_intervals \
                  WHERE julianday(started_at) < julianday(?1) \
-                 AND julianday(ended_at) > julianday(?2) RETURNING day, repo",
+                 AND julianday(ended_at) > julianday(?2)",
             )
-            .bind(&w.ended_at)
-            .bind(&w.started_at)
+            .bind(&hi)
+            .bind(&lo)
             .fetch_all(&mut *tx)
             .await?;
-            for r in gone {
-                days.insert((r.get("day"), r.get("repo")));
+            let ms = |t: &str| {
+                OffsetDateTime::parse(t, &Rfc3339)
+                    .ok()
+                    .map(crate::sync::meetings::unix_ms)
+            };
+            for r in candidates {
+                let (id, started_at, ended_at): (String, String, String) =
+                    (r.get("id"), r.get("started_at"), r.get("ended_at"));
+                let (Some(s), Some(e)) = (ms(&started_at), ms(&ended_at)) else {
+                    continue;
+                };
+                if !region.iter().any(|&(a, b)| s < b && e > a) {
+                    continue;
+                }
+                let (day, repo, session): (String, String, String) =
+                    (r.get("day"), r.get("repo"), r.get("session_id"));
+                let human: i64 = r.get("human_seconds");
+                sqlx::query("DELETE FROM day_intervals WHERE id = ?1")
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                days.insert((day, repo.clone()));
+                for (pid, x, y, secs) in
+                    crate::sync::meetings::clip_outside(&id, s, e, human.max(0) as u64, &region)
+                {
+                    let keep = |at_ms: i64, orig: &str, orig_ms: i64| {
+                        if at_ms == orig_ms {
+                            Some(orig.to_string())
+                        } else {
+                            rfc(at_ms)
+                        }
+                    };
+                    let (Some(ps), Some(pe)) = (keep(x, &started_at, s), keep(y, &ended_at, e))
+                    else {
+                        continue;
+                    };
+                    let Some(pday) = utc_day(&ps).map(str::to_string) else {
+                        continue;
+                    };
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO day_intervals \
+                         (id, day, repo, human_seconds, session_id, started_at, ended_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    )
+                    .bind(&pid)
+                    .bind(&pday)
+                    .bind(&repo)
+                    .bind(secs as i64)
+                    .bind(&session)
+                    .bind(&ps)
+                    .bind(&pe)
+                    .execute(&mut *tx)
+                    .await?;
+                    days.insert((pday, repo.clone()));
+                }
             }
         }
         for i in &batch.intervals {
@@ -7008,6 +7112,86 @@ mod v2_tests {
             (d.human_seconds, d.interval_count, d.revision),
             (1800, 2, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn a_restatement_clips_a_straddling_row_like_the_cloud() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        let at = |hm: &str| format!("{day}T{hm}:00Z");
+        let span = |id: &str, s: &str, e: &str, secs: u64| Interval {
+            id: id.into(),
+            started_at: at(s),
+            ended_at: at(e),
+            ..interval(id, &day, secs)
+        };
+        // The cloud test's flush (unpack-windows.pg.test.ts): one row straddles
+        // the restated region's start, one lies inside it, one after it.
+        store
+            .record_acked_batch(&batch(vec![
+                span("w1", "09:30", "09:58", 1680),
+                span("w2", "10:05", "10:25", 1200),
+                span("w3", "10:40", "11:00", 1200),
+            ]))
+            .await
+            .unwrap();
+        let mut restated = batch(vec![span("r1", "09:50", "10:00", 600)]);
+        restated.windows = vec![dira_contract::BatchWindow {
+            started_at: at("09:55"),
+            ended_at: at("10:35"),
+        }];
+        store.record_acked_batch(&restated).await.unwrap();
+
+        let rows: Vec<(String, String, String, i64)> = sqlx::query(
+            "SELECT id, started_at, ended_at, human_seconds FROM day_intervals ORDER BY started_at",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r.get("id"),
+                r.get("started_at"),
+                r.get("ended_at"),
+                r.get("human_seconds"),
+            )
+        })
+        .collect();
+        // w1 keeps 09:30-09:50 under its own id with floor(1680 * 20 / 28)
+        // seconds, as the cloud's clipped claim does; w2 is gone; w3 untouched.
+        assert_eq!(
+            rows,
+            vec![
+                ("w1".into(), at("09:30"), at("09:50"), 1200),
+                ("r1".into(), at("09:50"), at("10:00"), 600),
+                ("w3".into(), at("10:40"), at("11:00"), 1200),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn compacted_since_sees_a_rollup_day_at_or_after_the_read_start() {
+        use time::macros::datetime;
+        let store = Store::open_in_memory().await.unwrap();
+        let t = datetime!(2026-10-20 23:50 UTC);
+        assert!(!store.compacted_since(t).await.unwrap());
+        sqlx::query(
+            "INSERT INTO session_rollup_daily (day, session_id) VALUES ('2026-10-19', 's')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        // A compacted day before the read's own day leaves the read complete.
+        assert!(!store.compacted_since(t).await.unwrap());
+        sqlx::query(
+            "INSERT INTO session_rollup_daily (day, session_id) VALUES ('2026-10-20', 's')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        // Its own day was compacted: events before `t` that day are gone.
+        assert!(store.compacted_since(t).await.unwrap());
     }
 
     #[tokio::test]

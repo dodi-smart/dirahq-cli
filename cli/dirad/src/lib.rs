@@ -861,7 +861,12 @@ pub async fn maintenance_sweep(
     }
 
     let cursor = state.store.sync_cursor().await.ok().flatten();
-    let cutoff = OffsetDateTime::now_utc() - state.config.retention();
+    let mut cutoff = OffsetDateTime::now_utc() - state.config.retention();
+    // Never prune the raw events a waiting meeting restatement still has to
+    // read: it would then go out records-only (DIRASH-0067).
+    if let Some(floor) = crate::meeting_sync::compaction_floor(state, state.config.idle()).await {
+        cutoff = cutoff.min(floor);
+    }
     match state
         .store
         .compact(cursor.as_deref(), cutoff, state.config.idle())

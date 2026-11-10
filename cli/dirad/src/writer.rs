@@ -350,8 +350,13 @@ async fn process_message(
     // normal path. `ManualStop` is deliberately not a trigger — a manual session is
     // an explicit `dira start`, and `ManualStop` is itself a human signal, so it
     // could never be degenerate anyway.
+    //
+    // Not while the spool holds records: a live `SessionEnd` can overtake the
+    // same session's spooled prompt or tool events (DIRASH-0049), and pruning
+    // then would delete a real session whose activity arrives a moment later.
     if ev.kind == EventKind::SessionEnd
         && crate::control::lock_recover(&state.sessions).is_degenerate(&ev.session_id)
+        && !dira_sources::spool::has_records(&dira_sources::spool::dir_for(&state.config.db_path))
     {
         match state.store.delete_session_events(&ev.session_id).await {
             Ok(deleted) => {
@@ -890,6 +895,19 @@ async fn transcript_fingerprint(file: &mut tokio::fs::File, len: u64) -> Option<
 
 fn offset_key_for(session_id: &str, transcript_path: &str) -> String {
     let path = std::path::Path::new(transcript_path);
+    // A legacy-layout sidecar sits directly in the project dir, shared by every
+    // session there, so its watermark is keyed by the FILE: each one is read
+    // once overall instead of from offset 0 by every new session. The current
+    // layout (`<session>/subagents/`) belongs to one session and stays keyed
+    // by it.
+    let in_session_dir = path
+        .parent()
+        .and_then(|d| d.file_name())
+        .is_some_and(|n| n == "subagents");
+    if is_subagent_transcript(path) && !in_session_dir {
+        let h = dira_core::sync::fnv1a_bytes(transcript_path.as_bytes(), 0xcbf2_9ce4_8422_2325);
+        return format!("token_offset:sidecar:{h:016x}");
+    }
     if is_subagent_transcript(path) {
         let stem = path
             .file_stem()
@@ -912,18 +930,11 @@ fn offset_key_for(session_id: &str, transcript_path: &str) -> String {
 ///   session's own `<project>/<session-id>.jsonl`. Only this session's files.
 ///   The sweep used to look only in `<project>/`, so it never found these.
 /// - legacy: `agent-*.jsonl` directly in `<project>/`, shared by every session
-///   in the project. Each new session re-read all of them from offset 0 (the
-///   watermark is per session), one SQL statement per turn, inline in the
-///   writer. Only files modified within [`LEGACY_SIDECAR_WINDOW`] are swept
-///   now: an older one is finished, and its own session read it.
+///   in the project. Their watermarks are keyed by file ([`offset_key_for`]),
+///   so an unchanged one costs one `metadata` call no matter how many sessions
+///   sweep it. Keyed by session, every new session used to re-read all of them
+///   from offset 0.
 fn subagent_transcripts(main: &str) -> Vec<String> {
-    subagent_transcripts_at(main, std::time::SystemTime::now())
-}
-
-/// How recently a legacy-layout sidecar must have been written to be swept.
-const LEGACY_SIDECAR_WINDOW: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
-
-fn subagent_transcripts_at(main: &str, now: std::time::SystemTime) -> Vec<String> {
     let main = std::path::Path::new(main);
     let agent_files = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(dir)
@@ -951,18 +962,11 @@ fn subagent_transcripts_at(main: &str, now: std::time::SystemTime) -> Vec<String
             );
         }
     }
-    // Legacy layout: recently written siblings only.
+    // Legacy layout: siblings in the project dir.
     if let Some(dir) = main.parent() {
         found.extend(
             agent_files(dir)
                 .into_iter()
-                .filter(|p| {
-                    std::fs::metadata(p)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| now.duration_since(t).ok())
-                        .is_none_or(|age| age <= LEGACY_SIDECAR_WINDOW)
-                })
                 .filter_map(|p| p.to_str().map(str::to_string)),
         );
     }
@@ -1318,7 +1322,8 @@ mod tests {
         // The session's own transcript keeps the legacy key, so upgrading does not
         // orphan existing watermarks and re-read multi-megabyte transcripts.
         assert_eq!(main, "token_offset:sess-1");
-        assert_eq!(side, "token_offset:sess-1:agent-abc");
+        // A legacy sibling is keyed by file (see `offset_key_for`).
+        assert!(side.starts_with("token_offset:sidecar:"));
         // Two different sidecars are also distinct from each other.
         assert_ne!(side, offset_key_for("sess-1", "/p/agent-def.jsonl"));
         // `nuke` clears these with `LIKE 'token_offset:%'` — both forms match.
@@ -1374,13 +1379,22 @@ mod tests {
     }
 
     #[test]
-    fn subagent_discovery_skips_old_legacy_siblings() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("sess-1.jsonl");
-        std::fs::write(&main, "").unwrap();
-        std::fs::write(dir.path().join("agent-old.jsonl"), "").unwrap();
-        let later = std::time::SystemTime::now() + LEGACY_SIDECAR_WINDOW * 2;
-        assert!(subagent_transcripts_at(main.to_str().unwrap(), later).is_empty());
+    fn a_legacy_sidecar_has_one_watermark_shared_by_every_session() {
+        let legacy = "/p/agent-abc.jsonl";
+        assert_eq!(
+            offset_key_for("sess-1", legacy),
+            offset_key_for("sess-2", legacy),
+            "read once overall, not once per session"
+        );
+        assert_ne!(
+            offset_key_for("sess-1", legacy),
+            offset_key_for("sess-1", "/p/agent-def.jsonl")
+        );
+        // The current layout belongs to one session and stays keyed by it.
+        assert_eq!(
+            offset_key_for("sess-1", "/p/sess-1/subagents/agent-x.jsonl"),
+            "token_offset:sess-1:agent-x"
+        );
     }
 
     #[test]
@@ -2052,7 +2066,7 @@ mod tests {
         );
         assert!(state
             .store
-            .meta_get("token_offset:sess-1:agent-aaa")
+            .meta_get(&offset_key_for("sess-1", side.to_str().unwrap()))
             .await
             .unwrap()
             .is_some());

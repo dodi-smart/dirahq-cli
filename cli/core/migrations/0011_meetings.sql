@@ -34,9 +34,7 @@ CREATE TABLE IF NOT EXISTS meetings (
 CREATE INDEX IF NOT EXISTS meetings_started_idx ON meetings (started_at);
 CREATE INDEX IF NOT EXISTS meetings_seq_idx ON meetings (updated_seq);
 
--- A restatement batch (one that declares `windows`) replaces this device's
--- intervals inside each window, possibly under new ids. The day rollup's
--- interval rows need their start to be found and dropped by window, or the
--- old ids would still be summed next to the new ones.
-ALTER TABLE day_intervals ADD COLUMN started_at TEXT;
+-- A restatement batch (one that declares `windows`) drops this device's
+-- day_intervals rows overlapping each window (0010 stores their RFC 3339 start
+-- and end); an index keeps that delete cheap.
 CREATE INDEX IF NOT EXISTS day_intervals_started_idx ON day_intervals (started_at);

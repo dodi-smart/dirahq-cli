@@ -95,12 +95,14 @@ fn spawn_updater(config: &dira_core::Config) -> anyhow::Result<()> {
     };
     let log = open_log(&log_path(config))?;
     let mut cmd = std::process::Command::new(&dira);
-    cmd.args(["update", "--auto"])
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    dira_core::process::detached(&mut cmd);
-    let child = spawn_breaking_away(&mut cmd)?;
+    cmd.args(["update", "--auto"]);
+    // Breakaway, so the updater outlives the task's job object when it stops
+    // this daemon to restart it.
+    let child = dira_core::process::spawn_background(
+        &mut cmd,
+        Some(log),
+        dira_core::process::CREATE_BREAKAWAY_FROM_JOB,
+    )?;
     tracing::info!(
         pid = child.id(),
         "auto-update: started `dira update --auto`"
@@ -110,34 +112,6 @@ fn spawn_updater(config: &dira_core::Config) -> anyhow::Result<()> {
         let _ = child.wait();
     });
     Ok(())
-}
-
-/// On windows, ask for `CREATE_BREAKAWAY_FROM_JOB` so the updater survives the
-/// task's job object when this daemon exits, and fall back without it when the
-/// job forbids breakaway.
-#[cfg(windows)]
-fn spawn_breaking_away(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    cmd.creation_flags(
-        dira_core::process::CREATE_NO_WINDOW
-            | dira_core::process::CREATE_NEW_PROCESS_GROUP
-            | CREATE_BREAKAWAY_FROM_JOB,
-    );
-    match dira_core::process::spawn_isolated(cmd) {
-        Ok(c) => Ok(c),
-        Err(_) => {
-            cmd.creation_flags(
-                dira_core::process::CREATE_NO_WINDOW | dira_core::process::CREATE_NEW_PROCESS_GROUP,
-            );
-            dira_core::process::spawn_isolated(cmd)
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn spawn_breaking_away(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
-    cmd.spawn()
 }
 
 #[cfg(test)]

@@ -696,10 +696,11 @@ do_uninstall() {
   fi
 
   rm -f "$dira_path" "$dirad_path"
-  # The rollback copies `dira update` keeps (.dira.prev) and any swap
-  # leftovers (.dira.old.<pid>, .dira.bak) are ours too.
-  rm -f "$bin_dir/.dira.prev" "$bin_dir/.dirad.prev" "$bin_dir/.dira.bak" "$bin_dir/.dirad.bak" \
-    "$bin_dir"/.dira.old.* "$bin_dir"/.dirad.old.* 2>/dev/null || true
+  # `dira update` keeps its backups and the --rollback copy in one owned
+  # directory; the .old.<pid> rename-aside files are the swap convention this
+  # script shares with it (D-0003).
+  rm -rf "$bin_dir/.dira-update"
+  rm -f "$bin_dir"/.dira.old.* "$bin_dir"/.dirad.old.* 2>/dev/null || true
   info "removed dira and dirad from $bin_dir"
 
   printf '\nConfig and data were NOT removed.\n' >&2
@@ -719,6 +720,8 @@ main() {
   # 1. defaults from environment
   version_pin="${DIRA_VERSION:-latest}"
   channel="${DIRA_CHANNEL:-stable}"
+  channel_explicit=0
+  [ -n "${DIRA_CHANNEL:-}" ] && channel_explicit=1
   bin_dir_opt="${DIRA_BIN_DIR:-}"
   target_opt="${DIRA_TARGET:-}"
   repo="${DIRA_REPO:-dodi-smart/dirahq-cli}"
@@ -755,14 +758,17 @@ main() {
     --channel)
       [ $# -ge 2 ] || err "--channel requires a value"
       channel="$2"
+      channel_explicit=1
       shift 2
       ;;
     --channel=*)
       channel="${1#*=}"
+      channel_explicit=1
       shift
       ;;
     --prerelease)
       channel="prerelease"
+      channel_explicit=1
       shift
       ;;
     --bin-dir)
@@ -999,15 +1005,13 @@ main() {
     fi
   fi
 
-  # 14b. remember the channel, so background updates follow it (DIRASH-0050).
+  # 14b. remember a channel the user CHOSE, so background updates follow it
+  # (DIRASH-0050). Without one, background updates follow the installed
+  # version's own channel, so a pinned prerelease keeps following prereleases.
   # Best effort: a pinned older binary may not know the knob.
-  # A pinned prerelease (--version 1.2.0-develop.3) follows prereleases even
-  # though --channel defaulted to stable.
-  case "$version" in
-  *-*) remembered_channel=prerelease ;;
-  *) remembered_channel="$channel" ;;
-  esac
-  "$bin_dir/dira" config set update.channel "$remembered_channel" >/dev/null 2>&1 || true
+  if [ "$channel_explicit" = "1" ]; then
+    "$bin_dir/dira" config set update.channel "$channel" >/dev/null 2>&1 || true
+  fi
 
   # 15. PATH hint + next steps. One command, because the previous three-line
   # block omitted `dira init` and so left anyone who followed it with a

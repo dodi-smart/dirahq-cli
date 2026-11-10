@@ -26,8 +26,8 @@ Every hook either reaches the store or waits in the **spool**: one JSON file per
   `systemctl --user start`, else a bare windowless spawn. At most once per 30 s, never when
   elevated, never in a debug build.
 - **Daemon.** It spills to the same spool when its ingest queue is full, where it used to
-  answer `Ok` and discard the event. It replays the spool at startup and every 2–30 s, only
-  while the queue has room, keeping each event's original `observed_at`. The shim now sends
+  answer `Ok` and discard the event. It replays the spool at startup, the moment it spills, every 2 s while
+  records remain and on a 5-minute backstop, only while the queue has room, keeping each event's original `observed_at`. The shim now sends
   `observed_at` with every hook.
 - **Content.** A spool record holds only the normalized event (`dira_sources::Normalized`),
   never the raw harness payload.
@@ -81,9 +81,10 @@ A tmp-file-plus-rename needs no lock, and a reader never sees a torn record.
 
 ## Deviations from the 2026-11-09 plan (Phase 2)
 
-- The local pipe still carries the raw payload, as it did before. Only disk is protected.
-  Moving normalization fully into the shim needs a new request variant and an upgrade-skew
-  fallback, so it is left for later.
+- ~~The local pipe still carries the raw payload.~~ Resolved: the shim normalizes once and sends
+  `Request::IngestRecord`, the same record the spool holds. Raw content no longer crosses the
+  pipe either, and an older daemon's `bad request: unknown variant` makes the shim spool the
+  record.
 - The event sync cursor stays on `id`. The monotonic generator closes the skip for every id the
   writer mints, which is every hook. A rowid cursor is planned with contract 2.0 (Phase 5).
 - Writer insert batching and a separate token-sweep task are not done. The two spawns that made

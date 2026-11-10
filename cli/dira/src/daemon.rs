@@ -39,8 +39,15 @@ fn pidfile(config: &Config) -> PathBuf {
     config.pidfile_path()
 }
 
+/// The Windows scheduled task, launchd label and systemd unit `install`
+/// registers. One spelling, shared by install, detection, restart and the hook
+/// shim's autostart, so they can never disagree about what is registered.
+pub(crate) const TASK_NAME: &str = "DiraDaemon";
+pub(crate) const LAUNCHD_LABEL: &str = "sh.dirahq.dirad";
+pub(crate) const SYSTEMD_UNIT: &str = "dirad.service";
+
 /// Locate the `dirad` binary: `DIRAD_BIN`, else a sibling of this exe, else PATH.
-fn locate_dirad() -> PathBuf {
+pub(crate) fn locate_dirad() -> PathBuf {
     if let Ok(p) = std::env::var("DIRAD_BIN") {
         return PathBuf::from(p);
     }
@@ -143,48 +150,14 @@ pub async fn start(config: &Config) -> Result<()> {
     }
     let bin = locate_dirad();
     println!("starting {} ...", bin.display());
-    let mut cmd = Command::new(&bin);
-    cmd.stdin(std::process::Stdio::null());
     // A daemon that dies *before* `tracing` initialises — a config parse error, a
-    // missing DLL, a panic in startup — writes to stderr and nothing else. Nulling
-    // it meant those failures left no trace on any platform. Truncate per start so
-    // this stays bounded to one process's output.
-    match spawn_log(config) {
-        Some(f) => {
-            let dup = f.try_clone().ok();
-            cmd.stderr(std::process::Stdio::from(f));
-            match dup {
-                Some(d) => cmd.stdout(std::process::Stdio::from(d)),
-                None => cmd.stdout(std::process::Stdio::null()),
-            };
-        }
-        None => {
-            cmd.stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW (0x0800_0000): suppresses the console-flash that would
-        // otherwise briefly appear for this stdio-nulled child. NOT
-        // DETACHED_PROCESS (0x0000_0008) — the Win32 docs call the two mutually
-        // exclusive, and DETACHED_PROCESS is the one that actually conflicts here
-        // since it also detaches stdio, which this spawn already does explicitly.
-        // CREATE_NEW_PROCESS_GROUP (0x0000_0200): puts dirad in its own process
-        // group so a Ctrl-C/Ctrl-Break delivered to the parent console (e.g. the
-        // terminal `dira daemon start` was run from) doesn't propagate to it.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    // Never let the daemon inherit our own stdout pipe (see
-    // `dira_core::process::spawn_isolated`): a caller piping this command,
-    // like install.ps1, would otherwise wait for the daemon to exit.
-    let mut child = dira_core::process::spawn_isolated(&mut cmd)
-        .with_context(|| format!("failed to spawn {}", bin.display()))?;
+    // missing DLL, a panic in startup — writes to stderr and nothing else, so its
+    // output goes to a per-start log where one resolves. Windowless, its own
+    // process group, never holding our stdout (see
+    // `dira_core::process::spawn_background`).
+    let mut child =
+        dira_core::process::spawn_background(&mut Command::new(&bin), spawn_log(config), 0)
+            .with_context(|| format!("failed to spawn {}", bin.display()))?;
 
     // The pidfile is written only once the child has proven itself (below), never
     // here. Writing it up front meant a start that failed — the common case when
@@ -1481,7 +1454,9 @@ struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, prog: &str, args: &[&str]) -> Option<Output> {
-        Command::new(prog).args(args).output().ok()
+        // Windowless: the hook shim runs these too, from a harness that may have
+        // no console, where a bare `schtasks` would flash one.
+        dira_core::process::command(prog).args(args).output().ok()
     }
 }
 
@@ -1651,7 +1626,7 @@ async fn detect_supervision_with(
     let default_instance =
         cfg!(test) || is_default_endpoint(&config.socket_path, &Config::default().socket_path);
     if default_instance && os == Os::Macos {
-        if let Some(out) = runner.run("launchctl", &["list", "sh.dirahq.dirad"]) {
+        if let Some(out) = runner.run("launchctl", &["list", LAUNCHD_LABEL]) {
             if out.status.success() {
                 return Supervision::Launchd;
             }
@@ -1659,7 +1634,7 @@ async fn detect_supervision_with(
     }
 
     if default_instance && os == Os::Linux {
-        if let Some(out) = runner.run("systemctl", &["--user", "is-active", "dirad.service"]) {
+        if let Some(out) = runner.run("systemctl", &["--user", "is-active", SYSTEMD_UNIT]) {
             if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "active" {
                 return Supervision::SystemdUser;
             }
@@ -1667,7 +1642,7 @@ async fn detect_supervision_with(
     }
 
     if default_instance && os == Os::Windows {
-        if let Some(out) = runner.run("schtasks", &["/Query", "/TN", "DiraDaemon"]) {
+        if let Some(out) = runner.run("schtasks", &["/Query", "/TN", TASK_NAME]) {
             if out.status.success() {
                 return Supervision::ScheduledTask;
             }
@@ -1727,6 +1702,95 @@ async fn detect_supervision_with(
     }
 
     Supervision::NotRunning
+}
+
+/// What is registered to run the daemon, whether or not it is running now.
+///
+/// Distinct from [`Supervision`], which describes the RUNNING daemon. The two
+/// differ exactly when the daemon is down, which is when the hook shim's
+/// autostart asks. A stopped systemd unit reports `is-active` false, so
+/// detection says `NotRunning`, yet the unit is still installed with
+/// `Restart=always`. A bare spawn beside it would hold the single-instance guard
+/// and respawn-loop the unit (D-0009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Registration {
+    Launchd,
+    SystemdUser,
+    ScheduledTask,
+    RunKey,
+    None,
+}
+
+pub(crate) fn registration() -> Registration {
+    registration_with(&SystemRunner, current_os())
+}
+
+fn registration_with(runner: &dyn Runner, os: Os) -> Registration {
+    let home = dira_core::config::home_dir().ok();
+    match os {
+        Os::Macos
+            if home.as_ref().is_some_and(|h| {
+                h.join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist"))
+                    .exists()
+            }) =>
+        {
+            Registration::Launchd
+        }
+        Os::Linux
+            if home.as_ref().is_some_and(|h| {
+                h.join(format!(".config/systemd/user/{SYSTEMD_UNIT}"))
+                    .exists()
+            }) =>
+        {
+            Registration::SystemdUser
+        }
+        Os::Windows => {
+            let ok = |prog: &str, args: &[&str]| {
+                runner.run(prog, args).is_some_and(|o| o.status.success())
+            };
+            if ok("schtasks", &["/Query", "/TN", TASK_NAME]) {
+                Registration::ScheduledTask
+            } else if ok("reg", &["query", RUN_KEY, "/v", TASK_NAME]) {
+                Registration::RunKey
+            } else {
+                Registration::None
+            }
+        }
+        _ => Registration::None,
+    }
+}
+
+/// Ask the registered service manager to start the daemon, quietly (the hook
+/// shim must never write to stdout). `false` when nothing that can start it is
+/// registered (the Run key only runs at logon), and the caller spawns it
+/// itself.
+pub(crate) fn start_registered(reg: Registration) -> bool {
+    start_registered_with(reg, &SystemRunner)
+}
+
+fn start_registered_with(reg: Registration, runner: &dyn Runner) -> bool {
+    let ok = |prog: &str, args: &[&str]| runner.run(prog, args).is_some_and(|o| o.status.success());
+    match reg {
+        Registration::Launchd => {
+            let Some(uid) = runner
+                .run("id", &["-u"])
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            else {
+                return false;
+            };
+            ok(
+                "launchctl",
+                &["kickstart", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
+            )
+        }
+        Registration::SystemdUser => ok(
+            "systemctl",
+            &["--user", "start", "--no-block", SYSTEMD_UNIT],
+        ),
+        Registration::ScheduledTask => ok("schtasks", &["/Run", "/TN", TASK_NAME]),
+        Registration::RunKey | Registration::None => false,
+    }
 }
 
 /// `launchctl kickstart -k gui/<uid>/sh.dirahq.dirad`, falling back to
@@ -2349,7 +2413,7 @@ mod tests {
     /// can assert a command was (or wasn't) invoked, not just what it would
     /// have returned.
     #[derive(Default)]
-    struct FakeRunner {
+    pub(super) struct FakeRunner {
         responses: HashMap<String, (i32, String)>,
         calls: std::cell::RefCell<Vec<String>>,
         /// When set, `tasklist` reports the process alive until a `taskkill` has
@@ -2359,7 +2423,13 @@ mod tests {
     }
 
     impl FakeRunner {
-        fn returning(mut self, prog: &str, args: &[&str], code: i32, stdout: &str) -> Self {
+        pub(super) fn returning(
+            mut self,
+            prog: &str,
+            args: &[&str],
+            code: i32,
+            stdout: &str,
+        ) -> Self {
             self.responses
                 .insert(key(prog, args), (code, stdout.to_string()));
             self
@@ -3610,5 +3680,47 @@ mod instance_tests {
             Path::new(r"\\.\pipe\dira-vmtest-iso"),
             &default
         ));
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::tests::FakeRunner;
+    use super::*;
+
+    #[test]
+    fn a_registered_task_wins_over_the_run_key_and_starts_through_schtasks() {
+        let runner = FakeRunner::default()
+            .returning("schtasks", &["/Query", "/TN", TASK_NAME], 0, "")
+            .returning("schtasks", &["/Run", "/TN", TASK_NAME], 0, "");
+        let reg = registration_with(&runner, Os::Windows);
+        assert_eq!(reg, Registration::ScheduledTask);
+        assert!(start_registered_with(reg, &runner));
+    }
+
+    #[test]
+    fn a_run_key_alone_cannot_start_it_now() {
+        let runner = FakeRunner::default()
+            .returning("schtasks", &["/Query", "/TN", TASK_NAME], 1, "")
+            .returning("reg", &["query", RUN_KEY, "/v", TASK_NAME], 0, "");
+        let reg = registration_with(&runner, Os::Windows);
+        assert_eq!(reg, Registration::RunKey);
+        assert!(
+            !start_registered_with(reg, &runner),
+            "the caller spawns it bare"
+        );
+    }
+
+    #[test]
+    fn launchd_is_kickstarted_by_label() {
+        let runner = FakeRunner::default()
+            .returning("id", &["-u"], 0, "501\n")
+            .returning(
+                "launchctl",
+                &["kickstart", "gui/501/sh.dirahq.dirad"],
+                0,
+                "",
+            );
+        assert!(start_registered_with(Registration::Launchd, &runner));
     }
 }

@@ -12,6 +12,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() -> anyhow::Result<()> {
+    // Children (git, plugin scripts, the background updater) must not hold
+    // whatever handles this process was started with.
+    dira_core::process::disinherit_std_handles();
     // The daemon takes no real CLI args, but answer `--version`/`-V` directly so
     // it can be inspected the same way as `dira` (e.g. by a service script).
     if std::env::args()

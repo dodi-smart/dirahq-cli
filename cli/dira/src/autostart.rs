@@ -11,6 +11,9 @@
 //!   spawn.
 //! - Linux: `systemctl --user start` when the unit exists; else a direct spawn.
 //!
+//! The decision is `daemon::registration` / `daemon::start_registered`, the
+//! same names and probes `dira daemon` uses.
+//!
 //! Starting through the supervisor where there is one matters. A bare spawn
 //! beside a supervisor would hold the single-instance guard, and the
 //! supervisor's own start would then fail its bind and respawn-loop (D-0009).
@@ -45,21 +48,27 @@ fn stamp_path(config: &Config) -> PathBuf {
 }
 
 /// Claim the attempt slot: `true` if no attempt happened within
-/// [`MIN_INTERVAL`]. Writing the stamp first means two racing hooks cannot both
-/// start a daemon.
+/// [`MIN_INTERVAL`]. The stamp is created with `create_new`, so of two hooks
+/// racing for a free slot exactly one wins; a stale stamp is removed first.
 fn claim(stamp: &Path, now: SystemTime) -> bool {
-    let recent = std::fs::metadata(stamp)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| now.duration_since(t).ok())
-        .is_some_and(|age| age < MIN_INTERVAL);
-    if recent {
-        return false;
+    if let Ok(modified) = std::fs::metadata(stamp).and_then(|m| m.modified()) {
+        let fresh = now
+            .duration_since(modified)
+            .map(|age| age < MIN_INTERVAL)
+            .unwrap_or(true);
+        if fresh {
+            return false;
+        }
+        let _ = std::fs::remove_file(stamp);
     }
     if let Some(dir) = stamp.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::write(stamp, b"").is_ok()
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(stamp)
+        .is_ok()
 }
 
 /// Is the daemon simply not running (as opposed to busy or refusing us)?
@@ -71,90 +80,20 @@ pub async fn is_down(config: &Config) -> bool {
 }
 
 /// Try to bring the daemon back. Best effort and silent: the event is already
-/// spooled, so nothing here can lose data.
+/// spooled, so nothing here can lose data. Whatever is registered to run the
+/// daemon starts it (one decision, shared with `dira daemon`); with nothing
+/// registered, it is spawned directly.
 pub fn kick(config: &Config) {
     if !claim(&stamp_path(config), SystemTime::now()) {
         return;
     }
-    if !via_supervisor() {
-        spawn_bare();
+    if !crate::daemon::start_registered(crate::daemon::registration()) {
+        let _ = dira_core::process::spawn_background(
+            &mut std::process::Command::new(crate::daemon::locate_dirad()),
+            None,
+            0,
+        );
     }
-}
-
-#[cfg(windows)]
-fn via_supervisor() -> bool {
-    dira_core::process::command("schtasks")
-        .args(["/Run", "/TN", "DiraDaemon"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-#[cfg(target_os = "macos")]
-fn via_supervisor() -> bool {
-    let Ok(home) = dira_core::config::home_dir() else {
-        return false;
-    };
-    if !home
-        .join("Library/LaunchAgents/sh.dirahq.dirad.plist")
-        .exists()
-    {
-        return false;
-    }
-    // SAFETY: getuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    std::process::Command::new("launchctl")
-        .args(["kickstart", &format!("gui/{uid}/sh.dirahq.dirad")])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-#[cfg(target_os = "linux")]
-fn via_supervisor() -> bool {
-    let Ok(home) = dira_core::config::home_dir() else {
-        return false;
-    };
-    if !home.join(".config/systemd/user/dirad.service").exists() {
-        return false;
-    }
-    std::process::Command::new("systemctl")
-        .args(["--user", "start", "--no-block", "dirad.service"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn via_supervisor() -> bool {
-    false
-}
-
-/// Spawn `dirad` detached and windowless, the sibling of this executable.
-fn spawn_bare() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let Some(dir) = exe.parent() else {
-        return;
-    };
-    let bin = dir.join(dira_ipc::DIRAD_BIN);
-    if !bin.exists() {
-        return;
-    }
-    let mut cmd = std::process::Command::new(bin);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    dira_core::process::detached(&mut cmd);
-    // The harness reads this hook's stdout; the daemon must not hold it open.
-    let _ = dira_core::process::spawn_isolated(&mut cmd);
 }
 
 #[cfg(test)]

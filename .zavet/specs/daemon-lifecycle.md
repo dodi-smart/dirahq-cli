@@ -90,11 +90,14 @@ the interactive user entirely. That was a silent, total capture outage.
   --user stop` for systemd, and confirmed-exit `Shutdown`/`taskkill` for the
   windows task and Run key (DIRASH-0048).
 - Long-lived children (`dirad` from `daemon start`, the hook shim's autostart,
-  the background updater) are spawned with `dira_core::process::spawn_isolated`.
-  On windows it clears the inherit flag on the parent's std handles for the
-  spawn, so the child never holds the caller's stdout pipe. Before this,
-  `install.ps1 | Out-Null` and a harness reading a hook's stdout hung for as
-  long as the daemon lived (reproduced in the VM run, 2026-11-10).
+  the background updater, the update-check refresh) go through
+  `dira_core::process::spawn_background`: stdin null, output to a log or null,
+  windowless, in their own process group. Both `main`s first call
+  `disinherit_std_handles`, which clears the inherit flag on the process's own
+  std handles once. Before this, `install.ps1 | Out-Null` and a harness reading
+  a hook's stdout hung for as long as the daemon lived (reproduced in the VM
+  run, 2026-11-10). `Stdio::inherit()` children are unaffected: Rust hands them
+  a fresh inheritable duplicate.
 - The registered service supervises only the default instance. An instance
   on its own endpoint (`DIRA_SOCKET_PATH`) is never labelled as service-run,
   and on windows its pidfile sits beside its own `DIRA_DB_PATH`.

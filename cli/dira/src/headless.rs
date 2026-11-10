@@ -27,25 +27,6 @@ fn decide(var: impl Fn(&str) -> Option<String>) -> bool {
     var(ENV_GITHUB_ACTIONS).is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-/// Would `payload` reach the daemon as a human signal for `harness`?
-///
-/// Asks the same normalizer the daemon runs, so the shim can never disagree
-/// with the daemon about which hooks are human. Only the payload's scalar
-/// top-level fields are copied: the event name is always one, while
-/// `tool_input`/`tool_response` can be megabytes and never decide the kind.
-pub(crate) fn is_human_signal(harness: &str, payload: &serde_json::Value) -> bool {
-    let Some(obj) = payload.as_object() else {
-        return false;
-    };
-    let scalars: serde_json::Map<_, _> = obj
-        .iter()
-        .filter(|(_, v)| !v.is_object() && !v.is_array())
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    dira_sources::normalize_for(harness, scalars.into())
-        .is_some_and(|(norm, _)| norm.kind.is_human_signal())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +62,13 @@ mod tests {
                 "{off} must force interactive even on Actions"
             );
         }
+    }
+
+    /// The shim withholds a hook when its NORMALIZED kind is a human signal
+    /// (main.rs `forward_hook`); this pins which hooks that is.
+    fn is_human_signal(harness: &str, payload: &serde_json::Value) -> bool {
+        dira_sources::normalize_for(harness, payload.clone())
+            .is_some_and(|(norm, _)| norm.kind.is_human_signal())
     }
 
     #[test]

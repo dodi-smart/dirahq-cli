@@ -146,6 +146,7 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             payload,
             observed_at,
         } => ingest_hook(state, harness, payload, observed_at).await,
+        Request::IngestRecord { record } => ingest_record(state, record),
         Request::Nuke => nuke(state).await,
         Request::DaemonInfo => daemon_info(state),
         Request::ResyncCursor { from } => resync_cursor(state, from).await,
@@ -330,6 +331,49 @@ async fn ingest_hook(
         }
     };
 
+    let at = crate::spool::event_time(observed_at.as_deref());
+    admit_and_enqueue(state, &harness, "", norm, harness_kind, at)
+}
+
+/// Ingest a hook the shim already normalized (`Request::IngestRecord`).
+fn ingest_record(state: &AppState, record: serde_json::Value) -> Response {
+    let rec: dira_sources::spool::Record = match serde_json::from_value(record) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::Error {
+                message: format!("bad hook record: {e}"),
+            }
+        }
+    };
+    if rec.v != dira_sources::spool::VERSION {
+        return Response::Error {
+            message: format!("unknown hook record version {}", rec.v),
+        };
+    }
+    let Some(harness_kind) = dira_sources::harness_for(&rec.harness) else {
+        return Response::Error {
+            message: format!("unknown harness: {}", rec.harness),
+        };
+    };
+    // Delivered twice (the shim timed out after this daemon had queued it,
+    // and spooled it too): acknowledge, store once.
+    if crate::spool::already_queued(&rec.id) {
+        return Response::Ok;
+    }
+    let at = crate::spool::event_time(Some(&rec.observed_at));
+    admit_and_enqueue(state, &rec.harness, &rec.id, rec.event, harness_kind, at)
+}
+
+/// The one live ingress for a normalized hook, whichever request carried it:
+/// capture-probe admission, then [`crate::spool::enqueue`].
+fn admit_and_enqueue(
+    state: &AppState,
+    harness_id: &str,
+    hook_id: &str,
+    norm: dira_sources::Normalized,
+    harness_kind: dira_contract::Harness,
+    at: OffsetDateTime,
+) -> Response {
     // Reserved-prefix enforcement. A probe row is admitted only when THIS
     // daemon minted the id moments ago and the arm has not lapsed, so a stale
     // hook replay, a hand-crafted payload, or a `doctor` that died between arm
@@ -343,8 +387,7 @@ async fn ingest_hook(
     // A full queue spills to the spool instead of dropping the hook
     // (DIRASH-0049). It used to answer `Ok` and discard it, so the shim recorded
     // a success for an event that never landed.
-    let at = crate::spool::event_time(observed_at.as_deref());
-    match crate::spool::enqueue(state, &harness, norm, harness_kind, at) {
+    match crate::spool::enqueue(state, harness_id, hook_id, norm, harness_kind, at) {
         Ok(()) => Response::Ok,
         Err(why) => Response::Error {
             message: why.into(),
@@ -844,10 +887,7 @@ fn build_session_views(
                 label: s.label.clone(),
                 activity: s.activity.clone(),
                 note: s.note.clone(),
-                started_at: s
-                    .started_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default(),
+                started_at: fmt_ts(s.started_at),
                 human_seconds: human,
                 agent_seconds: agent,
                 idle: human_idle,
@@ -877,8 +917,7 @@ fn build_session_views(
 /// Format an instant as RFC3339 for the wire (empty string on the format error,
 /// which never happens for a valid `OffsetDateTime`).
 fn fmt_ts(t: OffsetDateTime) -> String {
-    t.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
+    crate::heartbeat::fmt_rfc3339(t)
 }
 
 /// Whether a session has any agent-activity evidence, and its agent wall-clock

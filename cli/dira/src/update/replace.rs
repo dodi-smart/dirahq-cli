@@ -324,8 +324,19 @@ pub(crate) fn stale_old_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The one directory `dira update` keeps its own copies in: the pre-swap
+/// backup (`<name>.bak`) and the previous version for `--rollback`
+/// (`<name>.prev`). Owned and named once, so an uninstall removes this
+/// directory instead of hard-coding each file name. Same volume as `bin_dir`,
+/// so hard links and renames into it stay rename-only (D-0003).
+pub const UPDATE_DIR: &str = ".dira-update";
+
+fn update_dir(bin_dir: &Path) -> PathBuf {
+    bin_dir.join(UPDATE_DIR)
+}
+
 fn backup_path(bin_dir: &Path, name: &str) -> PathBuf {
-    bin_dir.join(format!(".{name}.bak"))
+    update_dir(bin_dir).join(format!("{name}.bak"))
 }
 
 /// Hard-link the existing `bin_dir/{name}` to `.{name}.bak` for rollback.
@@ -337,6 +348,8 @@ fn backup(bin_dir: &Path, name: &str) -> Result<bool> {
         return Ok(false);
     }
     let bak = backup_path(bin_dir, name);
+    std::fs::create_dir_all(update_dir(bin_dir))
+        .with_context(|| format!("create {}", update_dir(bin_dir).display()))?;
     let _ = std::fs::remove_file(&bak);
     std::fs::hard_link(&src, &bak)
         .with_context(|| format!("hard-link backup {} -> {}", src.display(), bak.display()))?;
@@ -408,11 +421,11 @@ pub fn rollback(bin_dir: &Path) {
 }
 
 fn previous_path(bin_dir: &Path, name: &str) -> PathBuf {
-    bin_dir.join(format!(".{name}.prev"))
+    update_dir(bin_dir).join(format!("{name}.prev"))
 }
 
 /// After a confirmed-good update, keep the pre-update binaries as
-/// `.{name}.prev` instead of deleting them, so `dira update --rollback` can
+/// `.dira-update/{name}.prev` instead of deleting them, so `dira update --rollback` can
 /// return to them later (DIRASH-0050). A rename of the `.bak` hard link: no
 /// copy, and the running binaries are never opened for writing (D-0003).
 pub fn keep_previous(bin_dir: &Path) {
@@ -782,8 +795,8 @@ mod tests {
         std::fs::write(bin_dir.join(dira_ipc::DIRAD_BIN), b"old-dirad").unwrap();
         let extracted = fake_extracted(dir.path(), b"new-dira", b"new-dirad");
 
-        let dira_bak = bin_dir.join(format!(".{}.bak", dira_ipc::DIRA_BIN));
-        let dirad_bak = bin_dir.join(format!(".{}.bak", dira_ipc::DIRAD_BIN));
+        let dira_bak = backup_path(&bin_dir, dira_ipc::DIRA_BIN);
+        let dirad_bak = backup_path(&bin_dir, dira_ipc::DIRAD_BIN);
 
         swap_binaries(&bin_dir, &extracted).unwrap();
         assert_eq!(std::fs::read(&dira_bak).unwrap(), b"old-dira");

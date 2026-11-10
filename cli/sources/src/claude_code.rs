@@ -65,6 +65,11 @@ pub struct ClaudeHook {
     /// session's host id; never kept.
     #[serde(default)]
     pub tool_response: Option<serde_json::Value>,
+    /// `Notification.notification_type`: `permission_prompt`,
+    /// `elicitation_dialog`, `idle_prompt`, `auth_success`. Absent from older
+    /// Claude Code versions.
+    #[serde(default)]
+    pub notification_type: Option<String>,
     /// Env hints the `dira hook` shim forwarded (the harness never sets this).
     #[serde(default, rename = "dira_env")]
     pub dira_env: Option<DiraEnv>,
@@ -87,9 +92,18 @@ pub fn normalize(hook: &ClaudeHook) -> Option<Normalized> {
         "Stop" | "SubagentStop" => EventKind::Stop,
         "PreToolUse" => EventKind::PreTool,
         "PostToolUse" => EventKind::PostTool,
-        // Notifications are emitted when Claude needs the human (e.g. permission);
-        // treat as a human-attention signal.
-        "PermissionRequest" | "Notification" => EventKind::PermissionDecision,
+        "PermissionRequest" => EventKind::PermissionDecision,
+        // A notification counts only when it asks the person something. Claude
+        // Code also fires it as `idle_prompt` ("waiting for input" after 60 s)
+        // and `auth_success`, and counting those as a human signal and a
+        // permission prompt credited presence and approval wait to nobody. An
+        // older Claude Code that sends no type keeps the old reading.
+        "Notification" => match hook.notification_type.as_deref() {
+            None | Some("permission_prompt") | Some("elicitation_dialog") => {
+                EventKind::PermissionDecision
+            }
+            Some(_) => return None,
+        },
         _ => return None,
     };
     Some(Normalized {
@@ -415,5 +429,35 @@ mod facts_tests {
             }))
             .unwrap();
         assert!(n.facts.compaction);
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    fn notification(kind: Option<&str>) -> Option<Normalized> {
+        let mut p = serde_json::json!({"hook_event_name": "Notification", "session_id": "s"});
+        if let Some(k) = kind {
+            p["notification_type"] = k.into();
+        }
+        ClaudeCodeSource.normalize(p)
+    }
+
+    #[test]
+    fn only_a_question_to_the_person_is_a_permission_prompt() {
+        for asks in [Some("permission_prompt"), Some("elicitation_dialog"), None] {
+            assert_eq!(
+                notification(asks).map(|n| n.kind),
+                Some(EventKind::PermissionDecision),
+                "{asks:?}"
+            );
+        }
+        for idle in ["idle_prompt", "auth_success"] {
+            assert!(
+                notification(Some(idle)).is_none(),
+                "{idle} asks nobody anything"
+            );
+        }
     }
 }

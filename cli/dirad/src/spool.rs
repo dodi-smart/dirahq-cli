@@ -94,19 +94,69 @@ pub fn event_time(observed_at: Option<&str>) -> OffsetDateTime {
         .unwrap_or(now)
 }
 
+/// Ids of hook records recently queued to the writer, so a record that
+/// arrives twice (live after the shim timed out, then from the spool) is
+/// stored once. Bounded; a daemon restart forgets it, which only reopens that
+/// rare window.
+struct Seen {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+const SEEN_CAP: usize = 65_536;
+
+/// Whether a record with this id was already queued. Empty ids never are.
+pub fn already_queued(id: &str) -> bool {
+    !id.is_empty()
+        && SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|s| s.set.contains(id))
+}
+
+/// Remember that a record with this id reached the writer queue. Called only
+/// once it is queued, never when it is spilled: the spilled copy must replay.
+fn mark_queued(id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let mut guard = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seen = guard.get_or_insert_with(|| Seen {
+        set: Default::default(),
+        order: Default::default(),
+    });
+    if seen.set.insert(id.to_string()) {
+        seen.order.push_back(id.to_string());
+        if seen.order.len() > SEEN_CAP {
+            if let Some(old) = seen.order.pop_front() {
+                seen.set.remove(&old);
+            }
+        }
+    }
+}
+
 /// Queue a normalized hook for the writer, spilling it to the spool when the
-/// queue is full. `Err` only when the daemon is shutting down.
+/// queue is full. `hook_id` is the shim's record id, or `""`. `Err` only when
+/// the daemon is shutting down.
 pub fn enqueue(
     state: &AppState,
     harness_id: &str,
+    hook_id: &str,
     norm: Normalized,
     harness: Harness,
     at: OffsetDateTime,
 ) -> Result<(), &'static str> {
     match state.tx.try_send(EventMsg::Hook { norm, harness, at }) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            mark_queued(hook_id);
+            Ok(())
+        }
         Err(tokio::sync::mpsc::error::TrySendError::Full(EventMsg::Hook { norm, at, .. })) => {
-            spill(state, harness_id, norm, at);
+            spill(state, harness_id, hook_id, norm, at);
             Ok(())
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
@@ -114,18 +164,26 @@ pub fn enqueue(
     }
 }
 
-fn spill(state: &AppState, harness_id: &str, norm: Normalized, at: OffsetDateTime) {
+/// The write stays inline on purpose. It is one small file that must be on disk
+/// before this daemon answers `Ok`; deferring it would let a crash lose an
+/// event the shim was told had landed.
+fn spill(state: &AppState, harness_id: &str, hook_id: &str, norm: Normalized, at: OffsetDateTime) {
     // A capture-probe row is admitted only live (DIRASH-0023); replaying one
     // later would fail admission anyway, so it is not worth keeping.
     if dira_core::model::is_probe_session(&norm.session_id) {
         return;
     }
-    let observed_at = at.format(&Rfc3339).unwrap_or_default();
+    let observed_at = crate::heartbeat::fmt_rfc3339(at);
     let dir = spool::dir_for(&state.config.db_path);
-    match spool::write(&dir, &Record::new(harness_id, observed_at, norm)) {
+    let mut record = Record::new(harness_id, observed_at, norm);
+    if !hook_id.is_empty() {
+        record.id = hook_id.to_string();
+    }
+    match spool::write(&dir, &record) {
         Ok(_) => {
             SPILLED.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("ingest queue full; spilled a hook to the spool");
+            WAKE.notify_one();
         }
         Err(e) => {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -134,15 +192,23 @@ fn spill(state: &AppState, harness_id: &str, norm: Normalized, at: OffsetDateTim
     }
 }
 
-/// How often the spool is checked when the last pass found nothing.
-const IDLE_INTERVAL: Duration = Duration::from_secs(30);
+/// Wakes the drain the moment the daemon spills, instead of waiting out an
+/// interval.
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The backstop between passes when the spool was empty. The drain is woken
+/// directly when this daemon spills; the backstop covers records the `dira
+/// hook` shim spooled while this daemon was up but busy or slow, which nothing
+/// else announces.
+const IDLE_INTERVAL: Duration = Duration::from_secs(300);
 /// How often while records are still waiting.
 const BUSY_INTERVAL: Duration = Duration::from_secs(2);
 /// Most records replayed per pass, so one pass never monopolises the writer.
 const PASS_LIMIT: usize = 2_000;
 
-/// Replay the spool forever: once right away, then on a short interval while
-/// records remain and a long one when it is empty.
+/// Replay the spool forever: once right away (records from while the daemon
+/// was down), then whenever a spill wakes it, every few seconds while records
+/// remain, and on the idle backstop.
 pub fn spawn_drain(state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -157,6 +223,7 @@ pub fn spawn_drain(state: AppState) {
             };
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
+                _ = WAKE.notified() => {}
                 _ = state.shutdown.notified() => return,
             }
         }
@@ -165,46 +232,57 @@ pub fn spawn_drain(state: AppState) {
 
 /// One drain pass. Returns `(replayed, still waiting)`.
 ///
-/// Replays only while the queue has room to spare, so live hooks always find
-/// space ahead of the backlog. A record is deleted only after the writer queue
-/// accepted it.
+/// The spool is listed once, trimmed from that list, and the first
+/// [`PASS_LIMIT`] records read, all on a blocking thread. Replays only while the
+/// queue has room to spare, so live hooks always find space ahead of the
+/// backlog. A record is deleted only after the writer queue accepted it.
 pub async fn drain_once(state: &AppState) -> (usize, usize) {
     let dir = spool::dir_for(&state.config.db_path);
     let dir_c = dir.clone();
-    let trimmed = tokio::task::spawn_blocking(move || spool::trim(&dir_c, spool::MAX_RECORDS))
-        .await
-        .unwrap_or(0);
+    let listed = tokio::task::spawn_blocking(move || {
+        let mut files = spool::list(&dir_c);
+        let trimmed = spool::trim(&mut files, spool::MAX_RECORDS);
+        let total = files.len();
+        let mut good = Vec::new();
+        for path in files.into_iter().take(PASS_LIMIT) {
+            match spool::read(&path) {
+                Ok(r) => good.push((path, r)),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), "unreadable spool record ({e}); quarantined");
+                    spool::quarantine(&dir_c, &path);
+                }
+            }
+        }
+        (trimmed, total, good)
+    })
+    .await;
+    let Ok((trimmed, total, records)) = listed else {
+        return (0, 0);
+    };
     if trimmed > 0 {
         DROPPED.fetch_add(trimmed as u64, Ordering::Relaxed);
         tracing::warn!(trimmed, "spool over its cap; dropped the oldest records");
     }
-    let dir_c = dir.clone();
-    let files = tokio::task::spawn_blocking(move || spool::list(&dir_c))
-        .await
-        .unwrap_or_default();
-    let total = files.len();
+
+    let mut done: Vec<std::path::PathBuf> = Vec::new();
+    let mut bad: Vec<std::path::PathBuf> = Vec::new();
     let mut replayed = 0;
-    for path in files.into_iter().take(PASS_LIMIT) {
+    for (path, record) in records {
         if state.tx.capacity() < state.tx.max_capacity() / 4 {
             break;
         }
-        let record = match spool::read(&path) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "unreadable spool record ({e}); quarantined");
-                spool::quarantine(&dir, &path);
-                continue;
-            }
-        };
         let Some(harness) = dira_sources::harness_for(&record.harness) else {
-            spool::quarantine(&dir, &path);
+            bad.push(path);
             continue;
         };
-        if dira_core::model::is_probe_session(&record.event.session_id) {
-            let _ = std::fs::remove_file(&path);
+        if dira_core::model::is_probe_session(&record.event.session_id)
+            || already_queued(&record.id)
+        {
+            done.push(path);
             continue;
         }
         let at = event_time(Some(&record.observed_at));
+        let id = record.id;
         let msg = EventMsg::Hook {
             norm: record.event,
             harness,
@@ -213,10 +291,20 @@ pub async fn drain_once(state: &AppState) -> (usize, usize) {
         if state.tx.send(msg).await.is_err() {
             break; // shutting down; the record stays for the next start
         }
-        let _ = std::fs::remove_file(&path);
+        mark_queued(&id);
+        done.push(path);
         DRAINED.fetch_add(1, Ordering::Relaxed);
         replayed += 1;
     }
+    let _ = tokio::task::spawn_blocking(move || {
+        for p in &done {
+            let _ = std::fs::remove_file(p);
+        }
+        for p in &bad {
+            spool::quarantine(&dir, p);
+        }
+    })
+    .await;
     (replayed, total - replayed)
 }
 

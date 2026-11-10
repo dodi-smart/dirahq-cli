@@ -37,7 +37,7 @@ knob falls back to the installed version's channel, so a prerelease install keep
 prereleases. A hand-run `dira update` keeps the stable default and its downgrade refusal. An
 explicit `--channel` is persisted.
 
-After every successful update the replaced binaries are kept as `.{name}.prev`.
+After every successful update the replaced binaries are kept as `.dira-update/{name}.prev`.
 `dira update --rollback` swaps them back with the same rename-only swap, restarts the daemon, and
 adds the version it left to `update.skip_version`. A rollback can itself be rolled back.
 
@@ -77,7 +77,7 @@ The updater must outlive the daemon it restarts:
 - Never add network I/O to `dirad` for updates. It only spawns `dira update --auto`.
 - `--auto` must stay a no-op unless a strictly newer, non-skipped release exists, and must never
   prompt.
-- Keep `.{name}.prev` after every successful swap. `--rollback` depends on it.
+- Keep `.dira-update/{name}.prev` after every successful swap. `--rollback` depends on it.
 - Not yet observed end to end on a real install (`verified: false`). It needs a released build
   older than the next one.
 

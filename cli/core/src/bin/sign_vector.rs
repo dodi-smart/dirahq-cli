@@ -113,7 +113,7 @@ pub fn build_vector() -> serde_json::Value {
                 agent_lines_added: Some(120),
                 agent_lines_removed: Some(18),
                 subagents: 1,
-                compactions: None,
+                compactions: Some(1),
                 permission_prompts: 2,
                 approval_wait_seconds: 41,
                 test_runs: Some(dira_contract::TestRuns {
@@ -139,7 +139,7 @@ pub fn build_vector() -> serde_json::Value {
             spilled: 1,
             dropped: 0,
             quarantined: 0,
-            hook_failures: None,
+            hook_failures: Some(4),
         }),
         day_rollups: vec![dira_contract::DayRollup {
             day: "2026-11-09".into(),
@@ -157,7 +157,10 @@ pub fn build_vector() -> serde_json::Value {
                 cache_read: 90000,
                 cache_create: 5000,
             }],
-            est_cost_usd: None,
+            // A float that needs shortest-round-trip formatting: JCS parity on
+            // signed f64 values is the riskiest part of cross-language
+            // verification.
+            est_cost_usd: Some(0.30000000000000004),
             interval_count: 4,
             interval_digest: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                 .into(),

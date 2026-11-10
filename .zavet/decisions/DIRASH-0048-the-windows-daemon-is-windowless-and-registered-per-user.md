@@ -65,8 +65,9 @@ three traced back to these causes:
   time-limit and restart settings. They are the fix, not decoration.
 - Run-key installs must start the daemon now (`Launch::NeedsStart`). A Run-key restart spawns
   the replacement and never calls `schtasks`.
-- Start every long-lived child (`dirad`, the background updater) with
-  `dira_core::process::spawn_isolated`. On windows a child otherwise inherits the parent's own
+- Start every long-lived child (`dirad`, the background updater, the update-check refresh) with
+  `dira_core::process::spawn_background`, and keep `disinherit_std_handles()` first in both
+  `main`s. On windows a child otherwise inherits the parent's own
   stdout pipe and holds it open for its life. Whoever reads that pipe then hangs: `install.ps1`
   piping `dira daemon install`, or a harness reading `dira hook`.
 - Validated on 2026-11-10 in a Windows 11 ARM64 VM (x64 build, filtered medium-integrity token):

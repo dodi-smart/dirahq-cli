@@ -42,6 +42,12 @@ pub struct Record {
     /// When the hook fired (RFC 3339), so a late delivery keeps its real time.
     pub observed_at: String,
     pub event: Normalized,
+    /// Unique per hook, minted by the shim. The daemon drops a record whose id
+    /// it already queued: a hook the shim gave up on after the daemon had in
+    /// fact taken it is also spooled, and must not be stored twice. Empty in
+    /// records from before this field, which are never deduplicated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 impl Record {
@@ -53,8 +59,23 @@ impl Record {
                 .to_string(),
             observed_at,
             event,
+            id: new_id(),
         }
     }
+}
+
+/// A record id unique across hook processes: nanoseconds, pid and a
+/// per-process counter.
+fn new_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{nanos:x}-{:x}-{:x}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The spool directory for a store at `db_path`: `spool/` beside the database.
@@ -117,6 +138,21 @@ pub fn list(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Whether any complete record is waiting, without listing them all.
+pub fn has_records(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| {
+        entries.any(|e| {
+            e.ok().is_some_and(|e| {
+                let p = e.path();
+                p.extension().is_some_and(|x| x == "json")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| !n.starts_with('.'))
+            })
+        })
+    })
+}
+
 /// Read one record. `Err` for unreadable, malformed or unknown-version files.
 pub fn read(path: &Path) -> Result<Record, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -141,18 +177,19 @@ pub fn quarantine(dir: &Path, path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Drop the oldest records beyond `max`. Returns how many were dropped.
-pub fn trim(dir: &Path, max: usize) -> usize {
-    let files = list(dir);
+/// Drop the oldest records beyond `max` from an already-listed, oldest-first
+/// `files`, on disk and in the list. Returns how many were dropped.
+pub fn trim(files: &mut Vec<PathBuf>, max: usize) -> usize {
     if files.len() <= max {
         return 0;
     }
     let excess = files.len() - max;
-    files
+    let removed = files[..excess]
         .iter()
-        .take(excess)
         .filter(|p| std::fs::remove_file(p).is_ok())
-        .count()
+        .count();
+    files.drain(..excess);
+    removed
 }
 
 #[cfg(test)]
@@ -231,7 +268,9 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(trim(&dir, 2), 2);
+        let mut files = list(&dir);
+        assert_eq!(trim(&mut files, 2), 2);
+        assert_eq!(files.len(), 2);
         let left: Vec<String> = list(&dir)
             .iter()
             .map(|p| read(p).unwrap().event.session_id)
@@ -263,7 +302,8 @@ mod tests {
                     "source",
                     "reason",
                     "hints",
-                    "facts"
+                    "facts",
+                    "id"
                 ]
                 .contains(k),
                 "unexpected field {k}"

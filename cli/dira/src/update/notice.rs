@@ -23,7 +23,7 @@ use std::{
     env, fs,
     io::IsTerminal,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -388,24 +388,11 @@ fn spawn_refresh() {
         return;
     };
     let mut cmd = Command::new(exe);
-    cmd.args(["update", "--check"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // Without this, spawning a console-subsystem child (`dira.exe` is one)
-    // from another console app briefly flashes a new console window on
-    // Windows — visible noise for what's supposed to be a fully detached,
-    // invisible background refresh (D-0006's "never blocks the foreground"
-    // covers *behavior*; this covers the equivalent visual guarantee).
-    // `CREATE_NO_WINDOW` suppresses that; it has no unix equivalent (no
-    // console to flash), hence the platform gate rather than a portable flag.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let _ = cmd.spawn();
+    cmd.args(["update", "--check"]);
+    // Windowless (dira.exe is a console program, so a bare spawn from another
+    // console app flashes a window) and never holding our stdout pipe, so
+    // `dira status | ...` returns at once instead of waiting for the refresh.
+    let _ = dira_core::process::spawn_background(&mut cmd, None, 0);
 }
 
 /// Print a cached "update available" notice to stderr, if one is warranted.

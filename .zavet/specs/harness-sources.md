@@ -34,17 +34,25 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
   wall-clock, tools and tokens are captured as before (`prompts` reads 0).
   The capture probe never withholds. See DIRASH-0047.
 - A hook is stored or spooled, never dropped (DIRASH-0049).
-  - The shim stamps `observed_at` on every `IngestHook`.
+  - The shim normalizes each hook once and sends the normalized record
+    (`Request::IngestRecord`, the spool's `Record` format) with its
+    `observed_at`. The raw payload never crosses the pipe. Live and spooled
+    hooks reach the writer through one path (`control::admit_and_enqueue` →
+    `spool::enqueue`), which is also where capture-probe admission lives. An
+    older daemon that answers `unknown variant` gets the record spooled
+    instead. The legacy `IngestHook` (raw payload) is still accepted from
+    older shims.
   - A delivery that fails (daemon down, busy, or timed out) is normalized in
     the shim and written to `spool/` beside the database, one file per event.
     The raw payload never touches disk.
   - When nothing is listening, the shim asks the supervisor (logon task,
     launchd, systemd --user) to start the daemon, or spawns it bare where
-    there is none, through `spawn_isolated`, so the daemon never holds the
+    there is none, through `spawn_background`, so the daemon never holds the
     pipe the harness reads the hook's stdout from. At most once per 30 s, never elevated, never in a debug
     build.
   - The daemon spills to the same spool when its ingest queue is full, and
-    replays the spool at startup and every 2–30 s while the queue has room,
+    replays the spool at startup, the moment it spills, every 2 s while records
+    remain and on a 5-minute backstop, while the queue has room,
     keeping each event's original time.
 - Alias spelling lives ONLY in `canonical_harness_id()`. `dira init` and hook
   dispatch both resolve through it, so accepted spellings can never drift.

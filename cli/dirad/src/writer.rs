@@ -1382,7 +1382,11 @@ mod tests {
         std::fs::write(other.join("agent-y.jsonl"), "").unwrap();
         let found = subagent_transcripts(main.to_str().unwrap());
         assert_eq!(found.len(), 1);
-        assert!(found[0].ends_with("sess-1/subagents/agent-x.jsonl"));
+        // Component-wise, so the check holds with backslash separators on Windows.
+        let expected = std::path::Path::new("sess-1")
+            .join("subagents")
+            .join("agent-x.jsonl");
+        assert!(std::path::Path::new(&found[0]).ends_with(&expected));
     }
 
     #[test]

@@ -35,7 +35,10 @@ reliably gets: cloud sessions clone your repository and honor its committed
 hook configs (`.claude/settings.json`, `.cursor/hooks.json`). The generated
 commands are **portable** — they invoke `.dira/hook.sh`, which resolves the
 `dira` binary at run time — unlike `dira init`'s local configs, which embed
-this machine's absolute path.
+this machine's absolute path. Each command first checks that the script exists
+(`[ ! -f … ] || sh …`), so a branch without `.dira/` still runs a hook config
+from one that has it (as claude-code-action does on pull requests) and never
+blocks the prompt.
 
 On your laptop the same files are harmless: `bootstrap.sh` detects it is not
 in a cloud runtime and skips straight to forwarding, and `hook.sh` silently
@@ -234,6 +237,7 @@ setting.
 | `DIRA_EXTRA_CA_CERTS` | Additive PEM trust anchors for the runtime's TLS-intercepting egress proxy. The bootstrap sets it from the CA the runtime declares (`$SSL_CERT_FILE`, `$NODE_EXTRA_CA_CERTS`, `~/.ccr/ca-bundle.crt`, then the system bundle). Never replaces the bundled roots, and a bundle with one corrupt block still loads the certs that do parse — see decision DIRASH-0033. |
 | `DIRA_SYNC_BACKSTOP_SECS` | Sync safety-net cadence; bootstrap sets `15` so an abruptly reclaimed VM loses at most ~15s of un-synced tail. Batches are idempotent, so nothing double-counts. |
 | `DIRA_RUNTIME` | Explicit runtime marker (`cursor-cloud`, …) for runtimes without a detectable one. Trimmed and clamped to 64 chars before it reaches a runner label or the wire. |
+| `DIRA_HEADLESS` | Nobody is at the keyboard (CI, scheduled agents). `dira hook` then withholds prompts and notifications, so the run records agent time only and no human time. On by default when `GITHUB_ACTIONS=true`; set `0` to opt out, or any other value to turn it on elsewhere. See decision DIRASH-0047. |
 
 ## How this stays working
 

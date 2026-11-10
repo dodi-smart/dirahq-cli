@@ -11,8 +11,8 @@
 //!   `.cursor/hooks.json`); each event maps to an array of `{ command }` entries
 //!   running `dira hook cursor`.
 //! - **Codex** (`dira init codex`): Codex reads command hooks from
-//!   `~/.codex/config.toml` `[[hooks.<Event>]]`; we print the snippet so events flow
-//!   over the same stdin→socket shim.
+//!   `~/.codex/config.toml` `[[hooks.<Event>]]` (honouring `CODEX_HOME`); we merge
+//!   the hook tables with `toml_edit` so events flow over the same stdin→socket shim.
 //! - **OpenCode** (`dira init opencode`): OpenCode has no command hooks, so we
 //!   write a tiny forwarder **plugin** to `~/.config/opencode/plugin/dira.js`
 //!   that HTTP-POSTs to the daemon's `/hooks/opencode` route.
@@ -43,7 +43,7 @@ pub struct Wired {
     /// forwarder plugin instead.
     pub kind: Kind,
     /// Where the config was written. `None` when nothing was written —
-    /// `--print`, or codex, whose snippet is only ever printed.
+    /// `--print`.
     pub path: Option<PathBuf>,
     /// The hook command embedded in the config — or, for a [`Kind::Plugin`]
     /// harness, the URL its forwarder posts to.
@@ -51,8 +51,7 @@ pub struct Wired {
     /// How many events this run newly added. Zero with a `Some(path)` means
     /// every event was already wired — the idempotent re-run case.
     pub events_added: usize,
-    /// Harness-specific aside (grok's user-level-only note, codex's paste
-    /// instruction).
+    /// Harness-specific aside (grok's user-level-only note).
     pub note: Option<String>,
 }
 
@@ -680,8 +679,9 @@ pub(crate) struct HarnessConfig {
 /// Every harness config `dira init` can write: `(harness, relative path, event
 /// names, project-scoped)`.
 ///
-/// Codex is absent on purpose — `dira init codex` only prints a TOML snippet
-/// for the user to paste, so there is no file we own and nothing to verify.
+/// Codex is absent: its config is TOML, not JSON, so the JSON wiring report
+/// cannot read it. `dira init codex` merges it idempotently and reports what
+/// it added.
 /// Grok is user-level only, matching `run_grok`.
 type HarnessRow = (&'static str, &'static str, fn() -> Vec<&'static str>, bool);
 const HARNESS_CONFIGS: &[HarnessRow] = &[
@@ -848,34 +848,84 @@ pub(crate) fn apply_json_settings(
     })
 }
 
-/// `dira init codex` — emit the `~/.codex/config.toml` hook tables that wire
-/// `dira hook codex` onto Codex's command hooks. The hook flows over the same
-/// stdin→socket shim as Claude, so no HTTP bearer is needed.
-///
-/// We only ever **print** the snippet (TOML merging across arbitrary user config
-/// is risky); the user pastes it into their `~/.codex/config.toml`.
+/// Codex's hook events, and whether each takes a `matcher`. They mirror Claude
+/// Code's; each runs the same forwarder.
+const CODEX_EVENTS: &[(&str, bool)] = &[
+    ("SessionStart", false),
+    ("UserPromptSubmit", false),
+    ("Stop", false),
+    ("SubagentStop", false),
+    ("PreToolUse", true),
+    ("PostToolUse", true),
+    ("PermissionRequest", false),
+];
+
+/// `~/.codex/config.toml`, honouring `CODEX_HOME`.
+fn codex_config_path() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(home).join("config.toml"));
+    }
+    Ok(dira_core::config::home_dir()
+        .context("resolve home directory")?
+        .join(".codex/config.toml"))
+}
+
+/// `dira init codex` — wire `dira hook codex` onto Codex's command hooks in
+/// `~/.codex/config.toml`. The hook flows over the same stdin→socket shim as
+/// Claude, so no HTTP bearer is needed.
 ///
 /// Codex hooks use nested array-of-tables: `[[hooks.<Event>]]` (with an optional
 /// regex `matcher`) then `[[hooks.<Event>.hooks]]` carrying `type`/`command`.
-pub fn run_codex(_print_only: bool) -> Result<Wired> {
+///
+/// It used to only print the snippet for the user to paste, because merging
+/// into arbitrary user TOML felt risky. That left Codex as the one harness
+/// onboarding could not finish. `toml_edit` keeps every comment, key order and
+/// formatting of the existing file, the merge only appends missing events, and
+/// an unparseable file is refused rather than rewritten. `--print` still
+/// prints the snippet and writes nothing.
+pub fn run_codex(print_only: bool) -> Result<Wired> {
     let (command, _legacy_command) = hook_commands("codex");
-    // The snippet is only ever printed (never merged into an existing file),
-    // so there's no idempotency check here and no need for the legacy form.
+    if print_only {
+        print_codex_snippet(&command);
+        return Ok(Wired {
+            label: "Codex CLI",
+            kind: Kind::Hooks,
+            path: None,
+            command,
+            events_added: 0,
+            note: None,
+        });
+    }
+    let path = codex_config_path()?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let (merged, added) = merge_codex_hooks(&existing, &command).with_context(|| {
+        format!(
+            "{} is not valid TOML; fix it, or run `dira init codex --print` and paste the snippet",
+            path.display()
+        )
+    })?;
+    if added > 0 {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        std::fs::write(&path, merged).with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(Wired {
+        label: "Codex CLI",
+        kind: Kind::Hooks,
+        path: Some(path),
+        command,
+        events_added: added,
+        note: None,
+    })
+}
+
+fn print_codex_snippet(command: &str) {
     // TOML basic strings use `"` as the delimiter, so a quoted exe path (see
     // `quote_if_needed`) needs its inner `"` escaped to stay valid TOML.
     let toml_command = command.replace('"', "\\\"");
-    // Codex's hook events mirror Claude Code's; each runs the same forwarder.
-    let events: &[(&str, bool)] = &[
-        ("SessionStart", false),
-        ("UserPromptSubmit", false),
-        ("Stop", false),
-        ("SubagentStop", false),
-        ("PreToolUse", true),
-        ("PostToolUse", true),
-        ("PermissionRequest", false),
-    ];
     println!("# Add this to ~/.codex/config.toml to report Codex sessions to dira:");
-    for (ev, needs_matcher) in events {
+    for (ev, needs_matcher) in CODEX_EVENTS {
         println!("[[hooks.{ev}]]");
         if *needs_matcher {
             println!("matcher = \".*\"");
@@ -885,25 +935,114 @@ pub fn run_codex(_print_only: bool) -> Result<Wired> {
         println!("command = \"{toml_command}\"");
         println!();
     }
-    // `dira daemon start` is exactly the trap DIRASH-0029 exists to delete:
-    // a bare-started daemon holds the control socket, which then blocks
-    // `dira daemon install` (D-0009). Point at the commands that actually
-    // set the machine up instead.
-    println!(
-        "# Then run `dira onboard` (or `dira daemon install` to register it as a login service)."
-    );
-    // `path: None` — codex is print-only by construction, so there is nothing
-    // for a caller to report as written. `dira onboard` renders this as
-    // "snippet printed, paste it into ~/.codex/config.toml" rather than as a
-    // completed step, because it isn't one.
-    Ok(Wired {
-        label: "Codex CLI",
-        kind: Kind::Hooks,
-        path: None,
-        command,
-        events_added: 0,
-        note: Some("codex is print-only: paste the snippet above into ~/.codex/config.toml".into()),
-    })
+}
+
+/// Merge the dira hook for every [`CODEX_EVENTS`] event into a Codex
+/// `config.toml`, returning the new text and how many events were added. An
+/// event that already runs a `dira hook codex` command (any exe path) is left
+/// alone, so a re-run is a no-op. Pure, so it is tested on strings.
+fn merge_codex_hooks(existing: &str, command: &str) -> Result<(String, usize)> {
+    use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+    let mut doc: DocumentMut = existing.parse()?;
+    let hooks = doc
+        .entry("hooks")
+        .or_insert_with(|| {
+            let mut t = Table::new();
+            t.set_implicit(true);
+            Item::Table(t)
+        })
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("`hooks` is not a table"))?;
+
+    fn runs_dira(entry: &Table) -> bool {
+        let is_dira = |cmd: Option<&str>| cmd.is_some_and(|c| c.contains("hook codex"));
+        match entry.get("hooks") {
+            Some(Item::ArrayOfTables(aot)) => aot
+                .iter()
+                .any(|h| is_dira(h.get("command").and_then(|c| c.as_str()))),
+            Some(Item::Value(v)) => v.as_array().is_some_and(|arr| {
+                arr.iter().any(|h| {
+                    is_dira(
+                        h.as_inline_table()
+                            .and_then(|t| t.get("command"))
+                            .and_then(|c| c.as_str()),
+                    )
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    let mut added = 0;
+    for (ev, needs_matcher) in CODEX_EVENTS {
+        let item = hooks
+            .entry(ev)
+            .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+        let Some(aot) = item.as_array_of_tables_mut() else {
+            // Some other shape we did not write; leave the user's config alone.
+            continue;
+        };
+        if aot.iter().any(runs_dira) {
+            continue;
+        }
+        let mut hook = Table::new();
+        hook["type"] = value("command");
+        hook["command"] = value(command);
+        let mut inner = ArrayOfTables::new();
+        inner.push(hook);
+        let mut entry = Table::new();
+        if *needs_matcher {
+            entry["matcher"] = value(".*");
+        }
+        entry.insert("hooks", Item::ArrayOfTables(inner));
+        aot.push(entry);
+        added += 1;
+    }
+    Ok((doc.to_string(), added))
+}
+
+#[cfg(test)]
+mod codex_tests {
+    use super::*;
+
+    #[test]
+    fn merges_every_event_once_and_keeps_the_users_config() {
+        let existing = "# my settings\nmodel = \"o4\"\n\n[profiles.fast]\nmodel = \"mini\"\n";
+        let (out, added) = merge_codex_hooks(existing, "/bin/dira hook codex").unwrap();
+        assert_eq!(added, CODEX_EVENTS.len());
+        assert!(out.starts_with("# my settings\nmodel = \"o4\""));
+        assert!(out.contains("[profiles.fast]"));
+        let doc: toml_edit::DocumentMut = out.parse().unwrap();
+        let pre = doc["hooks"]["PreToolUse"].as_array_of_tables().unwrap();
+        assert_eq!(pre.len(), 1);
+        let first = pre.get(0).unwrap();
+        assert_eq!(first["matcher"].as_str(), Some(".*"));
+        let inner = first["hooks"].as_array_of_tables().unwrap().get(0).unwrap();
+        assert_eq!(inner["command"].as_str(), Some("/bin/dira hook codex"));
+        assert_eq!(inner["type"].as_str(), Some("command"));
+
+        let (again, added_again) = merge_codex_hooks(&out, "/other/dira hook codex").unwrap();
+        assert_eq!(
+            added_again, 0,
+            "a re-run with another exe path adds nothing"
+        );
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn keeps_the_users_own_hooks_on_the_same_event() {
+        let existing = "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"notify-send done\"\n";
+        let (out, added) = merge_codex_hooks(existing, "dira hook codex").unwrap();
+        assert_eq!(added, CODEX_EVENTS.len());
+        let doc: toml_edit::DocumentMut = out.parse().unwrap();
+        assert_eq!(doc["hooks"]["Stop"].as_array_of_tables().unwrap().len(), 2);
+        assert!(out.contains("notify-send done"));
+    }
+
+    #[test]
+    fn refuses_a_file_that_is_not_toml() {
+        assert!(merge_codex_hooks("this is = = not toml", "dira hook codex").is_err());
+    }
 }
 
 /// Whether `path` already holds exactly `content` — a missing or unreadable

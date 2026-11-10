@@ -8,6 +8,7 @@ pub mod drift;
 pub mod handshake;
 pub mod health;
 pub mod knowledge;
+pub mod meetings;
 pub mod ratelimit;
 
 pub use batch::{
@@ -47,6 +48,14 @@ pub const META_ARTIFACTS_CURSOR: &str = "sync_cursor_artifact_rowid";
 /// over-inclusive lower bound is free; under-inclusion is the only direction
 /// the id cannot protect against.
 pub const META_TOKEN_CURSOR: &str = "sync_cursor_token_rowid";
+/// `meta` key: JSON list of ingest chunks the cloud kept rejecting, which the
+/// daemon stepped past (DIRASH-0049). Read by `dira doctor`.
+pub const META_SYNC_QUARANTINE: &str = "sync_quarantine";
+/// `meta` keys for the contract 2.0 batch hash chain (DIRASH-0052): the next
+/// batch's `seq`, the previous acknowledged batch's hash, and the epoch.
+pub const META_BATCH_SEQ: &str = "batch_seq";
+pub const META_BATCH_PREV_HASH: &str = "batch_prev_hash";
+pub const META_CHAIN_EPOCH: &str = "chain_epoch";
 
 /// `meta` key: the last `dataEpoch` the cloud reported. A change means the cloud's
 /// durable log was reset → the daemon re-sends from scratch (see [`handshake`]).

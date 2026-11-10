@@ -53,7 +53,19 @@ pub enum Request {
     IngestHook {
         harness: String,
         payload: serde_json::Value,
+        /// When the shim saw the hook (RFC 3339). The daemon stamps receipt time
+        /// when it is absent (older shims). Lets a hook delivered late keep its
+        /// real time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_at: Option<String>,
     },
+    /// A hook the `dira hook` shim already normalized: a
+    /// `dira_sources::spool::Record` as JSON, the same record the spool holds
+    /// (DIRASH-0049). The raw harness payload never crosses the pipe, and live
+    /// and spooled hooks take one ingress path. An older daemon answers
+    /// `bad request: unknown variant`, and the shim then spools the record for
+    /// the restarted daemon to drain.
+    IngestRecord { record: serde_json::Value },
     /// Wipe all local statistics (events + token usage) for a fresh start. Keeps
     /// device identity; resets the sync cursor and the live-session registry.
     Nuke,
@@ -171,6 +183,75 @@ pub enum Request {
     /// exactly the machine the bug is on. The spawning process must be
     /// `dira doctor`, running under the user's own ordinary token.
     CaptureProbe { phase: ProbePhase },
+    /// Meeting detection's live state, pending suggestions and recent meetings
+    /// (`dira meetings`, DIRASH-0060). Local control protocol only.
+    Meetings,
+    /// Confirm, dismiss, retract or assign a detected meeting.
+    MeetingAction {
+        id: String,
+        action: MeetingAction,
+        /// For `assign`: the project to file it under; `None` clears it.
+        #[serde(default)]
+        project: Option<String>,
+    },
+}
+
+/// What `dira meetings <verb>` does to one meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingAction {
+    /// Count a suggestion (or keep a recorded meeting) as meeting time.
+    Confirm,
+    /// Drop a suggestion; it never counts.
+    Dismiss,
+    /// Withdraw a recorded meeting; it stops counting and the cloud is told.
+    Retract,
+    /// File the meeting under a project.
+    Assign,
+}
+
+/// One meeting as `dira meetings` shows it: times and a closed provider class,
+/// never an app name or title (D-0001).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingRowView {
+    pub id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    /// `suggested`, `recorded`, `confirmed`, `dismissed` or `retracted`.
+    pub state: String,
+    pub provider_class: String,
+    /// `high` or `low`.
+    pub confidence: String,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// `Meetings`: the module's mode, what the detector sees now, and the rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingsView {
+    /// `off`, `suggest` or `auto`.
+    pub mode: String,
+    /// The sampling adapter (`replay`, `macos.coreaudio`, …), when one runs.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// Why no adapter runs although the module is on (e.g. no OS adapter yet).
+    #[serde(default)]
+    pub unavailable: Option<String>,
+    /// A meeting in progress: provider class, since (RFC 3339), and whether it is
+    /// already confident.
+    #[serde(default)]
+    pub live: Option<MeetingLiveView>,
+    #[serde(default)]
+    pub suggestions: Vec<MeetingRowView>,
+    #[serde(default)]
+    pub recent: Vec<MeetingRowView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingLiveView {
+    pub provider_class: String,
+    pub since: String,
+    pub confident: bool,
 }
 
 /// Which half of the capture probe a [`Request::CaptureProbe`] drives.
@@ -369,6 +450,8 @@ pub enum Response {
     /// Same new-variant skew posture as `ZavetSpec`, and harmless here: only a
     /// CLI new enough to send `CaptureProbe` can ever receive this.
     CaptureProbe(Box<CaptureProbeView>),
+    /// `Meetings`. Boxed like the other views; same new-variant skew posture.
+    Meetings(Box<MeetingsView>),
 }
 
 /// A live or recent session as shown by `status` / `sessions`.
@@ -446,6 +529,28 @@ pub struct SessionView {
     /// Canonical repos an orchestrator's own tool calls touched, sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<String>,
+    /// The branch the session's work landed on, by the ended rollup's rule
+    /// (`dira_core::sync::SessionBranch`): the latest non-trunk branch of its
+    /// own repo. This and the next two fields are defaulted for version skew:
+    /// an older daemon omits them and they read as unknown / zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The spec slug the session works under, when one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
+    /// The session's `token_usage` inside the listed window — the same rows
+    /// `dira status` sums for today's compute row, split per session.
+    #[serde(default)]
+    pub tokens: SessionTokens,
+}
+
+/// One session's token use: every token through the pipe (input + output +
+/// cache read/create) and the local USD estimate. A display estimate, never a
+/// billing base.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionTokens {
+    pub total: u64,
+    pub est_cost_usd: f64,
 }
 
 /// Lenient deserializers for the two typed enums above.
@@ -548,6 +653,12 @@ impl SessionView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusView {
     pub active: Vec<SessionView>,
+    /// Sessions that are no longer live but descend from a session in
+    /// `active` and did something today: a run's ended children (#182), so
+    /// its tree keeps them. Never counted as active. Defaulted so an older
+    /// daemon degrades to the previous tree, which dropped them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_children: Vec<SessionView>,
     pub today: Report,
     pub sync_pending: u64,
     /// Un-synced `token_usage` rows past the confirmed token cursor. Reported
@@ -1219,6 +1330,9 @@ mod tests {
             orchestrator: false,
             parent_session: None,
             repos: Vec::new(),
+            branch: None,
+            spec: None,
+            tokens: Default::default(),
         }
     }
 
@@ -1264,6 +1378,7 @@ mod tests {
         // fields ignored, but keep the payload minimal) sees the pre-field shape.
         let v = StatusView {
             active: vec![],
+            run_children: vec![],
             today: Report {
                 projects: vec![],
                 total_human_seconds: 0,

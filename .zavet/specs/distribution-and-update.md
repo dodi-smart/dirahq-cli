@@ -1,19 +1,20 @@
 ---
 title: Distribution and self-update
-version: 10
+version: 11
 origin: session
 verified: false
 confidence: high
-date: 2026-09-09
+date: 2026-10-27
 paths:
   - install.sh
   - install.ps1
   - cli/dira/src/update/**
   - cli/dira/src/cloud_init.rs
   - cli/dira/src/daemon.rs
+  - cli/dirad/src/autoupdate.rs
   - cli/ipc/**
   - .github/workflows/build-release.yml
-decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038]
+decisions: [D-0003, D-0004, D-0006, D-0007, D-0008, D-0009, D-0011, D-0013, D-0014, D-0019, D-0021, DIRASH-0022, DIRASH-0024, DIRASH-0029, DIRASH-0031, DIRASH-0038, DIRASH-0048, DIRASH-0050]
 checks:
   - the post-update steps honour --no-zavet and --no-cloud :: cargo test -p dira --bin dira -- update::tests::post_update_steps_honour_no_zavet_and_no_cloud
   - refresh never creates artifacts and never lowers a pin :: cargo test -p dira --bin dira -- cloud_init::tests::refresh_never_creates_artifacts_and_never_downgrades
@@ -21,6 +22,9 @@ checks:
   - cloud refresh bumps an older pin and lists other stale repos :: cargo test -p dira --test cloud_init_e2e cloud_refresh_bumps_an_older_pin_and_lists_other_stale_repos
   - a repo without .dira/ is a silent no-op :: cargo test -p dira --test cloud_init_e2e cloud_refresh_outside_a_wired_repo_is_a_silent_noop
   - a newer pin is left alone :: cargo test -p dira --test cloud_init_e2e cloud_refresh_never_lowers_a_newer_pin
+  - update --check --json agrees with the text verdict and always parses :: cargo test -p dira --bin dira -- update::tests::check_json_has_the_documented_shape
+  - version --json names both builds and both comparisons :: cargo test -p dira --bin dira -- daemon::probe_tests::version_json_has_the_documented_shape
+  - daemon status --json keeps the install.sh running contract :: cargo test -p dira --bin dira -- daemon::probe_tests::status_json_has_the_documented_shape
 ---
 
 ## Overview
@@ -32,6 +36,34 @@ Releases as the only artifact source, and an in-binary updater that swaps
 both executables and restarts whatever is supervising the daemon.
 
 ## Behavior
+
+- **Background auto-update (DIRASH-0050).**
+  - **Schedule.** `dirad` spawns a detached, windowless `dira update --auto`
+    10 min after start, then every 6 h ± 30 min. Output goes to
+    `logs/update.log`, capped at 1 MiB.
+  - **Work.** The CLI does all of it through the ordinary update path. It acts
+    only on a strictly newer release that is not in `update.skip_version`,
+    under an `update.lock`, and is a no-op when `update.auto = false`,
+    `DIRA_DISABLE_AUTOUPDATE` or `CI` is set, in debug builds, and on dev
+    installs.
+  - **Surviving the restart.** The updater outlives the daemon it restarts:
+    its own process group on unix, `KillMode=process` in the systemd unit,
+    and `CREATE_BREAKAWAY_FROM_JOB` (with fallback) on windows.
+- **Channel.** `--channel`, else `update.channel`, else stable. In background
+  mode only, an unset knob falls back to the installed version's channel, so a
+  prerelease install keeps following prereleases. An explicit `--channel` is
+  persisted. The installers write `update.channel` on every install.
+- **Installers record a chosen channel.** They write `update.channel` only when
+  a channel was passed (`--channel`/`--prerelease`/`DIRA_CHANNEL`). Otherwise
+  background updates follow the installed version's own channel, so a pinned
+  prerelease keeps following prereleases. `dira update` keeps its backups and
+  the `--rollback` copy in one owned directory, `bin_dir/.dira-update/`.
+  Uninstall removes it, along with the `.old.<pid>` rename-aside files the
+  installers share with the updater (D-0003).
+- **Rollback.** After every successful update the replaced binaries are kept as
+  `.dira-update/{name}.prev`. `dira update --rollback` swaps them back (rename-only),
+  restarts the daemon, and records the version it left in
+  `update.skip_version`. A rollback can itself be rolled back.
 
 - `install.sh` detects OS/arch, resolves a version, downloads the archive and
   its checksum, verifies sha256, then installs both binaries atomically. It
@@ -130,7 +162,23 @@ both executables and restarts whatever is supervising the daemon.
 - `dira update` resolves → downloads → verifies → swaps → restarts, then
   asserts the installed binary reports the expected version. `--check`
   resolves only and exits 0 in every non-error case, including offline, so it
-  is safe in a script.
+  is safe in a script. `--check --json` (`--json` requires `--check`) prints
+  exactly one object on stdout in every case, a failed resolve included, so a
+  script can parse stdout unconditionally; it still exits 0. Its `status` is
+  the same three-way `compare_versions` verdict the text line words
+  (`available` / `up_to_date` / `ahead`), plus `error`:
+
+  ```json
+  {
+    "channel": "stable",
+    "current_version": "0.11.1-develop.2",
+    "error": null,
+    "requested_version": null,
+    "resolved_version": "0.11.0",
+    "status": "ahead",
+    "update_available": false
+  }
+  ```
 - After a successful swap-and-restart, `dira update` also spawns the freshly
   installed `bin_dir/dira cloud refresh --after-update` (DIRASH-0038): it
   refreshes the *cwd repo's* committed cloud wiring (`.dira/hook.sh` +
@@ -267,6 +315,35 @@ both executables and restarts whatever is supervising the daemon.
   `install.sh` keys its post-upgrade restart decision off that exit code, so
   a legacy daemon must count as "running" (a restart will migrate it) rather
   than "down" (which would make install.sh skip the restart and strand it).
+  `--json` prints one object (`running`, `state`, `degraded`, `socket`,
+  `legacy_socket`, `supervision`, `supervision_label`, `daemon`) and keeps the
+  same exit code. `state` is `up` / `unexpected` / `legacy` / `denied` /
+  `busy` / `down`: a refusing daemon is `denied`, never `down` (D-0016).
+- `dira version --json` prints one object with the same facts as the text:
+  this CLI's `version` and `schema_version`, `daemon_state`, the daemon's
+  self-report under `daemon` (or `null`), `legacy_socket`, and the two
+  comparisons the text warns about, `version_skew` (bool) and
+  `store_divergence` (`{cli_db_path, daemon_db_path}` or `null`). A daemon too
+  old or too absent to say yields `false`/`null`, never an invented finding:
+
+  ```json
+  {
+    "daemon": { "version": "0.11.0", "schema_version": "1.8.0", "pid": 4242,
+                "uptime_seconds": 3600, "db_path": "/Users/u/.local/share/dira/dira.db",
+                "http_ingress_error": null, "control_channel_warning": null,
+                "storage_warning": null },
+    "daemon_state": "up",
+    "legacy_socket": null,
+    "schema_version": "1.8.0",
+    "store_divergence": null,
+    "version": "0.11.1-develop.2",
+    "version_skew": true
+  }
+  ```
+- Every `--json` above follows `dira doctor --json`'s stdout rule
+  (DIRASH-0022): stdout carries exactly one object. The hook breadcrumb stays
+  on stderr and the passive update notice is skipped. Keys are snake_case and
+  additive-only: a new key is free, a rename or removal breaks scripts.
 
 ## Interfaces & data
 
@@ -294,11 +371,23 @@ both executables and restarts whatever is supervising the daemon.
   windows the updater uses the `zip` crate (target-gated dep). There is no
   guaranteed tar on constrained images, and the archive contents are
   restricted to the two expected binary names (zip-slip guard).
-- Daemon supervision spans launchd, systemd-user, a windows logon scheduled
-  task (`schtasks`, HKCU Run-key fallback), and pidfile. Windows stop is
-  graceful `Request::Shutdown` over the control pipe, escalating to
-  `taskkill /F`. Known gap: a logon task does not resupervise a crash
-  (RestartOnFailure task XML is the follow-up).
+- Daemon supervision spans launchd, systemd-user, a windows per-user logon
+  task, the HKCU Run key, and pidfile (DIRASH-0048).
+  - The task is registered from XML (`schtasks /Create /XML`, UTF-16 with a BOM).
+    It names the current user in the trigger and the principal (no admin),
+    starts on battery and keeps running when unplugged, has no execution time
+    limit, restarts on failure every minute, and is hidden.
+  - If the task cannot be registered, the Run key is written and `dirad` is
+    started at once.
+  - `Supervision::RunKey` is its own variant: restart stops the process and
+    spawns the replacement directly.
+  - `dirad` is a windows-subsystem binary, so neither path opens a console
+    window.
+  - Windows stop is graceful `Request::Shutdown` over the control pipe,
+    escalating to `taskkill /F`, with exit confirmed by `tasklist` (D-0019).
+    `dira daemon stop` and `uninstall` apply it to task- and Run-key-launched
+    daemons too, and `install` stops one before re-registering, so the new
+    binary is what starts.
 
 ## Invariants
 
@@ -330,9 +419,11 @@ both executables and restarts whatever is supervising the daemon.
   (default `no`) is separately the answer to a bare Enter once a real prompt
   is shown. The two knobs are deliberately independent, not one shared
   fallback: a scripted `--uninstall` wants unattended runs to proceed
-  (`_confirm`'s own default call has `notty=yes`), while installing a
-  persistent service must never happen unattended (the service prompt is
-  `_confirm "..." yes no`, `notty=no`). Every call site is a single
+  (`_confirm`'s own default call has `notty=yes`), and the service
+  no longer prompts at all (DIRASH-0051): the per-user service is installed by
+  default, terminal or not, unless `--no-service`, `--no-daemon`,
+  `--no-interactive` or `CI=true`. With a terminal the installer then runs
+  `dira onboard` itself. Every call site is a single
   `_confirm` invocation; there is no second hand-rolled `/dev/tty` read
   anywhere in the script.
 - Checksum verification is mandatory and has no override flag. An
@@ -394,8 +485,9 @@ both executables and restarts whatever is supervising the daemon.
 - Windows arm64 now builds and smokes natively on `windows-11-arm` (D-0014),
   closing the "ships untested" gap; the exes are still unsigned (Authenticode
   remains a follow-up. Unsigned logon-task daemons are prime AV
-  false-positive material), and the schtasks ONLOGON + HKCU-fallback path
-  still needs validation on a real Windows machine.
+  false-positive material), and the XML logon task + HKCU-fallback path
+  still needs validation on a real standard-user Windows account (Parallels
+  runbook, plan 2026-11-09 Phase 0).
 - The Windows binaries link the MSVC CRT **statically** (`.cargo/config.toml`,
   `-C target-feature=+crt-static`), so they need no VC++ Redistributable on the
   target host. This closes #60 and puts Windows on the same footing as the

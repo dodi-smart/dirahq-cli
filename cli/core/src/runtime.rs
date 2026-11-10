@@ -4,7 +4,9 @@
 //! Claude Code on the web, Cursor cloud agents — as opposed to a developer's
 //! own machine. Detection is metadata for labeling and diagnostics only
 //! (device labels, `dira doctor`): capture and accounting behave identically
-//! everywhere, per the policy-free posture.
+//! everywhere, per the policy-free posture. Whether a person is present is a
+//! separate fact, decided by the hook shim (`DIRA_HEADLESS`, DIRASH-0047),
+//! never inferred from the runtime: a cloud VM can have someone typing.
 //!
 //! Detection is deliberately conservative: only markers the vendor documents
 //! as set inside their VM, plus an explicit [`ENV_RUNTIME`] override for

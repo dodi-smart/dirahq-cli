@@ -32,7 +32,9 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -288,7 +290,8 @@ impl SpecRunner for SystemSpecRunner {
         args: &[&str],
         timeout: Duration,
     ) -> Result<String, RunError> {
-        let mut cmd = Command::new(bin);
+        // Runs inside `dirad` (no console on windows), so it must be windowless.
+        let mut cmd = crate::process::command(bin);
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -1667,6 +1670,32 @@ mod tests {
         assert!(resolve_units(&fake, &root(), Path::new("/r"), false).is_err());
     }
 
+    /// [`SystemSpecRunner::run`] on a script this test has just written.
+    ///
+    /// Another test thread can fork while the script's write fd is still open.
+    /// Its child then holds that fd until its own exec closes it (`O_CLOEXEC`),
+    /// and our exec of the inode in that window is refused with `ETXTBSY`
+    /// (golang/go#22315, D-0021). Production never execs a file it has just
+    /// written, so the wait lives here: retry only that refusal, briefly.
+    #[cfg(unix)]
+    fn run_fresh(
+        bin: &Path,
+        cwd: &Path,
+        args: &[&str],
+        budget: Duration,
+    ) -> Result<String, RunError> {
+        let mut tries = 0;
+        loop {
+            match SystemSpecRunner.run(bin, cwd, args, budget) {
+                Err(RunError::Spawn(e)) if e.contains("os error 26") && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                r => return r,
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_system_runner_kills_a_wedged_plugin_at_the_deadline() {
@@ -1676,7 +1705,7 @@ mod tests {
         std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let t0 = Instant::now();
-        let r = SystemSpecRunner.run(&bin, dir.path(), &["specs"], Duration::from_millis(200));
+        let r = run_fresh(&bin, dir.path(), &["specs"], Duration::from_millis(200));
         assert_eq!(r, Err(RunError::Timeout));
         assert!(t0.elapsed() < Duration::from_secs(5));
     }
@@ -1699,7 +1728,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = script(dir.path(), "slow", "sleep 30 &\necho partial");
         let t0 = Instant::now();
-        let r = SystemSpecRunner.run(&bin, dir.path(), &[], Duration::from_secs(10));
+        let r = run_fresh(&bin, dir.path(), &[], Duration::from_secs(10));
         assert_eq!(r, Err(RunError::Timeout));
         assert!(t0.elapsed() < Duration::from_secs(8));
     }
@@ -1714,7 +1743,7 @@ mod tests {
             "big",
             &format!("head -c {n} /dev/zero | tr '\\0' 'x'"),
         );
-        let r = SystemSpecRunner.run(&bin, dir.path(), &[], Duration::from_secs(20));
+        let r = run_fresh(&bin, dir.path(), &[], Duration::from_secs(20));
         assert_eq!(r, Err(RunError::OutputCap));
         // Exactly at the cap is fine.
         let bin = script(
@@ -1722,9 +1751,7 @@ mod tests {
             "exact",
             &format!("head -c {MAX_OUTPUT_BYTES} /dev/zero | tr '\\0' 'x'"),
         );
-        let out = SystemSpecRunner
-            .run(&bin, dir.path(), &[], Duration::from_secs(20))
-            .unwrap();
+        let out = run_fresh(&bin, dir.path(), &[], Duration::from_secs(20)).unwrap();
         assert_eq!(out.len() as u64, MAX_OUTPUT_BYTES);
     }
 
@@ -1741,7 +1768,7 @@ mod tests {
         // The script sleeps 60s, so any timeout proves the kill; it only has to
         // outlast the shell writing the pidfile, which a loaded test run can
         // delay well past a few hundred milliseconds.
-        let r = SystemSpecRunner.run(&bin, dir.path(), &[], Duration::from_secs(3));
+        let r = run_fresh(&bin, dir.path(), &[], Duration::from_secs(3));
         assert_eq!(r, Err(RunError::Timeout));
         let pid: i32 = std::fs::read_to_string(&pidfile)
             .unwrap()
@@ -1832,12 +1859,10 @@ mod tests {
         for p in [&ok, &bad] {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let out = SystemSpecRunner
-            .run(&ok, dir.path(), &[], Duration::from_secs(5))
-            .unwrap();
+        let out = run_fresh(&ok, dir.path(), &[], Duration::from_secs(5)).unwrap();
         assert_eq!(out.trim(), "hello");
         assert_eq!(
-            SystemSpecRunner.run(&bad, dir.path(), &[], Duration::from_secs(5)),
+            run_fresh(&bad, dir.path(), &[], Duration::from_secs(5)),
             Err(RunError::Failed(3))
         );
     }

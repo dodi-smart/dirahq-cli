@@ -8,7 +8,10 @@
 //!
 //! ## Invariants
 //! - Every envelope carries a `schemaVersion`; evolution is **additive** (new
-//!   optional fields only) within a major version.
+//!   optional fields only) within a major version. 2.0 is the one breaking step
+//!   so far: every attestation batch now carries a per-device hash chain
+//!   (`seq`, `prevBatchHash`, `chainEpoch`), see [`AttestationBatch`]
+//!   (DIRASH-0052).
 //! - Capture is **policy-free**: there is no money, rate, or currency field
 //!   anywhere in this contract. Billing is resolved late, in the cloud.
 //! - **Metadata only**: there is deliberately no field for prompt text, file
@@ -26,7 +29,7 @@ use std::collections::BTreeMap;
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "1.8.0";
+pub const SCHEMA_VERSION: &str = "2.1.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -58,6 +61,26 @@ pub struct AttestationBatch {
     pub device_id: String,
     /// RFC 3339 timestamp the batch was assembled.
     pub generated_at: String,
+    /// 2.0: this batch's position in the device's chain, starting at 0 for each
+    /// [`Self::chain_epoch`]. It advances only when a batch is acknowledged, so a
+    /// retry re-sends the same `seq` (and the same payload, deduplicated by
+    /// `batchId`).
+    pub seq: u64,
+    /// 2.0: lowercase hex SHA-256 of the RFC 8785 (JCS) encoding of the
+    /// previous acknowledged batch's payload in this epoch; `""` at `seq` 0.
+    /// Makes a device's history tamper-evident: a dropped, altered or
+    /// reordered batch breaks the chain the cloud recomputes.
+    pub prev_batch_hash: String,
+    /// 2.0: increments when the chain restarts (a local wipe, a re-link, a key
+    /// rotation). The cloud treats `(deviceId, chainEpoch)` as one chain.
+    pub chain_epoch: u32,
+    /// 2.0: the build and platform that produced the batch. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ClientInfo>,
+    /// 2.0: capture-health counters since the previous acknowledged batch, so
+    /// the cloud can show when a device lost or delayed events. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_health: Option<CaptureHealth>,
     /// De-duplicated, idle-trimmed billable human-time intervals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intervals: Vec<Interval>,
@@ -70,6 +93,190 @@ pub struct AttestationBatch {
     /// Git artifacts referenced by intervals, for cloud-side anchoring.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactRef>,
+    /// 2.0: per-day totals for reconciliation (see [`DayRollup`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub day_rollups: Vec<DayRollup>,
+    /// 2.1: meetings this device detected or the person confirmed (see
+    /// [`Meeting`]). Their time rides [`Interval`]s carrying `meetingId`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meetings: Vec<Meeting>,
+    /// 2.1: time ranges whose intervals this batch restates IN FULL for its
+    /// device. The cloud replaces the device's claims inside each window even
+    /// where the batch sends no interval, so re-decomposing a window down to
+    /// nothing (a retracted meeting with no work left) removes the stale claim
+    /// (D-0085). Empty means "only where my intervals land", as before.
+    ///
+    /// A window may only come from a builder that read EVERY stored event whose
+    /// `at` falls in it (a re-decompose by time, an explicit resync), never
+    /// from an ordinary flush: a flush is an event-id slice, and spool replays
+    /// insert events with past `at` values, so its time span overlaps minutes
+    /// synced in earlier batches. Declaring that span would delete valid claims.
+    /// Readers ignore `windows` from a producer older than 2.1. A reader applies
+    /// each window to ALL of the device's claims, in every workspace, including
+    /// ones where this batch lands no interval: a meeting and the work around it
+    /// can route to different workspaces. Producers send meetings only to a
+    /// cloud that does so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<BatchWindow>,
+}
+
+/// 2.1: a range a batch restates in full (see [`AttestationBatch::windows`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchWindow {
+    /// RFC 3339, inclusive.
+    pub started_at: String,
+    /// RFC 3339, exclusive.
+    pub ended_at: String,
+}
+
+/// 2.0: the build and platform that produced a batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientInfo {
+    /// The `dirad` version, e.g. `"0.13.0"`.
+    pub version: String,
+    /// The update channel the device follows (`stable`, `prerelease`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// `macos`, `linux` or `windows`.
+    pub os: String,
+    /// `aarch64`, `x86_64`, ...
+    pub arch: String,
+}
+
+/// 2.0: capture-health counters, each a count since the previous acknowledged
+/// batch (DIRASH-0049). All zero is the healthy case.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureHealth {
+    /// Hooks that reached the store late, through the on-disk spool (the hook
+    /// shim could not reach the daemon, or the daemon's queue was full).
+    #[serde(default)]
+    pub spooled: u64,
+    /// Of those, hooks the daemon itself spilled because its queue was full.
+    #[serde(default)]
+    pub spilled: u64,
+    /// Hooks lost for good (the spool was unwritable or over its cap).
+    #[serde(default)]
+    pub dropped: u64,
+    /// Sync chunks the cloud rejected repeatedly that the device skipped.
+    #[serde(default)]
+    pub quarantined: u64,
+    /// Hook deliveries the shim recorded as failed, when the device knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_failures: Option<u64>,
+}
+
+/// 2.0: one device's totals for one UTC day and repo, sent so the cloud can
+/// reconcile its own daily facts and flag drift. A reconciliation check, not a
+/// display source: display buckets come from intervals in the viewer's time
+/// zone. Re-sent with a higher `revision` whenever late data changes the day.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DayRollup {
+    /// UTC calendar day, `YYYY-MM-DD`.
+    pub day: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_canonical: Option<String>,
+    /// The cloud workspace the repo is pinned to, when the device knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_hint: Option<String>,
+    pub human_seconds: u64,
+    pub agent_wall_seconds: u64,
+    pub sessions: u32,
+    pub prompts: u64,
+    pub commits: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<DayTokens>,
+    /// Estimated USD cost from the bundled pricing table. A label, never billed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub est_cost_usd: Option<f64>,
+    /// How many intervals the device holds for this day and repo.
+    pub interval_count: u32,
+    /// Lowercase hex SHA-256 of the sorted interval ids joined by `\n`.
+    pub interval_digest: String,
+    /// Starts at 0; incremented each time the day's totals change.
+    pub revision: u32,
+}
+
+/// 2.0: token totals for one model within a [`DayRollup`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DayTokens {
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_create: u64,
+}
+
+/// 2.0: counts describing what happened in a session. Counts only (D-0001):
+/// tool categories, not tool names or arguments; numbers of lines and files,
+/// never their content or paths. A field the producer did not measure is
+/// omitted, never zero-filled.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStats {
+    pub tool_calls: ToolCalls,
+    /// Distinct files the agent's tools read or wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_touched: Option<u32>,
+    /// Lines the agent's edit/write tools added and removed (counted by the
+    /// producer from the tool input, which never leaves the device).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_lines_added: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_lines_removed: Option<u32>,
+    /// Subagents the session started.
+    #[serde(default)]
+    pub subagents: u32,
+    /// Context compactions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compactions: Option<u32>,
+    /// Times the harness asked the person for permission.
+    #[serde(default)]
+    pub permission_prompts: u32,
+    /// Seconds between a permission request and the next activity in the session.
+    #[serde(default)]
+    pub approval_wait_seconds: u64,
+    /// Test runs the agent started through its shell tool, by outcome. Best
+    /// effort: classified from the command's leading words and its exit status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_runs: Option<TestRuns>,
+}
+
+/// 2.0: tool calls by category. A tool the producer cannot place is `other`;
+/// MCP tools count as `mcp` without naming the server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCalls {
+    #[serde(default)]
+    pub read: u32,
+    #[serde(default)]
+    pub edit: u32,
+    #[serde(default)]
+    pub write: u32,
+    #[serde(default)]
+    pub search: u32,
+    #[serde(default)]
+    pub shell: u32,
+    #[serde(default)]
+    pub web: u32,
+    #[serde(default)]
+    pub mcp: u32,
+    #[serde(default)]
+    pub task: u32,
+    #[serde(default)]
+    pub other: u32,
+}
+
+/// 2.0: test runs by outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TestRuns {
+    pub passed: u32,
+    pub failed: u32,
 }
 
 /// How a piece of work was captured. Drives assurance on the cloud side.
@@ -148,6 +355,166 @@ pub struct Interval {
     pub activity: Option<String>,
     /// The session this interval was derived from.
     pub source_session: String,
+    /// 2.1: the [`Meeting`] this interval is a slice of; `activity` is then
+    /// `meeting`. The device has already decided, on its own timeline, which
+    /// seconds were meeting and which were work, so a reader sums intervals as
+    /// before and never adds meeting time twice (DIRASH-0063).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<String>,
+}
+
+/// 2.1: a meeting, detected from local device-in-use signals or confirmed by the
+/// person (DIRASH-0060, DIRASH-0062). Content-free by construction (D-0001):
+/// every field is a closed enum, a time, a count bucket, a boolean, a
+/// device-minted id, a reference to the workspace's own entities, or a keyed
+/// hash. There is nowhere for a title, attendee, address, domain or URL to go.
+///
+/// Upserted by `(deviceId, id)`; a higher `version` replaces a lower one, never
+/// the reverse. A retraction is a record with `state: retracted`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Meeting {
+    /// Minted by the daemon at detection; stable across confirm, reassign and retract.
+    pub id: String,
+    /// Monotonic per meeting.
+    pub version: u32,
+    pub started_at: String,
+    pub ended_at: String,
+    pub state: MeetingState,
+    /// The evidence family that decided the meeting.
+    pub source: MeetingSource,
+    pub confidence: MeetingConfidence,
+    pub provider_class: ProviderClass,
+    /// Which signals were seen, for the cloud's assurance display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<MeetingEvidence>,
+    /// Facts reduced from a matched calendar event, if one matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<CalendarFacts>,
+    /// Where the meeting's time belongs, if the device could tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<MeetingAttribution>,
+    /// Seconds of engaged work the device saw during this meeting. Reported for
+    /// the "engaged during meetings" view; never added to any total.
+    #[serde(default)]
+    pub engaged_during_meeting_seconds: u64,
+}
+
+/// 2.1: a meeting's lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingState {
+    /// Detected with high confidence and recorded.
+    Recorded,
+    /// Confirmed by the person (a suggestion they accepted, or a recorded meeting they kept).
+    Confirmed,
+    /// Withdrawn: its intervals are gone and it no longer counts.
+    Retracted,
+}
+
+/// 2.1: the evidence family that decided a meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingSource {
+    Device,
+    Calendar,
+    Presence,
+    User,
+}
+
+/// 2.1: how sure the device is. Low-confidence runs stay local suggestions and
+/// never cross the wire unconfirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingConfidence {
+    High,
+    Confirmed,
+}
+
+/// 2.1: the kind of call. Deliberately coarser than the device's app catalogue,
+/// so adding an app never changes the wire. Readers map an unknown value to `other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderClass {
+    Zoom,
+    Teams,
+    Slack,
+    Webex,
+    Meet,
+    Discord,
+    Facetime,
+    Chat,
+    Browser,
+    InPerson,
+    Other,
+}
+
+/// 2.1: a signal family that contributed to a meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingEvidence {
+    Capture,
+    Camera,
+    Output,
+    Window,
+    Process,
+    Calendar,
+    Presence,
+}
+
+/// 2.1: what survives of a matched calendar event after on-device reduction
+/// (DIRASH-0064). No title, attendee or domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarFacts {
+    pub attendee_bucket: AttendeeBucket,
+    pub recurring: bool,
+    /// Lowercase hex HMAC-SHA256(workspace salt, calendar UID): groups a recurring
+    /// series across a workspace's members, and reveals nothing about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_key: Option<String>,
+    /// Any attendee outside the person's own domains (decided on the device).
+    pub external: bool,
+}
+
+/// 2.1: attendee count, bucketed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttendeeBucket {
+    One,
+    Two,
+    ThreeToFive,
+    SixToTen,
+    ElevenPlus,
+}
+
+/// 2.1: where a meeting's time belongs, resolved on the device against the
+/// workspace's own directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingAttribution {
+    /// The workspace's project id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_ref: Option<String>,
+    /// The workspace's client id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
+    /// Only for `method: context`: the repo with engaged time around the meeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_canonical: Option<String>,
+    pub method: AttributionMethod,
+}
+
+/// 2.1: how a meeting was attributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionMethod {
+    User,
+    CalendarRule,
+    Domain,
+    Series,
+    /// A suggestion from nearby repo work; never billed unless policy allows.
+    Context,
 }
 
 /// Per-session rollup. Agent wall-clock sums freely; it is evidence, never billed.
@@ -252,6 +619,14 @@ pub struct SessionRollup {
     /// Optional + omitted-when-absent so pre-1.8 payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_name: Option<String>,
+    /// 2.0: what happened in the session, as counts (see [`SessionStats`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SessionStats>,
+    /// 2.0: the cloud workspace the session's repo is pinned to, when the
+    /// device knows it (the repo's committed cloud pin). A routing hint the
+    /// cloud validates, never trusts; unrelated to the lineage `workspaceRef`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_hint: Option<String>,
 }
 
 /// Token usage for a session/turn. Cost is always an estimate, separate from time.
@@ -352,6 +727,13 @@ pub struct ArtifactRef {
     /// object id, never file content. Optional + omitted-when-absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blobs: Option<Vec<BlobRef>>,
+    /// 2.0: lines the commit added and removed (`git diff --numstat`), counts
+    /// only. With the session's `agentLinesAdded` the cloud can estimate how
+    /// much of a commit the agent wrote, and must label it an estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines_added: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines_removed: Option<u32>,
 }
 
 /// One touched path and its git post-image blob SHA — a content-identity pointer
@@ -487,6 +869,11 @@ pub struct ServerMeta {
     /// The oldest contract version the cloud still accepts, e.g. `"1.0.0"`.
     #[serde(default)]
     pub min_schema_version: String,
+    /// 2.0: request-body encodings ingest accepts besides identity, e.g.
+    /// `["zstd"]`. Absent (an older cloud) means none: the producer then sends
+    /// an uncompressed body rather than fail.
+    #[serde(default)]
+    pub accept_encodings: Vec<String>,
 }
 
 /// A request to rotate a device's signing key, sent to
@@ -1187,6 +1574,14 @@ mod tests {
                 sessions: vec![],
                 token_usage: vec![],
                 artifacts: vec![],
+                seq: 0,
+                prev_batch_hash: String::new(),
+                chain_epoch: 0,
+                client: None,
+                capture_health: None,
+                day_rollups: Vec::new(),
+                meetings: Vec::new(),
+                windows: Vec::new(),
             },
             sig: "deadbeef".to_string(),
         };
@@ -1208,6 +1603,14 @@ mod tests {
             sessions: vec![],
             token_usage: vec![],
             artifacts: vec![],
+            seq: 0,
+            prev_batch_hash: String::new(),
+            chain_epoch: 0,
+            client: None,
+            capture_health: None,
+            day_rollups: Vec::new(),
+            meetings: Vec::new(),
+            windows: Vec::new(),
         };
         let json = serde_json::to_string(&batch).unwrap();
         assert!(!json.contains("intervals"));
@@ -1278,6 +1681,7 @@ mod tests {
         let meta = ServerMeta {
             schema_version: "1.2.0".into(),
             min_schema_version: "1.0.0".into(),
+            accept_encodings: Vec::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"schemaVersion\""));
@@ -1577,6 +1981,8 @@ mod tests {
                     human_seconds: 1,
                     activity: Some("a".into()),
                     source_session: "ss".into(),
+                    // Populated so the content-token walk covers the 2.1 field.
+                    meeting_id: Some("m".into()),
                 }],
                 sessions: vec![SessionRollup {
                     session_id: "s".into(),
@@ -1604,6 +2010,25 @@ mod tests {
                     // Populated so the content-token walk covers the 1.8 fields.
                     trigger: Some(SessionTrigger::Scheduled),
                     trigger_name: Some("dodi-smart-triage-refresh".into()),
+                    stats: Some(SessionStats {
+                        tool_calls: ToolCalls {
+                            read: 1,
+                            edit: 1,
+                            ..ToolCalls::default()
+                        },
+                        files_touched: Some(1),
+                        agent_lines_added: Some(1),
+                        agent_lines_removed: Some(1),
+                        subagents: 1,
+                        compactions: Some(1),
+                        permission_prompts: 1,
+                        approval_wait_seconds: 1,
+                        test_runs: Some(TestRuns {
+                            passed: 1,
+                            failed: 0,
+                        }),
+                    }),
+                    workspace_hint: Some("w".into()),
                 }],
                 token_usage: vec![TokenUsage {
                     id: "t".into(),
@@ -1633,6 +2058,75 @@ mod tests {
                         path: "src/lib.rs".into(),
                         blob: "deadbeef".into(),
                     }]),
+                    lines_added: Some(1),
+                    lines_removed: Some(1),
+                }],
+                seq: 0,
+                prev_batch_hash: String::new(),
+                chain_epoch: 0,
+                client: Some(ClientInfo {
+                    version: "2.0.0".into(),
+                    channel: Some("stable".into()),
+                    os: "macos".into(),
+                    arch: "aarch64".into(),
+                }),
+                capture_health: Some(CaptureHealth {
+                    spooled: 1,
+                    spilled: 1,
+                    dropped: 1,
+                    quarantined: 1,
+                    hook_failures: Some(1),
+                }),
+                // Populated so the content-token walk covers the 2.0 fields.
+                day_rollups: vec![DayRollup {
+                    day: "2026-11-09".into(),
+                    repo_canonical: Some("r".into()),
+                    workspace_hint: Some("w".into()),
+                    human_seconds: 1,
+                    agent_wall_seconds: 1,
+                    sessions: 1,
+                    prompts: 1,
+                    commits: 1,
+                    tokens: vec![DayTokens {
+                        model: "m".into(),
+                        input: 1,
+                        output: 1,
+                        cache_read: 1,
+                        cache_create: 1,
+                    }],
+                    est_cost_usd: Some(1.0),
+                    interval_count: 1,
+                    interval_digest: "d".into(),
+                    revision: 0,
+                }],
+                // Populated so the content-token walk covers the 2.1 fields.
+                meetings: vec![Meeting {
+                    id: "m".into(),
+                    version: 1,
+                    started_at: "s".into(),
+                    ended_at: "e".into(),
+                    state: MeetingState::Confirmed,
+                    source: MeetingSource::Device,
+                    confidence: MeetingConfidence::High,
+                    provider_class: ProviderClass::Zoom,
+                    evidence: vec![MeetingEvidence::Capture],
+                    calendar: Some(CalendarFacts {
+                        attendee_bucket: AttendeeBucket::ThreeToFive,
+                        recurring: true,
+                        series_key: Some("k".into()),
+                        external: true,
+                    }),
+                    attribution: Some(MeetingAttribution {
+                        project_ref: Some("p".into()),
+                        client_ref: Some("c".into()),
+                        repo_canonical: Some("r".into()),
+                        method: AttributionMethod::Domain,
+                    }),
+                    engaged_during_meeting_seconds: 1,
+                }],
+                windows: vec![BatchWindow {
+                    started_at: "s".into(),
+                    ended_at: "e".into(),
                 }],
             },
             sig: "sig".into(),
@@ -1880,6 +2374,8 @@ mod tests {
             workspace_ref: None,
             trigger: None,
             trigger_name: None,
+            stats: None,
+            workspace_hint: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"spec\":\"bmad:epic-1\""));
@@ -1916,6 +2412,8 @@ mod tests {
             workspace_ref: Some("0123456789abcdef".into()),
             trigger: Some(SessionTrigger::Scheduled),
             trigger_name: Some("dodi-smart-triage-refresh".into()),
+            stats: None,
+            workspace_hint: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"trigger\":\"scheduled\""));
@@ -2024,6 +2522,8 @@ mod tests {
                 path: "a.rs".into(),
                 blob: "de98044".into(),
             }]),
+            lines_added: None,
+            lines_removed: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"sessionChangeId\":\"3e53248\""));
@@ -2051,6 +2551,8 @@ mod tests {
             session_change_id: None,
             touched_paths: None,
             blobs: None,
+            lines_added: None,
+            lines_removed: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("sessionChangeId"));
@@ -2085,6 +2587,8 @@ mod tests {
             workspace_ref: None,
             trigger: None,
             trigger_name: None,
+            stats: None,
+            workspace_hint: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"runtime\":\"claude-web\""));

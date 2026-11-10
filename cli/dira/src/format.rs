@@ -29,9 +29,69 @@ pub fn project_label(p: &Option<String>) -> String {
 /// What orchestration time is called wherever a repo name would go.
 pub const ORCHESTRATION_LABEL: &str = "orchestration";
 
+/// What an orchestrator that spawned nothing and touched no repo is called
+/// (#181): an hourly scheduled run in a scratch workspace, say. Display only —
+/// the session keeps its role, and its repo-less time stays in the
+/// orchestration report bucket (DIRASH-0041).
+pub const SCRATCH_LABEL: &str = "scratch session";
+
+/// The KIND cell: `orch` for an orchestrator, except one shown as a
+/// [`SCRATCH_LABEL`] — it coordinated nothing, so it reads as the session it is.
+fn kind_cell(s: &dira_core::protocol::SessionView, scratch: bool) -> &'static str {
+    if s.orchestrator && !scratch {
+        "orch"
+    } else {
+        kind_label(s.kind)
+    }
+}
+
+/// Keep the first `n` top-level entries of `sessions` (a run counts as one,
+/// grouped by [`dira_core::runs::group`]), in list order, and say how many
+/// entries were left out. The one `--limit` rule for the table and `--json`.
+pub fn limit_entries(
+    sessions: &[dira_core::protocol::SessionView],
+    n: usize,
+) -> (Vec<dira_core::protocol::SessionView>, usize) {
+    use dira_core::runs::{group, Entry};
+    let entries = group(sessions);
+    let hidden = entries.len().saturating_sub(n);
+    let keep: std::collections::HashSet<&str> = entries
+        .iter()
+        .take(n)
+        .flat_map(|e| match e {
+            Entry::Session(s) => vec![s.session_id.as_str()],
+            Entry::Run(r) => std::iter::once(r.root)
+                .chain(r.members.iter().copied())
+                .map(|s| s.session_id.as_str())
+                .collect(),
+        })
+        .collect();
+    let kept = sessions
+        .iter()
+        .filter(|s| keep.contains(s.session_id.as_str()))
+        .cloned()
+        .collect();
+    (kept, hidden)
+}
+
+/// The sessions a status tree lays out: the live ones, then the ended
+/// children of listed runs (#182), so a run keeps its members after they end.
+/// Counts and lanes stay on `active` alone.
+pub fn status_tree_sessions(
+    s: &dira_core::protocol::StatusView,
+) -> Vec<dira_core::protocol::SessionView> {
+    s.active.iter().chain(&s.run_children).cloned().collect()
+}
+
 /// The PROJECT cell for a report line: the orchestration bucket is named as
 /// such, never folded into `(unresolved)`.
 pub fn report_line_label(p: &dira_core::report::ProjectReport) -> String {
+    if p.meeting {
+        return match &p.project {
+            Some(_) => format!("meetings · {}", project_label(&p.project)),
+            None => "meetings".to_string(),
+        };
+    }
     if p.orchestration {
         ORCHESTRATION_LABEL.to_string()
     } else {
@@ -76,6 +136,8 @@ pub struct TreeRow<'a> {
     pub project: String,
     /// A short project label for narrow places (the dashboard's lanes).
     pub short: String,
+    /// The KIND cell ([`kind_cell`]; `direct` on a direct-repo row).
+    pub kind: &'static str,
 }
 
 /// Lay a session list out as run trees with [`dira_core::runs::group`] — the
@@ -90,16 +152,13 @@ pub fn tree_rows<'a>(
     let mut out = Vec::new();
     for entry in group(sessions) {
         match entry {
-            Entry::Session(s) => out.push(TreeRow {
-                glyph: "  ",
-                session: Some(s),
-                handle: s.handle.clone(),
-                project: session_project_label(s),
-                short: session_repo_short(s),
-            }),
+            Entry::Session(s) => out.push(session_row("  ", s)),
             Entry::Run(run) => {
                 let root = run.root;
-                let (project, short) = if run.folded() {
+                let scratch = run.is_scratch();
+                let (project, short) = if scratch {
+                    (SCRATCH_LABEL.to_string(), "scratch".to_string())
+                } else if run.folded() {
                     let repo = run.repos.first().cloned();
                     (
                         repo.clone()
@@ -121,16 +180,11 @@ pub fn tree_rows<'a>(
                     handle: root.handle.clone(),
                     project,
                     short,
+                    kind: kind_cell(root, scratch),
                 });
                 let branch = |i: usize| if i + 1 == total { "└ " } else { "├ " };
                 for (i, s) in run.members.iter().enumerate() {
-                    out.push(TreeRow {
-                        glyph: branch(i),
-                        session: Some(s),
-                        handle: s.handle.clone(),
-                        project: session_project_label(s),
-                        short: session_repo_short(s),
-                    });
+                    out.push(session_row(branch(i), s));
                 }
                 for (k, repo) in direct.iter().enumerate() {
                     out.push(TreeRow {
@@ -139,12 +193,82 @@ pub fn tree_rows<'a>(
                         handle: "·".to_string(),
                         project: repo.clone(),
                         short: repo_short(&Some(repo.clone())),
+                        kind: "direct",
                     });
                 }
             }
         }
     }
     out
+}
+
+/// A row for a session that is not a run root.
+fn session_row<'a>(glyph: &'static str, s: &'a dira_core::protocol::SessionView) -> TreeRow<'a> {
+    TreeRow {
+        glyph,
+        session: Some(s),
+        handle: s.handle.clone(),
+        project: session_project_label(s),
+        short: session_repo_short(s),
+        kind: kind_cell(s, false),
+    }
+}
+
+/// `sessions` one row each, in list order (`dira sessions --flat`), labelled
+/// the way [`tree_rows`] labels them — a run root that reads as a
+/// [`SCRATCH_LABEL`] there reads as one here.
+pub fn flat_rows(sessions: &[dira_core::protocol::SessionView]) -> Vec<TreeRow<'_>> {
+    use dira_core::runs::{group, Entry};
+    let scratch: std::collections::HashSet<&str> = group(sessions)
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Run(r) if r.is_scratch() => Some(r.root.session_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    sessions
+        .iter()
+        .map(|s| {
+            let mut row = session_row("  ", s);
+            if scratch.contains(s.session_id.as_str()) {
+                row.project = SCRATCH_LABEL.to_string();
+                row.short = "scratch".to_string();
+                row.kind = kind_cell(s, true);
+            }
+            row
+        })
+        .collect()
+}
+
+/// The agent lanes' rows (`status --detailed` PARALLEL and the `watch`
+/// chart): run trees grouped over `tree` — so a root whose children ended
+/// (#182) keeps its run label — keeping only sessions in `live` that `keep`
+/// accepts, with branches re-closed. Yields each session, its gutter glyph
+/// (`""` off-tree) and its short label.
+pub fn lane_rows<'a>(
+    tree: &'a [dira_core::protocol::SessionView],
+    live: &[dira_core::protocol::SessionView],
+    titles: &std::collections::HashMap<String, String>,
+    keep: impl Fn(&dira_core::protocol::SessionView) -> bool,
+) -> Vec<(&'a dira_core::protocol::SessionView, &'static str, String)> {
+    let live: std::collections::HashSet<&str> =
+        live.iter().map(|s| s.session_id.as_str()).collect();
+    let kept: Vec<TreeRow<'a>> = tree_rows(tree, titles)
+        .into_iter()
+        .filter(|r| {
+            r.session
+                .is_some_and(|s| live.contains(s.session_id.as_str()) && keep(s))
+        })
+        .collect();
+    let mut glyphs: Vec<&'static str> = kept.iter().map(|r| r.glyph).collect();
+    retree(&mut glyphs);
+    kept.into_iter()
+        .zip(glyphs)
+        .map(|(r, g)| {
+            let s = r.session.expect("filtered to sessions");
+            (s, if g == "  " { "" } else { g }, r.short)
+        })
+        .collect()
 }
 
 /// Re-close tree branches after rows were filtered out: a member glyph
@@ -203,10 +327,11 @@ pub fn display_width(s: &str) -> usize {
 /// Truncate `s` to at most `max` display columns, appending the ellipsis glyph
 /// when clipped.
 ///
-/// The only truncation in the CLI. It replaced a char-counting variant that
-/// also hardcoded `…`: two functions with near-identical names and divergent
-/// semantics meant a call site could silently pick the wrong one, and the
-/// hardcoded ellipsis leaked a non-ASCII glyph into `DIRA_ASCII` output.
+/// It replaced a char-counting variant that also hardcoded `…`: two functions
+/// with near-identical names and divergent semantics meant a call site could
+/// silently pick the wrong one, and the hardcoded ellipsis leaked a non-ASCII
+/// glyph into `DIRA_ASCII` output. [`truncate_middle_cols`] is the one other
+/// cut, sharing its width walk ([`take_cols`]).
 ///
 /// The result never exceeds `max` columns, including the ellipsis, and never
 /// splits a wide character in half.
@@ -219,9 +344,17 @@ pub fn truncate_cols(s: &str, max: usize) -> String {
     }
     let ell = crate::theme::glyphs().ellipsis;
     let budget = max.saturating_sub(display_width(ell));
+    let mut out = take_cols(s.chars(), budget);
+    out.push_str(ell);
+    out
+}
+
+/// The leading chars of `chars` that fit in `budget` display columns, never
+/// splitting a wide character.
+fn take_cols(chars: impl Iterator<Item = char>, budget: usize) -> String {
     let mut out = String::new();
     let mut w = 0;
-    for c in s.chars() {
+    for c in chars {
         let cw = UnicodeWidthChar::width(c).unwrap_or(0);
         if w + cw > budget {
             break;
@@ -229,8 +362,58 @@ pub fn truncate_cols(s: &str, max: usize) -> String {
         out.push(c);
         w += cw;
     }
-    out.push_str(ell);
     out
+}
+
+/// Truncate `s` to at most `max` display columns by cutting the middle, so
+/// both ends survive: `acme/platform-api` and `acme/platform-web` stay
+/// distinguishable where [`truncate_cols`] would clip both to `acme/platf…`.
+/// Same guarantees as [`truncate_cols`]: never wider than `max`, never splits
+/// a wide character.
+pub fn truncate_middle_cols(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    let ell = crate::theme::glyphs().ellipsis;
+    let budget = max.saturating_sub(display_width(ell));
+    if budget == 0 {
+        return truncate_cols(s, max);
+    }
+    let tail_budget = budget / 2;
+    let head = take_cols(s.chars(), budget - tail_budget);
+    let tail: String = take_cols(s.chars().rev(), tail_budget)
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}{ell}{tail}")
+}
+
+/// A repo label for the report table: the forge host is dropped
+/// (`github.com/acme/api` → `acme/api`) — it is the same on nearly every row
+/// and only pushed the part that tells repos apart past the column edge — and
+/// what is still too wide is cut in the middle ([`truncate_middle_cols`]).
+pub fn report_repo_cell(label: &str, max: usize) -> String {
+    let short = match label.split_once('/') {
+        Some((host, rest)) if host.contains('.') && rest.contains('/') => rest,
+        _ => label,
+    };
+    truncate_middle_cols(short, max)
+}
+
+/// Compact age since `started_at` for the sessions table: `45s`, `12m`,
+/// `3h`, `2d`. Empty when the timestamp is missing or in the future.
+pub fn age_compact(started_at: &str, now: time::OffsetDateTime) -> String {
+    let Some(t) = parse_ts(Some(started_at)) else {
+        return String::new();
+    };
+    let secs = (now - t).whole_seconds();
+    match secs {
+        s if s < 0 => String::new(),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
 }
 
 /// Pad `s` on the right to `width` display columns. Use before painting — SGR
@@ -496,5 +679,98 @@ mod tests {
         assert_eq!(money("€", 0.0), "€0");
         assert_eq!(money("$", 1_234_567.0), "$1,234,567");
         assert_eq!(money("£", 999.5), "£1,000");
+    }
+
+    fn sv(id: &str, extra: serde_json::Value) -> dira_core::protocol::SessionView {
+        let mut v = serde_json::json!({
+            "handle": id, "session_id": id, "harness": "claude_code", "kind": "agent",
+            "started_at": "2026-10-27T10:00:00Z", "human_seconds": 0,
+            "agent_seconds": 60, "idle": true,
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// #181: an orchestrator that spawned nothing listed and touched no repo
+    /// reads as a scratch session; one with a child or a repo stays a run.
+    #[test]
+    fn a_bare_orchestrator_reads_as_a_scratch_session() {
+        let bare = sv("o", serde_json::json!({"orchestrator": true}));
+        let list = vec![bare.clone()];
+        let rows = tree_rows(&list, &Default::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project, SCRATCH_LABEL);
+        assert_eq!(rows[0].kind, "agent", "a scratch session is not `orch`");
+        assert_eq!(flat_rows(&list)[0].project, SCRATCH_LABEL, "--flat agrees");
+
+        let kid = sv(
+            "k",
+            serde_json::json!({"parent_session": "o", "project": "acme/api"}),
+        );
+        let list = vec![bare.clone(), kid];
+        let rows = tree_rows(&list, &Default::default());
+        assert_eq!(rows[0].kind, "orch");
+        assert_ne!(rows[0].project, SCRATCH_LABEL);
+        assert!(flat_rows(&list).iter().all(|r| r.project != SCRATCH_LABEL));
+
+        let reached = sv(
+            "r",
+            serde_json::json!({"orchestrator": true, "repos": ["acme/api"]}),
+        );
+        let rows = tree_rows(std::slice::from_ref(&reached), &Default::default());
+        assert_eq!(rows[0].kind, "orch");
+        assert_eq!(rows[0].project, "acme/api");
+    }
+
+    /// `--limit` keeps whole runs: the root and every member stay or go
+    /// together, in list order, and the count says how many entries went.
+    #[test]
+    fn limit_entries_counts_a_run_as_one() {
+        let list = vec![
+            sv("o", serde_json::json!({"orchestrator": true})),
+            sv("k", serde_json::json!({"parent_session": "o"})),
+            sv("p", serde_json::json!({})),
+            sv("q", serde_json::json!({})),
+        ];
+        let (kept, hidden) = limit_entries(&list, 2);
+        let ids: Vec<&str> = kept.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["o", "k", "p"]);
+        assert_eq!(hidden, 1);
+        assert_eq!(limit_entries(&list, 10).1, 0);
+    }
+
+    #[test]
+    fn report_repo_cell_drops_the_host_and_keeps_both_ends() {
+        assert_eq!(report_repo_cell("github.com/acme/api", 32), "acme/api");
+        // A bare name or a two-part slug keeps its first segment.
+        assert_eq!(report_repo_cell("acme/api", 32), "acme/api");
+        assert_eq!(report_repo_cell("scratch", 32), "scratch");
+        let a = report_repo_cell("github.com/dodi-smart/dirahq-platform-api", 20);
+        let b = report_repo_cell("github.com/dodi-smart/dirahq-platform-web", 20);
+        assert_ne!(a, b, "distinct repos stay distinguishable");
+        assert!(display_width(&a) <= 20, "{a}");
+        assert!(a.starts_with("dodi-smart") && a.ends_with("-api"), "{a}");
+    }
+
+    #[test]
+    fn truncate_middle_never_exceeds_the_width() {
+        for max in 0..12 {
+            let t = truncate_middle_cols("abcdefghijklmnop", max);
+            assert!(display_width(&t) <= max, "{max}: {t}");
+        }
+        assert_eq!(truncate_middle_cols("short", 10), "short");
+    }
+
+    #[test]
+    fn age_compact_buckets_by_magnitude() {
+        let now = time::macros::datetime!(2026-10-27 12:00 UTC);
+        assert_eq!(age_compact("2026-10-27T11:59:15Z", now), "45s");
+        assert_eq!(age_compact("2026-10-27T11:48:00Z", now), "12m");
+        assert_eq!(age_compact("2026-10-27T09:00:00Z", now), "3h");
+        assert_eq!(age_compact("2026-10-25T12:00:00Z", now), "2d");
+        assert_eq!(age_compact("2026-10-27T13:00:00Z", now), "", "future");
+        assert_eq!(age_compact("", now), "", "unparseable");
     }
 }

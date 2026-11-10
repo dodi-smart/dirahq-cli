@@ -15,6 +15,12 @@ tokio.workspace = true
 # the elevation self-check (src/elevation.rs) need the token + SDDL surfaces. Feature
 # flags only — `windows-sys` is already a workspace dependency and tokio pulls the
 # same major, so this adds no crates.
+# `geteuid` for the access-denied advice (src/elevation.rs): a refused unix socket
+# is reported as "owned by uid N, you are uid M". Already a workspace dependency
+# (dirad uses it), so this adds no crates.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     # ERROR_PIPE_BUSY, LocalFree, CloseHandle, HANDLE

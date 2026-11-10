@@ -42,6 +42,7 @@ pub fn normalize(hook: &GenericHook) -> Option<Normalized> {
         source: None,
         reason: None,
         hints: Default::default(),
+        facts: Default::default(),
     })
 }
 

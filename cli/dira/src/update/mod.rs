@@ -118,6 +118,16 @@ pub struct UpdateArgs {
     pub no_zavet: bool,
     /// Don't refresh this repo's committed cloud wiring after the update.
     pub no_cloud: bool,
+    /// With `check`: print [`check_json`] as one object on stdout instead of
+    /// the human line. Errors become `"status": "error"` in that object, so
+    /// stdout always parses.
+    pub json: bool,
+    /// Background mode (`dirad` schedules it, DIRASH-0050): a no-op unless
+    /// auto-update is enabled and a strictly newer release is out on the
+    /// channel, never prompts, and one at a time.
+    pub auto: bool,
+    /// Swap back to the binaries the last successful update replaced.
+    pub rollback: bool,
 }
 
 /// A post-update step [`run`]'s success arm can take, as a value —
@@ -167,12 +177,56 @@ impl Drop for Workdir {
     }
 }
 
+/// The channel to resolve against: `--channel`, else the `update.channel`
+/// knob, else stable. In background mode only, an unset knob falls back to the
+/// channel of the installed version, so a prerelease install keeps following
+/// prereleases without anyone having set the knob. A hand-run `dira update`
+/// keeps the stable default and its downgrade refusal.
+fn effective_channel(
+    arg: Option<&str>,
+    knob: Option<&str>,
+    current: &str,
+    auto: bool,
+) -> Result<Channel> {
+    if let Some(raw) = arg {
+        return Channel::parse(raw);
+    }
+    if let Some(raw) = knob {
+        if let Ok(c) = Channel::parse(raw) {
+            return Ok(c);
+        }
+    }
+    let prerelease = semver::Version::parse(current).is_ok_and(|v| !v.pre.is_empty());
+    Ok(if auto && prerelease {
+        Channel::Prerelease
+    } else {
+        resolve::default_channel()
+    })
+}
+
 /// Run `dira update`.
 pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
-    let channel = match &args.channel {
-        Some(raw) => Channel::parse(raw)?,
-        None => resolve::default_channel(),
-    };
+    if args.rollback {
+        return run_rollback(config, &args).await;
+    }
+    if args.auto && !dira_core::config::auto_update_enabled(config) {
+        return Ok(());
+    }
+    let channel = effective_channel(
+        args.channel.as_deref(),
+        config.update.channel.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        args.auto,
+    )?;
+    // An explicit `--channel` on a real update is remembered, so background
+    // updates keep following it.
+    if !args.check && !args.auto {
+        if let Some(raw) = &args.channel {
+            if config.update.channel.as_deref() != Some(channel.label()) {
+                let _ = crate::config_cmd::set_quiet(config, "update.channel", raw);
+            }
+        }
+    }
 
     // `connect_timeout` bounds the TCP+TLS handshake; `read_timeout` bounds
     // the gap between successful body reads (an inactivity timeout — it
@@ -203,7 +257,7 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
         .context("build HTTP client")?;
 
     if args.check {
-        run_check(&http, args.version.as_deref(), channel).await;
+        run_check(&http, args.version.as_deref(), channel, args.json).await;
         return Ok(());
     }
 
@@ -218,6 +272,14 @@ pub async fn run(config: &Config, args: UpdateArgs) -> Result<()> {
     // `--version 0.3.5` runs must not escalate a notice about 0.4.0, which may
     // well install fine.
     let pinned = args.version.is_some();
+    let _auto_lock = if args.auto {
+        match AutoLock::acquire(&config.db_path) {
+            Some(lock) => Some(lock),
+            None => return Ok(()), // another background update is running
+        }
+    } else {
+        None
+    };
     let outcome = run_update(config, args, &http, channel).await;
     if !pinned {
         match &outcome {
@@ -250,6 +312,22 @@ async fn run_update(
     let resolved = resolve::resolve(http, &target, args.version.as_deref(), channel)
         .await
         .context("resolve release")?;
+
+    // Background mode acts only on a strictly newer release, and never on one
+    // a rollback put on the skip list. A plain `dira update` reinstalls the
+    // same version on purpose (it repairs a damaged install); this must not.
+    if args.auto {
+        if check_verdict(&resolved.version, env!("CARGO_PKG_VERSION")) != CheckVerdict::Available {
+            return Ok(());
+        }
+        if config.update.skip_version.as_deref() == Some(resolved.version.as_str()) {
+            println!(
+                "dira update --auto: {} is on the skip list",
+                resolved.version
+            );
+            return Ok(());
+        }
+    }
 
     // Refuse an implicit downgrade before anything is downloaded or swapped.
     // `--check` and the passive notice already decline to *offer* an older
@@ -313,7 +391,7 @@ async fn run_update(
     }
 
     if args.no_restart {
-        replace::cleanup_backups(&bin_dir);
+        replace::keep_previous(&bin_dir);
         println!("{}", no_restart_notice(&resolved.version, &bin_dir));
         return Ok(());
     }
@@ -323,7 +401,7 @@ async fn run_update(
     // polls for a healthy comeback and reports the version that answers.
     match daemon::restart(config).await {
         Ok(()) => {
-            replace::cleanup_backups(&bin_dir);
+            replace::keep_previous(&bin_dir);
             println!(
                 "dira + dirad updated to {} and the daemon restarted",
                 resolved.version
@@ -371,6 +449,62 @@ async fn run_update(
             )))
         }
     }
+}
+
+/// One background update at a time: an exclusive lock file beside the store.
+/// A lock older than [`AutoLock::STALE`] is taken over, so a crashed run never
+/// blocks updates for good.
+struct AutoLock(PathBuf);
+
+impl AutoLock {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    fn acquire(db_path: &Path) -> Option<Self> {
+        let path = db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+            .join("update.lock");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let stale = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .is_some_and(|age| age > Self::STALE);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .ok()
+            .map(|_| Self(path))
+    }
+}
+
+impl Drop for AutoLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `dira update --rollback`: swap the binaries the last successful update
+/// replaced back into place, restart the daemon, and put the version being
+/// rolled away from on the skip list so background updates do not re-apply it.
+async fn run_rollback(config: &Config, args: &UpdateArgs) -> Result<()> {
+    let guard = replace::discover_install(args.bin_dir.as_deref())?;
+    let bin_dir = guard_to_bin_dir(guard, args.force)?;
+    let from = env!("CARGO_PKG_VERSION");
+    replace::rollback_to_previous(&bin_dir)?;
+    let _ = crate::config_cmd::set_quiet(config, "update.skip_version", from);
+    println!("rolled dira + dirad back from {from}; background updates will skip {from}");
+    if args.no_restart {
+        return Ok(());
+    }
+    daemon::restart(config).await
 }
 
 /// The 90-second wall-clock budget [`cloud_refresh_after_update`] gives the
@@ -586,21 +720,80 @@ fn downgrade_refusal(
 /// load-bearing — [`notice::spawn_refresh`] runs this detached purely to warm
 /// the cache.
 fn check_message(resolved: &str, current: &str, channel: Channel) -> String {
-    match resolve::compare_versions(resolved, current) {
-        Some(std::cmp::Ordering::Greater) => {
+    match check_verdict(resolved, current) {
+        CheckVerdict::Available => {
             format!("dira {resolved} is available (you have {current}) — run `dira update`")
         }
-        Some(std::cmp::Ordering::Equal) => format!("dira is up to date ({current})"),
-        // Older, or a version either side of the comparison can't parse: in
-        // both cases there is nothing to offer, and claiming otherwise is the
-        // bug. `None` is near-unreachable (`pick_latest` drops unparseable
-        // tags and `current` is `CARGO_PKG_VERSION`) but must not fall through
-        // to "available".
-        _ => format!(
+        CheckVerdict::UpToDate => format!("dira is up to date ({current})"),
+        CheckVerdict::Ahead => format!(
             "dira is up to date ({current} — ahead of the {} channel's {resolved})",
             channel.label()
         ),
     }
+}
+
+/// `--check`'s three-way verdict on a successful resolve. The single source
+/// both [`check_message`] (humans) and [`check_json`] (`status`) word, so the
+/// two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckVerdict {
+    /// The channel head is newer than this build.
+    Available,
+    /// The channel head is this build.
+    UpToDate,
+    /// The channel head is older than this build — or either side is
+    /// unparseable. In both cases there is nothing to offer, and claiming
+    /// otherwise is the bug. Unparseable is near-unreachable (`pick_latest`
+    /// drops unparseable tags and `current` is `CARGO_PKG_VERSION`) but must
+    /// not fall through to "available".
+    Ahead,
+}
+
+impl CheckVerdict {
+    /// The stable word `--check --json` reports as `status`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::UpToDate => "up_to_date",
+            Self::Ahead => "ahead",
+        }
+    }
+}
+
+fn check_verdict(resolved: &str, current: &str) -> CheckVerdict {
+    match resolve::compare_versions(resolved, current) {
+        Some(std::cmp::Ordering::Greater) => CheckVerdict::Available,
+        Some(std::cmp::Ordering::Equal) => CheckVerdict::UpToDate,
+        _ => CheckVerdict::Ahead,
+    }
+}
+
+/// `dira update --check --json`: one object, snake_case keys. Pure so the
+/// shape is pinned by a test.
+///
+/// `resolved` is the resolve outcome: `Ok(version)` or `Err(message)`. An
+/// error is still one object on stdout (`"status": "error"`), and the process
+/// still exits 0 — the same contract as the text form, which prints the
+/// error to stderr.
+fn check_json(
+    current: &str,
+    channel: Channel,
+    version_pin: Option<&str>,
+    resolved: Result<&str, &str>,
+) -> serde_json::Value {
+    let (latest, status, error) = match resolved {
+        Ok(v) => (Some(v), check_verdict(v, current).as_str(), None),
+        Err(e) => (None, "error", Some(e)),
+    };
+    serde_json::json!({
+        "current_version": current,
+        "channel": channel.label(),
+        "requested_version": version_pin,
+        "resolved_version": latest,
+        "status": status,
+        "update_available": status == "available",
+        "error": error,
+    })
 }
 
 /// `--check`: resolve only, write nothing to disk except (when not pinned to
@@ -608,23 +801,52 @@ fn check_message(resolved: &str, current: &str, channel: Channel) -> String {
 /// 0 in every non-error case — including offline. Errors are printed to
 /// stderr, never propagated, so this stays safe to run speculatively (e.g.
 /// from [`notice::maybe_print`]'s detached background refresh).
-async fn run_check(http: &reqwest::Client, version_pin: Option<&str>, channel: Channel) {
+///
+/// With `json`, stdout carries exactly one [`check_json`] object in every
+/// case, errors included; nothing else is printed to stdout.
+async fn run_check(
+    http: &reqwest::Client,
+    version_pin: Option<&str>,
+    channel: Channel,
+    json: bool,
+) {
     let now = now_unix();
+    let current = env!("CARGO_PKG_VERSION");
+    let emit_json = |resolved: Result<&str, &str>| match serde_json::to_string_pretty(&check_json(
+        current,
+        channel,
+        version_pin,
+        resolved,
+    )) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("dira update --check: could not serialize: {e}"),
+    };
+
+    // Every error takes the same path: one JSON object on stdout with
+    // `--json`, a line on stderr without.
+    let report_error = |e: &anyhow::Error| {
+        if json {
+            emit_json(Err(&format!("{e:#}")));
+        } else {
+            eprintln!("dira update --check: {e:#}");
+        }
+    };
 
     let target = match artifact::detect_target() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("dira update --check: {e:#}");
+            report_error(&e);
             return;
         }
     };
 
     match resolve::resolve(http, &target, version_pin, channel).await {
         Ok(resolved) => {
-            println!(
-                "{}",
-                check_message(&resolved.version, env!("CARGO_PKG_VERSION"), channel)
-            );
+            if json {
+                emit_json(Ok(&resolved.version));
+            } else {
+                println!("{}", check_message(&resolved.version, current, channel));
+            }
             // A pinned `--version` check isn't "the latest" — don't let it
             // clobber the passive notice's idea of what's current.
             if version_pin.is_none() {
@@ -632,7 +854,7 @@ async fn run_check(http: &reqwest::Client, version_pin: Option<&str>, channel: C
             }
         }
         Err(e) => {
-            eprintln!("dira update --check: {e:#}");
+            report_error(&e);
             if version_pin.is_none() {
                 notice::record_check(now, None, channel.label(), Some(&e.to_string()));
             }
@@ -819,6 +1041,37 @@ mod tests {
     // The bug these pin down: every one of these compared with `==` and read
     // any inequality as an upgrade, so a prerelease build announced — and then
     // installed — an older stable release.
+
+    /// `--check --json` agrees with the text verdict and always parses, even
+    /// for a failed resolve.
+    #[test]
+    fn check_json_has_the_documented_shape() {
+        let v = check_json("0.2.0", Channel::Stable, None, Ok("0.3.0"));
+        assert_eq!(v["current_version"], "0.2.0");
+        assert_eq!(v["channel"], "stable");
+        assert!(v["requested_version"].is_null());
+        assert_eq!(v["resolved_version"], "0.3.0");
+        assert_eq!(v["status"], "available");
+        assert_eq!(v["update_available"], true);
+        assert!(v["error"].is_null());
+
+        let v = check_json("0.2.0", Channel::Stable, None, Ok("0.2.0"));
+        assert_eq!(v["status"], "up_to_date");
+        assert_eq!(v["update_available"], false);
+
+        // Ahead of the channel is never an offer — the same bug
+        // `check_message_says_ahead_instead_of_offering_a_downgrade` pins.
+        let v = check_json("0.1.1-develop.1", Channel::Stable, None, Ok("0.1.0"));
+        assert_eq!(v["status"], "ahead");
+        assert_eq!(v["update_available"], false);
+
+        let v = check_json("0.2.0", Channel::Prerelease, Some("0.1.0"), Err("offline"));
+        assert_eq!(v["channel"], "prerelease");
+        assert_eq!(v["requested_version"], "0.1.0");
+        assert!(v["resolved_version"].is_null());
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"], "offline");
+    }
 
     #[test]
     fn check_message_offers_a_genuinely_newer_release() {
@@ -1042,5 +1295,38 @@ mod tests {
             lines.len()
         );
         assert!(lines.iter().all(|l| !l.contains(FALLBACK_MARKER)));
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_beats_knob_beats_installed_version() {
+        assert_eq!(
+            effective_channel(Some("stable"), Some("prerelease"), "1.0.0-develop.3", true).unwrap(),
+            Channel::Stable
+        );
+        assert_eq!(
+            effective_channel(None, Some("prerelease"), "1.0.0", false).unwrap(),
+            Channel::Prerelease
+        );
+        assert_eq!(
+            effective_channel(None, None, "0.12.0-develop.2", true).unwrap(),
+            Channel::Prerelease,
+            "a prerelease install follows prereleases in the background"
+        );
+        assert_eq!(
+            effective_channel(None, None, "0.12.0-develop.2", false).unwrap(),
+            Channel::Stable,
+            "a hand-run update keeps the stable default"
+        );
+        assert_eq!(
+            effective_channel(None, Some("nonsense"), "0.12.0", true).unwrap(),
+            Channel::Stable,
+            "a bad knob falls through rather than failing a background run"
+        );
+        assert!(effective_channel(Some("nightly"), None, "0.12.0", false).is_err());
     }
 }

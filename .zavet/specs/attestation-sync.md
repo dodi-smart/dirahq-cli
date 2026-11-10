@@ -1,10 +1,10 @@
 ---
 title: Attestation sync and session rollups
-version: 10
+version: 12
 origin: session
 verified: false
 confidence: high
-date: 2026-10-16
+date: 2026-11-09
 paths:
   - cli/core/src/sync/batch.rs
   - cli/core/src/store.rs
@@ -12,8 +12,9 @@ paths:
   - cli/dirad/src/sync.rs
   - cli/dirad/src/state.rs
   - cli/dirad/src/writer.rs
+  - cli/dirad/src/chain.rs
   - cli/core/src/tokens.rs
-decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046]
+decisions: [D-0001, D-0006, D-0018, D-0020, DIRASH-0025, DIRASH-0041, DIRASH-0042, DIRASH-0043, DIRASH-0045, DIRASH-0046, DIRASH-0049, DIRASH-0052]
 ---
 
 ## Overview
@@ -25,6 +26,34 @@ rollups keep their `prompts`/`branch`/wall-clock when a session outlives a
 single flush window (issue #40).
 
 ## Behavior
+
+- **Contract 2.0 hash chain (DIRASH-0052).**
+  - **Fields.** Every attestation batch, including lineage re-sends, carries
+    `seq`, `prevBatchHash` (SHA-256 of the previous acknowledged batch's JCS
+    payload, `""` at seq 0) and `chainEpoch`, plus `client`.
+  - **When.** The chain is stamped before signing and advances only on a 2xx,
+    so a retry is byte-identical and a quarantined chunk does not advance it.
+  - **Reset.** `nuke` and a cloud data-epoch reset start a new epoch at seq 0.
+  - **State.** Kept in `meta` as `batch_seq`, `batch_prev_hash` and
+    `chain_epoch`.
+- **Contract 2.0 producer fields.**
+  - **`captureHealth`.** The first chunk of each flush carries spool and
+    quarantine deltas since the last acknowledged report.
+  - **`stats`.** Session rollups carry `stats` derived from the event log:
+    tool calls by category (`dira_core::stats::tool_category`, MCP server
+    names never sent), subagents, permission prompts, and the approval wait
+    capped at 30 min. Manual sessions carry none.
+  - **zstd.** Ingest bodies are zstd only when the last `/api/v1/meta` listed
+    it in `acceptEncodings`.
+  - **Claude Code session facts.** The writer records lines added/removed,
+    compactions and touched-file path hashes per session at capture time,
+    before coalescing (`session_facts`, `session_paths`, migration 0010). Sync
+    adds them to Claude Code rollups.
+  - **Day rollups.** Each acknowledged batch is recorded per UTC day and repo
+    in the `day_*` tables, keyed by wire id so re-sends replace themselves.
+    Changed days ride the next flush's first chunk as `dayRollups`; on ack
+    their revision advances. Days older than 40 days are pruned, and `nuke`
+    clears all of it.
 
 - A flush reads events in `(META_SYNC_CURSOR, until]`, splits the window into
   chunks only at > idle breaks (never inside a billable interval), POSTs each
@@ -92,6 +121,27 @@ single flush window (issue #40).
   session. Best-effort: compaction prunes events that are both synced and
   past retention, so a session outliving retention rolls up from what
   remains (still a superset of the tail window).
+- Compaction (`Store::compact`) rolls synced events past retention into
+  `session_rollup_daily`, one row per UTC day and session, and deletes them.
+  It compacts whole UTC days only. The cutoff is aligned down to its UTC
+  midnight, and further down to the midnight of the oldest unsynced event's
+  day, so one bound serves both the selection and the delete. Reports add a
+  day's rollup rows to that day's raw events, so a day left part rollup and
+  part raw put one session in both. A mid-day cutoff now leaves that whole
+  day raw until the next sweep after its midnight.
+- A rollup row carries its day's `input_tokens`, `output_tokens` and
+  `est_cost`, summed from `token_usage` for the same session and UTC day
+  (`at` in `[day, day + 1)`, bound through `StoredAt`). Compaction keeps the
+  `token_usage` rows, which ride their own cursor (D-0018), so each pass
+  recomputes the sums and keeps them with `MAX`. Time and prompts still add
+  up across passes. Before this, every rollup row had zero tokens. A reader
+  that sums both tables counts a rollup's tokens only for a day with no
+  `token_usage` rows left for that session (`Store::zavet_session_totals`).
+- Rollup rows written before that are filled once at `Store::open`, after the
+  time-column rewrite, from whatever `token_usage` still holds for their day.
+  It is gated by the `meta` key `rollup_tokens_backfill_v1` in one
+  `BEGIN IMMEDIATE` transaction and only touches rows whose three token
+  columns are all zero.
 - "Ended" is decided from the window slice ONLY, never from history: a live
   session's history can carry stale `SessionEnd`s (Claude Code emits one on
   compaction), and a history-derived end would fabricate a false terminal
@@ -183,6 +233,18 @@ single flush window (issue #40).
   omits them clears nothing. A trigger seen by the live registry counts as a
   lineage change, so a partial ships it. `LINEAGE_RULES_VERSION` is unchanged:
   past events carry no trigger, so there is nothing to re-send.
+- Contract 2.1 (proposed, meetings) adds `AttestationBatch.meetings[]` and an
+  optional `Interval.meetingId`. A `Meeting` is content-free (closed enums,
+  times, buckets, booleans, ids, workspace refs, an HMAC series key) and is
+  upserted by `(deviceId, id)` with a monotonic `version`; a retraction is a
+  record with `state: retracted` (DIRASH-0062). The producer does not emit
+  either yet: `batch.rs` sets `meetingId: None` and sends no meetings until the
+  daemon wiring lands. When it does, a meeting's time rides intervals the
+  device has already overlaid with its work (DIRASH-0063), so a reader still
+  sums `humanSeconds` once. 2.1 also adds `AttestationBatch.windows[]`: ranges
+  the batch restates in full for its device, so the cloud's per-device claims
+  (cloud D-0085) are replaced there even where no interval lands, e.g. a
+  retracted meeting with nothing left. The producer sends none yet.
 
 ## Invariants
 
@@ -213,6 +275,16 @@ single flush window (issue #40).
   therefore evidence of one pathological record, not of backlog size, and
   gets its own `SyncError` + `payload_too_large` health kind so it is never
   mistaken for a retryable failure.
+- A chunk the cloud rejects for its content (413, or a 4xx other than
+  401/403) five times in a row is quarantined (DIRASH-0049). The event,
+  artifact and token cursors advance to that chunk's high-water marks, and its
+  bounds and reason are appended to the `sync_quarantine` meta list (newest
+  100 kept). Auth, schema skew, 429, 5xx and network errors never count.
+  Before this, one malformed row stopped the event cursor for good.
+- Event ids come from one process-wide monotonic ULID generator
+  (`dira_core::model::new_event_id`), so id order is mint order. A random
+  within-millisecond ULID could put an event behind the `(cursor, until]`
+  window and skip it forever.
 - `events.at`, `token_usage.at` and `artifacts.authored_at` are stored
   fixed-width UTC (`…SS.fffffffffZ`), so text order is time order
   (DIRASH-0043). Every `ORDER BY at` and every `at` bound (hydrate replay,

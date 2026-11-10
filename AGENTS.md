@@ -56,6 +56,9 @@ agent context at session start. Keep it short and non-negotiable.
 - Nothing enters `repo_dirs` unless the directory demonstrably belongs to the
   repo it is filed under, and `register_repo_dir` stays I/O-free.
   See DIRASH-0027.
+- A headless run (`DIRA_HEADLESS`, or `GITHUB_ACTIONS=true`) never reports a
+  human signal: the `dira hook` shim withholds those and forwards the rest.
+  Never infer presence from the cloud runtime id. See DIRASH-0047.
 
 ### Recorded decisions (read the file before changing guarded code; ask /zavet:why)
 
@@ -104,6 +107,19 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0044 — A scratch session is an orchestrator only when it coordinates (active)
 - DIRASH-0045 — A lineage rule change re-sends the ended rollups once, sessions only (active)
 - DIRASH-0046 — A scheduled-task slug may cross the wire as triggerName, only when its directory exists (active)
+- DIRASH-0047 — A headless run withholds human signals at the hook shim, and forwards everything else (active)
+- DIRASH-0048 — The Windows daemon is a windowless binary, registered per user by an XML logon task or a Run key, and started at once (active)
+- DIRASH-0049 — A hook event is stored or spooled, never dropped, and the spool holds normalized metadata only (active)
+- DIRASH-0050 — Updates apply in the background by default; dirad schedules, the CLI performs (active)
+- DIRASH-0051 — The installers register the per-user service by default and hand off to dira onboard (active)
+- DIRASH-0052 — Contract 2.0: chained batches, day rollups and count-only session stats (active)
+- DIRASH-0060 — Meeting time comes from local device-in-use signals, never a bot or call content (proposed)
+- DIRASH-0061 — Meeting detection is gated by OS notifications; the per-process walk runs only while a call is a candidate (proposed)
+- DIRASH-0062 — Meetings are their own versioned wire record; meeting time rides intervals with a meetingId (proposed)
+- DIRASH-0063 — The meeting/work overlay is computed once, on the device; precedence is per user and a meeting wins across workspaces (proposed)
+- DIRASH-0064 — Calendar facts are reduced on the device; attribution resolves locally; no titles, attendees or domains cross (proposed)
+- DIRASH-0065 — Meeting titles ride only their own consent-gated labels channel, never the attestation wire (proposed)
+- DIRASH-0066 — The daemon obeys the workspace meeting policy; admins can disable but never force capture on, and the user's opt-out always wins (proposed)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

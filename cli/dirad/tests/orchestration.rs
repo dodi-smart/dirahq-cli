@@ -55,6 +55,7 @@ async fn hook(state: &AppState, payload: serde_json::Value) {
         Request::IngestHook {
             harness: "claude".into(),
             payload,
+            observed_at: None,
         },
     )
     .await;

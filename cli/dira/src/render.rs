@@ -6,8 +6,8 @@
 //! parse the plain output (and pipes, which fall back to 80) stay stable.
 
 use crate::format::{
-    bar as bar_cells, billing_line, display_width, hms, kind_label, pad_cols, pad_left_cols,
-    project_label, session_project_label, tokens_compact, truncate_cols, usd_approx,
+    bar as bar_cells, billing_line, display_width, hms, pad_cols, pad_left_cols, project_label,
+    tokens_compact, truncate_cols, usd_approx,
 };
 use crate::theme::{self, Role};
 use dira_core::protocol::{
@@ -216,7 +216,16 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
         Response::Sessions { sessions } => {
             let shown: Vec<SessionView> =
                 sessions.iter().filter(|s| has_time(s)).cloned().collect();
+            let (shown, hidden) = match opts.limit {
+                Some(n) => crate::format::limit_entries(&shown, n),
+                None => (shown, 0),
+            };
             print_sessions(&shown, &Layout::for_width(terminal_cols()), opts.flat);
+            if hidden > 0 {
+                let ell = theme::glyphs().ellipsis;
+                let line = format!("  {ell} {hidden} more (raise --limit to see them)");
+                println!("{}", theme::paint(&line, Role::Faint));
+            }
             true
         }
         Response::Report(r) => {
@@ -306,6 +315,73 @@ pub fn print_with(resp: &Response, opts: RowOpts) -> bool {
             eprintln!("unexpected capture-probe response outside `dira doctor --probe`");
             false
         }
+        Response::Meetings(v) => {
+            print_meetings(v);
+            true
+        }
+    }
+}
+
+/// `dira meetings`: mode, what the detector sees, suggestions, recent meetings.
+/// Times and a provider class only; there is no title or app name to show.
+fn print_meetings(v: &dira_core::protocol::MeetingsView) {
+    let faint = |s: &str| theme::paint(s, Role::Faint);
+    let hm = |t: &str| t.get(11..16).unwrap_or(t).to_string();
+    let day = |t: &str| t.get(..10).unwrap_or(t).to_string();
+    let mut head = format!("meetings  {}", v.mode);
+    if let Some(a) = &v.adapter {
+        head.push_str(&format!(" {} {a}", dot_glyph()));
+    }
+    println!("{head}");
+    if v.mode == "off" {
+        println!("{}", faint("  off: nothing is sampled. Turn on with `dira config set modules.meetings suggest`."));
+        return;
+    }
+    if let Some(why) = &v.unavailable {
+        println!("{}", faint(&format!("  unavailable: {why}")));
+    }
+    match &v.live {
+        Some(l) => println!(
+            "  in a meeting ({}, {}, since {})",
+            l.provider_class,
+            if l.confident { "sure" } else { "not sure yet" },
+            hm(&l.since)
+        ),
+        None if v.unavailable.is_none() => println!("{}", faint("  no meeting right now")),
+        None => {}
+    }
+    let line = |m: &dira_core::protocol::MeetingRowView| {
+        let project = m
+            .project
+            .as_deref()
+            .map(|p| format!("  {p}"))
+            .unwrap_or_default();
+        format!(
+            "  {}  {} {}-{}  {:<9} {:<9} {}{project}",
+            m.id,
+            day(&m.started_at),
+            hm(&m.started_at),
+            hm(&m.ended_at),
+            m.provider_class,
+            m.state,
+            m.confidence
+        )
+    };
+    println!();
+    println!("{}", theme::paint("SUGGESTIONS", Role::Muted));
+    if v.suggestions.is_empty() {
+        println!("{}", faint("  none to review"));
+    }
+    for m in &v.suggestions {
+        println!("{}", line(m));
+    }
+    println!();
+    println!("{}", theme::paint("LAST 7 DAYS", Role::Muted));
+    if v.recent.is_empty() {
+        println!("{}", faint("  no meetings recorded"));
+    }
+    for m in &v.recent {
+        println!("{}", line(m));
     }
 }
 
@@ -536,6 +612,9 @@ pub struct RowOpts {
     pub branch_only: bool,
     /// List sessions one per row, without grouping runs (`dira sessions --flat`).
     pub flat: bool,
+    /// Show at most this many sessions, a run counting as one (`dira sessions
+    /// --limit`).
+    pub limit: Option<usize>,
 }
 
 /// `4d` / `3mo` since `created_at`, or `new` inside the first two days.
@@ -2048,10 +2127,16 @@ pub fn print_status(s: &StatusView, detailed: bool) {
         let layout = Layout::for_width(terminal_cols());
         println!();
         if !active.is_empty() {
+            // The table keeps a listed run's ended children (#182); the
+            // headline above counts live sessions only.
+            let tree: Vec<SessionView> = crate::format::status_tree_sessions(s)
+                .into_iter()
+                .filter(has_time)
+                .collect();
             println!("{}", theme::paint("ACTIVE SESSIONS", Role::Muted));
-            print_sessions(&active, &layout, false);
+            print_sessions(&tree, &layout, false);
             println!();
-            print_parallel(&active, &s.today, &layout);
+            print_parallel(&active, &tree, &s.today, &layout);
         }
         println!("{}", theme::paint("TODAY", Role::Muted));
         print_report(&s.today, &layout);
@@ -2184,7 +2269,7 @@ const BILLING_STALE_AFTER_SECS: i64 = 15 * 60;
 /// The status summary block, mirroring the concept layout:
 ///
 /// ```text
-/// 3 active sessions · 1 you · 2.5× parallel
+/// 3 active sessions · 1 engaged · 2.5× parallel
 ///
 ///   ● engaged   11h 54m    billable base
 ///   ◆ agent     26h 41m    wall-clock
@@ -2207,20 +2292,22 @@ const BILLING_STALE_AFTER_SECS: i64 = 15 * 60;
 fn summary_lines(s: &StatusView, active: &[SessionView], now: OffsetDateTime) -> Vec<String> {
     let mut lines = Vec::new();
 
-    // --- header: `3 active sessions · 1 you · 2.5× parallel` -----------------
+    // --- header: `3 active sessions · 1 engaged · 2.5× parallel` -------------
     if active.is_empty() {
         lines.push(theme::paint("no active sessions", Role::Faint));
     } else {
         let n = active.len();
         let plural = if n == 1 { "" } else { "s" };
         let mut head = theme::paint(&format!("{n} active session{plural}"), Role::Ink);
-        let you = active
+        // "engaged" is the STATE word on the rows below, so the count reads
+        // the same as the column it counts ("1 you" read as a person count).
+        let engaged = active
             .iter()
             .filter(|v| v.live_state() == LiveState::Engaged)
             .count();
-        if you > 0 {
+        if engaged > 0 {
             head.push_str(&dot_sep().painted);
-            head.push_str(&theme::paint(&format!("{you} you"), Role::Engaged));
+            head.push_str(&theme::paint(&format!("{engaged} engaged"), Role::Engaged));
         }
         if s.today.total_human_seconds > 0 {
             let mult = s.today.total_agent_seconds as f64 / s.today.total_human_seconds as f64;
@@ -2299,13 +2386,7 @@ fn billing_age_suffix(fetched_at: &str, now: OffsetDateTime) -> Option<String> {
     if age <= BILLING_STALE_AFTER_SECS {
         return None;
     }
-    let label = if age < 3600 {
-        format!("{}m", age / 60)
-    } else if age < 86_400 {
-        format!("{}h", age / 3600)
-    } else {
-        format!("{}d", age / 86_400)
-    };
+    let label = crate::format::age_compact(fetched_at, now);
     Some(format!("(as of {label} ago)"))
 }
 
@@ -2316,18 +2397,17 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout, flat: bool) {
     }
     let pw = layout.session_project;
     let header = format!(
-        "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  STATE",
-        "HANDLE", "HARNESS", "KIND", "PROJECT", "HUMAN", "AGENT"
+        "  {:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8} {:>4}  STATE",
+        "HANDLE", "HARNESS", "KIND", "PROJECT", "HUMAN", "AGENT", "AGE"
     );
     println!("{}", theme::paint(&header, Role::Muted));
-    if flat {
-        for s in sessions {
-            print_session_row(s, "  ", &s.handle, &session_project_label(s), pw);
-            print_session_meta(s);
-        }
-        return;
-    }
-    for row in crate::format::tree_rows(sessions, &titles_if_needed(sessions)) {
+    let now = OffsetDateTime::now_utc();
+    let rows = if flat {
+        crate::format::flat_rows(sessions)
+    } else {
+        crate::format::tree_rows(sessions, &titles_if_needed(sessions))
+    };
+    for row in rows {
         match row.session {
             Some(s) => {
                 let (gutter, handle) = match row.glyph {
@@ -2335,7 +2415,7 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout, flat: bool) {
                     "  " => ("  ", row.handle.clone()),
                     branch => ("  ", format!("{branch}{}", row.handle)),
                 };
-                print_session_row(s, gutter, &handle, &row.project, pw);
+                print_session_row(s, gutter, &handle, &row.project, row.kind, pw, now);
                 if row.glyph == "  " {
                     print_session_meta(s);
                 }
@@ -2345,7 +2425,7 @@ fn print_sessions(sessions: &[SessionView], layout: &Layout, flat: bool) {
                     "  {:<8} {:<10} {:<7} {}",
                     format!("{}·", row.glyph),
                     "",
-                    "direct",
+                    row.kind,
                     truncate_cols(&row.project, pw),
                 );
                 println!("{}", theme::paint(&line, Role::Faint));
@@ -2366,7 +2446,15 @@ pub(crate) fn titles_if_needed(
     }
 }
 
-fn print_session_row(s: &SessionView, gutter: &str, handle: &str, project: &str, pw: usize) {
+fn print_session_row(
+    s: &SessionView,
+    gutter: &str,
+    handle: &str,
+    project: &str,
+    kind: &str,
+    pw: usize,
+    now: OffsetDateTime,
+) {
     // Paint only the trailing STATE word so the fixed-width columns stay
     // aligned (the colour escapes have zero display width). "engaged" (you're
     // driving it) is teal like the human lane; "active" (its agent is working
@@ -2377,19 +2465,15 @@ fn print_session_row(s: &SessionView, gutter: &str, handle: &str, project: &str,
         LiveState::Idle => ("idle", Role::Faint),
     };
     let state = theme::paint(label, role);
-    let kind = if s.orchestrator {
-        "orch"
-    } else {
-        kind_label(s.kind)
-    };
     println!(
-        "{gutter}{:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8}  {}",
+        "{gutter}{:<8} {:<10} {:<7} {:<pw$} {:>8} {:>8} {:>4}  {}",
         truncate_cols(handle, 8),
         truncate_cols(dira_sources::harness_id(s.harness), 10),
         truncate_cols(kind, 7),
         truncate_cols(project, pw),
         hms(s.human_seconds),
         hms(s.agent_seconds),
+        crate::format::age_compact(&s.started_at, now),
         state,
     );
 }
@@ -2420,7 +2504,10 @@ fn print_session_meta(s: &SessionView) {
 /// bars scaled to the longest, with the deduped human (engaged) lane underneath
 /// so "one person supervising several agents" is visible at a glance, like the
 /// web's Right Now view.
-fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
+/// `tree` is what the session table laid out (`active` plus a run's ended
+/// children): lanes are grouped over it so a run root keeps its label, then
+/// only live sessions get a lane.
+fn print_parallel(active: &[SessionView], tree: &[SessionView], today: &Report, layout: &Layout) {
     // Only sessions with real agent evidence get a lane. A manual `dira start`
     // stopwatch is not a parallel agent, and listing one both invented a lane and
     // skewed the ×-today multiplier next to it. This filter was missing entirely
@@ -2474,21 +2561,15 @@ fn print_parallel(active: &[SessionView], today: &Report, layout: &Layout) {
     let agent_mark = theme::paint(theme::glyphs().diamond, Role::Agent);
     // Lanes follow the run trees the sessions table shows: an orchestrator,
     // then its members indented. Each lane is still one session's own time.
-    let kept: Vec<_> = crate::format::tree_rows(active, &titles_if_needed(active))
-        .into_iter()
-        .filter(|r| r.session.is_some_and(|s| s.accrues_agent_time()))
-        .collect();
-    let mut glyphs: Vec<&'static str> = kept.iter().map(|r| r.glyph).collect();
-    crate::format::retree(&mut glyphs);
-    for (row, glyph) in kept.iter().zip(glyphs) {
-        let s = row.session.expect("filtered to sessions");
-        let glyph = if glyph == "  " { "" } else { glyph };
+    let lanes = crate::format::lane_rows(tree, active, &titles_if_needed(tree), |s| {
+        s.accrues_agent_time()
+    });
+    for (s, glyph, short) in lanes {
         let label = truncate_cols(
             &format!(
-                "{glyph}{} {} {}",
+                "{glyph}{} {} {short}",
                 dira_sources::harness_id(s.harness),
                 dot_glyph(),
-                row.short
             ),
             lw,
         );
@@ -2519,7 +2600,7 @@ fn print_report(r: &Report, layout: &Layout) {
     for p in &r.projects {
         println!(
             "  {:<pw$} {:>10} {:>10}",
-            truncate_cols(&crate::format::report_line_label(p), pw),
+            crate::format::report_repo_cell(&crate::format::report_line_label(p), pw),
             hms(p.human_seconds),
             hms(p.agent_wall_seconds),
         );
@@ -2717,12 +2798,16 @@ mod tests {
             orchestrator: false,
             parent_session: None,
             repos: Vec::new(),
+            branch: None,
+            spec: None,
+            tokens: Default::default(),
         }
     }
 
     fn status(human: i64, agent: i64) -> StatusView {
         StatusView {
             active: vec![],
+            run_children: vec![],
             today: Report {
                 projects: vec![],
                 total_human_seconds: human,
@@ -2763,7 +2848,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "3 active sessions · 1 you · 2.2× parallel".to_string(),
+                "3 active sessions · 1 engaged · 2.2× parallel".to_string(),
                 String::new(),
                 "  ● engaged  11h 54m    billable base".to_string(),
                 "  ◆ agent    26h 41m    wall-clock".to_string(),
@@ -2782,7 +2867,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "1 active session · 1 you · 2.0× parallel".to_string(),
+                "1 active session · 1 engaged · 2.0× parallel".to_string(),
                 String::new(),
                 "  ● engaged  1h 00m  billable base".to_string(),
                 "  ◆ agent    2h 00m  wall-clock".to_string(),
@@ -3475,8 +3560,7 @@ mod tests {
         };
         let opts = RowOpts {
             guards: true,
-            branch_only: false,
-            flat: false,
+            ..Default::default()
         };
         for cols in [60, 80, 100, 140, 200] {
             let lines = zavet_decisions_lines(&decisions, cols, opts, now())

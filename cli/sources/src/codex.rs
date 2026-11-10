@@ -71,6 +71,7 @@ pub fn normalize(hook: &CodexHook) -> Option<Normalized> {
         source: None,
         reason: None,
         hints: Default::default(),
+        facts: Default::default(),
     })
 }
 
@@ -128,6 +129,7 @@ impl HarnessSource for CodexSource {
             source: None,
             reason: None,
             hints: Default::default(),
+            facts: Default::default(),
         })
     }
 }

@@ -4,13 +4,14 @@ members = [
     "contract",
     "cli/core",
     "cli/sources",
+    "cli/meetings",
     "cli/ipc",
     "cli/dirad",
     "cli/dira",
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0-develop.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/dodi-smart/dirahq-cli"
@@ -107,6 +108,9 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 keyring = { version = "4", features = ["v1"] }
 keyring-core = "1"
 serde_jcs = "0.2"
+# Contract 2.0 ingest bodies are zstd when the cloud advertises it (DIRASH-0052).
+# Pure Rust, so no extra C toolchain on the musl and windows-arm64 legs.
+ruzstd = "0.9"
 base64 = "0.23"
 
 # Config + ids + logging
@@ -137,6 +141,7 @@ fastrand = "2"
 dira-contract = { path = "contract" }
 dira-core = { path = "cli/core" }
 dira-sources = { path = "cli/sources" }
+dira-meetings = { path = "cli/meetings" }
 # UDS (unix) / named-pipe (windows) transport + shared length-prefixed-JSON framing;
 # the only framing implementation in the workspace — both dira and dirad go through it.
 dira-ipc = { path = "cli/ipc" }

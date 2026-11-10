@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 dira-core.workspace = true
+dira-meetings.workspace = true
 dira-sources.workspace = true
 dira-contract.workspace = true
 dira-ipc.workspace = true
@@ -33,6 +34,15 @@ anyhow.workspace = true
 fastrand.workspace = true
 futures.workspace = true
 libc.workspace = true
+# Contract 2.0 batch hash chain: SHA-256 over the JCS payload (DIRASH-0052).
+sha2.workspace = true
+hex.workspace = true
+ruzstd.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# `dirad` is a windows-subsystem binary (DIRASH-0048). `AttachConsole` lets
+# `dirad --version` still print when run from a terminal.
+windows-sys = { workspace = true, features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 # Throwaway dirs for `zavet`'s activation-probe and capture tests.

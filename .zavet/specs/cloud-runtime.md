@@ -1,10 +1,10 @@
 ---
 title: Cloud agent runtimes (teleport)
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: high
-date: 2026-09-09
+date: 2026-10-27
 paths:
   - cli/dira/src/cloud_init.rs
   - cli/dira/templates/
@@ -13,8 +13,9 @@ paths:
   - cli/core/src/httpclient.rs
   - cli/dira/src/device.rs
   - cli/dira/src/json_splice.rs
-decisions: [D-0001, D-0009, D-0011, DIRASH-0029, DIRASH-0033, DIRASH-0037, DIRASH-0038]
+decisions: [D-0001, D-0009, D-0011, DIRASH-0029, DIRASH-0033, DIRASH-0037, DIRASH-0038, DIRASH-0047]
 checks:
+  - a committed hook command exits 0 without its script and passes the script's status through with it; refresh upgrades the unguarded spelling :: cargo test -p dira --bin dira -- cloud_init::tests::guarded_commands_exit_zero_without_the_script_and_run_it_with cloud_init::tests::replace_mode_upgrades_the_unguarded_spelling
   - status: freshness/pin/per-harness judgment matches what apply would do :: cargo test -p dira --bin dira -- cloud_init::tests::status_
   - select_harnesses accepts aliases and rejects non-cloud-capable ones :: cargo test -p dira --bin dira -- cloud_init::tests::select_harnesses_accepts_aliases_and_rejects_non_cloud_ones
   - generated scripts substituted + POSIX + contracts :: cargo test -p dira --bin dira -- cloud_init::tests::generated_scripts_are_substituted_and_shell_sane
@@ -283,7 +284,8 @@ live wiring instead (DIRASH-0037).
   `timeout(2s)`; a TLS failure names `DIRA_EXTRA_CA_CERTS`, other transport
   failures name the egress allowlist, and the verdict is `warn`, never `fail`,
   on any transport error — an unreachable cloud is not broken local capture),
-  and `cloud.bootstrap` (artifact completeness + the version pin). Absent
+  and `cloud.bootstrap` (artifact completeness + the version pin; a pin
+  older than the installed dira warns and names `dira cloud refresh`). Absent
   evidence skips (DIRASH-0022); a VM without a runner token warns. The
   `hooks.scope_overlap` check (not cloud-specific, but load-bearing for the
   yield story above) judges the same harness-wiring facts `hooks.config`/
@@ -301,6 +303,10 @@ live wiring instead (DIRASH-0037).
 
 ## Invariants
 
+- Runtime detection never decides whether a person is present. A cloud VM
+  (`claude-web`) can have someone typing; a CI job (`github-actions`) cannot.
+  Presence is the hook shim's `DIRA_HEADLESS` / `GITHUB_ACTIONS` check, which
+  withholds human signals from a headless run (DIRASH-0047).
 - The wire stays content-free (D-0001): the runtime marker shipped in schema
   1.4 (`SessionRollup.runtime` + `runtimeSessionRef`) is a runtime *name* and
   a harness session id — metadata, never content. The daemon stamps both at
@@ -323,6 +329,14 @@ live wiring instead (DIRASH-0037).
   back to the working directory instead of resolving to `/.dira/…`.
 - Generated scripts are POSIX sh (no bashisms), and hook.sh's exit status is
   0 on every path.
+- A committed hook command exits 0 even when its script is missing. Every
+  command is `[ ! -f <script> ] || sh <script> <harness>`. A harness may load
+  the config from one tree and run it in another: claude-code-action restores
+  `.claude/` from a PR's base but keeps the head's working tree. A bare
+  `sh <missing>` exits 2 under dash, and exit 2 from `UserPromptSubmit` blocks
+  the prompt, so the run ends after 0 turns. The command still ends in the
+  `<script> <harness>` suffix the reader matches on, so `cloud refresh` replaces
+  the old unguarded spelling instead of adding a second entry.
 - `DIRA_RUNNER_TOKEN`'s value never appears in diagnostics, logs, or facts, or
   on any subprocess's argv — only its presence.
 - The portable hook yields, it never dedups: no cache, no time window,

@@ -107,11 +107,108 @@ async fn normalize_stored_at(pool: &SqlitePool) -> Result<(), Error> {
     Ok(())
 }
 
+/// Meta key set once every `session_rollup_daily` row written before
+/// compaction filled the token columns has been recomputed.
+pub const META_ROLLUP_TOKENS_BACKFILLED: &str = "rollup_tokens_backfill_v1";
+
+/// `input`, `output` and estimated cost of one session's `token_usage` rows
+/// dated within the UTC day `day` (`YYYY-MM-DD`). `TOTAL` keeps the cost a
+/// REAL even when every `est_cost` is NULL.
+///
+/// The day is matched as `substr(at, 1, 10)`, the same key
+/// [`Store::zavet_session_totals`] uses to tell which days still have live
+/// rows. A text range would agree on canonical rows, but a non-RFC 3339 `at`
+/// kept verbatim (DIRASH-0043) could land in one day here and another there,
+/// and be counted twice.
+async fn day_token_sums(
+    conn: &mut sqlx::SqliteConnection,
+    day: &str,
+    session_id: &str,
+) -> Result<(i64, i64, f64), Error> {
+    let r = sqlx::query(
+        "SELECT COALESCE(SUM(input), 0) AS i, COALESCE(SUM(output), 0) AS o, \
+         TOTAL(est_cost) AS c FROM token_usage \
+         WHERE session_id = ?1 AND substr(at, 1, 10) = ?2",
+    )
+    .bind(session_id)
+    .bind(day)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok((r.get("i"), r.get("o"), r.get("c")))
+}
+
+/// One-shot data migration: fill the token columns of rollup rows that
+/// compaction wrote before it summed `token_usage` into them (every such row
+/// is all-zero). Each row gets the sums of whatever `token_usage` still holds
+/// for its day and session. A row that already carries tokens is left alone.
+///
+/// Gated by [`META_ROLLUP_TOKENS_BACKFILLED`] in one `BEGIN IMMEDIATE`
+/// transaction, as [`normalize_stored_at`] is, and run after it, because the
+/// day bounds compare against canonical `token_usage.at` text. A plain read
+/// of the flag comes first, so an open after the backfill took place takes
+/// no write lock for it.
+async fn backfill_rollup_tokens(pool: &SqlitePool) -> Result<(), Error> {
+    let flag = "SELECT 1 FROM meta WHERE key = ?1";
+    let done = sqlx::query(flag)
+        .bind(META_ROLLUP_TOKENS_BACKFILLED)
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+    if done {
+        return Ok(());
+    }
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let done = sqlx::query(flag)
+        .bind(META_ROLLUP_TOKENS_BACKFILLED)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+    if done {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT day, session_id FROM session_rollup_daily \
+         WHERE COALESCE(input_tokens, 0) = 0 AND COALESCE(output_tokens, 0) = 0 \
+         AND COALESCE(est_cost, 0.0) = 0.0",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for r in rows {
+        let day: String = r.get("day");
+        let session_id: String = r.get("session_id");
+        let (i, o, c) = day_token_sums(&mut tx, &day, &session_id).await?;
+        if i == 0 && o == 0 && c == 0.0 {
+            continue;
+        }
+        sqlx::query(
+            "UPDATE session_rollup_daily \
+             SET input_tokens = ?1, output_tokens = ?2, est_cost = ?3 \
+             WHERE day = ?4 AND session_id = ?5",
+        )
+        .bind(i)
+        .bind(o)
+        .bind(c)
+        .bind(&day)
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("INSERT INTO meta (key, value) VALUES (?1, '1')")
+        .bind(META_ROLLUP_TOKENS_BACKFILLED)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Handle to the local SQLite store. Cheap to clone (wraps a pool).
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
 }
+
+mod meetings;
+pub use meetings::{wire_str, DetectionConfidence, MeetingState, NewMeeting, StoredMeeting};
 
 impl Store {
     /// Open (creating if needed) the store at `path`, enable WAL, and migrate.
@@ -171,6 +268,7 @@ impl Store {
             return Err(e.into());
         }
         normalize_stored_at(&pool).await?;
+        backfill_rollup_tokens(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -212,6 +310,7 @@ impl Store {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         normalize_stored_at(&pool).await?;
+        backfill_rollup_tokens(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -345,6 +444,27 @@ impl Store {
                 .await?
             }
         };
+        rows.iter().map(row_to_event).collect()
+    }
+
+    /// Every stored event whose `at` lies in `[from, to)`, oldest first. The
+    /// by-time read a restatement needs (contract 2.1 `windows`): unlike a flush's
+    /// event-id slice, it sees events a spool replay inserted later with past
+    /// `at` values, so the window it restates is complete.
+    pub async fn events_in_at_range(
+        &self,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE at >= ?1 AND at < ?2 AND session_id NOT LIKE ?3 \
+             ORDER BY at ASC, id ASC",
+        )
+        .bind(StoredAt(from))
+        .bind(StoredAt(to))
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(row_to_event).collect()
     }
 
@@ -594,6 +714,23 @@ impl Store {
     }
 
     /// Upsert a meta value.
+    /// Several `meta` writes in one transaction: all land or none do.
+    pub async fn meta_set_many(&self, pairs: &[(&str, &str)]) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        for (key, value) in pairs {
+            sqlx::query(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn meta_set(&self, key: &str, value: &str) -> Result<(), Error> {
         sqlx::query(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -663,6 +800,26 @@ impl Store {
         sqlx::query("DELETE FROM session_rollup_daily")
             .execute(&mut *tx)
             .await?;
+        // Contract 2.0 local state (0010): per-session facts and what was sent
+        // per day. A wipe starts the chain over (see below), so the day
+        // rollups start over with it.
+        for sql in [
+            "DELETE FROM session_facts",
+            "DELETE FROM session_paths",
+            "DELETE FROM day_intervals",
+            "DELETE FROM day_sessions",
+            "DELETE FROM day_tokens",
+            "DELETE FROM day_commits",
+            "DELETE FROM day_rollup_state",
+            // Meetings (0011): detected spans are local state too, and the
+            // meeting sync cursor starts over with them. The change sequence's
+            // high-water mark (`meeting_seq`) is kept, so a new change is
+            // always past anything sync saw before.
+            "DELETE FROM meetings",
+            "DELETE FROM meta WHERE key = 'meeting_cursor'",
+        ] {
+            sqlx::query(sql).execute(&mut *tx).await?;
+        }
         // Per-session token offsets (Phase 1c capture watermarks, meta keys
         // `token_offset:<session_id>`) are stats too — clear them so a nuked
         // slate re-captures token usage from the start of each session's
@@ -687,7 +844,19 @@ impl Store {
         // For `token_usage` that would re-create the exact defect
         // `META_TOKEN_CURSOR` exists to fix, since `nuke` also clears the
         // `token_offset:%` watermarks above and thus guarantees a full re-import.
+        // A wipe starts a new batch-chain epoch at seq 0 (DIRASH-0052): the
+        // cloud keys a chain by (device, epoch), and restarting seq 0 in the
+        // old epoch would collide with batches it already holds.
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES (?1, '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(COALESCE(NULLIF(value, ''), '0') AS INTEGER) + 1",
+        )
+        .bind(crate::sync::META_CHAIN_EPOCH)
+        .execute(&mut *tx)
+        .await?;
         for key in [
+            crate::sync::META_BATCH_SEQ,
+            crate::sync::META_BATCH_PREV_HASH,
             crate::sync::META_SYNC_CURSOR,
             crate::sync::META_ARTIFACTS_CURSOR,
             crate::sync::META_TOKEN_CURSOR,
@@ -931,32 +1100,46 @@ impl Store {
     ) -> Result<TokenTotals, Error> {
         let row = match since {
             Some(ts) => {
-                sqlx::query(
-                    "SELECT COALESCE(SUM(input),0) i, COALESCE(SUM(output),0) o, \
-                     COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
-                     COALESCE(SUM(est_cost),0.0) cost FROM token_usage WHERE at >= ?1",
-                )
+                sqlx::query(concat!(
+                    "SELECT ",
+                    token_sum_cols!(),
+                    " FROM token_usage WHERE at >= ?1"
+                ))
                 .bind(StoredAt(ts))
                 .fetch_one(&self.pool)
                 .await?
             }
             None => {
-                sqlx::query(
-                    "SELECT COALESCE(SUM(input),0) i, COALESCE(SUM(output),0) o, \
-                     COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
-                     COALESCE(SUM(est_cost),0.0) cost FROM token_usage",
-                )
-                .fetch_one(&self.pool)
-                .await?
+                sqlx::query(concat!("SELECT ", token_sum_cols!(), " FROM token_usage"))
+                    .fetch_one(&self.pool)
+                    .await?
             }
         };
-        Ok(TokenTotals {
-            input: row.get::<i64, _>("i") as u64,
-            output: row.get::<i64, _>("o") as u64,
-            cache_read: row.get::<i64, _>("cr") as u64,
-            cache_create: row.get::<i64, _>("cc") as u64,
-            est_cost_usd: row.get::<f64, _>("cost"),
-        })
+        Ok(TokenTotals::from_sum_row(&row))
+    }
+
+    /// [`Self::token_totals_since`] per session, for the session list. Rows
+    /// with no session id are left out: they belong to no listed session.
+    /// Reporting only — never a sync selector (D-0018).
+    pub async fn token_totals_by_session_since(
+        &self,
+        since: OffsetDateTime,
+    ) -> Result<std::collections::HashMap<String, TokenTotals>, Error> {
+        let rows = sqlx::query(concat!(
+            "SELECT session_id, ",
+            token_sum_cols!(),
+            " FROM token_usage \
+             WHERE at >= ?1 AND session_id IS NOT NULL AND session_id NOT LIKE ?2 \
+             GROUP BY session_id"
+        ))
+        .bind(StoredAt(since))
+        .bind(PROBE_LIKE_PATTERN)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get("session_id"), TokenTotals::from_sum_row(row)))
+            .collect())
     }
 
     /// The current sync cursor (last event id confirmed-synced), or `None` if
@@ -980,8 +1163,21 @@ impl Store {
     ///
     /// The rollup is computed with [`crate::accounting`] — the same gap model the
     /// reports use — so the summarized totals match what `report` would have
-    /// produced over those raw rows. Rollup rows accumulate (additive upsert), so
-    /// compacting a day in two passes (a later batch ages out) is safe.
+    /// produced over those raw rows. Time and prompts accumulate (additive
+    /// upsert), so a late, back-dated event folded in by a second pass is safe.
+    ///
+    /// Only whole UTC days are compacted. `cutoff` is aligned down to its UTC
+    /// midnight, and further down to the midnight of the oldest unsynced event's
+    /// day, so a day is never part rollup and part raw. Reports add rollup rows
+    /// for a day on top of that day's raw events, so a split day would put one
+    /// session in both halves. The selection and the delete use the same
+    /// aligned bound.
+    ///
+    /// Each rollup row also carries its day's `input`/`output` tokens and
+    /// estimated cost, summed from `token_usage` for the same UTC day and
+    /// session. Compaction never deletes `token_usage` (its rows ride their own
+    /// sync cursor, D-0018), so the sums are recomputed on every pass and kept
+    /// with `MAX`, never added: a second pass over a day cannot count it twice.
     ///
     /// `cursor = None` means nothing is synced yet → nothing is eligible, returns 0.
     pub async fn compact(
@@ -993,9 +1189,25 @@ impl Store {
         let Some(cursor) = cursor else {
             return Ok(0); // nothing synced yet — never prune un-synced data
         };
-        let cutoff_at = StoredAt(cutoff);
+        let utc_midnight = |t| crate::config::start_of_day(t, time::UtcOffset::UTC);
 
         let mut tx = self.pool.begin().await?;
+
+        // An unsynced event keeps its whole day raw, and every day after it:
+        // nothing at or past that midnight is eligible. Probe rows never sync
+        // and are never rolled up, so they cannot hold a day back.
+        let oldest_unsynced: Option<StoredAt> =
+            sqlx::query("SELECT MIN(at) AS m FROM events WHERE id > ?1 AND session_id NOT LIKE ?2")
+                .bind(cursor)
+                .bind(PROBE_LIKE_PATTERN)
+                .fetch_one(&mut *tx)
+                .await?
+                .get("m");
+        let mut cutoff = utc_midnight(cutoff);
+        if let Some(StoredAt(t)) = oldest_unsynced {
+            cutoff = cutoff.min(utc_midnight(t));
+        }
+        let cutoff_at = StoredAt(cutoff);
 
         // Snapshot the eligible rows (synced AND old). Ordered by time so the
         // accounting gap model sees them in timeline order.
@@ -1029,6 +1241,7 @@ impl Store {
         for ev in &events {
             let day = ev
                 .at
+                .to_offset(time::UtcOffset::UTC)
                 .format(&time::format_description::well_known::Iso8601::DATE)
                 .map_err(Error::time)?;
             let acc = groups
@@ -1054,9 +1267,6 @@ impl Store {
             }
         }
 
-        // Token totals per (day, session) for the same eligible window. Tokens
-        // aren't ULID-ordered, so we bound them by the same `at < cutoff` only
-        // (the cloud-sync cursor doesn't apply); recent tokens stay live.
         for ((day, session_id), acc) in &groups {
             // Never immortalise a session that did nothing (issue #74). The
             // writer prunes degenerate sessions when their `SessionEnd` arrives,
@@ -1072,14 +1282,22 @@ impl Store {
             }
             let human = accounting::total_human_seconds(&acc.signals, idle);
             let active = accounting::active_seconds(&acc.activity, idle);
+            // The whole day's tokens for this session, by the same UTC day the
+            // group was keyed on. Token rows are not ULID-ordered and ride their
+            // own cursor (D-0018), so only the day bounds them.
+            let (input, output, cost) = day_token_sums(&mut tx, day, session_id).await?;
             sqlx::query(
                 "INSERT INTO session_rollup_daily
-                    (day, session_id, project, human_seconds, active_seconds, prompts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    (day, session_id, project, human_seconds, active_seconds, prompts,
+                     input_tokens, output_tokens, est_cost)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(day, session_id) DO UPDATE SET
                     human_seconds  = human_seconds  + excluded.human_seconds,
                     active_seconds = active_seconds + excluded.active_seconds,
                     prompts        = prompts        + excluded.prompts,
+                    input_tokens   = MAX(input_tokens,  excluded.input_tokens),
+                    output_tokens  = MAX(output_tokens, excluded.output_tokens),
+                    est_cost       = MAX(est_cost,      excluded.est_cost),
                     project        = COALESCE(session_rollup_daily.project, excluded.project)",
             )
             .bind(day)
@@ -1088,6 +1306,9 @@ impl Store {
             .bind(human)
             .bind(active)
             .bind(acc.prompts)
+            .bind(input)
+            .bind(output)
+            .bind(cost)
             .execute(&mut *tx)
             .await?;
         }
@@ -2070,6 +2291,11 @@ impl Store {
     /// the caller over the event log (global human attribution can't be done
     /// per-session in SQL) and added on top — compaction deletes the raw rows
     /// it rolls up, so the two parts never double-count.
+    ///
+    /// Tokens are different: compaction copies a day's `token_usage` sums into
+    /// the rollup but keeps the rows. A rollup row's tokens therefore count only
+    /// for a day with no `token_usage` rows left for the session. Rollup days
+    /// and stored `at` are both UTC, so the day is the first ten characters.
     pub async fn zavet_session_totals(
         &self,
         session_id: &str,
@@ -2077,9 +2303,12 @@ impl Store {
         let r = sqlx::query(
             "SELECT COALESCE(SUM(human_seconds), 0) AS h,
                     COALESCE(SUM(active_seconds), 0) AS a,
-                    COALESCE(SUM(input_tokens), 0) AS i,
-                    COALESCE(SUM(output_tokens), 0) AS o
-             FROM session_rollup_daily WHERE session_id = ?1",
+                    COALESCE(SUM(CASE WHEN live.d IS NULL THEN input_tokens END), 0) AS i,
+                    COALESCE(SUM(CASE WHEN live.d IS NULL THEN output_tokens END), 0) AS o
+             FROM session_rollup_daily r
+             LEFT JOIN (SELECT DISTINCT substr(at, 1, 10) AS d FROM token_usage
+                        WHERE session_id = ?1) live ON live.d = r.day
+             WHERE r.session_id = ?1",
         )
         .bind(session_id)
         .fetch_one(&self.pool)
@@ -2746,6 +2975,36 @@ pub struct TokenTotals {
     pub est_cost_usd: f64,
 }
 
+/// The select list every token-sum query shares, read back by
+/// [`TokenTotals::from_sum_row`]. A macro so the queries stay `&'static str`
+/// (sqlx refuses SQL built at run time).
+macro_rules! token_sum_cols {
+    () => {
+        "COALESCE(SUM(input),0) i, COALESCE(SUM(output),0) o, \
+         COALESCE(SUM(cache_read),0) cr, COALESCE(SUM(cache_create),0) cc, \
+         COALESCE(SUM(est_cost),0.0) cost"
+    };
+}
+use token_sum_cols;
+
+impl TokenTotals {
+    /// Every token through the pipe: input, output and both cache counts —
+    /// what the status compute row and a session's `tokens.total` show.
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_create
+    }
+
+    fn from_sum_row(row: &sqlx::sqlite::SqliteRow) -> Self {
+        TokenTotals {
+            input: row.get::<i64, _>("i") as u64,
+            output: row.get::<i64, _>("o") as u64,
+            cache_read: row.get::<i64, _>("cr") as u64,
+            cache_create: row.get::<i64, _>("cc") as u64,
+            est_cost_usd: row.get::<f64, _>("cost"),
+        }
+    }
+}
+
 /// A decision record as parsed from a `.zavet/decisions/*.md` blob at capture
 /// time — the input to [`Store::zavet_upsert_decision`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3257,6 +3516,444 @@ fn row_to_token_row(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRow, Error> {
         est_cost_usd: row.get::<Option<f64>, _>("est_cost"),
         at: display_at(row.get("at")),
     })
+}
+
+/// Contract 2.0 session facts the event log does not carry (DIRASH-0052).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionFacts {
+    pub lines_added: u32,
+    pub lines_removed: u32,
+    pub compactions: u32,
+    pub files_touched: u32,
+}
+
+/// The first `YYYY-MM-DD` of an RFC 3339 UTC timestamp, or `None`.
+fn utc_day(ts: &str) -> Option<&str> {
+    let d = ts.get(..10)?;
+    (d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-').then_some(d)
+}
+
+impl Store {
+    /// Record what one hook said about its session, at capture time: lines its
+    /// edit/write tool added and removed, a compaction, a touched file (as a
+    /// hash of its path). A no-op when there is nothing to record.
+    pub async fn record_hook_facts(
+        &self,
+        session_id: &str,
+        lines_added: u32,
+        lines_removed: u32,
+        compaction: bool,
+        path_hash: Option<&str>,
+    ) -> Result<(), Error> {
+        if lines_added > 0 || lines_removed > 0 || compaction {
+            sqlx::query(
+                "INSERT INTO session_facts (session_id, lines_added, lines_removed, compactions)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                   lines_added = lines_added + excluded.lines_added,
+                   lines_removed = lines_removed + excluded.lines_removed,
+                   compactions = compactions + excluded.compactions",
+            )
+            .bind(session_id)
+            .bind(i64::from(lines_added))
+            .bind(i64::from(lines_removed))
+            .bind(i64::from(compaction))
+            .execute(&self.pool)
+            .await?;
+        }
+        if let Some(h) = path_hash {
+            sqlx::query(
+                "INSERT OR IGNORE INTO session_paths (session_id, path_hash) VALUES (?1, ?2)",
+            )
+            .bind(session_id)
+            .bind(h)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The facts recorded for a session, `None` when nothing was recorded.
+    pub async fn session_facts(&self, session_id: &str) -> Result<Option<SessionFacts>, Error> {
+        let row = sqlx::query(
+            "SELECT
+               (SELECT lines_added FROM session_facts WHERE session_id = ?1) AS la,
+               (SELECT lines_removed FROM session_facts WHERE session_id = ?1) AS lr,
+               (SELECT compactions FROM session_facts WHERE session_id = ?1) AS cp,
+               (SELECT COUNT(*) FROM session_paths WHERE session_id = ?1) AS ft",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let la: Option<i64> = row.get("la");
+        let ft: i64 = row.get("ft");
+        if la.is_none() && ft == 0 {
+            return Ok(None);
+        }
+        let n = |v: Option<i64>| v.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32;
+        Ok(Some(SessionFacts {
+            lines_added: n(la),
+            lines_removed: n(row.get("lr")),
+            compactions: n(row.get("cp")),
+            files_touched: n(Some(ft)),
+        }))
+    }
+
+    /// [`Self::session_facts`] for many sessions in one query. Sessions with
+    /// nothing recorded are absent from the map.
+    pub async fn session_facts_many(
+        &self,
+        session_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, SessionFacts>, Error> {
+        let ids = serde_json::to_string(session_ids).unwrap_or_else(|_| "[]".into());
+        let rows = sqlx::query(
+            "WITH ids(session_id) AS (SELECT value FROM json_each(?1)) \
+             SELECT ids.session_id AS sid, f.lines_added AS la, f.lines_removed AS lr, \
+                    f.compactions AS cp, \
+                    (SELECT COUNT(*) FROM session_paths p WHERE p.session_id = ids.session_id) AS ft \
+             FROM ids LEFT JOIN session_facts f ON f.session_id = ids.session_id",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let n = |v: Option<i64>| v.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let la: Option<i64> = r.get("la");
+                let ft: i64 = r.get("ft");
+                (la.is_some() || ft > 0).then(|| {
+                    (
+                        r.get::<String, _>("sid"),
+                        SessionFacts {
+                            lines_added: n(la),
+                            lines_removed: n(r.get("lr")),
+                            compactions: n(r.get("cp")),
+                            files_touched: n(Some(ft)),
+                        },
+                    )
+                })
+            })
+            .collect())
+    }
+
+    /// Record what an acknowledged batch carried, per UTC day and repo, and
+    /// mark those days as changed so their `DayRollup` is (re-)sent. Keyed by
+    /// the wire ids, so a re-sent row replaces itself. Old days are pruned by
+    /// [`Self::prune_day_rollups`].
+    pub async fn record_acked_batch(
+        &self,
+        batch: &dira_contract::AttestationBatch,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut days: std::collections::BTreeSet<(String, String)> = Default::default();
+        // A batch that restates windows (contract 2.1, a meeting re-decompose)
+        // replaces this device's intervals inside them, possibly under new ids:
+        // drop every stored row that OVERLAPS a window (a neighbour starting just
+        // before it too) and mark their days dirty, or both would be summed into
+        // the next day rollup. Compared as instants, like the replace below:
+        // RFC 3339 text with fractional seconds does not sort as time.
+        for w in &batch.windows {
+            let gone = sqlx::query(
+                "DELETE FROM day_intervals \
+                 WHERE julianday(started_at) < julianday(?1) \
+                 AND julianday(ended_at) > julianday(?2) RETURNING day, repo",
+            )
+            .bind(&w.ended_at)
+            .bind(&w.started_at)
+            .fetch_all(&mut *tx)
+            .await?;
+            for r in gone {
+                days.insert((r.get("day"), r.get("repo")));
+            }
+        }
+        for i in &batch.intervals {
+            let Some(day) = utc_day(&i.started_at) else {
+                continue;
+            };
+            let repo = i.repo_canonical.clone().unwrap_or_default();
+            // A late hook can split an interval this device already sent into
+            // two new ones. The stale wider row would otherwise be summed with
+            // them, so this session's stored intervals that overlap the new one
+            // are replaced, and their days re-sent.
+            let replaced = sqlx::query(
+                "DELETE FROM day_intervals WHERE id != ?1 \
+                 AND julianday(started_at) < julianday(?2) \
+                 AND julianday(ended_at) > julianday(?3) RETURNING day, repo",
+            )
+            .bind(&i.id)
+            .bind(&i.ended_at)
+            .bind(&i.started_at)
+            .fetch_all(&mut *tx)
+            .await?;
+            for r in replaced {
+                days.insert((r.get("day"), r.get("repo")));
+            }
+            sqlx::query(
+                "INSERT OR REPLACE INTO day_intervals \
+                 (id, day, repo, human_seconds, session_id, started_at, ended_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(&i.id)
+            .bind(day)
+            .bind(&repo)
+            .bind(i.human_seconds as i64)
+            .bind(&i.source_session)
+            .bind(&i.started_at)
+            .bind(&i.ended_at)
+            .execute(&mut *tx)
+            .await?;
+            days.insert((day.to_string(), repo));
+        }
+        for s in &batch.sessions {
+            let Some(day) = utc_day(&s.started_at) else {
+                continue;
+            };
+            let repo = s.repo_canonical.clone().unwrap_or_default();
+            // A re-sent rollup can move its session to another day or repo (a
+            // partial without a repo, then a final with one). The day it leaves
+            // changes too.
+            if let Some(old) =
+                sqlx::query("SELECT day, repo FROM day_sessions WHERE session_id = ?1")
+                    .bind(&s.session_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            {
+                days.insert((old.get("day"), old.get("repo")));
+            }
+            sqlx::query(
+                "INSERT OR REPLACE INTO day_sessions (session_id, day, repo, agent_wall_seconds, prompts)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(&s.session_id)
+            .bind(day)
+            .bind(&repo)
+            .bind(s.agent_wall_seconds as i64)
+            .bind(s.prompts.unwrap_or(0) as i64)
+            .execute(&mut *tx)
+            .await?;
+            days.insert((day.to_string(), repo));
+        }
+        for t in &batch.token_usage {
+            let Some(day) = utc_day(&t.at) else {
+                continue;
+            };
+            let repo = t.repo_canonical.clone().unwrap_or_default();
+            sqlx::query(
+                "INSERT OR REPLACE INTO day_tokens
+                   (id, day, repo, model, input, output, cache_read, cache_create, est_cost_usd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind(&t.id)
+            .bind(day)
+            .bind(&repo)
+            .bind(&t.model)
+            .bind(t.input as i64)
+            .bind(t.output as i64)
+            .bind(t.cache_read as i64)
+            .bind(t.cache_create as i64)
+            .bind(t.est_cost_usd)
+            .execute(&mut *tx)
+            .await?;
+            days.insert((day.to_string(), repo));
+        }
+        for a in &batch.artifacts {
+            if a.kind != dira_contract::ArtifactKind::Commit {
+                continue;
+            }
+            let Some(day) = a.authored_at.as_deref().and_then(utc_day) else {
+                continue;
+            };
+            let repo = a.repo_canonical.clone().unwrap_or_default();
+            sqlx::query("INSERT OR IGNORE INTO day_commits (sha, repo, day) VALUES (?1, ?2, ?3)")
+                .bind(&a.sha)
+                .bind(&repo)
+                .bind(day)
+                .execute(&mut *tx)
+                .await?;
+            days.insert((day.to_string(), repo));
+        }
+        for (day, repo) in &days {
+            sqlx::query(
+                "INSERT INTO day_rollup_state (day, repo, revision, dirty) VALUES (?1, ?2, 0, 1)
+                 ON CONFLICT(day, repo) DO UPDATE SET dirty = 1",
+            )
+            .bind(day)
+            .bind(repo)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Drop day-rollup state older than 40 days. Run from the hourly
+    /// maintenance sweep, not per acknowledged batch.
+    pub async fn prune_day_rollups(&self) -> Result<u64, Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut removed = 0;
+        for sql in [
+            "DELETE FROM day_intervals WHERE day < date('now', '-40 days')",
+            "DELETE FROM day_sessions WHERE day < date('now', '-40 days')",
+            "DELETE FROM day_tokens WHERE day < date('now', '-40 days')",
+            "DELETE FROM day_commits WHERE day < date('now', '-40 days')",
+            "DELETE FROM day_rollup_state WHERE day < date('now', '-40 days')",
+        ] {
+            removed += sqlx::query(sql).execute(&mut *tx).await?.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
+    /// Whether any day's rollup changed since it was last sent.
+    pub async fn has_pending_day_rollups(&self) -> Result<bool, Error> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM day_rollup_state WHERE dirty = 1)")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n != 0)
+    }
+
+    /// The `DayRollup`s of days that changed since they were last sent, oldest
+    /// first, at most `limit`. Four grouped reads over the same set of dirty
+    /// days, in one read transaction, whatever the number of days.
+    pub async fn pending_day_rollups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<dira_contract::DayRollup>, Error> {
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+        type Key = (String, String);
+
+        #[derive(Default)]
+        struct Acc {
+            revision: i64,
+            ids: Vec<String>,
+            human: i64,
+            sessions: i64,
+            agent: i64,
+            prompts: i64,
+            commits: i64,
+            tokens: Vec<dira_contract::DayTokens>,
+            cost: Option<f64>,
+        }
+
+        // The dirty days this call reports: every read below starts with the
+        // same `k` CTE, so all four see the same set of days.
+        let limit = i64::from(limit);
+        let mut tx = self.pool.begin().await?;
+        let mut days: BTreeMap<Key, Acc> = BTreeMap::new();
+
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT day, repo, revision FROM k")
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?
+        {
+            days.entry((r.get("day"), r.get("repo"))).or_default().revision = r.get("revision");
+        }
+        if days.is_empty() {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT i.day, i.repo, i.id, i.human_seconds FROM day_intervals i \
+             JOIN k ON k.day = i.day AND k.repo = i.repo ORDER BY i.day, i.repo, i.id")
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            if let Some(a) = days.get_mut(&(r.get("day"), r.get("repo"))) {
+                a.ids.push(r.get("id"));
+                a.human += r.get::<i64, _>("human_seconds").max(0);
+            }
+        }
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT s.day, s.repo, COUNT(*) AS n, SUM(s.agent_wall_seconds) AS agent, \
+             SUM(s.prompts) AS prompts FROM day_sessions s \
+             JOIN k ON k.day = s.day AND k.repo = s.repo GROUP BY s.day, s.repo")
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            if let Some(a) = days.get_mut(&(r.get("day"), r.get("repo"))) {
+                a.sessions = r.get("n");
+                a.agent = r.get::<Option<i64>, _>("agent").unwrap_or(0);
+                a.prompts = r.get::<Option<i64>, _>("prompts").unwrap_or(0);
+            }
+        }
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT c.day, c.repo, COUNT(*) AS n FROM day_commits c \
+             JOIN k ON k.day = c.day AND k.repo = c.repo GROUP BY c.day, c.repo")
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            if let Some(a) = days.get_mut(&(r.get("day"), r.get("repo"))) {
+                a.commits = r.get("n");
+            }
+        }
+        for r in sqlx::query("WITH k AS (SELECT day, repo, revision FROM day_rollup_state WHERE dirty = 1 ORDER BY day, repo LIMIT ?1) SELECT t.day, t.repo, t.model, SUM(t.input) AS i, SUM(t.output) AS o, \
+             SUM(t.cache_read) AS cr, SUM(t.cache_create) AS cc, SUM(t.est_cost_usd) AS cost \
+             FROM day_tokens t JOIN k ON k.day = t.day AND k.repo = t.repo \
+             GROUP BY t.day, t.repo, t.model ORDER BY t.day, t.repo, t.model")
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            if let Some(a) = days.get_mut(&(r.get("day"), r.get("repo"))) {
+                if let Some(c) = r.get::<Option<f64>, _>("cost") {
+                    *a.cost.get_or_insert(0.0) += c;
+                }
+                a.tokens.push(dira_contract::DayTokens {
+                    model: r.get("model"),
+                    input: r.get::<i64, _>("i").max(0) as u64,
+                    output: r.get::<i64, _>("o").max(0) as u64,
+                    cache_read: r.get::<i64, _>("cr").max(0) as u64,
+                    cache_create: r.get::<i64, _>("cc").max(0) as u64,
+                });
+            }
+        }
+        tx.commit().await?;
+
+        Ok(days
+            .into_iter()
+            .map(|((day, repo), a)| {
+                let digest = Sha256::digest(a.ids.join("\n").as_bytes());
+                dira_contract::DayRollup {
+                    day,
+                    repo_canonical: (!repo.is_empty()).then_some(repo),
+                    workspace_hint: None,
+                    human_seconds: a.human as u64,
+                    agent_wall_seconds: a.agent.max(0) as u64,
+                    sessions: a.sessions.max(0) as u32,
+                    prompts: a.prompts.max(0) as u64,
+                    commits: a.commits.max(0) as u32,
+                    tokens: a.tokens,
+                    est_cost_usd: a.cost,
+                    interval_count: a.ids.len() as u32,
+                    interval_digest: hex::encode(digest),
+                    revision: a.revision.max(0) as u32,
+                }
+            })
+            .collect())
+    }
+
+    /// Record that these days' rollups were acknowledged: clear the change
+    /// mark and advance the revision the next send of each will carry.
+    pub async fn mark_day_rollups_sent(
+        &self,
+        keys: &[(String, Option<String>)],
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        for (day, repo) in keys {
+            sqlx::query(
+                "UPDATE day_rollup_state SET dirty = 0, revision = revision + 1 WHERE day = ?1 AND repo = ?2",
+            )
+            .bind(day)
+            .bind(repo.clone().unwrap_or_default())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<RawEvent, Error> {
@@ -4160,10 +4857,13 @@ mod tests {
         store.append(&recent_a).await.unwrap();
         store.append(&recent_b).await.unwrap();
         // Un-synced old row: old enough by age, but past the cursor — must be kept.
+        // It sits on a LATER day than the old window: an unsynced row holds its
+        // whole UTC day raw (see `compact_never_splits_a_day_around_an_unsynced_event`),
+        // so on the old window's own day it would keep that day raw too.
         let unsynced_old = ev_at(
             "01ZZZZ", // > cursor "01OLD3"
             "s_unsynced",
-            old_base + time::Duration::seconds(10),
+            old_base + time::Duration::days(2) + time::Duration::seconds(10),
             EventKind::UserPrompt,
         );
         store.append(&unsynced_old).await.unwrap();
@@ -4207,6 +4907,278 @@ mod tests {
             .map(|l| l.human_seconds)
             .sum();
         assert_eq!(total_human2, expected_human, "no double counting on re-run");
+    }
+
+    /// Insert one `token_usage` row directly, so a test controls `est_cost`
+    /// exactly instead of going through the bundled pricing table.
+    async fn put_token(
+        store: &Store,
+        id: &str,
+        session: &str,
+        at: OffsetDateTime,
+        input: i64,
+        output: i64,
+        cost: f64,
+    ) {
+        sqlx::query(
+            "INSERT INTO token_usage
+                (id, at, session_id, project, model, input, output, cache_read, cache_create, est_cost)
+             VALUES (?1, ?2, ?3, 'github.com/acme/api', 'm', ?4, ?5, 0, 0, ?6)",
+        )
+        .bind(id)
+        .bind(StoredAt(at))
+        .bind(session)
+        .bind(input)
+        .bind(output)
+        .bind(cost)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    /// `(input_tokens, output_tokens, est_cost)` of one rollup row.
+    async fn rollup_tokens(store: &Store, day: &str, session: &str) -> (i64, i64, f64) {
+        let r = sqlx::query(
+            "SELECT input_tokens, output_tokens, est_cost FROM session_rollup_daily \
+             WHERE day = ?1 AND session_id = ?2",
+        )
+        .bind(day)
+        .bind(session)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        (
+            r.get("input_tokens"),
+            r.get("output_tokens"),
+            r.get("est_cost"),
+        )
+    }
+
+    /// The UTC days that hold a rollup row, and those that still hold raw events.
+    async fn rollup_and_raw_days(store: &Store) -> (Vec<String>, Vec<String>) {
+        let rolled = sqlx::query("SELECT DISTINCT day FROM session_rollup_daily ORDER BY day")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("day"))
+            .collect();
+        let raw = sqlx::query("SELECT DISTINCT substr(at, 1, 10) d FROM events ORDER BY d")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("d"))
+            .collect();
+        (rolled, raw)
+    }
+
+    /// A rollup row carries the tokens and estimated cost of its own UTC day and
+    /// session, summed from `token_usage`, and a second pass over the same day
+    /// never adds them twice.
+    #[tokio::test]
+    async fn compact_rollup_carries_the_days_token_usage() {
+        let store = Store::open_in_memory().await.unwrap();
+        let idle = time::Duration::minutes(5);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(30);
+        let day = now - time::Duration::days(20); // 1970-01-11T00:00Z
+        for i in 0..4 {
+            store
+                .append(&ev_at(
+                    &format!("01OLD{i}"),
+                    "s_old",
+                    day + time::Duration::hours(9) + time::Duration::seconds(60 * i),
+                    EventKind::UserPrompt,
+                ))
+                .await
+                .unwrap();
+        }
+        // Two turns on that day count. A turn on the next day, one from another
+        // session, and one a nanosecond before the day starts do not.
+        let h = time::Duration::hours;
+        put_token(&store, "t1", "s_old", day + h(9), 100, 10, 0.5).await;
+        put_token(&store, "t2", "s_old", day + h(23), 200, 20, 0.25).await;
+        put_token(&store, "t3", "s_old", day + h(25), 1000, 1000, 9.0).await;
+        put_token(&store, "t4", "other", day + h(9), 7, 7, 7.0).await;
+        let before = day - time::Duration::nanoseconds(1);
+        put_token(&store, "t5", "s_old", before, 3, 3, 3.0).await;
+
+        let cutoff = now - time::Duration::days(14);
+        assert_eq!(
+            store.compact(Some("01OLD9"), cutoff, idle).await.unwrap(),
+            4
+        );
+        assert_eq!(
+            rollup_tokens(&store, "1970-01-11", "s_old").await,
+            (300, 30, 0.75)
+        );
+
+        // A late, back-dated event on the same day folds in on a second pass.
+        // Time accumulates; the day's tokens are recomputed, not added again.
+        store
+            .append(&ev_at(
+                "01OLD5",
+                "s_old",
+                day + h(10),
+                EventKind::UserPrompt,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.compact(Some("01OLD9"), cutoff, idle).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            rollup_tokens(&store, "1970-01-11", "s_old").await,
+            (300, 30, 0.75)
+        );
+
+        // `token_usage` still holds those rows, so a reader adding rollup tokens
+        // to live tokens would count the day twice.
+        let totals = store.zavet_session_totals("s_old").await.unwrap();
+        assert_eq!(totals.input_tokens, 100 + 200 + 1000 + 3);
+        assert_eq!(totals.output_tokens, 10 + 20 + 1000 + 3);
+    }
+
+    /// Rollups written before the token columns were filled get them once, from
+    /// whatever `token_usage` still holds for that day. The recompute is gated,
+    /// and it never touches a row that already carries tokens.
+    #[tokio::test]
+    async fn backfill_rollup_tokens_recomputes_zero_rows_once() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10);
+        for (session, input) in [("s_zero", 0_i64), ("s_set", 7)] {
+            sqlx::query(
+                "INSERT INTO session_rollup_daily
+                    (day, session_id, project, human_seconds, active_seconds, prompts,
+                     input_tokens, output_tokens, est_cost)
+                 VALUES ('1970-01-11', ?1, NULL, 60, 0, 2, ?2, ?2, 0.0)",
+            )
+            .bind(session)
+            .bind(input)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        let h = time::Duration::hours;
+        put_token(&store, "t1", "s_zero", day + h(1), 100, 10, 0.5).await;
+        put_token(&store, "t2", "s_zero", day + h(30), 9, 9, 9.0).await; // next day
+        put_token(&store, "t3", "s_set", day + h(1), 50, 50, 5.0).await;
+
+        // `open` already ran it on an empty store; clear the flag to run it again
+        // the way an upgrading install does.
+        sqlx::query("DELETE FROM meta WHERE key = ?1")
+            .bind(META_ROLLUP_TOKENS_BACKFILLED)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        backfill_rollup_tokens(&store.pool).await.unwrap();
+        assert_eq!(
+            rollup_tokens(&store, "1970-01-11", "s_zero").await,
+            (100, 10, 0.5)
+        );
+        assert_eq!(
+            rollup_tokens(&store, "1970-01-11", "s_set").await,
+            (7, 7, 0.0),
+            "a row that already carries tokens is left alone"
+        );
+        assert!(store
+            .meta_get(META_ROLLUP_TOKENS_BACKFILLED)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Idempotent: a second run is gated, so more usage changes nothing.
+        put_token(&store, "t4", "s_zero", day + h(2), 1, 1, 1.0).await;
+        backfill_rollup_tokens(&store.pool).await.unwrap();
+        assert_eq!(
+            rollup_tokens(&store, "1970-01-11", "s_zero").await,
+            (100, 10, 0.5)
+        );
+    }
+
+    /// A mid-day cutoff compacts only the whole days before that day's UTC
+    /// midnight. Splitting a day would put one session in both the rollup and
+    /// the raw log, and reports add both for the same day.
+    #[tokio::test]
+    async fn compact_aligns_a_mid_day_cutoff_down_to_utc_midnight() {
+        let store = Store::open_in_memory().await.unwrap();
+        let idle = time::Duration::minutes(5);
+        let d = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10); // 1970-01-11
+        let h = time::Duration::hours;
+        let m = time::Duration::minutes;
+        for (id, at) in [
+            ("01A0", d + h(1)),
+            ("01A1", d + h(1) + m(1)),
+            // The cutoff's own day: before the cutoff time, and after it.
+            ("01B0", d + h(24 + 3)),
+            ("01B1", d + h(24 + 3) + m(1)),
+            ("01B2", d + h(24 + 15)),
+        ] {
+            store
+                .append(&ev_at(id, "s", at, EventKind::UserPrompt))
+                .await
+                .unwrap();
+        }
+        put_token(&store, "t1", "s", d + h(24 + 3), 5, 5, 0.5).await;
+
+        let cutoff = d + h(24 + 12); // 1970-01-12T12:00Z
+        let deleted = store.compact(Some("01Z"), cutoff, idle).await.unwrap();
+        assert_eq!(deleted, 2, "only the day before the cutoff's midnight");
+
+        let (rolled, raw) = rollup_and_raw_days(&store).await;
+        assert_eq!(rolled, vec!["1970-01-11".to_string()]);
+        assert_eq!(raw, vec!["1970-01-12".to_string()]);
+        assert_eq!(
+            rollup_tokens(&store, "1970-01-11", "s").await,
+            (0, 0, 0.0),
+            "the next day's tokens stay with its raw events"
+        );
+
+        // The same cutoff again finds nothing: the day stays whole and raw.
+        assert_eq!(store.compact(Some("01Z"), cutoff, idle).await.unwrap(), 0);
+        assert_eq!(store.events_since(None).await.unwrap().len(), 3);
+    }
+
+    /// The sync cursor must not split a day either. An unsynced event keeps its
+    /// whole UTC day raw, and every day after it, until it ships.
+    #[tokio::test]
+    async fn compact_never_splits_a_day_around_an_unsynced_event() {
+        let store = Store::open_in_memory().await.unwrap();
+        let idle = time::Duration::minutes(5);
+        let d = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10); // 1970-01-11
+        let h = time::Duration::hours;
+        for (id, at) in [
+            ("01A0", d + h(1)),
+            ("01A1", d + h(2)),
+            ("01B0", d + h(24 + 1)),
+            ("01B1", d + h(24 + 2)),
+            ("01C0", d + h(48 + 1)),
+            // Back-dated onto the second day, appended after the cursor.
+            ("01Z0", d + h(24 + 12)),
+        ] {
+            store
+                .append(&ev_at(id, "s", at, EventKind::UserPrompt))
+                .await
+                .unwrap();
+        }
+        let cutoff = d + time::Duration::days(5);
+        let deleted = store.compact(Some("01M"), cutoff, idle).await.unwrap();
+        assert_eq!(deleted, 2, "only the day before the unsynced event's day");
+
+        let (rolled, raw) = rollup_and_raw_days(&store).await;
+        assert_eq!(rolled, vec!["1970-01-11".to_string()]);
+        assert_eq!(
+            raw,
+            vec!["1970-01-12".to_string(), "1970-01-13".to_string()]
+        );
+
+        // Once it is synced, the rest compacts whole.
+        let deleted = store.compact(Some("01ZZ"), cutoff, idle).await.unwrap();
+        assert_eq!(deleted, 4);
+        let (rolled, raw) = rollup_and_raw_days(&store).await;
+        assert_eq!(rolled.len(), 3);
+        assert!(raw.is_empty());
     }
 
     #[tokio::test]
@@ -5334,6 +6306,40 @@ mod tests {
         assert_eq!(e1, "2026-10-16T12:00:05Z");
     }
 
+    /// The per-session split sums each session's rows inside the window and
+    /// leaves out rows before it and probe rows (DIRASH-0023).
+    #[tokio::test]
+    async fn token_totals_by_session_split_the_window_per_session() {
+        let store = Store::open_in_memory().await.unwrap();
+        let turn = |id: &str, at: &str, input: u64| TokenTurn {
+            id: id.to_string(),
+            at: at.to_string(),
+            model: "m".to_string(),
+            input,
+            output: 1,
+            cache_read: 0,
+            cache_create: 0,
+            cwd: None,
+        };
+        for (id, at, input, session) in [
+            ("t1", "2026-10-16T09:00:00Z", 100, "a"),
+            ("t2", "2026-10-16T13:00:00Z", 10, "a"),
+            ("t3", "2026-10-16T14:00:00Z", 5, "a"),
+            ("t4", "2026-10-16T13:30:00Z", 7, "b"),
+            ("t5", "2026-10-16T13:30:00Z", 9, "dira-probe-x"),
+        ] {
+            store
+                .upsert_token_usage(&turn(id, at, input), session, None)
+                .await
+                .unwrap();
+        }
+        let since = time::macros::datetime!(2026-10-16 12:00 UTC);
+        let by = store.token_totals_by_session_since(since).await.unwrap();
+        assert_eq!(by.len(), 2, "probe rows never surface: {by:?}");
+        assert_eq!((by["a"].input, by["a"].output), (15, 2));
+        assert_eq!((by["b"].input, by["b"].output), (7, 1));
+    }
+
     /// Token and commit timestamps a harness or git wrote are stored in the
     /// canonical form, so `token_totals_since` compares on the index, and
     /// they still read back as plain RFC 3339 for the wire. An empty
@@ -5731,5 +6737,311 @@ mod tests {
         assert_eq!(totals.cache_read, 0);
         assert_eq!(totals.cache_create, 0);
         assert_eq!(totals.est_cost_usd, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+    use dira_contract::{AttestationBatch, Interval};
+
+    fn interval(id: &str, day: &str, secs: u64) -> Interval {
+        Interval {
+            id: id.into(),
+            repo_canonical: Some("github.com/acme/api".into()),
+            identity_email: "e".into(),
+            started_at: format!("{day}T10:00:00Z"),
+            ended_at: format!("{day}T10:30:00Z"),
+            human_seconds: secs,
+            activity: None,
+            source_session: "s".into(),
+            meeting_id: None,
+        }
+    }
+
+    fn batch(intervals: Vec<Interval>) -> AttestationBatch {
+        AttestationBatch {
+            batch_id: "b".into(),
+            device_id: "d".into(),
+            generated_at: "t".into(),
+            seq: 0,
+            prev_batch_hash: String::new(),
+            chain_epoch: 0,
+            client: None,
+            capture_health: None,
+            intervals,
+            sessions: vec![],
+            token_usage: vec![],
+            artifacts: vec![],
+            day_rollups: vec![],
+            meetings: vec![],
+            windows: vec![],
+        }
+    }
+
+    fn today() -> String {
+        OffsetDateTime::now_utc().date().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_day_is_sent_once_per_change_with_a_rising_revision() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        store
+            .record_acked_batch(&batch(vec![
+                span("i1", &day, "10:00:00", "10:01:00", 60),
+                span("i2", &day, "11:00:00", "11:00:30", 30),
+            ]))
+            .await
+            .unwrap();
+        // A re-sent interval replaces itself rather than counting twice.
+        store
+            .record_acked_batch(&batch(vec![span("i1", &day, "10:00:00", "10:01:00", 60)]))
+            .await
+            .unwrap();
+
+        let pending = store.pending_day_rollups(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let d = &pending[0];
+        assert_eq!((d.human_seconds, d.interval_count, d.revision), (90, 2, 0));
+        assert_eq!(d.interval_digest.len(), 64);
+        assert_eq!(d.repo_canonical.as_deref(), Some("github.com/acme/api"));
+
+        let keys = vec![(d.day.clone(), d.repo_canonical.clone())];
+        store.mark_day_rollups_sent(&keys).await.unwrap();
+        assert!(store.pending_day_rollups(10).await.unwrap().is_empty());
+
+        store
+            .record_acked_batch(&batch(vec![span("i3", &day, "12:00:00", "12:00:15", 15)]))
+            .await
+            .unwrap();
+        let again = store.pending_day_rollups(10).await.unwrap();
+        assert_eq!((again[0].human_seconds, again[0].revision), (105, 1));
+    }
+
+    fn span(id: &str, day: &str, from: &str, to: &str, secs: u64) -> Interval {
+        Interval {
+            started_at: format!("{day}T{from}Z"),
+            ended_at: format!("{day}T{to}Z"),
+            ..interval(id, day, secs)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_split_replaces_the_wider_interval_instead_of_adding_to_it() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        store
+            .record_acked_batch(&batch(vec![span(
+                "wide", &day, "10:00:00", "10:04:00", 240,
+            )]))
+            .await
+            .unwrap();
+        // A late signal at 10:02 splits the same gap into two.
+        store
+            .record_acked_batch(&batch(vec![
+                span("a", &day, "10:00:00", "10:02:00", 120),
+                span("b", &day, "10:02:00", "10:04:00", 120),
+            ]))
+            .await
+            .unwrap();
+        let d = &store.pending_day_rollups(10).await.unwrap()[0];
+        assert_eq!((d.human_seconds, d.interval_count), (240, 2));
+    }
+
+    #[tokio::test]
+    async fn sub_second_spans_are_compared_as_times_not_text() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        // As text, "…04:00.1Z" sorts after "…04:00.12Z": the stored interval
+        // would read as overlapping the next one and be deleted.
+        store
+            .record_acked_batch(&batch(vec![span("a", &day, "10:00:00", "10:04:00.1", 240)]))
+            .await
+            .unwrap();
+        store
+            .record_acked_batch(&batch(vec![span(
+                "b",
+                &day,
+                "10:04:00.12",
+                "10:06:00",
+                120,
+            )]))
+            .await
+            .unwrap();
+        let d = &store.pending_day_rollups(10).await.unwrap()[0];
+        assert_eq!((d.human_seconds, d.interval_count), (360, 2));
+    }
+
+    #[tokio::test]
+    async fn an_overlap_from_another_session_also_replaces_the_stale_interval() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        store
+            .record_acked_batch(&batch(vec![span("x", &day, "10:00:00", "10:04:00", 240)]))
+            .await
+            .unwrap();
+        // Human time is de-duplicated across sessions, so a re-derived interval
+        // from another session overlapping a stored one means the stored one is
+        // stale.
+        let mut late = span("y", &day, "10:00:00", "10:04:00", 240);
+        late.source_session = "other".into();
+        store.record_acked_batch(&batch(vec![late])).await.unwrap();
+        let d = &store.pending_day_rollups(10).await.unwrap()[0];
+        assert_eq!((d.human_seconds, d.interval_count), (240, 1));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_moves_repo_marks_the_day_it_left() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        let rollup = |repo: Option<&str>| dira_contract::SessionRollup {
+            session_id: "s".into(),
+            harness: dira_contract::Harness::ClaudeCode,
+            kind: dira_contract::SessionKind::Agent,
+            repo_canonical: repo.map(str::to_string),
+            identity_email: "e".into(),
+            started_at: format!("{day}T09:00:00Z"),
+            ended_at: None,
+            agent_wall_seconds: 60,
+            prompts: Some(1),
+            branch: None,
+            note: None,
+            label: None,
+            runtime: None,
+            runtime_session_ref: None,
+            spec: None,
+            role: None,
+            parent_session: None,
+            repos: None,
+            workspace_ref: None,
+            trigger: None,
+            trigger_name: None,
+            stats: None,
+            workspace_hint: None,
+        };
+        let mut b = batch(vec![]);
+        b.sessions = vec![rollup(None)];
+        store.record_acked_batch(&b).await.unwrap();
+        let first = store.pending_day_rollups(10).await.unwrap();
+        let keys: Vec<_> = first
+            .iter()
+            .map(|d| (d.day.clone(), d.repo_canonical.clone()))
+            .collect();
+        store.mark_day_rollups_sent(&keys).await.unwrap();
+
+        b.sessions = vec![rollup(Some("github.com/acme/api"))];
+        store.record_acked_batch(&b).await.unwrap();
+        let pending = store.pending_day_rollups(10).await.unwrap();
+        let repos: Vec<_> = pending.iter().map(|d| d.repo_canonical.clone()).collect();
+        assert!(
+            repos.contains(&None),
+            "the repo-less day it left is re-sent: {repos:?}"
+        );
+        let left = pending.iter().find(|d| d.repo_canonical.is_none()).unwrap();
+        assert_eq!(left.sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn prune_drops_only_days_past_the_window() {
+        let store = Store::open_in_memory().await.unwrap();
+        let old = (OffsetDateTime::now_utc() - time::Duration::days(60))
+            .date()
+            .to_string();
+        let day = today();
+        store
+            .record_acked_batch(&batch(vec![
+                interval("old", &old, 10),
+                interval("new", &day, 20),
+            ]))
+            .await
+            .unwrap();
+        assert!(store.prune_day_rollups().await.unwrap() > 0);
+        let pending = store.pending_day_rollups(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].day, day);
+    }
+
+    #[tokio::test]
+    async fn a_restated_window_replaces_its_intervals_in_the_day_rollup() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        // Flushed earlier: one 30-minute interval at 10:00 (see `interval`).
+        store
+            .record_acked_batch(&batch(vec![interval("work-1", &day, 1800)]))
+            .await
+            .unwrap();
+        let keys: Vec<_> = store
+            .pending_day_rollups(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.day, d.repo_canonical))
+            .collect();
+        store.mark_day_rollups_sent(&keys).await.unwrap();
+
+        // A meeting restatement over 09:55-10:35 re-decomposes the same minutes
+        // under new ids (work clipped around the meeting).
+        // The slices are disjoint, as the overlay emits them.
+        let mut restated = batch(vec![
+            Interval {
+                id: "meeting-slice".into(),
+                activity: Some("meeting".into()),
+                meeting_id: Some("m1".into()),
+                ended_at: format!("{day}T10:20:00Z"),
+                ..interval("x", &day, 1200)
+            },
+            Interval {
+                started_at: format!("{day}T10:20:00Z"),
+                ..interval("work-2", &day, 600)
+            },
+        ]);
+        restated.windows = vec![dira_contract::BatchWindow {
+            started_at: format!("{day}T09:55:00Z"),
+            ended_at: format!("{day}T10:35:00Z"),
+        }];
+        store.record_acked_batch(&restated).await.unwrap();
+
+        let d = &store.pending_day_rollups(10).await.unwrap()[0];
+        // The old id is gone, not summed next to the new ones.
+        assert_eq!(
+            (d.human_seconds, d.interval_count, d.revision),
+            (1800, 2, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_facts_accumulate_and_count_distinct_files() {
+        let store = Store::open_in_memory().await.unwrap();
+        assert_eq!(store.session_facts("s").await.unwrap(), None);
+        store
+            .record_hook_facts("s", 3, 1, false, Some("aa"))
+            .await
+            .unwrap();
+        store
+            .record_hook_facts("s", 2, 0, false, Some("aa"))
+            .await
+            .unwrap();
+        store
+            .record_hook_facts("s", 0, 0, true, Some("bb"))
+            .await
+            .unwrap();
+        let f = store.session_facts("s").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                f.lines_added,
+                f.lines_removed,
+                f.compactions,
+                f.files_touched
+            ),
+            (5, 1, 1, 2)
+        );
+        let many = store.session_facts_many(&["s", "none"]).await.unwrap();
+        assert_eq!(
+            many.get("s"),
+            Some(&f),
+            "one query agrees with the single lookup"
+        );
+        assert!(!many.contains_key("none"));
     }
 }

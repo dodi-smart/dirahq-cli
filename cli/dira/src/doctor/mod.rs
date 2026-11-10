@@ -134,6 +134,7 @@ pub(crate) const CHECK_IDS: &[&str] = &[
     "hooks.exe_path",
     "hooks.scope_overlap",
     "hook.breadcrumb",
+    "capture.backlog",
     "project.resolves",
     "sync.health",
     "device.link",
@@ -198,11 +199,13 @@ pub(crate) struct Facts {
     /// stays a pure function of already-gathered facts.
     pub cwd: Option<String>,
     pub project: Result<String, dira_core::project::ProjectMiss>,
-    /// Is THIS process elevated? Gathered rather than probed inside a judge:
-    /// the advice for a refused channel differs by it, and a judge that asks
-    /// the OS is a judge whose verdict changes with the host it runs on — which
-    /// is exactly how the Windows arm escapes its own tests.
-    pub doctor_elevated: bool,
+    /// What the control endpoint looks like to THIS process: the windows
+    /// pipe and this token's elevation, or the unix socket file's owner and
+    /// mode against our uid. Gathered rather than probed inside a judge: the
+    /// advice for a refused channel differs by it, and a judge that asks the OS
+    /// is a judge whose verdict changes with the host it runs on — which is
+    /// exactly how the Windows arm escapes its own tests.
+    pub endpoint: dira_ipc::elevation::EndpointAccess,
     /// What the update-check cache knows, and where an update would land.
     pub update: UpdateFacts,
     /// Cloud-runtime facts: detected runtime, provisioning env, committed
@@ -210,6 +213,10 @@ pub(crate) struct Facts {
     pub cloud: checks::CloudFacts,
     /// Spec-framework adoption in the repo doctor was invoked from.
     pub spec_sources: checks::SpecSourceFacts,
+    /// Hooks waiting in the spool for the daemon (DIRASH-0049).
+    pub spooled: usize,
+    /// Ingest chunks the cloud kept rejecting and the daemon stepped past.
+    pub quarantined: usize,
 }
 
 /// Everything the three `update.*` checks judge, gathered up front like the rest.
@@ -278,6 +285,16 @@ async fn gather(config: &Config, args: &Args) -> Facts {
     // Open once and share: `device::probe` and the write proof both need it,
     // and opening `dira.db` twice risks two different answers.
     let store = Store::open(&config.db_path).await;
+    let quarantined = match &store {
+        Ok(s) => s
+            .meta_get(dira_core::sync::META_SYNC_QUARANTINE)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str::<Vec<serde_json::Value>>(&v).ok())
+            .map_or(0, |l| l.len()),
+        Err(_) => 0,
+    };
     let (store_write, device) = match &store {
         // Prove durability rather than assuming it: a `meta` round-trip is one
         // idempotent row, no event data, and it doubles as a record of when
@@ -404,9 +421,11 @@ async fn gather(config: &Config, args: &Args) -> Facts {
         hooks: checks::read_harness_wiring(),
         breadcrumb: crate::hook_health::snapshot(),
         current_exe: Some(crate::init::dira_exe_path()),
-        doctor_elevated: dira_ipc::elevation::is_elevated(),
+        endpoint: dira_ipc::elevation::EndpointAccess::probe(&config.socket_path),
         store_write,
         device,
+        spooled: dira_sources::spool::list(&dira_sources::spool::dir_for(&config.db_path)).len(),
+        quarantined,
     }
 }
 
@@ -492,6 +511,11 @@ pub(crate) fn run_checks(f: &Facts, args: &Args) -> Vec<Check> {
     push(checks::hooks_exe_path(&f.hooks, f.current_exe.as_deref()));
     push(checks::scope_overlap(&f.hooks));
     push(checks::breadcrumb(f.breadcrumb.as_ref()));
+    push(checks::capture_backlog(
+        f.spooled,
+        f.quarantined,
+        f.daemon.info.is_some(),
+    ));
     push(checks::project_resolves(f));
 
     push(match &f.device {

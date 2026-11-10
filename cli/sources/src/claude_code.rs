@@ -65,6 +65,11 @@ pub struct ClaudeHook {
     /// session's host id; never kept.
     #[serde(default)]
     pub tool_response: Option<serde_json::Value>,
+    /// `Notification.notification_type`: `permission_prompt`,
+    /// `elicitation_dialog`, `idle_prompt`, `auth_success`. Absent from older
+    /// Claude Code versions.
+    #[serde(default)]
+    pub notification_type: Option<String>,
     /// Env hints the `dira hook` shim forwarded (the harness never sets this).
     #[serde(default, rename = "dira_env")]
     pub dira_env: Option<DiraEnv>,
@@ -87,9 +92,18 @@ pub fn normalize(hook: &ClaudeHook) -> Option<Normalized> {
         "Stop" | "SubagentStop" => EventKind::Stop,
         "PreToolUse" => EventKind::PreTool,
         "PostToolUse" => EventKind::PostTool,
-        // Notifications are emitted when Claude needs the human (e.g. permission);
-        // treat as a human-attention signal.
-        "PermissionRequest" | "Notification" => EventKind::PermissionDecision,
+        "PermissionRequest" => EventKind::PermissionDecision,
+        // A notification counts only when it asks the person something. Claude
+        // Code also fires it as `idle_prompt` ("waiting for input" after 60 s)
+        // and `auth_success`, and counting those as a human signal and a
+        // permission prompt credited presence and approval wait to nobody. An
+        // older Claude Code that sends no type keeps the old reading.
+        "Notification" => match hook.notification_type.as_deref() {
+            None | Some("permission_prompt") | Some("elicitation_dialog") => {
+                EventKind::PermissionDecision
+            }
+            Some(_) => return None,
+        },
         _ => return None,
     };
     Some(Normalized {
@@ -104,7 +118,63 @@ pub fn normalize(hook: &ClaudeHook) -> Option<Normalized> {
         source: hook.source.clone(),
         reason: hook.reason.clone(),
         hints: Box::new(hints(hook, kind)),
+        facts: Box::new(facts(hook, kind)),
     })
+}
+
+/// Contract 2.0 counts for one hook (DIRASH-0052), read from the tool input
+/// that is then dropped. Only `PreToolUse` is counted, so a call is never
+/// counted twice: lines a file tool adds and removes (an `Edit` replaces
+/// `old_string`'s lines with `new_string`'s), and a hash of the file it names.
+/// A `SessionStart` with `source = compact` is a context compaction.
+fn facts(hook: &ClaudeHook, kind: EventKind) -> crate::HookFacts {
+    let mut f = crate::HookFacts {
+        compaction: kind == EventKind::SessionStart && hook.source.as_deref() == Some("compact"),
+        ..Default::default()
+    };
+    if kind != EventKind::PreTool {
+        return f;
+    }
+    let Some(input) = hook.tool_input.as_ref() else {
+        return f;
+    };
+    let lines = |v: Option<&serde_json::Value>| -> u32 {
+        v.and_then(|s| s.as_str())
+            .map(|s| s.lines().count() as u32)
+            .unwrap_or(0)
+    };
+    match hook.tool_name.as_deref().unwrap_or_default() {
+        "Edit" => {
+            f.lines_removed = lines(input.get("old_string"));
+            f.lines_added = lines(input.get("new_string"));
+        }
+        "MultiEdit" => {
+            for e in input
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .into_iter()
+                .flatten()
+            {
+                f.lines_removed += lines(e.get("old_string"));
+                f.lines_added += lines(e.get("new_string"));
+            }
+        }
+        "Write" => f.lines_added = lines(input.get("content")),
+        "NotebookEdit" => f.lines_added = lines(input.get("new_source")),
+        _ => {}
+    }
+    let path = input
+        .get("file_path")
+        .or_else(|| input.get("notebook_path"))
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.is_empty());
+    f.path_hash = path.map(|p| {
+        format!(
+            "{:016x}",
+            dira_core::sync::fnv1a_bytes(p.as_bytes(), 0xcbf2_9ce4_8422_2325)
+        )
+    });
+    f
 }
 
 /// Orchestration hints for one hook. Evidence is only worth deriving for a
@@ -295,5 +365,99 @@ mod tests {
             *parse(r#"{"hook_event_name":"Stop","session_id":"o"}"#).hints,
             Hints::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::*;
+
+    fn pre(tool: &str, input: serde_json::Value) -> Normalized {
+        ClaudeCodeSource
+            .normalize(serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "s",
+                "tool_name": tool,
+                "tool_input": input,
+            }))
+            .unwrap()
+    }
+
+    #[test]
+    fn counts_edit_lines_and_hashes_the_path_without_keeping_it() {
+        let n = pre(
+            "Edit",
+            serde_json::json!({"file_path": "/w/src/lib.rs", "old_string": "a\nb", "new_string": "a\nb\nc"}),
+        );
+        assert_eq!((n.facts.lines_removed, n.facts.lines_added), (2, 3));
+        let h = n.facts.path_hash.clone().unwrap();
+        assert_eq!(h.len(), 16);
+        assert!(!serde_json::to_string(&n).unwrap().contains("lib.rs"));
+    }
+
+    #[test]
+    fn counts_multiedit_and_write_and_reads_count_as_touched() {
+        let m = pre(
+            "MultiEdit",
+            serde_json::json!({"file_path": "/x", "edits": [
+                {"old_string": "1", "new_string": "1\n2"},
+                {"old_string": "3\n4", "new_string": ""}
+            ]}),
+        );
+        assert_eq!((m.facts.lines_removed, m.facts.lines_added), (3, 2));
+        assert_eq!(
+            pre(
+                "Write",
+                serde_json::json!({"file_path": "/y", "content": "a\nb\n"})
+            )
+            .facts
+            .lines_added,
+            2
+        );
+        let r = pre("Read", serde_json::json!({"file_path": "/y"}));
+        assert_eq!(
+            (r.facts.lines_added, r.facts.path_hash.is_some()),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn a_compact_start_is_a_compaction() {
+        let n = ClaudeCodeSource
+            .normalize(serde_json::json!({
+                "hook_event_name": "SessionStart", "session_id": "s", "source": "compact"
+            }))
+            .unwrap();
+        assert!(n.facts.compaction);
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    fn notification(kind: Option<&str>) -> Option<Normalized> {
+        let mut p = serde_json::json!({"hook_event_name": "Notification", "session_id": "s"});
+        if let Some(k) = kind {
+            p["notification_type"] = k.into();
+        }
+        ClaudeCodeSource.normalize(p)
+    }
+
+    #[test]
+    fn only_a_question_to_the_person_is_a_permission_prompt() {
+        for asks in [Some("permission_prompt"), Some("elicitation_dialog"), None] {
+            assert_eq!(
+                notification(asks).map(|n| n.kind),
+                Some(EventKind::PermissionDecision),
+                "{asks:?}"
+            );
+        }
+        for idle in ["idle_prompt", "auth_success"] {
+            assert!(
+                notification(Some(idle)).is_none(),
+                "{idle} asks nobody anything"
+            );
+        }
     }
 }

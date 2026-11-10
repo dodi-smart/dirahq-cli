@@ -18,8 +18,10 @@
 //! real daemon (bind a socket, drive `Ping`/`Status`) against the same code the
 //! binary runs.
 
+pub mod autoupdate;
 pub mod billing;
 pub mod capture;
+pub mod chain;
 pub mod control;
 pub mod events;
 pub mod heartbeat;
@@ -27,7 +29,11 @@ pub mod http;
 pub mod jitter;
 pub mod knowledge_sync;
 pub mod logfile;
+pub mod meeting_sync;
+pub mod meetings;
 pub mod probe;
+pub mod quarantine;
+pub mod spool;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
@@ -389,6 +395,10 @@ pub async fn run() -> anyhow::Result<()> {
     let sock = config.socket_path.clone();
     let (listener, _socket_lock) = bind_control_socket(&sock).await?;
     tracing::info!(sock = %sock.display(), "control socket ready");
+    // Only now, holding the single-instance guard, does this process own the
+    // pidfile. A supervised daemon (launchd, systemd, the logon task, the Run
+    // key) had none before, so `dira daemon stop`/`restart` could not find it.
+    let _pidfile = PidfileGuard::write(config.pidfile_path());
 
     let store = Store::open(&config.db_path).await?;
     let (state, rx, sync_rx, knowledge_rx) = build_state(store, config).await?;
@@ -422,6 +432,12 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::warn!("{w}");
     }
     *control::lock_recover(&state.control_channel_warning) = control_warning;
+
+    // Accept on the control channel now, not after the background setup below.
+    // Hooks that arrived during that window used to wait on the single pending
+    // pipe instance, time out after 1-2 s and be dropped. The writer queue
+    // buffers them until the supervisor starts the writer a moment later.
+    serve_control(state.clone(), listener);
 
     // HTTP ingress (loopback only). Survivable: a conflict leaves the daemon up
     // and degraded, retrying in the background.
@@ -476,7 +492,12 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    serve_control(state.clone(), listener);
+    // Replay hooks spooled while this daemon was down, busy or full.
+    spool::spawn_drain(state.clone());
+    // Keep the clock for background updates; the CLI does the work.
+    autoupdate::spawn(state.clone());
+    // Bot-less meeting detection, only when the person opted in (DIRASH-0060).
+    meetings::spawn(state.clone());
 
     // Block until shutdown. The accept loop runs detached in `serve_control`.
     wait_for_shutdown_signal(&state, &mut shutdown_signals).await;
@@ -826,6 +847,11 @@ pub async fn maintenance_sweep(
 ) -> SweepOutcome {
     let mut outcome = SweepOutcome::default();
 
+    // Contract 2.0 day-rollup state older than its 40-day window (DIRASH-0052).
+    if let Err(e) = state.store.prune_day_rollups().await {
+        tracing::debug!("day-rollup prune failed: {e}");
+    }
+
     // See the startup sweep in `run` for why this is hygiene rather than
     // containment.
     match state.store.delete_probe_events().await {
@@ -907,6 +933,34 @@ pub async fn resolve_bearer(store: &Store) -> anyhow::Result<String> {
     let token = Ulid::generate().to_string();
     store.meta_set("bearer", &token).await?;
     Ok(token)
+}
+
+/// The daemon's own pidfile, written after the control-channel bind and removed
+/// on the way out only if it still names this process (a replacement that bound
+/// after us owns it then).
+struct PidfileGuard(std::path::PathBuf);
+
+impl PidfileGuard {
+    fn write(path: std::path::PathBuf) -> Self {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&path, std::process::id().to_string()) {
+            tracing::warn!(path = %path.display(), "could not write the pidfile: {e}");
+        }
+        Self(path)
+    }
+}
+
+impl Drop for PidfileGuard {
+    fn drop(&mut self) {
+        let ours = std::fs::read_to_string(&self.0)
+            .map(|s| s.trim() == std::process::id().to_string())
+            .unwrap_or(false);
+        if ours {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 }
 
 #[cfg(test)]

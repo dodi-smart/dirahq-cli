@@ -34,24 +34,20 @@ fn pidfile_beside(sock: &Path) -> PathBuf {
 /// file name carries the endpoint identity: two daemons (or two tests) with
 /// distinct pipe endpoints must not fight over a single dirad.pid.
 fn pidfile(config: &Config) -> PathBuf {
-    #[cfg(unix)]
-    {
-        pidfile_beside(&config.socket_path)
-    }
-    #[cfg(windows)]
-    {
-        let stem = config
-            .socket_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("dira");
-        let sanitized = dira_core::config::sanitize_ident(stem);
-        config.runtime_dir().join(format!("dirad-{sanitized}.pid"))
-    }
+    // One definition, shared with `dirad`, which now writes this file itself
+    // once it holds the single-instance guard.
+    config.pidfile_path()
 }
 
+/// The Windows scheduled task, launchd label and systemd unit `install`
+/// registers. One spelling, shared by install, detection, restart and the hook
+/// shim's autostart, so they can never disagree about what is registered.
+pub(crate) const TASK_NAME: &str = "DiraDaemon";
+pub(crate) const LAUNCHD_LABEL: &str = "sh.dirahq.dirad";
+pub(crate) const SYSTEMD_UNIT: &str = "dirad.service";
+
 /// Locate the `dirad` binary: `DIRAD_BIN`, else a sibling of this exe, else PATH.
-fn locate_dirad() -> PathBuf {
+pub(crate) fn locate_dirad() -> PathBuf {
     if let Ok(p) = std::env::var("DIRAD_BIN") {
         return PathBuf::from(p);
     }
@@ -149,51 +145,19 @@ pub async fn start(config: &Config) -> Result<()> {
     if reach(config).await == client::Reach::Denied {
         anyhow::bail!(
             "{}",
-            dira_ipc::elevation::access_denied_advice(dira_ipc::elevation::is_elevated())
+            dira_ipc::elevation::EndpointAccess::probe(&config.socket_path).denied_advice()
         );
     }
     let bin = locate_dirad();
     println!("starting {} ...", bin.display());
-    let mut cmd = Command::new(&bin);
-    cmd.stdin(std::process::Stdio::null());
     // A daemon that dies *before* `tracing` initialises — a config parse error, a
-    // missing DLL, a panic in startup — writes to stderr and nothing else. Nulling
-    // it meant those failures left no trace on any platform. Truncate per start so
-    // this stays bounded to one process's output.
-    match spawn_log(config) {
-        Some(f) => {
-            let dup = f.try_clone().ok();
-            cmd.stderr(std::process::Stdio::from(f));
-            match dup {
-                Some(d) => cmd.stdout(std::process::Stdio::from(d)),
-                None => cmd.stdout(std::process::Stdio::null()),
-            };
-        }
-        None => {
-            cmd.stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW (0x0800_0000): suppresses the console-flash that would
-        // otherwise briefly appear for this stdio-nulled child. NOT
-        // DETACHED_PROCESS (0x0000_0008) — the Win32 docs call the two mutually
-        // exclusive, and DETACHED_PROCESS is the one that actually conflicts here
-        // since it also detaches stdio, which this spawn already does explicitly.
-        // CREATE_NEW_PROCESS_GROUP (0x0000_0200): puts dirad in its own process
-        // group so a Ctrl-C/Ctrl-Break delivered to the parent console (e.g. the
-        // terminal `dira daemon start` was run from) doesn't propagate to it.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", bin.display()))?;
+    // missing DLL, a panic in startup — writes to stderr and nothing else, so its
+    // output goes to a per-start log where one resolves. Windowless, its own
+    // process group, never holding our stdout (see
+    // `dira_core::process::spawn_background`).
+    let mut child =
+        dira_core::process::spawn_background(&mut Command::new(&bin), spawn_log(config), 0)
+            .with_context(|| format!("failed to spawn {}", bin.display()))?;
 
     // The pidfile is written only once the child has proven itself (below), never
     // here. Writing it up front meant a start that failed — the common case when
@@ -333,15 +297,73 @@ async fn graceful_then_force(
     .await
 }
 
+/// Stop the daemon the way whatever runs it expects.
+///
+/// `dirad` writes its own pidfile now, so a supervised daemon has one too, and a
+/// plain pid kill under launchd (`KeepAlive`) or systemd (`Restart=always`)
+/// would only be undone by the supervisor. Those are stopped through the
+/// supervisor instead, until the next login. A windows task- or Run-key daemon
+/// has no supervisor to ask, so it gets the confirmed-exit stop (D-0019).
 pub async fn stop(config: &Config) -> Result<()> {
-    stop_with(
-        config,
-        &SystemRunner,
-        current_os(),
-        STOP_GRACE_ATTEMPTS,
-        STOP_GRACE_INTERVAL,
-    )
-    .await
+    let runner = SystemRunner;
+    let os = current_os();
+    match detect_supervision(config).await {
+        Supervision::Launchd => stop_launchd(&runner),
+        Supervision::SystemdUser => {
+            let ok = runner
+                .run("systemctl", &["--user", "stop", "dirad.service"])
+                .is_some_and(|o| o.status.success());
+            if !ok {
+                anyhow::bail!(
+                    "could not stop the systemd-user unit — run this yourself:\n  \
+                     systemctl --user stop dirad.service"
+                );
+            }
+            println!("stopped dirad (systemctl --user stop dirad.service)");
+            Ok(())
+        }
+        Supervision::ScheduledTask | Supervision::RunKey => {
+            stop_windows_confirmed(
+                config,
+                &runner,
+                STOP_GRACE_ATTEMPTS,
+                STOP_GRACE_INTERVAL,
+                "dira daemon start",
+            )
+            .await?;
+            std::fs::remove_file(pidfile(config)).ok();
+            println!("stopped dirad");
+            Ok(())
+        }
+        _ => {
+            stop_with(
+                config,
+                &runner,
+                os,
+                STOP_GRACE_ATTEMPTS,
+                STOP_GRACE_INTERVAL,
+            )
+            .await
+        }
+    }
+}
+
+/// `launchctl unload` the agent: it stops the daemon and keeps launchd from
+/// respawning it until the agent is loaded again (next login, or
+/// `dira daemon start`/`install`).
+fn stop_launchd(runner: &dyn Runner) -> Result<()> {
+    let plist = dira_core::config::home_dir()?.join("Library/LaunchAgents/sh.dirahq.dirad.plist");
+    let plist = plist.to_string_lossy();
+    let ok = runner
+        .run("launchctl", &["unload", plist.as_ref()])
+        .is_some_and(|o| o.status.success());
+    if !ok {
+        anyhow::bail!(
+            "could not unload the launchd agent — run this yourself:\n  launchctl unload {plist}"
+        );
+    }
+    println!("stopped dirad (launchd agent unloaded until next login)");
+    Ok(())
 }
 
 /// `attempts`/`interval` are parameters for the same reason `restart_*` take
@@ -448,9 +470,6 @@ async fn legacy_daemon_socket(config: &Config, legacy: &Path) -> Option<PathBuf>
     answers(legacy).await.then(|| legacy.to_path_buf())
 }
 
-/// The `dirad: up` line. A daemon whose hook ingress failed to bind answers
-/// every control request but captures nothing, so it is reported as **degraded**
-/// with the reason rather than as a healthy "up" (D-0009).
 /// A warning when `dira` and `dirad` resolved DIFFERENT capture stores.
 ///
 /// Neither process can see this alone. `project_dirs()` succeeds on both sides;
@@ -476,6 +495,9 @@ pub(crate) fn store_divergence_line(cli_db: &Path, daemon_db: Option<&str>) -> O
     ))
 }
 
+/// The `dirad: up` line. A daemon whose hook ingress failed to bind answers
+/// every control request but captures nothing, so it is reported as **degraded**
+/// with the reason rather than as a healthy "up" (D-0009).
 fn up_message(sock: &std::path::Path, ingress_error: Option<&str>) -> String {
     match ingress_error {
         None => format!("dirad: up  (socket {})", sock.display()),
@@ -492,15 +514,19 @@ fn up_message(sock: &std::path::Path, ingress_error: Option<&str>) -> String {
 /// Mirrors `Response::DaemonInfo` field for field so callers never have to
 /// re-send: `dira version`, `dira daemon status` and four `dira doctor` checks
 /// all read from one probe.
-#[derive(Debug, Clone)]
+///
+/// Serialized as-is for the `daemon` object of `dira daemon status --json` and
+/// `dira version --json`, so a field name here IS a JSON key: renaming one is a
+/// breaking change for scripts (additive-only, like `dira doctor --json`).
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Info {
     pub version: String,
     pub schema_version: String,
     pub pid: u32,
     pub uptime_seconds: u64,
+    pub db_path: Option<String>,
     pub http_ingress_error: Option<String>,
     pub control_channel_warning: Option<String>,
-    pub db_path: Option<String>,
     pub storage_warning: Option<String>,
 }
 
@@ -538,21 +564,95 @@ pub(crate) struct DaemonProbe {
     pub legacy: Option<PathBuf>,
 }
 
+/// How the daemon answered one [`DaemonProbe`], classified once.
+///
+/// The single source [`DaemonProbe::running`] (the exit code install.sh keys
+/// off), [`daemon_state`] (the `--json` word) and [`DaemonProbe::status_line`]
+/// (the text) all derive from, so the three cannot drift apart.
+///
+/// `Denied` and `Busy` are kept apart from `Down` for the same reason
+/// [`client::Reach`] is: a daemon that is running and refusing us is the
+/// opposite of one that is absent (D-0016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonState {
+    /// Answered `DaemonInfo`, or `Ping` (too old for `DaemonInfo`).
+    Up,
+    /// Answered `DaemonInfo` with something that was not a `DaemonInfo`.
+    Unexpected,
+    /// The configured socket is silent but a pre-D-0008 daemon answers on the
+    /// legacy one.
+    Legacy,
+    /// The control endpoint refused us.
+    Denied,
+    /// The control endpoint is there but did not take the connection.
+    Busy,
+    /// Nothing answered.
+    Down,
+}
+
+impl DaemonState {
+    /// The stable word both `--json` shapes report.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Unexpected => "unexpected",
+            Self::Legacy => "legacy",
+            Self::Denied => "denied",
+            Self::Busy => "busy",
+            Self::Down => "down",
+        }
+    }
+
+    /// A daemon is running somewhere — healthy, degraded, confused, or still
+    /// on the legacy socket. See [`status`] for why "legacy" counts.
+    fn is_running(self) -> bool {
+        matches!(self, Self::Up | Self::Unexpected | Self::Legacy)
+    }
+}
+
 impl DaemonProbe {
+    /// The one classification of this probe; see [`DaemonState`].
+    pub(crate) fn state(&self) -> DaemonState {
+        if self.unexpected {
+            return DaemonState::Unexpected;
+        }
+        if self.info.is_some() || self.answered_ping {
+            return DaemonState::Up;
+        }
+        if self.legacy.is_some() {
+            return DaemonState::Legacy;
+        }
+        match self.reach {
+            client::Reach::Denied => DaemonState::Denied,
+            client::Reach::Busy => DaemonState::Busy,
+            client::Reach::Up | client::Reach::Down | client::Reach::Other => DaemonState::Down,
+        }
+    }
+
     /// The `dira daemon status` line, unchanged from when `status_with` built
     /// it inline.
+    ///
+    /// Coarser than [`DaemonState`] on purpose (the text predates it): every
+    /// not-running state prints the `dirad: down` line, with the legacy-socket
+    /// hint when there is one, while `--json` names `legacy`/`denied`/`busy`.
     pub(crate) fn status_line(&self, sock: &Path) -> String {
-        match (&self.info, self.answered_ping) {
-            (Some(i), _) => up_message(sock, i.http_ingress_error.as_deref()),
-            (None, true) => up_message(sock, None),
-            (None, false) => down_message(self.legacy.as_deref()),
+        match self.state() {
+            DaemonState::Up | DaemonState::Unexpected => up_message(
+                sock,
+                self.info
+                    .as_ref()
+                    .and_then(|i| i.http_ingress_error.as_deref()),
+            ),
+            DaemonState::Legacy | DaemonState::Denied | DaemonState::Busy | DaemonState::Down => {
+                down_message(self.legacy.as_deref())
+            }
         }
     }
 
     /// `true` iff a daemon is running somewhere — see [`status`] for why
     /// "legacy" counts.
     pub(crate) fn running(&self) -> bool {
-        self.info.is_some() || self.answered_ping || self.legacy.is_some()
+        self.state().is_running()
     }
 }
 
@@ -653,6 +753,7 @@ pub(crate) fn supervision_label(s: &Supervision) -> Option<String> {
         Supervision::Launchd => "launchd".to_string(),
         Supervision::SystemdUser => "systemd --user".to_string(),
         Supervision::ScheduledTask => "scheduled task".to_string(),
+        Supervision::RunKey => "Run key (starts at logon)".to_string(),
         Supervision::Pidfile(pid) => format!("pidfile (pid {pid})"),
         Supervision::Socket(pid) => format!("unmanaged (pid {pid}, no pidfile)"),
         Supervision::LegacySocket { pid, sock } => format!(
@@ -680,6 +781,112 @@ async fn status_with(config: &Config, legacy_sock: &Path) -> Result<bool> {
     Ok(probe.running())
 }
 
+/// `dira daemon status --json`: [`status_json`] as one object on stdout.
+/// Returns [`DaemonProbe::running`], so the exit code contract install.sh keys
+/// off is the same in both modes.
+pub async fn status_json_print(config: &Config) -> Result<bool> {
+    let probe = probe(config).await;
+    let supervision = detect_supervision(config).await;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status_json(&probe, &config.socket_path, &supervision))?
+    );
+    Ok(probe.running())
+}
+
+/// `dira version --json`: [`version_json`] as one object on stdout.
+pub async fn version_json_print(config: &Config) -> Result<()> {
+    let probe = probe(config).await;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&version_json(
+            env!("CARGO_PKG_VERSION"),
+            dira_contract::SCHEMA_VERSION,
+            &probe,
+            &config.db_path,
+        ))?
+    );
+    Ok(())
+}
+
+/// One word for how the daemon answered, shared by both `--json` shapes:
+/// [`DaemonProbe::state`] as its stable string.
+pub(crate) fn daemon_state(p: &DaemonProbe) -> &'static str {
+    p.state().as_str()
+}
+
+/// The machine-readable kind of a supervision state (the human form is
+/// [`supervision_label`]).
+pub(crate) fn supervision_kind(s: &Supervision) -> &'static str {
+    match s {
+        Supervision::Launchd => "launchd",
+        Supervision::SystemdUser => "systemd_user",
+        Supervision::ScheduledTask => "scheduled_task",
+        Supervision::RunKey => "run_key",
+        Supervision::Pidfile(_) => "pidfile",
+        Supervision::Socket(_) => "socket",
+        Supervision::LegacySocket { .. } => "legacy_socket",
+        Supervision::NotRunning => "not_running",
+    }
+}
+
+/// The daemon's self-report as JSON, or `null` when it did not answer
+/// `DaemonInfo`.
+fn info_json(i: Option<&Info>) -> serde_json::Value {
+    // `Option<&Info>` serializes `None` as `null`; a plain-data struct cannot
+    // fail to serialize, so the fallback is unreachable in practice.
+    serde_json::to_value(i).unwrap_or(serde_json::Value::Null)
+}
+
+/// `dira daemon status --json`. Pure so the shape is pinned by a test.
+/// Additive-only, like `dira doctor --json`: new keys are free, renames are
+/// breaking.
+pub(crate) fn status_json(
+    p: &DaemonProbe,
+    sock: &Path,
+    supervision: &Supervision,
+) -> serde_json::Value {
+    serde_json::json!({
+        "running": p.running(),
+        "state": daemon_state(p),
+        "degraded": p.info.as_ref().is_some_and(|i| i.http_ingress_error.is_some()),
+        "socket": sock.display().to_string(),
+        "legacy_socket": p.legacy.as_ref().map(|l| l.display().to_string()),
+        "supervision": supervision_kind(supervision),
+        "supervision_label": supervision_label(supervision),
+        "daemon": info_json(p.info.as_ref()),
+    })
+}
+
+/// `dira version --json`. Pure so the shape is pinned by a test.
+///
+/// `version_skew` and `store_divergence` are the same comparisons the text
+/// form prints as warnings; both are `false`/`null` when the daemon is too
+/// old (or too absent) to say, because an unknown is not a finding.
+pub(crate) fn version_json(
+    cli: &str,
+    schema: &str,
+    p: &DaemonProbe,
+    cli_db: &Path,
+) -> serde_json::Value {
+    let info = p.info.as_ref();
+    serde_json::json!({
+        "version": cli,
+        "schema_version": schema,
+        "daemon_state": daemon_state(p),
+        "daemon": info_json(info),
+        "legacy_socket": p.legacy.as_ref().map(|l| l.display().to_string()),
+        "version_skew": info.is_some_and(|i| version_skew_line(cli, &i.version).is_some()),
+        "store_divergence": info
+            .and_then(|i| i.db_path.as_deref())
+            .filter(|d| store_divergence_line(cli_db, Some(d)).is_some())
+            .map(|d| serde_json::json!({
+                "cli_db_path": cli_db.display().to_string(),
+                "daemon_db_path": d,
+            })),
+    })
+}
+
 /// Write and load an OS service so the daemon survives reboots.
 ///
 /// Stops an unmanaged daemon first, and waits for it to actually exit.
@@ -699,8 +906,10 @@ async fn status_with(config: &Config, legacy_sock: &Path) -> Result<bool> {
 /// best-effort `dira daemon stop` only because they may be driving an older
 /// binary that lacks this.
 ///
-/// A daemon under a service manager already is left alone: stopping it would
-/// just make its supervisor restart it mid-install.
+/// A daemon under launchd or systemd is left alone: stopping it would just make
+/// its supervisor restart it mid-install, and re-registering restarts it anyway.
+/// On windows a task- or Run-key-launched daemon is stopped first, because
+/// re-registering does not replace it.
 pub async fn install(config: &Config) -> Result<()> {
     install_with_supervision(config, detect_supervision(config).await).await
 }
@@ -721,7 +930,23 @@ pub async fn install_with_supervision(config: &Config, supervision: Supervision)
         STOP_GRACE_INTERVAL,
     )
     .await?;
-    install_service(config)
+    if install_service(config)? == Launch::NeedsStart {
+        start(config).await?;
+        return Ok(());
+    }
+    // The service manager starts it asynchronously (`schtasks /Run`,
+    // `launchctl load`, `systemctl restart`). Wait briefly so the installer's
+    // next step, or the user's next command, finds it answering; a slow start
+    // is reported, never an error.
+    for _ in 0..100 {
+        if is_up(config).await {
+            println!("dirad is running");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    println!("dirad has not answered yet; check `dira daemon status` in a moment");
+    Ok(())
 }
 
 /// Stop a bare-started daemon so [`install`] can bind the control socket.
@@ -747,6 +972,21 @@ async fn stop_unmanaged_before_install(
     // `supervision` is a parameter rather than probed here so the three arms are
     // unit-testable without a live daemon, the same seam `restart_*` already use
     // for their grace budgets.
+    // Windows is the exception. Re-registering the task (`IgnoreNew`) or the Run
+    // key neither stops nor replaces a daemon that is already running, so a
+    // reinstall over a live one kept the old binary's process running, and with
+    // the Run key nothing would restart it either. Stop it (confirmed exit,
+    // D-0019) so the fresh registration starts the new binary.
+    if os == Os::Windows
+        && matches!(
+            supervision,
+            Supervision::ScheduledTask | Supervision::RunKey
+        )
+    {
+        return stop_windows_confirmed(config, runner, attempts, interval, "dira daemon install")
+            .await
+            .context("could not stop the running daemon before re-registering it");
+    }
     let running_unmanaged = matches!(
         supervision,
         Supervision::Pidfile(_) | Supervision::Socket(_) | Supervision::LegacySocket { .. }
@@ -761,7 +1001,7 @@ async fn stop_unmanaged_before_install(
 }
 
 /// The service-manager half of [`install`], with no daemon handling of its own.
-fn install_service(config: &Config) -> Result<()> {
+fn install_service(config: &Config) -> Result<Launch> {
     let bin = locate_dirad();
     // `dunce::canonicalize` behaves exactly like `std::fs::canonicalize` on
     // unix, but on windows it strips the `\\?\` verbatim-prefix windows'
@@ -811,7 +1051,7 @@ fn install_service(config: &Config) -> Result<()> {
         std::fs::create_dir_all(&dir)?;
         let unit_path = dir.join("dirad.service");
         let unit = format!(
-            "[Unit]\nDescription=Dira capture daemon\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={bin}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Dira capture daemon\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={bin}\nRestart=always\nRestartSec=3\n# Stopping the unit stops dirad only: the background updater it spawns\n# restarts this unit and must survive that (DIRASH-0050).\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
             bin = bin.display(),
         );
         std::fs::write(&unit_path, unit)?;
@@ -819,96 +1059,221 @@ fn install_service(config: &Config) -> Result<()> {
             .args(["--user", "daemon-reload"])
             .status();
         Command::new("systemctl")
-            .args(["--user", "enable", "--now", "dirad.service"])
+            .args(["--user", "enable", "dirad.service"])
+            .status()?;
+        // `restart`, not `enable --now`: `--now` is a no-op for a unit that is
+        // already running, so a reinstall over a live daemon kept the old
+        // binary's process. `restart` starts a stopped unit too.
+        Command::new("systemctl")
+            .args(["--user", "restart", "dirad.service"])
             .status()?;
         println!("installed systemd-user unit at {}", unit_path.display());
         let _ = config;
     }
 
     #[cfg(target_os = "windows")]
-    {
+    let launch = {
         let bin_str = bin
             .to_str()
             .context("dirad's install path must be valid UTF-8")?;
-        // `schtasks /TR` parses its value as a single command-line string and
-        // splits it on the first unquoted space — so a path containing spaces
-        // must carry its OWN embedded quotes as part of the value, not just be
-        // shell-quoted at this process's argv boundary (that only protects the
-        // value from *our* argv splitting, not schtasks' own parsing of the
-        // string it receives). Hence wrapping the value itself in literal `"`s:
-        // the /TR argument's *content* becomes `"C:\path with space\dirad.exe"`.
-        let quoted = format!("\"{bin_str}\"");
-
-        let created = Command::new("schtasks")
-            .args([
-                "/Create",
-                "/F",
-                "/TN",
-                "DiraDaemon",
-                "/SC",
-                "ONLOGON",
-                "/RL",
-                "LIMITED",
-                "/TR",
-                quoted.as_str(),
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if created {
-            // Start-now parity with the launchd/systemd blocks above (both
-            // `launchctl load` and `systemctl enable --now` bring the daemon up
-            // immediately, not just at the next login).
-            let _ = Command::new("schtasks")
-                .args(["/Run", "/TN", "DiraDaemon"])
-                .status();
-            println!("installed scheduled task DiraDaemon");
-        } else {
-            // Known gap: an ONLOGON task can require elevation on hardened or
-            // managed machines (Group Policy restricting non-admin task
-            // registration). Any user can write their own HKCU hive without
-            // elevation, so fall back to a Run key with the same "launch dirad
-            // at logon" effect. UNVALIDATED ON REAL WINDOWS — this fallback must
-            // be exercised on an actual machine before public launch; the
-            // windows CI job that gates this code has no way to simulate a
-            // restricted-elevation account.
-            println!(
-                "schtasks /Create failed (may require elevation) — falling back to an HKCU Run key"
-            );
-            let reg_ok = Command::new("reg")
-                .args([
-                    "add",
-                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                    "/v",
-                    "DiraDaemon",
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    quoted.as_str(),
-                    "/f",
-                ])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if reg_ok {
-                println!("installed HKCU Run key DiraDaemon");
-            } else {
-                anyhow::bail!(
-                    "could not install DiraDaemon via schtasks or the HKCU Run key fallback"
-                );
-            }
-        }
-
-        // Known gap: neither a logon task nor a Run key resupervises a crashed
-        // daemon the way launchd's KeepAlive or systemd's Restart=always do —
-        // both only launch dirad once, at logon. Follow-up: a task-XML
-        // definition with <RestartOnFailure> (the flat schtasks CLI form can't
-        // express it).
         let _ = config;
+        install_windows(bin_str)?
+    };
+    #[cfg(not(target_os = "windows"))]
+    let launch = Launch::Started;
+    Ok(launch)
+}
+
+/// What [`install_service`] left running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    /// The service manager started (or will start) the daemon itself.
+    Started,
+    /// Registered, but nothing launches it until the next logon (the HKCU Run
+    /// key). The caller must start it now.
+    NeedsStart,
+}
+
+/// Register the per-user logon launch on windows: a scheduled task defined by
+/// [`logon_task_xml`], else the HKCU Run key. Neither needs elevation.
+///
+/// The old `schtasks /SC ONLOGON` form registers a trigger for *any* user, which
+/// needs admin, so on a standard account it always fell through to the Run key.
+/// The XML form names the current user in the trigger and the principal, which a
+/// standard user may register for themselves. It also sets what the flat form
+/// cannot: start on battery and keep running when unplugged, no 72 h execution
+/// limit, and restart on failure.
+#[cfg(target_os = "windows")]
+fn install_windows(bin: &str) -> Result<Launch> {
+    let user = windows_user();
+    let xml = logon_task_xml(bin, user.as_deref());
+    let xml_path = std::env::temp_dir().join(format!("dira-task-{}.xml", std::process::id()));
+    std::fs::write(&xml_path, utf16le_with_bom(&xml))
+        .with_context(|| format!("could not write {}", xml_path.display()))?;
+    let created = dira_core::process::command("schtasks")
+        .args(["/Create", "/F", "/TN", "DiraDaemon", "/XML"])
+        .arg(&xml_path)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    std::fs::remove_file(&xml_path).ok();
+
+    if created {
+        // A task supersedes any earlier Run key, which would otherwise launch a
+        // second daemon at logon (it loses the pipe bind and exits, but noisily).
+        let _ = delete_run_key();
+        let _ = dira_core::process::command("schtasks")
+            .args(["/Run", "/TN", "DiraDaemon"])
+            .stdout(std::process::Stdio::null())
+            .status();
+        println!("installed scheduled task DiraDaemon (starts at logon, restarts on failure)");
+        return Ok(Launch::Started);
     }
 
-    Ok(())
+    println!("could not register the scheduled task — using an HKCU Run key instead");
+    let quoted = format!("\"{bin}\"");
+    let reg_ok = dira_core::process::command("reg")
+        .args([
+            "add",
+            RUN_KEY,
+            "/v",
+            "DiraDaemon",
+            "/t",
+            "REG_SZ",
+            "/d",
+            quoted.as_str(),
+            "/f",
+        ])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !reg_ok {
+        anyhow::bail!("could not install DiraDaemon via schtasks or the HKCU Run key fallback");
+    }
+    println!("installed HKCU Run key DiraDaemon (starts at logon)");
+    Ok(Launch::NeedsStart)
+}
+
+/// The per-user Run key the fallback writes.
+#[cfg_attr(not(windows), allow(dead_code))]
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+#[cfg(target_os = "windows")]
+fn delete_run_key() -> bool {
+    dira_core::process::command("reg")
+        .args(["delete", RUN_KEY, "/v", "DiraDaemon", "/f"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `DOMAIN\user` for the task's trigger and principal, from the environment.
+#[cfg(target_os = "windows")]
+fn windows_user() -> Option<String> {
+    let user = std::env::var("USERNAME").ok().filter(|u| !u.is_empty())?;
+    Some(match std::env::var("USERDOMAIN") {
+        Ok(d) if !d.is_empty() => format!("{d}\\{user}"),
+        _ => user,
+    })
+}
+
+/// The `DiraDaemon` task definition. Pure, so the exact XML is golden-tested on
+/// every platform.
+///
+/// - The logon trigger and the principal both name `user`. That is what lets a
+///   standard user register it; without a `UserId` the trigger means "any user"
+///   and needs admin. `None` (no `USERNAME`) leaves both out and lets schtasks
+///   refuse, which falls through to the Run key.
+/// - `InteractiveToken` + `LeastPrivilege`: runs only while the user is logged
+///   on, unelevated (D-0016: an elevated daemon is the broken combination).
+/// - Battery: start on battery and keep running when unplugged. The defaults
+///   skipped the logon start on a laptop on battery and killed the daemon on
+///   unplug.
+/// - `ExecutionTimeLimit` `PT0S`: no limit. The default killed it after 72 h.
+/// - `RestartOnFailure`: every minute, effectively forever, so a crash is
+///   resupervised the way launchd's `KeepAlive` and systemd's `Restart=always`
+///   are.
+/// - `IgnoreNew`: a second start while one runs is a no-op.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn logon_task_xml(dirad: &str, user: Option<&str>) -> String {
+    let user_id = user
+        .map(|u| format!("<UserId>{}</UserId>", xml_escape(u)))
+        .unwrap_or_default();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Dira</Author>
+    <Description>Dira capture daemon (dirad). Per-user, runs unelevated while you are logged on.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      {user_id}
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      {user_id}
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        command = xml_escape(dirad),
+    )
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// schtasks reads a task file as UTF-16 when it carries a BOM, which is the one
+/// encoding every Windows version accepts for `/XML`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn utf16le_with_bom(s: &str) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFE];
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
 }
 
 /// Remove whatever [`install`] set up: the launchd agent, the systemd-user
@@ -917,7 +1282,30 @@ fn install_service(config: &Config) -> Result<()> {
 /// succeeded, and a caller can't know which, so uninstall sweeps both,
 /// best-effort. Does NOT stop a bare (unsupervised) daemon — that's [`stop`]'s
 /// job, and installers call it separately before this.
-pub fn uninstall(config: &Config) -> Result<()> {
+pub async fn uninstall(config: &Config) -> Result<()> {
+    // A task- or Run-key-launched daemon outlives its registration otherwise:
+    // `/End` only ends a task instance, and nothing ends a Run-key process.
+    #[cfg(target_os = "windows")]
+    if matches!(
+        detect_supervision(config).await,
+        Supervision::ScheduledTask | Supervision::RunKey
+    ) {
+        if let Err(e) = stop_windows_confirmed(
+            config,
+            &SystemRunner,
+            STOP_GRACE_ATTEMPTS,
+            STOP_GRACE_INTERVAL,
+            "dira daemon uninstall",
+        )
+        .await
+        {
+            eprintln!("warning: {e:#}");
+        }
+    }
+    uninstall_registration(config)
+}
+
+fn uninstall_registration(config: &Config) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let plist_path =
@@ -957,25 +1345,20 @@ pub fn uninstall(config: &Config) -> Result<()> {
         // `/End` first so a task-launched dirad isn't left running headless
         // after its task disappears; both steps best-effort — an absent task
         // or key is success, not an error.
-        let _ = Command::new("schtasks")
-            .args(["/End", "/TN", "DiraDaemon"])
-            .status();
-        let task_gone = Command::new("schtasks")
-            .args(["/Delete", "/F", "/TN", "DiraDaemon"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        let key_gone = Command::new("reg")
-            .args([
-                "delete",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "DiraDaemon",
-                "/f",
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // Quiet: an absent task is the common case after a Run-key install, and
+        // schtasks' own "cannot find the file" read like a failed uninstall.
+        let quiet = |args: &[&str]| {
+            dira_core::process::command("schtasks")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let _ = quiet(&["/End", "/TN", "DiraDaemon"]);
+        let task_gone = quiet(&["/Delete", "/F", "/TN", "DiraDaemon"]);
+        let key_gone = delete_run_key();
         match (task_gone, key_gone) {
             (true, _) => println!("removed scheduled task DiraDaemon"),
             (false, true) => println!("removed HKCU Run key DiraDaemon"),
@@ -1003,12 +1386,16 @@ pub enum Supervision {
     Launchd,
     /// A systemd --user unit (`dirad.service`) is active.
     SystemdUser,
-    /// A windows scheduled task (`DiraDaemon`, `ONLOGON`) is registered
-    /// (`schtasks /Query` exits 0), or — if `install` fell back to it because
-    /// task creation needed elevation it didn't have — the HKCU Run-key
-    /// equivalent is present (`reg query` exits 0). Both are restarted the same
-    /// way (see [`restart_scheduled_task`]), so one variant covers either.
+    /// A windows scheduled task (`DiraDaemon`, logon trigger) is registered
+    /// (`schtasks /Query` exits 0). Restarted with `schtasks /Run`.
     ScheduledTask,
+    /// The HKCU Run-key fallback `install` writes when the task cannot be
+    /// registered. It only launches `dirad` at logon, so there is no supervisor
+    /// to ask for a restart: [`restart`] stops the process and spawns a new one
+    /// itself. This used to share [`Supervision::ScheduledTask`], and its restart
+    /// then ran `schtasks /Run` against a task that did not exist, leaving the
+    /// daemon stopped after every `dira update`.
+    RunKey,
     /// Neither service manager claims it, but `dirad.pid` next to the socket
     /// names a live process (`kill -0` succeeds, or on windows, `tasklist`
     /// lists it).
@@ -1067,7 +1454,9 @@ struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, prog: &str, args: &[&str]) -> Option<Output> {
-        Command::new(prog).args(args).output().ok()
+        // Windowless: the hook shim runs these too, from a harness that may have
+        // no console, where a bare `schtasks` would flash one.
+        dira_core::process::command(prog).args(args).output().ok()
     }
 }
 
@@ -1215,37 +1604,51 @@ pub async fn detect_supervision(config: &Config) -> Supervision {
     .await
 }
 
+/// Whether `socket` is the default control endpoint, the one the registered
+/// service runs. Pure, so it is tested without a service manager. (The unit
+/// tests of [`detect_supervision_with`] drive custom endpoints and treat them as
+/// the default instance.)
+fn is_default_endpoint(socket: &Path, default: &Path) -> bool {
+    socket == default
+}
+
 async fn detect_supervision_with(
     config: &Config,
     runner: &dyn Runner,
     os: Os,
     legacy_sock: &Path,
 ) -> Supervision {
-    if os == Os::Macos {
-        if let Some(out) = runner.run("launchctl", &["list", "sh.dirahq.dirad"]) {
+    // The registered service (launchd agent, systemd unit, logon task, Run
+    // key) runs the DEFAULT instance. An isolated instance on its own control
+    // endpoint (`DIRA_SOCKET_PATH`) is never what it supervises, so labelling it
+    // "supervised by" the service was wrong, and acting on that label would
+    // restart the user's real daemon instead.
+    let default_instance =
+        cfg!(test) || is_default_endpoint(&config.socket_path, &Config::default().socket_path);
+    if default_instance && os == Os::Macos {
+        if let Some(out) = runner.run("launchctl", &["list", LAUNCHD_LABEL]) {
             if out.status.success() {
                 return Supervision::Launchd;
             }
         }
     }
 
-    if os == Os::Linux {
-        if let Some(out) = runner.run("systemctl", &["--user", "is-active", "dirad.service"]) {
+    if default_instance && os == Os::Linux {
+        if let Some(out) = runner.run("systemctl", &["--user", "is-active", SYSTEMD_UNIT]) {
             if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "active" {
                 return Supervision::SystemdUser;
             }
         }
     }
 
-    if os == Os::Windows {
-        if let Some(out) = runner.run("schtasks", &["/Query", "/TN", "DiraDaemon"]) {
+    if default_instance && os == Os::Windows {
+        if let Some(out) = runner.run("schtasks", &["/Query", "/TN", TASK_NAME]) {
             if out.status.success() {
                 return Supervision::ScheduledTask;
             }
         }
-        // Covers the HKCU Run-key fallback `install` uses when `schtasks
-        // /Create` needed elevation it didn't have — see
-        // [`Supervision::ScheduledTask`]'s doc.
+        // The HKCU Run-key fallback `install` uses when the task could not be
+        // registered. See [`Supervision::RunKey`].
         if let Some(out) = runner.run(
             "reg",
             &[
@@ -1256,7 +1659,7 @@ async fn detect_supervision_with(
             ],
         ) {
             if out.status.success() {
-                return Supervision::ScheduledTask;
+                return Supervision::RunKey;
             }
         }
     }
@@ -1299,6 +1702,95 @@ async fn detect_supervision_with(
     }
 
     Supervision::NotRunning
+}
+
+/// What is registered to run the daemon, whether or not it is running now.
+///
+/// Distinct from [`Supervision`], which describes the RUNNING daemon. The two
+/// differ exactly when the daemon is down, which is when the hook shim's
+/// autostart asks. A stopped systemd unit reports `is-active` false, so
+/// detection says `NotRunning`, yet the unit is still installed with
+/// `Restart=always`. A bare spawn beside it would hold the single-instance guard
+/// and respawn-loop the unit (D-0009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Registration {
+    Launchd,
+    SystemdUser,
+    ScheduledTask,
+    RunKey,
+    None,
+}
+
+pub(crate) fn registration() -> Registration {
+    registration_with(&SystemRunner, current_os())
+}
+
+fn registration_with(runner: &dyn Runner, os: Os) -> Registration {
+    let home = dira_core::config::home_dir().ok();
+    match os {
+        Os::Macos
+            if home.as_ref().is_some_and(|h| {
+                h.join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist"))
+                    .exists()
+            }) =>
+        {
+            Registration::Launchd
+        }
+        Os::Linux
+            if home.as_ref().is_some_and(|h| {
+                h.join(format!(".config/systemd/user/{SYSTEMD_UNIT}"))
+                    .exists()
+            }) =>
+        {
+            Registration::SystemdUser
+        }
+        Os::Windows => {
+            let ok = |prog: &str, args: &[&str]| {
+                runner.run(prog, args).is_some_and(|o| o.status.success())
+            };
+            if ok("schtasks", &["/Query", "/TN", TASK_NAME]) {
+                Registration::ScheduledTask
+            } else if ok("reg", &["query", RUN_KEY, "/v", TASK_NAME]) {
+                Registration::RunKey
+            } else {
+                Registration::None
+            }
+        }
+        _ => Registration::None,
+    }
+}
+
+/// Ask the registered service manager to start the daemon, quietly (the hook
+/// shim must never write to stdout). `false` when nothing that can start it is
+/// registered (the Run key only runs at logon), and the caller spawns it
+/// itself.
+pub(crate) fn start_registered(reg: Registration) -> bool {
+    start_registered_with(reg, &SystemRunner)
+}
+
+fn start_registered_with(reg: Registration, runner: &dyn Runner) -> bool {
+    let ok = |prog: &str, args: &[&str]| runner.run(prog, args).is_some_and(|o| o.status.success());
+    match reg {
+        Registration::Launchd => {
+            let Some(uid) = runner
+                .run("id", &["-u"])
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            else {
+                return false;
+            };
+            ok(
+                "launchctl",
+                &["kickstart", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
+            )
+        }
+        Registration::SystemdUser => ok(
+            "systemctl",
+            &["--user", "start", "--no-block", SYSTEMD_UNIT],
+        ),
+        Registration::ScheduledTask => ok("schtasks", &["/Run", "/TN", TASK_NAME]),
+        Registration::RunKey | Registration::None => false,
+    }
 }
 
 /// `launchctl kickstart -k gui/<uid>/sh.dirahq.dirad`, falling back to
@@ -1383,6 +1875,57 @@ async fn restart_scheduled_task_with(
     attempts: u32,
     interval: std::time::Duration,
 ) -> Result<()> {
+    stop_windows_confirmed(
+        config,
+        runner,
+        attempts,
+        interval,
+        "schtasks /Run /TN DiraDaemon",
+    )
+    .await?;
+
+    if let Some(out) = runner.run("schtasks", &["/Run", "/TN", "DiraDaemon"]) {
+        if out.status.success() {
+            println!("schtasks /Run /TN DiraDaemon");
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "could not restart the scheduled task automatically — run this yourself:\n  \
+         schtasks /Run /TN DiraDaemon"
+    )
+}
+
+/// Restart a daemon launched by the HKCU Run key: there is no supervisor to ask,
+/// so stop it (confirmed exit, D-0019) and spawn the replacement directly, the
+/// same windowless spawn `dira daemon start` uses.
+async fn restart_run_key(config: &Config, runner: &dyn Runner) -> Result<()> {
+    stop_windows_confirmed(
+        config,
+        runner,
+        STOP_GRACE_ATTEMPTS,
+        STOP_GRACE_INTERVAL,
+        "dira daemon start",
+    )
+    .await?;
+    std::fs::remove_file(pidfile(config)).ok();
+    start(config).await
+}
+
+/// Stop a windows daemon and CONFIRM its process exited (D-0019), or refuse.
+/// `Ok` also when nothing is running. `relaunch` is the command the refusal
+/// messages tell the user to run once they have stopped it by hand.
+///
+/// The pid is resolved here (pidfile, else `DaemonInfo`) rather than inherited
+/// from detection, because detection returns on mere task/key registration.
+async fn stop_windows_confirmed(
+    config: &Config,
+    runner: &dyn Runner,
+    attempts: u32,
+    interval: std::time::Duration,
+    relaunch: &str,
+) -> Result<()> {
     let pid = match alive_pidfile_pid(config, runner, Os::Windows) {
         Some(p) => Some(p),
         None => match client::send(&config.socket_path, &Request::DaemonInfo).await {
@@ -1406,7 +1949,7 @@ async fn restart_scheduled_task_with(
                 anyhow::bail!(
                     "dirad (pid {pid}) did not exit — refusing to start a second daemon \
                      beside it. Stop it yourself, then start it again:\n  \
-                     taskkill /PID {pid} /F\n  schtasks /Run /TN DiraDaemon"
+                     taskkill /PID {pid} /F\n  {relaunch}"
                 );
             }
         }
@@ -1422,14 +1965,14 @@ async fn restart_scheduled_task_with(
             client::Reach::Up => anyhow::bail!(
                 "a dirad is answering but its pid could not be determined — refusing \
                  to start a second daemon beside it. Stop it via Task Manager, then:\n  \
-                 schtasks /Run /TN DiraDaemon"
+                 {relaunch}"
             ),
             client::Reach::Denied => anyhow::bail!(
                 "a dirad is running but refuses this connection — it was very likely \
                  started with different privileges (e.g. from an Administrator \
                  terminal). Refusing to start a second daemon beside it. Stop it from \
                  a terminal at the same privilege level, then:\n  \
-                 schtasks /Run /TN DiraDaemon"
+                 {relaunch}"
             ),
             // Busy means a daemon IS listening, every instance just happened to
             // be taken. That is emphatically not "nothing running".
@@ -1445,18 +1988,7 @@ async fn restart_scheduled_task_with(
             ),
         },
     }
-
-    if let Some(out) = runner.run("schtasks", &["/Run", "/TN", "DiraDaemon"]) {
-        if out.status.success() {
-            println!("schtasks /Run /TN DiraDaemon");
-            return Ok(());
-        }
-    }
-
-    anyhow::bail!(
-        "could not restart the scheduled task automatically — run this yourself:\n  \
-         schtasks /Run /TN DiraDaemon"
-    )
+    Ok(())
 }
 
 /// Kill the `dirad` at `pid` answering on `sock` (escalating to `-9` if it
@@ -1605,6 +2137,7 @@ async fn restart_with(
         Supervision::Launchd => restart_launchd(runner)?,
         Supervision::SystemdUser => restart_systemd(runner)?,
         Supervision::ScheduledTask => restart_scheduled_task(config, runner).await?,
+        Supervision::RunKey => restart_run_key(config, runner).await?,
         Supervision::Pidfile(pid) | Supervision::Socket(pid) => {
             restart_bare(config, *pid, &config.socket_path, runner, os).await?;
         }
@@ -1691,6 +2224,117 @@ mod probe_tests {
         );
     }
 
+    /// `dira daemon status --json` carries what the text prints, plus the
+    /// machine-readable supervision kind, under stable snake_case keys.
+    #[test]
+    fn status_json_has_the_documented_shape() {
+        let sock = Path::new("/run/dira.sock");
+        let mut degraded = info("0.3.0");
+        degraded.http_ingress_error = Some("port busy".into());
+        let v = status_json(
+            &probe_of(Some(degraded), true, None),
+            sock,
+            &Supervision::Launchd,
+        );
+        assert_eq!(v["running"], true);
+        assert_eq!(v["state"], "up");
+        assert_eq!(v["degraded"], true);
+        assert_eq!(v["socket"], "/run/dira.sock");
+        assert!(v["legacy_socket"].is_null());
+        assert_eq!(v["supervision"], "launchd");
+        assert_eq!(v["supervision_label"], "launchd");
+        assert_eq!(v["daemon"]["version"], "0.3.0");
+        assert_eq!(v["daemon"]["pid"], 1);
+        assert_eq!(v["daemon"]["http_ingress_error"], "port busy");
+        // `Info` is serialized by derive, so its field names are the keys:
+        // pin the whole set so a field rename cannot slip through.
+        let mut got: Vec<&str> = v["daemon"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut want = vec![
+            "version",
+            "schema_version",
+            "pid",
+            "uptime_seconds",
+            "db_path",
+            "http_ingress_error",
+            "control_channel_warning",
+            "storage_warning",
+        ];
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
+
+        let down = status_json(&probe_of(None, false, None), sock, &Supervision::NotRunning);
+        assert_eq!(down["running"], false);
+        assert_eq!(down["state"], "down");
+        assert_eq!(down["supervision"], "not_running");
+        assert!(down["supervision_label"].is_null());
+        assert!(down["daemon"].is_null());
+
+        let legacy = status_json(
+            &probe_of(None, false, Some(PathBuf::from("/tmp/dira.sock"))),
+            sock,
+            &Supervision::NotRunning,
+        );
+        assert_eq!(legacy["running"], true, "legacy counts as running (W1)");
+        assert_eq!(legacy["state"], "legacy");
+        assert_eq!(legacy["legacy_socket"], "/tmp/dira.sock");
+    }
+
+    /// A refusing daemon is `denied`, never `down` (D-0016).
+    #[test]
+    fn a_refusing_daemon_is_denied_not_down() {
+        let mut p = probe_of(None, false, None);
+        p.reach = client::Reach::Denied;
+        assert_eq!(daemon_state(&p), "denied");
+        p.reach = client::Reach::Busy;
+        assert_eq!(daemon_state(&p), "busy");
+        // Refusing or busy is not "running" for install.sh's exit code, and
+        // the text keeps its `dirad: down` line.
+        assert!(!p.running());
+        assert_eq!(
+            p.status_line(Path::new("/run/dira.sock")),
+            down_message(None)
+        );
+    }
+
+    /// `dira version --json` names both builds and the two comparisons the
+    /// text form warns about.
+    #[test]
+    fn version_json_has_the_documented_shape() {
+        let cli_db = Path::new("/home/u/.local/share/dira/dira.db");
+        let mut i = info("0.3.0");
+        i.db_path = Some("/var/root/dira.db".into());
+        let v = version_json("0.4.0", "1.5.0", &probe_of(Some(i), true, None), cli_db);
+        assert_eq!(v["version"], "0.4.0");
+        assert_eq!(v["schema_version"], "1.5.0");
+        assert_eq!(v["daemon_state"], "up");
+        assert_eq!(v["daemon"]["version"], "0.3.0");
+        assert_eq!(v["daemon"]["schema_version"], "3");
+        assert_eq!(v["version_skew"], true);
+        assert_eq!(v["store_divergence"]["daemon_db_path"], "/var/root/dira.db");
+        assert_eq!(
+            v["store_divergence"]["cli_db_path"],
+            "/home/u/.local/share/dira/dira.db"
+        );
+
+        let mut same = info("0.4.0");
+        same.db_path = Some(cli_db.display().to_string());
+        let v = version_json("0.4.0", "1.5.0", &probe_of(Some(same), true, None), cli_db);
+        assert_eq!(v["version_skew"], false);
+        assert!(v["store_divergence"].is_null());
+
+        // Not running: no daemon object, no invented skew.
+        let v = version_json("0.4.0", "1.5.0", &probe_of(None, false, None), cli_db);
+        assert_eq!(v["daemon_state"], "down");
+        assert!(v["daemon"].is_null());
+        assert_eq!(v["version_skew"], false);
+    }
+
     #[test]
     fn version_skew_line_is_silent_when_they_match() {
         assert!(version_skew_line("0.3.0", "0.3.0").is_none());
@@ -1712,6 +2356,10 @@ mod probe_tests {
         assert_eq!(
             supervision_label(&Supervision::ScheduledTask).as_deref(),
             Some("scheduled task")
+        );
+        assert_eq!(
+            supervision_label(&Supervision::RunKey).as_deref(),
+            Some("Run key (starts at logon)")
         );
         assert_eq!(
             supervision_label(&Supervision::Pidfile(7)).as_deref(),
@@ -1765,7 +2413,7 @@ mod tests {
     /// can assert a command was (or wasn't) invoked, not just what it would
     /// have returned.
     #[derive(Default)]
-    struct FakeRunner {
+    pub(super) struct FakeRunner {
         responses: HashMap<String, (i32, String)>,
         calls: std::cell::RefCell<Vec<String>>,
         /// When set, `tasklist` reports the process alive until a `taskkill` has
@@ -1775,7 +2423,13 @@ mod tests {
     }
 
     impl FakeRunner {
-        fn returning(mut self, prog: &str, args: &[&str], code: i32, stdout: &str) -> Self {
+        pub(super) fn returning(
+            mut self,
+            prog: &str,
+            args: &[&str],
+            code: i32,
+            stdout: &str,
+        ) -> Self {
             self.responses
                 .insert(key(prog, args), (code, stdout.to_string()));
             self
@@ -2251,10 +2905,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_supervision_scheduled_task_via_run_key_when_schtasks_query_fails() {
+    async fn detect_supervision_run_key_when_schtasks_query_fails() {
         // `schtasks /Query` fails (task never registered, e.g. `install` took
-        // the HKCU Run-key fallback), but `reg query` finds the fallback key —
-        // still `ScheduledTask`, see its doc.
+        // the HKCU Run-key fallback), but `reg query` finds the fallback key.
+        // Its own variant: there is no task to `/Run` on restart.
         let config = test_config("run-key");
         let runner = FakeRunner::default()
             .returning("schtasks", &["/Query", "/TN", "DiraDaemon"], 1, "ERROR:\n")
@@ -2270,7 +2924,7 @@ mod tests {
                 "DiraDaemon    REG_SZ    \"C:\\bin\\dirad.exe\"\n",
             );
         let got = detect_supervision_with(&config, &runner, Os::Windows, &dead_legacy("w")).await;
-        assert_eq!(got, Supervision::ScheduledTask);
+        assert_eq!(got, Supervision::RunKey);
     }
 
     #[tokio::test]
@@ -2964,5 +3618,109 @@ mod tests {
             msg.contains(&legacy.display().to_string()),
             "message was: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod windows_task_tests {
+    use super::*;
+
+    #[test]
+    fn logon_task_names_the_user_so_a_standard_account_can_register_it() {
+        let xml = logon_task_xml(r"C:\Users\a b\.local\bin\dirad.exe", Some(r"PC\ana"));
+        // Trigger AND principal carry the user; without it the trigger means
+        // "any user", which needs admin.
+        assert_eq!(xml.matches(r"<UserId>PC\ana</UserId>").count(), 2);
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(xml.contains(r"<Command>C:\Users\a b\.local\bin\dirad.exe</Command>"));
+    }
+
+    #[test]
+    fn logon_task_survives_battery_runs_forever_and_restarts_on_failure() {
+        let xml = logon_task_xml("dirad.exe", Some("u"));
+        for needle in [
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+            "<RestartOnFailure>",
+            "<Interval>PT1M</Interval>",
+            "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "<Hidden>true</Hidden>",
+        ] {
+            assert!(xml.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn logon_task_escapes_xml_in_paths_and_omits_an_unknown_user() {
+        let xml = logon_task_xml(r"C:\R&D\<x>\dirad.exe", None);
+        assert!(xml.contains(r"<Command>C:\R&amp;D\&lt;x&gt;\dirad.exe</Command>"));
+        assert!(!xml.contains("<UserId>"));
+    }
+
+    #[test]
+    fn task_file_is_utf16le_with_a_bom() {
+        let bytes = utf16le_with_bom("<a>é</a>");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+        assert_eq!(&bytes[2..4], &[b'<', 0]);
+        assert_eq!(bytes.len(), 2 + 2 * "<a>é</a>".encode_utf16().count());
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_default_endpoint_is_the_services_instance() {
+        let default = Config::default().socket_path;
+        assert!(is_default_endpoint(&default, &default));
+        assert!(!is_default_endpoint(
+            Path::new(r"\\.\pipe\dira-vmtest-iso"),
+            &default
+        ));
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::tests::FakeRunner;
+    use super::*;
+
+    #[test]
+    fn a_registered_task_wins_over_the_run_key_and_starts_through_schtasks() {
+        let runner = FakeRunner::default()
+            .returning("schtasks", &["/Query", "/TN", TASK_NAME], 0, "")
+            .returning("schtasks", &["/Run", "/TN", TASK_NAME], 0, "");
+        let reg = registration_with(&runner, Os::Windows);
+        assert_eq!(reg, Registration::ScheduledTask);
+        assert!(start_registered_with(reg, &runner));
+    }
+
+    #[test]
+    fn a_run_key_alone_cannot_start_it_now() {
+        let runner = FakeRunner::default()
+            .returning("schtasks", &["/Query", "/TN", TASK_NAME], 1, "")
+            .returning("reg", &["query", RUN_KEY, "/v", TASK_NAME], 0, "");
+        let reg = registration_with(&runner, Os::Windows);
+        assert_eq!(reg, Registration::RunKey);
+        assert!(
+            !start_registered_with(reg, &runner),
+            "the caller spawns it bare"
+        );
+    }
+
+    #[test]
+    fn launchd_is_kickstarted_by_label() {
+        let runner = FakeRunner::default()
+            .returning("id", &["-u"], 0, "501\n")
+            .returning(
+                "launchctl",
+                &["kickstart", "gui/501/sh.dirahq.dirad"],
+                0,
+                "",
+            );
+        assert!(start_registered_with(Registration::Launchd, &runner));
     }
 }

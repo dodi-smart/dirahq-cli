@@ -145,7 +145,10 @@ impl State {
     pub fn supervised(&self) -> bool {
         matches!(
             self.supervision,
-            Supervision::Launchd | Supervision::SystemdUser | Supervision::ScheduledTask
+            Supervision::Launchd
+                | Supervision::SystemdUser
+                | Supervision::ScheduledTask
+                | Supervision::RunKey
         )
     }
 

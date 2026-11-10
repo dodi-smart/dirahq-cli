@@ -45,3 +45,6 @@ agent context at session start. Keep it short and non-negotiable.
 - Nothing enters `repo_dirs` unless the directory demonstrably belongs to the
   repo it is filed under, and `register_repo_dir` stays I/O-free.
   See DIRASH-0027.
+- A headless run (`DIRA_HEADLESS`, or `GITHUB_ACTIONS=true`) never reports a
+  human signal: the `dira hook` shim withholds those and forwards the rest.
+  Never infer presence from the cloud runtime id. See DIRASH-0047.

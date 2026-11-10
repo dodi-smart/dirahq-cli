@@ -15,7 +15,7 @@
 //! that daemon-side knobs only take effect after `dira daemon restart`.
 
 use anyhow::{anyhow, bail, Context, Result};
-use dira_core::{config::project_dirs, Config};
+use dira_core::Config;
 use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut};
 
@@ -105,6 +105,14 @@ const KNOBS: &[Knob] = &[
         kind: Kind::Enum(&["auto", "on", "off"]),
         help: "zavet knowledge module: auto (active when a repo has .zavet/), on, off",
     },
+    // Meeting detection reads which app holds the mic, camera or speakers. It
+    // is consent-bearing like `sync.knowledge`, so it must be settable for
+    // `dira onboard`'s own prompt to be honest (DIRASH-0030).
+    Knob {
+        key: "modules.meetings",
+        kind: Kind::Enum(&["off", "suggest", "auto"]),
+        help: "bot-less meeting detection: off, suggest (confirm each), auto (record sure ones)",
+    },
     // The knowledge channel's consent tier. Unlike every other knob here this
     // one governs whether *content* — decision and spec bodies, trailer
     // values, check commands, framework requirement/task text — leaves the machine, so it is worth being
@@ -132,6 +140,21 @@ const KNOBS: &[Knob] = &[
         kind: Kind::Enum(&["on", "off"]),
         help: "passive update-available notice after status/version/daemon status: on, off",
     },
+    Knob {
+        key: "update.auto",
+        kind: Kind::Enum(&["on", "off"]),
+        help: "apply updates in the background (dirad schedules them): on, off",
+    },
+    Knob {
+        key: "update.channel",
+        kind: Kind::Enum(&["stable", "prerelease"]),
+        help: "release channel updates follow: stable, prerelease",
+    },
+    Knob {
+        key: "update.skip_version",
+        kind: Kind::Str,
+        help: "a version auto-update must not install (set by `dira update --rollback`)",
+    },
 ];
 
 fn knob(key: &str) -> Option<&'static Knob> {
@@ -158,9 +181,8 @@ pub(crate) fn knobs_after_help() -> String {
 
 /// The XDG path of the writable `config.toml`.
 fn config_path() -> Result<PathBuf> {
-    let dirs =
-        project_dirs().ok_or_else(|| anyhow!("could not resolve an XDG config directory"))?;
-    Ok(dirs.config_dir().join("config.toml"))
+    dira_core::config::config_file_path()
+        .ok_or_else(|| anyhow!("could not resolve an XDG config directory"))
 }
 
 /// `dira config path`.
@@ -218,7 +240,7 @@ fn render_json_scalar(v: &serde_json::Value) -> String {
 /// "on"/"off" like the enum knobs do, so `get` echoes the same words rather
 /// than leaking the wire representation.
 fn render_scalar(key: &str, v: &serde_json::Value) -> String {
-    if key == "update.check" {
+    if key == "update.check" || key == "update.auto" {
         if let Some(b) = v.as_bool() {
             return if b { "on" } else { "off" }.to_string();
         }
@@ -322,10 +344,8 @@ fn assign(doc: &mut DocumentMut, key: &str, item: toml_edit::Item) {
 fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_edit::Item> {
     match knob.key {
         "report_local_day" => {
-            let b = match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => true,
-                "0" | "false" | "no" | "off" => false,
-                _ => bail!("report_local_day must be a boolean (0/1, true/false)"),
+            let Some(b) = dira_core::env::parse_bool(raw) else {
+                bail!("report_local_day must be a boolean (0/1, true/false)");
             };
             Ok(value(b))
         }
@@ -343,10 +363,10 @@ fn parse_and_validate(config: &Config, knob: &Knob, raw: &str) -> Result<toml_ed
         // knobs) onto the real `bool` `Config.update.check` field — a real
         // TOML boolean, not the string "on"/"off", since that's what
         // `UpdateKnobs` deserializes.
-        "update.check" => match raw.trim().to_ascii_lowercase().as_str() {
+        "update.check" | "update.auto" => match raw.trim().to_ascii_lowercase().as_str() {
             "on" => Ok(value(true)),
             "off" => Ok(value(false)),
-            _ => bail!("update.check must be one of: on, off (got `{raw}`)"),
+            _ => bail!("{} must be one of: on, off (got `{raw}`)", knob.key),
         },
         key => match knob.kind {
             Kind::U64 => {
@@ -646,6 +666,7 @@ mod tests {
         let original = "# my config\nidle_seconds = 300\n";
         let mut doc: DocumentMut = original.parse().unwrap();
         assign(&mut doc, "modules.zavet", value("on"));
+        assign(&mut doc, "modules.meetings", value("suggest"));
         let out = doc.to_string();
         assert!(out.contains("# my config"));
         assert!(out.contains("idle_seconds = 300"));
@@ -659,6 +680,10 @@ mod tests {
                 .extract()
                 .unwrap();
         assert_eq!(cfg.modules.zavet, dira_core::config::ZavetMode::On);
+        assert_eq!(
+            cfg.modules.meetings,
+            dira_core::config::MeetingsMode::Suggest
+        );
     }
 
     #[test]

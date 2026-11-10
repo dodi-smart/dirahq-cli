@@ -45,3 +45,4 @@ jobs:
       release-command: bun run release
       node-version: "24"
       backmerge: true
+      sbom: true

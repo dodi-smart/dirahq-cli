@@ -70,7 +70,7 @@ pub struct Lane {
 /// single deduped human baseline lane. Idle/zero agent sessions are dropped so
 /// the chart shows actual concurrency. Lanes are returned human-first.
 pub fn lanes(s: &StatusView) -> Vec<Lane> {
-    lanes_with(s, &titles_for(&s.active))
+    lanes_with(s, &titles_for(s.active.iter().chain(&s.run_children)))
 }
 
 /// [`lanes`] with the local titles supplied, so tests need no filesystem.
@@ -83,20 +83,12 @@ pub fn lanes_with(s: &StatusView, titles: &std::collections::HashMap<String, Str
         is_human: true,
     }];
     // An agent lane is only interesting once it has accrued wall time.
-    let kept: Vec<_> = crate::format::tree_rows(&s.active, titles)
-        .into_iter()
-        .filter(|r| {
-            r.session
-                .is_some_and(|s| s.accrues_agent_time() && s.agent_seconds > 0)
-        })
-        .collect();
-    let mut glyphs: Vec<&'static str> = kept.iter().map(|r| r.glyph).collect();
-    crate::format::retree(&mut glyphs);
-    for (row, glyph) in kept.iter().zip(glyphs) {
-        let sess = row.session.expect("filtered to sessions");
-        let glyph = if glyph == "  " { "" } else { glyph };
+    let tree = crate::format::status_tree_sessions(s);
+    for (sess, glyph, short) in crate::format::lane_rows(&tree, &s.active, titles, |v| {
+        v.accrues_agent_time() && v.agent_seconds > 0
+    }) {
         lanes.push(Lane {
-            label: format!("{glyph}{} · {}", sess.handle, row.short),
+            label: format!("{glyph}{} · {short}", sess.handle),
             seconds: sess.agent_seconds,
             is_human: false,
         });
@@ -105,8 +97,10 @@ pub fn lanes_with(s: &StatusView, titles: &std::collections::HashMap<String, Str
 }
 
 /// Local titles, only when an orchestrator is on screen. Never synced.
-fn titles_for(active: &[SessionView]) -> std::collections::HashMap<String, String> {
-    if active.iter().any(|s| s.orchestrator) {
+fn titles_for<'a>(
+    mut sessions: impl Iterator<Item = &'a SessionView>,
+) -> std::collections::HashMap<String, String> {
+    if sessions.any(|s| s.orchestrator) {
         crate::session_titles::cached_claude_titles()
     } else {
         Default::default()
@@ -317,7 +311,10 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
         s.today.projects.len() as u16 + 4 // projects + header + total + borders
     };
     let billing_h = if s.billing.is_some() { 1 } else { 0 };
-    let sessions_need = crate::format::tree_rows(&s.active, &titles_for(&s.active))
+    // The table keeps a listed run's ended children (#182); lanes and the
+    // header count stay on the live sessions.
+    let tree = crate::format::status_tree_sessions(s);
+    let sessions_need = crate::format::tree_rows(&tree, &titles_for(tree.iter()))
         .len()
         .max(1) as u16
         + 3; // tree rows + header + borders
@@ -338,7 +335,7 @@ fn draw_body(frame: &mut Frame, area: Rect, s: &StatusView) {
         ],
     )
     .split(area);
-    draw_sessions(frame, chunks[0], &s.active);
+    draw_sessions(frame, chunks[0], &tree);
     draw_lanes(frame, chunks[1], s);
     draw_rollup(frame, chunks[2], s);
     if let Some(b) = &s.billing {
@@ -391,7 +388,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, active: &[SessionView]) {
     let project_w = (area.width as usize)
         .saturating_sub(48 + 5 + 2)
         .clamp(12, 200);
-    let titles = titles_for(active);
+    let titles = titles_for(active.iter());
     let rows = crate::format::tree_rows(active, &titles)
         .into_iter()
         .map(|row| {
@@ -504,7 +501,7 @@ fn draw_rollup(frame: &mut Frame, area: Rect, s: &StatusView) {
         .iter()
         .map(|p| {
             Row::new([
-                Cell::from(truncate_cols(
+                Cell::from(crate::format::report_repo_cell(
                     &crate::format::report_line_label(p),
                     project_w,
                 )),
@@ -608,6 +605,9 @@ mod tests {
             orchestrator: false,
             parent_session: None,
             repos: Vec::new(),
+            branch: None,
+            spec: None,
+            tokens: Default::default(),
         }
     }
 
@@ -627,6 +627,7 @@ mod tests {
     fn headline_reads_totals() {
         let s = StatusView {
             active: vec![],
+            run_children: vec![],
             today: report(600, 1800, vec![]),
             sync_pending: 3,
             tokens_pending: 0,
@@ -655,6 +656,43 @@ mod tests {
         assert_eq!(h.multiplier_label(), "—x parallel");
     }
 
+    /// #182: a live orchestrator whose only child has ended keeps its run
+    /// label in the lanes (the child is grouped from `run_children`), and the
+    /// ended child gets no lane of its own.
+    #[test]
+    fn a_runs_ended_child_keeps_the_root_label_but_gets_no_lane() {
+        let orch = SessionView {
+            orchestrator: true,
+            ..sess("o1", None, 900, false)
+        };
+        let kid = SessionView {
+            parent_session: Some("id-o1".into()),
+            ..sess("k1", Some("acme/web"), 300, false)
+        };
+        let s = StatusView {
+            active: vec![orch],
+            run_children: vec![kid],
+            today: report(600, 1200, vec![]),
+            sync_pending: 0,
+            tokens_pending: 0,
+            hydrating: false,
+            tokens: None,
+            billing: None,
+            writer_health: None,
+            sync_health: None,
+        };
+        let labels: Vec<String> = lanes_with(&s, &Default::default())
+            .into_iter()
+            .skip(1)
+            .map(|l| l.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["o1 · web".to_string()],
+            "folded to its one repo, not scratch"
+        );
+    }
+
     #[test]
     fn lanes_and_rows_group_an_orchestration_run_under_its_root() {
         let orch = SessionView {
@@ -674,6 +712,7 @@ mod tests {
                 orch,
                 kid("k2", "acme/api", 100),
             ],
+            run_children: vec![],
             today: report(600, 1500, vec![]),
             sync_pending: 0,
             tokens_pending: 0,
@@ -725,6 +764,7 @@ mod tests {
                 sess("a2", Some("acme/web"), 0, false), // no agent wall → dropped
                 manual_sess("m1", Some("acme/api"), 999), // manual → dropped from lanes
             ],
+            run_children: vec![],
             today: report(600, 1200, vec![]),
             sync_pending: 0,
             tokens_pending: 0,
@@ -766,6 +806,7 @@ mod tests {
         m.idle = false; // engaged: a manual session ticks, so it is never idle
         let s = StatusView {
             active: vec![m],
+            run_children: vec![],
             today: report(600, 0, vec![]),
             sync_pending: 0,
             tokens_pending: 0,
@@ -799,6 +840,7 @@ mod tests {
         a.last_activity_at = Some("2026-06-27T10:00:00Z".into());
         let s = StatusView {
             active: vec![a],
+            run_children: vec![],
             today: report(0, 0, vec![]),
             sync_pending: 0,
             tokens_pending: 0,
@@ -822,6 +864,7 @@ mod tests {
         a.last_activity_at = Some("2026-06-27T10:00:00Z".into());
         let s = StatusView {
             active: vec![a],
+            run_children: vec![],
             today: report(0, 0, vec![]),
             sync_pending: 0,
             tokens_pending: 0,
@@ -846,6 +889,7 @@ mod tests {
         a2.last_activity_at = Some("2026-06-27T10:00:09Z".into());
         let s = StatusView {
             active: vec![a1, a2],
+            run_children: vec![],
             today: report(
                 10,
                 150,
@@ -855,12 +899,14 @@ mod tests {
                         human_seconds: 10,
                         agent_wall_seconds: 100,
                         orchestration: false,
+                        meeting: false,
                     },
                     ProjectReport {
                         project: Some("acme/web".into()),
                         human_seconds: 0,
                         agent_wall_seconds: 50,
                         orchestration: false,
+                        meeting: false,
                     },
                 ],
             ),
@@ -907,6 +953,7 @@ mod tests {
         a.last_human_at = Some("2026-06-27T09:00:00Z".into()); // an hour ago
         let s = StatusView {
             active: vec![a],
+            run_children: vec![],
             today: report(
                 10,
                 100,
@@ -915,6 +962,7 @@ mod tests {
                     human_seconds: 10,
                     agent_wall_seconds: 100,
                     orchestration: false,
+                    meeting: false,
                 }],
             ),
             sync_pending: 0,

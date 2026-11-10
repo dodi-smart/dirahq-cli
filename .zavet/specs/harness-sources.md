@@ -1,6 +1,6 @@
 ---
 title: Harness sources and hook ingestion
-version: 4
+version: 5
 origin: session
 verified: false
 confidence: high
@@ -8,8 +8,11 @@ date: 2026-10-15
 paths:
   - cli/sources/src/
   - cli/dira/src/init.rs
+  - cli/dira/src/headless.rs
+  - cli/dira/src/autostart.rs
+  - cli/dirad/src/spool.rs
   - contract/src/lib.rs
-decisions: [D-0001, DIRASH-0041]
+decisions: [D-0001, DIRASH-0041, DIRASH-0047, DIRASH-0049]
 ---
 
 ## Overview
@@ -24,6 +27,33 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
 - Supported sources: claude (default), codex, gemini, cursor, opencode
   (HTTP plugin), grok (grok-build), generic (harness-neutral JSON). `Manual`
   is a pseudo-harness for `dira start`, outside the sources crate.
+- In a headless run (`DIRA_HEADLESS` truthy, or `GITHUB_ACTIONS=true` with
+  `DIRA_HEADLESS` unset) the `dira hook` shim withholds every hook that
+  normalizes to a human signal and forwards the rest. A CI agent's prompt
+  therefore opens no human-engaged interval, while its session, agent
+  wall-clock, tools and tokens are captured as before (`prompts` reads 0).
+  The capture probe never withholds. See DIRASH-0047.
+- A hook is stored or spooled, never dropped (DIRASH-0049).
+  - The shim normalizes each hook once and sends the normalized record
+    (`Request::IngestRecord`, the spool's `Record` format) with its
+    `observed_at`. The raw payload never crosses the pipe. Live and spooled
+    hooks reach the writer through one path (`control::admit_and_enqueue` →
+    `spool::enqueue`), which is also where capture-probe admission lives. An
+    older daemon that answers `unknown variant` gets the record spooled
+    instead. The legacy `IngestHook` (raw payload) is still accepted from
+    older shims.
+  - A delivery that fails (daemon down, busy, or timed out) is normalized in
+    the shim and written to `spool/` beside the database, one file per event.
+    The raw payload never touches disk.
+  - When nothing is listening, the shim asks the supervisor (logon task,
+    launchd, systemd --user) to start the daemon, or spawns it bare where
+    there is none, through `spawn_background`, so the daemon never holds the
+    pipe the harness reads the hook's stdout from. At most once per 30 s, never elevated, never in a debug
+    build.
+  - The daemon spills to the same spool when its ingest queue is full, and
+    replays the spool at startup, the moment it spills, every 2 s while records
+    remain and on a 5-minute backstop, while the queue has room,
+    keeping each event's original time.
 - Alias spelling lives ONLY in `canonical_harness_id()`. `dira init` and hook
   dispatch both resolve through it, so accepted spellings can never drift.
 - A source returns `None` for unknown events or malformed payloads; the daemon
@@ -91,6 +121,8 @@ a per-harness source in `cli/sources` normalizes the payload into the shared
   been implemented as "never tell anyone", so a dead capture channel was
   indistinguishable from a healthy one for days. A **semantic** non-result
   (unknown harness, unaccounted event kind) stays silent everywhere. See D-0016.
+- Nothing answers an ingest `Ok` unless the event is queued or spooled
+  (`dirad::spool::enqueue` is the only path into the writer queue for a hook).
 - The contract `Harness` enum is the wire's source of truth; schema artifacts
   are regenerated, never hand-edited.
 

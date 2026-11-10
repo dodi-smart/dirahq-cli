@@ -32,7 +32,7 @@ mod common;
 use common::isolate_user_dirs;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 /// `dira hook claude` fed `payload` on stdin, with an isolated `$HOME` (user
 /// scope) and a separate `$CLAUDE_PROJECT_DIR`/cwd (project scope),
@@ -47,10 +47,7 @@ fn run_hook(
     cmd.arg("hook")
         .arg("claude")
         .current_dir(project_dir)
-        .env("CLAUDE_PROJECT_DIR", project_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("CLAUDE_PROJECT_DIR", project_dir);
     isolate_user_dirs(&mut cmd, home);
     if via_portable {
         cmd.env("DIRA_HOOK_VIA", "portable");
@@ -58,41 +55,7 @@ fn run_hook(
         cmd.env_remove("DIRA_HOOK_VIA");
     }
 
-    let child = {
-        let _staging = common::lock_staging();
-        cmd.spawn().expect("spawn dira hook")
-    };
-    // Feed stdin and close it before waiting — mirrors `output_staged`, but
-    // that helper doesn't let us write to stdin first, so it's inlined here.
-    {
-        use std::io::Write;
-        child
-            .stdin
-            .as_ref()
-            .expect("piped stdin")
-            .write_all(payload.to_string().as_bytes())
-            .expect("write hook payload");
-    }
-    child.wait_with_output().expect("wait for dira hook")
-}
-
-/// Recursively find a file named `name` under `root`, if any.
-fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_file(&path, name) {
-                return Some(found);
-            }
-        } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn hook_health_recorded(home: &Path) -> bool {
-    find_file(home, "hook-health.json").is_some()
+    common::output_with_stdin(&mut cmd, payload.to_string().as_bytes()).expect("run dira hook")
 }
 
 /// Write a user-scope `~/.claude/settings.json` wiring `Stop` straight at
@@ -171,7 +134,7 @@ fn portable_invocation_yields_to_live_user_scope_wiring() {
         "a hook must never write stdout: {out:?}"
     );
     assert!(
-        !hook_health_recorded(home),
+        !common::hook_forward_attempted(home),
         "a yielded invocation must never attempt to forward, so it must never \
          touch hook_health"
     );
@@ -205,7 +168,7 @@ fn direct_invocation_still_forwards_with_the_same_wiring_present() {
         "a hook must never write stdout: {out:?}"
     );
     assert!(
-        hook_health_recorded(home),
+        common::hook_forward_attempted(home),
         "the direct invocation must still attempt to forward and record the \
          transport failure — only the portable marker changes behaviour"
     );
@@ -241,7 +204,7 @@ fn stray_marker_without_project_scope_portable_wiring_still_forwards() {
         "a hook must never write stdout: {out:?}"
     );
     assert!(
-        hook_health_recorded(home),
+        common::hook_forward_attempted(home),
         "a stray portable marker with no project-scope portable wiring must \
          still forward — the marker alone is never proof of a real portable \
          invocation"

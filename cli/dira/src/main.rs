@@ -1,6 +1,7 @@
 //! `dira` — the thin CLI client. Talks to the resident `dirad` daemon over a
 //! Unix domain socket; holds no state of its own.
 
+mod autostart;
 mod client;
 mod cloud_init;
 mod config_cmd;
@@ -9,6 +10,7 @@ mod device;
 mod doctor;
 mod duration;
 mod format;
+mod headless;
 mod hook_health;
 mod hook_yield;
 mod init;
@@ -27,7 +29,7 @@ mod zavet_install;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
-use dira_core::protocol::{ReportScope, Request, Response, StopSelector};
+use dira_core::protocol::{MeetingAction, ReportScope, Request, Response, StopSelector};
 use dira_core::Config;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -97,7 +99,7 @@ enum Command {
     /// Set this machine up end to end: harnesses, daemon service, cloud link, zavet.
     #[command(
         long_about = "\
-One command from a fresh install to actually capturing. Runs eight steps in
+One command from a fresh install to actually capturing. Runs these steps in
 dependency order, each idempotent and skippable, and is safe to re-run — a
 second run reports what is already done and picks up the rest.
 
@@ -268,7 +270,8 @@ Examples:
 Examples:
   dira sessions              handles, projects, human/agent time, state
   dira sessions --json       the same rows as one JSON object, for scripts
-  dira sessions --flat       one row per session, without grouping orchestration runs")]
+  dira sessions --flat       one row per session, without grouping orchestration runs
+  dira sessions --limit 10   only the 10 newest (a run counts as one)")]
     Sessions {
         /// Emit the session list as JSON instead of a table. Scriptable proof
         /// of what was captured (`jq '.sessions | length'`), and what CI
@@ -279,6 +282,10 @@ Examples:
         /// orchestrator with the sessions it spawned.
         #[arg(long)]
         flat: bool,
+        /// Show at most N sessions, newest first; a run counts as one, in the
+        /// table and with `--json` alike.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
     /// Retroactive manual entry, e.g. `dira invoice 1h Meeting with Fol` (bare = minutes).
     #[command(
@@ -328,7 +335,8 @@ Examples:
   dira report                today (default)
   dira report --week         the last 7 days
   dira report --all          everything on this device
-  dira report --project github.com/acme/api"
+  dira report --project github.com/acme/api
+  dira report --week --json  the same report as one JSON object, for scripts"
     )]
     Report {
         /// Today only (the default).
@@ -343,6 +351,10 @@ Examples:
         /// Only this repo/project (any scope).
         #[arg(long, value_name = "REPO")]
         project: Option<String>,
+        /// Emit the report as JSON instead of a table: full repo names, every
+        /// line, for scripts.
+        #[arg(long)]
+        json: bool,
     },
     /// Wire a harness's hooks to report to the daemon (default: claude).
     #[command(
@@ -486,8 +498,13 @@ Install:
     #[command(after_help = "\
 Examples:
   dira version               CLI + daemon build, wire schema, uptime — and a
-                             warning when the CLI and daemon builds differ")]
-    Version,
+                             warning when the CLI and daemon builds differ
+  dira version --json        the same as one JSON object, for scripts")]
+    Version {
+        /// Emit one JSON object on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Diagnose whether capture is actually working.
     #[command(
         long_about = "\
@@ -549,12 +566,18 @@ that. Neither step ever creates artifacts a repo didn't already opt into.",
         after_help = "\
 Examples:
   dira update --check               is a newer release available?
+  dira update --check --json        the same as one JSON object, for scripts
   dira update                       update to the latest release, restart the daemon
   dira update --channel prerelease  opt into a prerelease build
   dira update --version 0.2.0       pin to (or downgrade to) an exact version
   dira update --no-restart          swap the binaries, leave the running daemon alone
   dira update --no-zavet            skip the post-update zavet plugin refresh
-  dira update --no-cloud            skip the post-update cloud wiring refresh"
+  dira update --no-cloud            skip the post-update cloud wiring refresh
+  dira update --rollback            go back to the version the last update replaced
+
+Updates also apply in the background: dirad checks every few hours and installs
+a newer release on your channel. Turn that off with `dira config set update.auto
+off` (or DIRA_DISABLE_AUTOUPDATE=1)."
     )]
     Update {
         /// Resolve only — report what's available, change nothing.
@@ -581,6 +604,17 @@ Examples:
         /// Don't refresh this repo's committed cloud wiring after the update.
         #[arg(long)]
         no_cloud: bool,
+        /// With --check: emit one JSON object on stdout instead of text.
+        #[arg(long, requires = "check")]
+        json: bool,
+        /// Go back to the version the last update replaced, and skip the
+        /// version you are leaving in background updates.
+        #[arg(long, conflicts_with_all = ["check", "version", "channel"])]
+        rollback: bool,
+        /// Background mode, run by dirad: only acts on a newer release when
+        /// auto-update is on.
+        #[arg(long, hide = true)]
+        auto: bool,
     },
     /// Zavet knowledge module: what the tracked time produced, and why.
     #[command(
@@ -611,6 +645,35 @@ Examples:
         #[command(subcommand)]
         action: ZavetAction,
     },
+    /// Bot-less meeting detection: what it sees, and suggestions to review.
+    #[command(after_help = "\
+dira reads which app holds your microphone, camera or speakers, never audio,
+video, screen content, window titles or calendar entries. Turn it on with
+`dira config set modules.meetings suggest` (confirm each) or `auto` (record
+sure ones), then `dira daemon stop && dira daemon start`.
+
+Examples:
+  dira meetings                          live state, suggestions, last 7 days
+  dira meetings confirm 01J...           count a suggestion as meeting time
+  dira meetings dismiss 01J...           drop a suggestion
+  dira meetings retract 01J...           withdraw a recorded meeting
+  dira meetings assign 01J... github.com/acme/api")]
+    Meetings {
+        #[command(subcommand)]
+        action: Option<MeetingsCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeetingsCmd {
+    /// Count a suggestion (or keep a recorded meeting) as meeting time.
+    Confirm { id: String },
+    /// Drop a suggestion; it never counts.
+    Dismiss { id: String },
+    /// Withdraw a recorded meeting; it stops counting.
+    Retract { id: String },
+    /// File a meeting under a project (omit the project to clear it).
+    Assign { id: String, project: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -909,9 +972,18 @@ Examples:
     /// Show whether this device is linked, the cloud URL, and the sync backlog.
     #[command(after_help = "\
 Reports the link state, the cloud this device talks to, and how many captured
-events are still waiting to be sent. A growing backlog with a linked device
-usually means the daemon can't reach the cloud — `dira doctor` diagnoses it.")]
-    Status,
+events (and token-usage rows) are still waiting to be sent. A growing backlog
+with a linked device usually means the daemon can't reach the cloud —
+`dira doctor` diagnoses it.
+
+Examples:
+  dira device status         linked? cloud URL? sync backlog?
+  dira device status --json  the same as one JSON object, for scripts")]
+    Status {
+        /// Emit one JSON object on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Rotate this device's signing key (new keypair, signed by the old key).
     #[command(long_about = "\
 Generate a new signing keypair and register it with the cloud, authenticated
@@ -1006,10 +1078,19 @@ launchd/systemd directly.")]
     /// Show whether the daemon is up (exit 0 if any daemon is running — even
     /// a pre-upgrade one; 1 if none).
     #[command(after_help = "\
-Exit 0 if any daemon answers, 1 if none does. A daemon running under a
-different user or an elevated token can refuse this connection and still be
-reported as down — `dira doctor` is what distinguishes those.")]
-    Status,
+Exit 0 if any daemon answers, 1 if none does — in both modes. A daemon
+running under a different user or an elevated token can refuse this
+connection and still be reported as down — `dira doctor` is what
+distinguishes those (`--json` reports it as \"state\": \"denied\").
+
+Examples:
+  dira daemon status         up? which socket? who supervises it?
+  dira daemon status --json  the same as one JSON object, for scripts")]
+    Status {
+        /// Emit one JSON object on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Install an OS service (launchd/systemd-user/scheduled task) so it survives reboots.
     #[command(long_about = "\
 Register the daemon with this machine's own service manager — launchd on
@@ -1068,6 +1149,14 @@ fn daemon_skew_hint(message: &str) -> Option<String> {
 /// reporting this checkout's adapter staleness under it would be a plain lie.
 /// Pure, so the suppression rule is pinned by a test rather than by reading the
 /// dispatch site.
+fn meeting_action(id: String, action: MeetingAction, project: Option<String>) -> Request {
+    Request::MeetingAction {
+        id,
+        action,
+        project,
+    }
+}
+
 fn zavet_status_is_cwd_scoped(command: &Command) -> bool {
     matches!(
         command,
@@ -1079,6 +1168,9 @@ fn zavet_status_is_cwd_scoped(command: &Command) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything can spawn: no child may inherit our own stdout pipe
+    // (see `dira_core::process::disinherit_std_handles`).
+    dira_core::process::disinherit_std_handles();
     // Before anything prints: legacy Windows consoles need to be told to
     // interpret ANSI escapes, or every painted line leaks its SGR bytes.
     theme::enable_ansi();
@@ -1185,18 +1277,28 @@ async fn main() -> Result<()> {
             return match action {
                 DaemonAction::Start => daemon::start(&config).await,
                 DaemonAction::Stop => daemon::stop(&config).await,
-                DaemonAction::Status => {
-                    let running = daemon::status(&config).await?;
-                    print_supervision(&config).await;
+                DaemonAction::Status { json } => {
+                    // `--json`: stdout carries exactly one object. The
+                    // breadcrumb is stderr (as with `dira status --json`); the
+                    // update notice is skipped to keep that explicit.
+                    let running = if *json {
+                        daemon::status_json_print(&config).await?
+                    } else {
+                        let running = daemon::status(&config).await?;
+                        print_supervision(&config).await;
+                        running
+                    };
                     hook_health::maybe_warn();
-                    update::notice::maybe_print(&config);
+                    if !*json {
+                        update::notice::maybe_print(&config);
+                    }
                     if !running {
                         std::process::exit(1);
                     }
                     Ok(())
                 }
                 DaemonAction::Install => daemon::install(&config).await,
-                DaemonAction::Uninstall => daemon::uninstall(&config),
+                DaemonAction::Uninstall => daemon::uninstall(&config).await,
                 DaemonAction::Restart => daemon::restart(&config).await,
             };
         }
@@ -1238,7 +1340,14 @@ async fn main() -> Result<()> {
             });
         }
         Command::Nuke { yes } => return nuke(&config, *yes).await,
-        Command::Version => {
+        Command::Version { json } => {
+            // `--json`: one object on stdout. The breadcrumb goes to stderr;
+            // the update notice is skipped, as `dira doctor --json` does.
+            if *json {
+                daemon::version_json_print(&config).await?;
+                hook_health::maybe_warn();
+                return Ok(());
+            }
             print_version(&config).await?;
             hook_health::maybe_warn();
             update::notice::maybe_print(&config);
@@ -1278,6 +1387,9 @@ async fn main() -> Result<()> {
             bin_dir,
             no_zavet,
             no_cloud,
+            json,
+            rollback,
+            auto,
         } => {
             return update::run(
                 &config,
@@ -1290,6 +1402,9 @@ async fn main() -> Result<()> {
                     bin_dir: bin_dir.clone(),
                     no_zavet: *no_zavet,
                     no_cloud: *no_cloud,
+                    json: *json,
+                    rollback: *rollback,
+                    auto: *auto,
                 },
             )
             .await;
@@ -1301,7 +1416,7 @@ async fn main() -> Result<()> {
                     label,
                     runner_token,
                 } => device::link(&config, code.clone(), label.clone(), runner_token.clone()).await,
-                DeviceAction::Status => device::status(&config).await,
+                DeviceAction::Status { json } => device::status(&config, *json).await,
                 DeviceAction::RotateKey => device::rotate_key(&config).await,
                 DeviceAction::Unlink { yes } => device::unlink(&config, *yes).await,
                 DeviceAction::Resync { from } => device::resync(&config, from.clone()).await,
@@ -1374,6 +1489,7 @@ async fn main() -> Result<()> {
                 | ZavetAction::Wiki { json: true, .. }
                 | ZavetAction::Specs { json: true, .. }
         } | Command::Sessions { json: true, .. }
+            | Command::Report { json: true, .. }
     );
     let row_opts = match &cli.command {
         Command::Zavet {
@@ -1383,8 +1499,9 @@ async fn main() -> Result<()> {
             branch_only: *branch,
             ..Default::default()
         },
-        Command::Sessions { flat, .. } => render::RowOpts {
+        Command::Sessions { flat, limit, .. } => render::RowOpts {
             flat: *flat,
+            limit: *limit,
             ..Default::default()
         },
         _ => render::RowOpts::default(),
@@ -1448,6 +1565,7 @@ async fn main() -> Result<()> {
             week,
             all,
             project,
+            ..
         } => {
             let scope = if let Some(p) = project {
                 ReportScope::Project { project: p }
@@ -1499,6 +1617,15 @@ async fn main() -> Result<()> {
             ZavetAction::Emit => unreachable!(),
             ZavetAction::Install { .. } => unreachable!(),
         },
+        Command::Meetings { action } => match action {
+            None => Request::Meetings,
+            Some(MeetingsCmd::Confirm { id }) => meeting_action(id, MeetingAction::Confirm, None),
+            Some(MeetingsCmd::Dismiss { id }) => meeting_action(id, MeetingAction::Dismiss, None),
+            Some(MeetingsCmd::Retract { id }) => meeting_action(id, MeetingAction::Retract, None),
+            Some(MeetingsCmd::Assign { id, project }) => {
+                meeting_action(id, MeetingAction::Assign, project)
+            }
+        },
         // already handled above
         Command::Status { .. }
         | Command::Init { .. }
@@ -1510,12 +1637,19 @@ async fn main() -> Result<()> {
         | Command::Hook { .. }
         | Command::Nuke { .. }
         | Command::Completions { .. }
-        | Command::Version
+        | Command::Version { .. }
         | Command::Doctor { .. }
         | Command::Update { .. } => unreachable!(),
     };
 
-    let resp = client::send(&config.socket_path, &req).await?;
+    let mut resp = client::send(&config.socket_path, &req).await?;
+    // `sessions --json --limit N`: the same rule as the table (a run counts
+    // as one), over the daemon's newest-started-first list.
+    if let (true, Some(n), Response::Sessions { sessions }) =
+        (json_output, row_opts.limit, &mut resp)
+    {
+        *sessions = format::limit_entries(sessions, n).0;
+    }
     if let Response::Error { message } = &resp {
         if let Some(hint) = daemon_skew_hint(message) {
             eprintln!("{hint}");
@@ -1682,6 +1816,11 @@ enum HookOutcome {
     /// is how someone confirms it actually happened rather than the event
     /// having simply gone missing. See `hook_yield`.
     Yielded,
+    /// Never forwarded: a human signal from a headless run, where nobody is
+    /// present to have sent it. Silent and excluded from `hook_health` for
+    /// the same reason as [`Self::Yielded`]; `DIRA_HOOK_DEBUG` prints a line.
+    /// See `headless`.
+    Withheld,
 }
 
 /// Exit code a probe-mode hook uses to report a transport failure.
@@ -1694,10 +1833,16 @@ fn note_hook_failure(label: &str, probe: bool, reason: &str) -> HookOutcome {
     if !probe {
         hook_health::record_failure(label, reason);
     }
-    if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
-        eprintln!("dira hook {label}: {reason}");
-    }
+    hook_debug(format_args!("dira hook {label}: {reason}"));
     HookOutcome::Failed
+}
+
+/// Print `msg` to stderr when `DIRA_HOOK_DEBUG` is set (and not `0`). The
+/// only channel a silent hook outcome has, since a hook never writes stdout.
+fn hook_debug(msg: std::fmt::Arguments<'_>) {
+    if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
+        eprintln!("{msg}");
+    }
 }
 
 /// Forward a harness hook payload from stdin to the daemon — unless this is a
@@ -1725,9 +1870,9 @@ async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcom
             let user_scope_live = hook_yield::user_scope_wires(harness, event);
             let project_wraps_portable = hook_yield::project_scope_wires_portable(harness, event);
             if hook_yield::should_yield(user_scope_live, project_wraps_portable) {
-                if std::env::var("DIRA_HOOK_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
-                    eprintln!("dira hook {harness}: yielded to user-scope wiring for {event}");
-                }
+                hook_debug(format_args!(
+                    "dira hook {harness}: yielded to user-scope wiring for {event}"
+                ));
                 return HookOutcome::Yielded;
             }
         }
@@ -1739,14 +1884,109 @@ async fn forward_hook(config: &Config, harness: &str, probe: bool) -> HookOutcom
     if dira_sources::canonical_harness_id(harness) == Some("claude") {
         dira_core::orchestration::inject_env_hints(&mut payload, dira_core::env::non_blank);
     }
-    let owned = harness.to_string();
-    deliver_hook_payload(config, harness, probe, payload, move |payload| {
-        Request::IngestHook {
-            harness: owned,
-            payload,
+    // Normalize once, here (DIRASH-0049). Only the normalized record goes to
+    // the daemon or the spool; the raw payload (prompt text, tool input) never
+    // crosses the pipe or touches disk.
+    let Some((event, _)) = dira_sources::normalize_for(harness, payload) else {
+        // An unknown harness or a hook nothing accounts for: the daemon would
+        // have acknowledged it silently, so there is nothing to deliver.
+        hook_debug(format_args!(
+            "dira hook {harness}: not a hook dira accounts for; ignored"
+        ));
+        return HookOutcome::Delivered;
+    };
+    // Probe mode always forwards: its synthetic `UserPromptSubmit` must land
+    // even when `dira doctor` runs inside a CI job (DIRASH-0023).
+    if !probe && headless::is_headless() && event.kind.is_human_signal() {
+        hook_debug(format_args!(
+            "dira hook {harness}: withheld a human signal from a headless run"
+        ));
+        return HookOutcome::Withheld;
+    }
+    // When the hook fired, so a late delivery (through the spool) keeps its
+    // real time.
+    let observed_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let record = dira_sources::spool::Record::new(harness, observed_at, event);
+    deliver_record(config, harness, probe, record).await
+}
+
+/// Send one normalized hook record to the daemon (`Request::IngestRecord`).
+/// It is kept in the spool when the daemon cannot take it: unreachable, busy,
+/// timed out, or too old to know the request (the swap-before-restart moment of
+/// an update).
+async fn deliver_record(
+    config: &Config,
+    harness: &str,
+    probe: bool,
+    record: dira_sources::spool::Record,
+) -> HookOutcome {
+    let req = match serde_json::to_value(&record) {
+        Ok(record) => Request::IngestRecord { record },
+        Err(e) => return note_hook_failure(harness, probe, &format!("encode hook: {e}")),
+    };
+    let sent = tokio::time::timeout(
+        HOOK_TOTAL_BUDGET,
+        client::send_with_budget(&config.socket_path, &req, HOOK_CONNECT_BUDGET),
+    )
+    .await;
+    match sent {
+        // An older daemon that does not know the request, or one shutting down
+        // (a restart): it did not take the hook, so keep it for the next one.
+        Ok(Ok(dira_core::protocol::Response::Error { message }))
+            if client::is_daemon_too_old(&message) || message.contains("shutting down") =>
+        {
+            if probe {
+                return note_hook_failure(harness, probe, &message);
+            }
+            spool_undelivered(config, harness, record, false).await;
+            HookOutcome::Delivered
         }
-    })
-    .await
+        // Any other answer is the daemon's: an `Error` there is a semantic
+        // non-result (an unadmitted probe id, say), not a transport failure.
+        Ok(Ok(_)) => {
+            if !probe {
+                hook_health::record_success();
+            }
+            HookOutcome::Delivered
+        }
+        Ok(Err(e)) => {
+            let outcome = note_hook_failure(harness, probe, &e.to_string());
+            if !probe {
+                spool_undelivered(config, harness, record, true).await;
+            }
+            outcome
+        }
+        Err(_) => {
+            let outcome = note_hook_failure(harness, probe, "timed out reaching dirad");
+            if !probe {
+                spool_undelivered(config, harness, record, true).await;
+            }
+            outcome
+        }
+    }
+}
+
+/// Keep a hook the daemon could not take (DIRASH-0049): write it to the spool,
+/// which the daemon drains when it is back, and, if `kick` and nothing is
+/// listening, ask for the daemon to be started.
+async fn spool_undelivered(
+    config: &Config,
+    harness: &str,
+    record: dira_sources::spool::Record,
+    kick: bool,
+) {
+    let dir = dira_sources::spool::dir_for(&config.db_path);
+    match dira_sources::spool::write(&dir, &record) {
+        Ok(_) => hook_debug(format_args!(
+            "dira hook {harness}: spooled for later delivery"
+        )),
+        Err(e) => hook_debug(format_args!("dira hook {harness}: could not spool ({e})")),
+    }
+    if kick && autostart::allowed() && autostart::is_down(config).await {
+        autostart::kick(config);
+    }
 }
 
 /// Forward a zavet guard event from stdin to the daemon.

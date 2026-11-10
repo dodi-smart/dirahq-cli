@@ -183,6 +183,7 @@ pub fn build_batch_with_partials(
         idle,
         agent,
         now,
+        &[],
     )
 }
 
@@ -210,8 +211,12 @@ fn assemble_batch(
     idle: Duration,
     agent: crate::accounting::AgentPolicy,
     now: OffsetDateTime,
+    meetings: &[super::meetings::CountedMeeting],
 ) -> AttestationBatch {
-    let intervals = build_intervals_seeded(events, idle, seed);
+    // Work clipped around counted meetings (no-op without any): a minute is never
+    // sent as both work and meeting. Meeting time rides restatements.
+    let unclipped = build_intervals_seeded(events, idle, seed);
+    let intervals = super::meetings::overlay_intervals(&unclipped, meetings, false, "").0;
     // Compute the batch id AFTER the intervals exist, folding the interval
     // decomposition in (see `batch_id_for_chunk`): a re-derivation that changes an
     // interval's (start,end) split of the same minutes yields a DIFFERENT batch id so
@@ -221,8 +226,10 @@ fn assemble_batch(
     // Drop degenerate sessions before shipping: no engaged time AND no agent
     // activity is empty noise (a bare SessionStart with nothing after it), so it
     // never reaches the cloud. Manual/agent sessions with real time are kept.
+    // Engaged time BEFORE clipping: a manual session whose minutes all fell
+    // inside a meeting still happened, and its rollup (label, note) is sent once.
     let mut engaged: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
-    for iv in &intervals {
+    for iv in &unclipped {
         *engaged.entry(iv.source_session.as_str()).or_insert(0) += iv.human_seconds;
     }
     sessions.retain(|s| {
@@ -264,6 +271,8 @@ fn assemble_batch(
             workspace_ref: wire.workspace_ref,
             trigger: wire.trigger,
             trigger_name: wire.trigger_name,
+            stats: None,
+            workspace_hint: None,
         });
     }
 
@@ -278,6 +287,14 @@ fn assemble_batch(
         sessions,
         token_usage,
         artifacts,
+        seq: 0,
+        prev_batch_hash: String::new(),
+        chain_epoch: 0,
+        client: None,
+        capture_health: None,
+        day_rollups: Vec::new(),
+        meetings: Vec::new(),
+        windows: Vec::new(),
     }
 }
 
@@ -348,15 +365,30 @@ fn chunk_ranges(events: &[RawEvent], idle: Duration, min_chunk: usize) -> Vec<(u
         return ranges;
     }
     let min_chunk = min_chunk.max(1);
+    // Events come in id (arrival) order, not `at` order: a hook replayed from
+    // the spool (DIRASH-0049) arrives late with its original, older `at`. So a
+    // cut is taken only where EVERY event before it is more than `idle` earlier
+    // than EVERY event after it: the running max `at` of the prefix against the
+    // min `at` of the suffix. Comparing adjacent events let a late one fake a
+    // break and split a counted gap across chunks (only chunk 0 is seeded, so
+    // the gap was lost). For in-order events this is exactly the old rule, so
+    // boundaries (and batch ids) are unchanged.
+    let n = events.len();
+    let mut suffix_min = vec![events[n - 1].at; n];
+    for i in (0..n - 1).rev() {
+        suffix_min[i] = suffix_min[i + 1].min(events[i].at);
+    }
+    let mut prefix_max = events[0].at;
     let mut start = 0usize;
-    for i in 1..events.len() {
-        let big_break = events[i].at - events[i - 1].at > idle;
+    for i in 1..n {
+        let big_break = suffix_min[i] - prefix_max > idle;
         if i - start >= min_chunk && big_break {
             ranges.push((start, i - 1));
             start = i;
         }
+        prefix_max = prefix_max.max(events[i].at);
     }
-    ranges.push((start, events.len() - 1));
+    ranges.push((start, n - 1));
     ranges
 }
 
@@ -396,6 +428,10 @@ pub fn build_chunked_batches(
     // into whichever chunk holds that session's SessionEnd/ManualStop — passing it to
     // the others is a no-op for them, not a duplication risk.
     history: &[RawEvent],
+    // Recorded or confirmed meetings overlapping this flush's time span, read by
+    // time (DIRASH-0063). Work is clipped around them; their own time rides a
+    // restatement batch (`sync::meetings`), never these chunks. Empty: no change.
+    meetings: &[super::meetings::CountedMeeting],
 ) -> Vec<ChunkBatch> {
     // Size-bounded slices of the two collections that are NOT bounded by the
     // event window. `chunks` on an empty slice yields nothing, so a flush without
@@ -439,7 +475,7 @@ pub fn build_chunked_batches(
             // their sent-watermark advances with `is_last`.
             let parts: &[PartialSession] = if is_last { partials } else { &[] };
             let batch = assemble_batch(
-                chunk, chunk_seed, hist, toks, arts, parts, device_id, idle, agent, now,
+                chunk, chunk_seed, hist, toks, arts, parts, device_id, idle, agent, now, meetings,
             );
             ChunkBatch {
                 batch,
@@ -474,7 +510,9 @@ fn build_artifacts(rows: &[ArtifactRow]) -> Vec<ArtifactRef> {
             session_change_id: r.session_change_id.clone(),
             touched_paths: r.touched_paths.clone(),
             blobs: r.blobs.clone(),
-            // author_name is intentionally local-only (PII) — not on the wire.
+            // author_name is intentionally local-only (PII) — not on the wire.,
+            lines_added: None,
+            lines_removed: None,
         })
         .collect()
 }
@@ -509,7 +547,11 @@ fn build_intervals(events: &[RawEvent], idle: Duration) -> Vec<Interval> {
 /// must be selected by `at` (not event id): the window is an id-range but gaps are an
 /// `at`-relation, so a relevant earlier-by-`at` signal can be a higher-id row that
 /// `dira log` backdated (see `store::human_signal_seed`).
-fn build_intervals_seeded(events: &[RawEvent], idle: Duration, seed: &[RawEvent]) -> Vec<Interval> {
+pub(crate) fn build_intervals_seeded(
+    events: &[RawEvent],
+    idle: Duration,
+    seed: &[RawEvent],
+) -> Vec<Interval> {
     struct Sig {
         at: OffsetDateTime,
         project: Option<String>,
@@ -586,6 +628,8 @@ fn build_intervals_seeded(events: &[RawEvent], idle: Duration, seed: &[RawEvent]
             // None for agent work that carries no activity).
             activity: activities.get(&a.session_id).cloned().flatten(),
             source_session: a.session_id.clone(),
+            // Detected meetings are not wired into the batch yet (meetings P1/P2).
+            meeting_id: None,
         });
     }
 
@@ -611,7 +655,7 @@ fn build_intervals_seeded(events: &[RawEvent], idle: Duration, seed: &[RawEvent]
 /// Deterministic, content-derived interval id (a ULID-shaped 128-bit hash of the
 /// settled interval content). Stable across re-derivation — the basis for
 /// idempotent re-send/replay (see [`build_intervals`]).
-fn interval_id(
+pub(crate) fn interval_id(
     source_session: &str,
     started_at: &str,
     ended_at: &str,
@@ -770,6 +814,8 @@ fn build_sessions(
         /// First non-null spec slug across the session's events.
         spec: Option<String>,
         lineage: crate::orchestration::SessionLineage,
+        /// Contract 2.0 counts (DIRASH-0052).
+        stats: crate::stats::StatsAcc,
     }
 
     // Sessions that END in THIS window's slice ONLY — never from `history` (see the
@@ -821,8 +867,10 @@ fn build_sessions(
                 label: e.label.clone(),
                 spec: e.spec.clone(),
                 lineage: Default::default(),
+                stats: Default::default(),
             });
         entry.lineage.observe(e);
+        entry.stats.observe(e);
         entry.event_times.push(crate::accounting::AgentSample {
             at: e.at,
             opens_span: e.kind.opens_agent_span(),
@@ -901,6 +949,9 @@ fn build_sessions(
                 workspace_ref: wire.workspace_ref,
                 trigger: wire.trigger,
                 trigger_name: wire.trigger_name,
+                // Manual sessions have no tools or permissions to count.
+                stats: (a.harness != Harness::Manual).then(|| a.stats.finish()),
+                workspace_hint: None,
             }
         })
         .collect()
@@ -1005,6 +1056,14 @@ pub fn build_lineage_resend_batches(
                 sessions: chunk.to_vec(),
                 token_usage: Vec::new(),
                 artifacts: Vec::new(),
+                seq: 0,
+                prev_batch_hash: String::new(),
+                chain_epoch: 0,
+                client: None,
+                capture_health: None,
+                day_rollups: Vec::new(),
+                meetings: Vec::new(),
+                windows: Vec::new(),
             }
         })
         .collect()
@@ -1148,7 +1207,7 @@ pub(crate) fn fnv1a(ids: &[&str], seed: u64) -> u64 {
 }
 
 /// Format a timestamp as RFC 3339 (the contract's wire encoding).
-fn fmt(t: OffsetDateTime) -> String {
+pub(crate) fn fmt(t: OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }
 
@@ -1648,8 +1707,19 @@ mod tests {
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
-        let chunks =
-            build_chunked_batches(&events, &[], &rows, &[], "d", IDLE, AGENT, NOW, &[], &[]);
+        let chunks = build_chunked_batches(
+            &events,
+            &[],
+            &rows,
+            &[],
+            "d",
+            IDLE,
+            AGENT,
+            NOW,
+            &[],
+            &[],
+            &[],
+        );
 
         let (shipped, per_chunk) = shipped_artifacts(&chunks);
         assert!(
@@ -1673,8 +1743,19 @@ mod tests {
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
-        let chunks =
-            build_chunked_batches(&events, &[], &rows, &[], "d", IDLE, AGENT, NOW, &[], &[]);
+        let chunks = build_chunked_batches(
+            &events,
+            &[],
+            &rows,
+            &[],
+            "d",
+            IDLE,
+            AGENT,
+            NOW,
+            &[],
+            &[],
+            &[],
+        );
 
         assert_eq!(
             chunks.len(),
@@ -1701,7 +1782,8 @@ mod tests {
             .map(|i| art(i as i64 + 1, &format!("sha-{i:04}")))
             .collect();
 
-        let chunks = build_chunked_batches(&[], &[], &rows, &[], "d", IDLE, AGENT, NOW, &[], &[]);
+        let chunks =
+            build_chunked_batches(&[], &[], &rows, &[], "d", IDLE, AGENT, NOW, &[], &[], &[]);
 
         let (shipped, per_chunk) = shipped_artifacts(&chunks);
         assert_eq!(per_chunk, vec![CHUNK_ARTIFACTS, CHUNK_ARTIFACTS, 1]);
@@ -1738,8 +1820,19 @@ mod tests {
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
-        let chunks =
-            build_chunked_batches(&events, &rows, &[], &[], "d", IDLE, AGENT, NOW, &[], &[]);
+        let chunks = build_chunked_batches(
+            &events,
+            &rows,
+            &[],
+            &[],
+            "d",
+            IDLE,
+            AGENT,
+            NOW,
+            &[],
+            &[],
+            &[],
+        );
 
         let per_chunk: Vec<usize> = chunks.iter().map(|c| c.batch.token_usage.len()).collect();
         assert_eq!(per_chunk, vec![CHUNK_TOKENS, CHUNK_TOKENS, 5]);
@@ -1765,8 +1858,19 @@ mod tests {
             .collect();
         let events = vec![ev("s1", 0, EventKind::UserPrompt, "p")];
 
-        let chunks =
-            build_chunked_batches(&events, &rows, &arts, &[], "d", IDLE, AGENT, NOW, &[], &[]);
+        let chunks = build_chunked_batches(
+            &events,
+            &rows,
+            &arts,
+            &[],
+            "d",
+            IDLE,
+            AGENT,
+            NOW,
+            &[],
+            &[],
+            &[],
+        );
 
         let toks: Vec<Option<i64>> = chunks.iter().map(|c| c.token_rowid_high).collect();
         assert_eq!(
@@ -1798,7 +1902,8 @@ mod tests {
             ev("s1", 0, EventKind::UserPrompt, "p"),
             ev("s1", 10, EventKind::PreTool, "p"),
         ];
-        let chunks = build_chunked_batches(&events, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &[]);
+        let chunks =
+            build_chunked_batches(&events, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &[], &[]);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].is_last);
         assert!(chunks[0].cursor_event_id.is_some());
@@ -2274,8 +2379,19 @@ mod tests {
         // pre-fix, a window slice that's just a bare SessionEnd has no agent
         // activity and no interval-engaged time of its own, so the old (window-
         // only) rollup would have been silently dropped by that filter.
-        let chunks =
-            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &history);
+        let chunks = build_chunked_batches(
+            &window,
+            &[],
+            &[],
+            &[],
+            "d",
+            IDLE,
+            AGENT,
+            NOW,
+            &[],
+            &history,
+            &[],
+        );
         assert_eq!(chunks.len(), 1);
         let sessions = &chunks[0].batch.sessions;
         assert_eq!(
@@ -2360,10 +2476,21 @@ mod tests {
         window.push(ev("s1", 1300, EventKind::PreTool, "p"));
         window.push(ev("s1", 1305, EventKind::SessionEnd, "p"));
 
-        let with_history =
-            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &window);
+        let with_history = build_chunked_batches(
+            &window,
+            &[],
+            &[],
+            &[],
+            "d",
+            IDLE,
+            AGENT,
+            NOW,
+            &[],
+            &window,
+            &[],
+        );
         let without_history =
-            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &[]);
+            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &[], &[]);
 
         assert_eq!(
             with_history.len(),
@@ -2504,8 +2631,19 @@ mod tests {
         let history = ended_history("s1");
         // What the first send produced: the bare end in the window, the rest as history.
         let window = vec![history[5].clone()];
-        let normal =
-            build_chunked_batches(&window, &[], &[], &[], "d", IDLE, AGENT, NOW, &[], &history);
+        let normal = build_chunked_batches(
+            &window,
+            &[],
+            &[],
+            &[],
+            "d",
+            IDLE,
+            AGENT,
+            NOW,
+            &[],
+            &history,
+            &[],
+        );
         let first = &normal[0].batch.sessions;
         assert_eq!(first.len(), 1);
 
@@ -2564,5 +2702,55 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].sessions.len(), CHUNK_RESEND_SESSIONS);
         assert_eq!(batches[1].sessions.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod late_event_chunk_tests {
+    use super::*;
+    use crate::model::EventKind;
+    use dira_contract::Harness;
+
+    fn ev(id: &str, secs: i64) -> RawEvent {
+        RawEvent {
+            id: id.into(),
+            at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(secs),
+            session_id: "s".into(),
+            harness: Harness::ClaudeCode,
+            kind: EventKind::UserPrompt,
+            cwd: None,
+            project: None,
+            identity_email: None,
+            branch: None,
+            tool: None,
+            label: None,
+            activity: None,
+            note: None,
+            spec: None,
+            lineage: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_late_event_never_fakes_a_break_between_two_close_signals() {
+        // Arrival order: x@0, A@10000, late@500 (replayed from the spool), B@10180.
+        // A and B are 180 s apart, inside the 300 s idle window: one counted gap.
+        let events = [ev("1", 0), ev("2", 10_000), ev("3", 500), ev("4", 10_180)];
+        let ranges = chunk_ranges(&events, Duration::seconds(300), 1);
+        let chunk_of = |i: usize| ranges.iter().position(|&(a, b)| a <= i && i <= b);
+        assert_eq!(
+            chunk_of(1),
+            chunk_of(3),
+            "A and B stay in one chunk: {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn in_order_events_cut_exactly_as_before() {
+        let events = [ev("1", 0), ev("2", 100), ev("3", 1000), ev("4", 1100)];
+        assert_eq!(
+            chunk_ranges(&events, Duration::seconds(300), 1),
+            vec![(0, 1), (2, 3)]
+        );
     }
 }

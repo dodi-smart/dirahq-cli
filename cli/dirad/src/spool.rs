@@ -155,7 +155,16 @@ pub static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Called by the writer when it is done with a spooled message.
 pub fn finished_spooled() {
-    let _ = IN_FLIGHT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    // Saturating decrement. A compare-exchange loop rather than `fetch_update`,
+    // which newer toolchains deprecate in favour of `try_update` (not yet on
+    // every supported toolchain), so it builds clean everywhere.
+    let mut n = IN_FLIGHT.load(Ordering::Acquire);
+    while n > 0 {
+        match IN_FLIGHT.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(current) => n = current,
+        }
+    }
 }
 
 /// Whether any spooled hook is still on its way: on disk, or queued and not

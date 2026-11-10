@@ -3622,13 +3622,35 @@ impl Store {
                 continue;
             };
             let repo = i.repo_canonical.clone().unwrap_or_default();
+            // A late hook can split an interval this device already sent into
+            // two new ones. The stale wider row would otherwise be summed with
+            // them, so this session's stored intervals that overlap the new one
+            // are replaced, and their days re-sent.
+            let replaced = sqlx::query(
+                "DELETE FROM day_intervals WHERE id != ?1 AND session_id = ?2 \
+                 AND started_at < ?3 AND ended_at > ?4 RETURNING day, repo",
+            )
+            .bind(&i.id)
+            .bind(&i.source_session)
+            .bind(&i.ended_at)
+            .bind(&i.started_at)
+            .fetch_all(&mut *tx)
+            .await?;
+            for r in replaced {
+                days.insert((r.get("day"), r.get("repo")));
+            }
             sqlx::query(
-                "INSERT OR REPLACE INTO day_intervals (id, day, repo, human_seconds) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO day_intervals \
+                 (id, day, repo, human_seconds, session_id, started_at, ended_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .bind(&i.id)
             .bind(day)
             .bind(&repo)
             .bind(i.human_seconds as i64)
+            .bind(&i.source_session)
+            .bind(&i.started_at)
+            .bind(&i.ended_at)
             .execute(&mut *tx)
             .await?;
             days.insert((day.to_string(), repo));
@@ -3638,6 +3660,17 @@ impl Store {
                 continue;
             };
             let repo = s.repo_canonical.clone().unwrap_or_default();
+            // A re-sent rollup can move its session to another day or repo (a
+            // partial without a repo, then a final with one). The day it leaves
+            // changes too.
+            if let Some(old) =
+                sqlx::query("SELECT day, repo FROM day_sessions WHERE session_id = ?1")
+                    .bind(&s.session_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            {
+                days.insert((old.get("day"), old.get("repo")));
+            }
             sqlx::query(
                 "INSERT OR REPLACE INTO day_sessions (session_id, day, repo, agent_wall_seconds, prompts)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3720,6 +3753,15 @@ impl Store {
         }
         tx.commit().await?;
         Ok(removed)
+    }
+
+    /// Whether any day's rollup changed since it was last sent.
+    pub async fn has_pending_day_rollups(&self) -> Result<bool, Error> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM day_rollup_state WHERE dirty = 1)")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n != 0)
     }
 
     /// The `DayRollup`s of days that changed since they were last sent, oldest
@@ -6694,14 +6736,14 @@ mod v2_tests {
         let day = today();
         store
             .record_acked_batch(&batch(vec![
-                interval("i1", &day, 60),
-                interval("i2", &day, 30),
+                span("i1", &day, "10:00:00", "10:01:00", 60),
+                span("i2", &day, "11:00:00", "11:00:30", 30),
             ]))
             .await
             .unwrap();
         // A re-sent interval replaces itself rather than counting twice.
         store
-            .record_acked_batch(&batch(vec![interval("i1", &day, 60)]))
+            .record_acked_batch(&batch(vec![span("i1", &day, "10:00:00", "10:01:00", 60)]))
             .await
             .unwrap();
 
@@ -6717,11 +6759,92 @@ mod v2_tests {
         assert!(store.pending_day_rollups(10).await.unwrap().is_empty());
 
         store
-            .record_acked_batch(&batch(vec![interval("i3", &day, 15)]))
+            .record_acked_batch(&batch(vec![span("i3", &day, "12:00:00", "12:00:15", 15)]))
             .await
             .unwrap();
         let again = store.pending_day_rollups(10).await.unwrap();
         assert_eq!((again[0].human_seconds, again[0].revision), (105, 1));
+    }
+
+    fn span(id: &str, day: &str, from: &str, to: &str, secs: u64) -> Interval {
+        Interval {
+            started_at: format!("{day}T{from}Z"),
+            ended_at: format!("{day}T{to}Z"),
+            ..interval(id, day, secs)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_split_replaces_the_wider_interval_instead_of_adding_to_it() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        store
+            .record_acked_batch(&batch(vec![span(
+                "wide", &day, "10:00:00", "10:04:00", 240,
+            )]))
+            .await
+            .unwrap();
+        // A late signal at 10:02 splits the same gap into two.
+        store
+            .record_acked_batch(&batch(vec![
+                span("a", &day, "10:00:00", "10:02:00", 120),
+                span("b", &day, "10:02:00", "10:04:00", 120),
+            ]))
+            .await
+            .unwrap();
+        let d = &store.pending_day_rollups(10).await.unwrap()[0];
+        assert_eq!((d.human_seconds, d.interval_count), (240, 2));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_moves_repo_marks_the_day_it_left() {
+        let store = Store::open_in_memory().await.unwrap();
+        let day = today();
+        let rollup = |repo: Option<&str>| dira_contract::SessionRollup {
+            session_id: "s".into(),
+            harness: dira_contract::Harness::ClaudeCode,
+            kind: dira_contract::SessionKind::Agent,
+            repo_canonical: repo.map(str::to_string),
+            identity_email: "e".into(),
+            started_at: format!("{day}T09:00:00Z"),
+            ended_at: None,
+            agent_wall_seconds: 60,
+            prompts: Some(1),
+            branch: None,
+            note: None,
+            label: None,
+            runtime: None,
+            runtime_session_ref: None,
+            spec: None,
+            role: None,
+            parent_session: None,
+            repos: None,
+            workspace_ref: None,
+            trigger: None,
+            trigger_name: None,
+            stats: None,
+            workspace_hint: None,
+        };
+        let mut b = batch(vec![]);
+        b.sessions = vec![rollup(None)];
+        store.record_acked_batch(&b).await.unwrap();
+        let first = store.pending_day_rollups(10).await.unwrap();
+        let keys: Vec<_> = first
+            .iter()
+            .map(|d| (d.day.clone(), d.repo_canonical.clone()))
+            .collect();
+        store.mark_day_rollups_sent(&keys).await.unwrap();
+
+        b.sessions = vec![rollup(Some("github.com/acme/api"))];
+        store.record_acked_batch(&b).await.unwrap();
+        let pending = store.pending_day_rollups(10).await.unwrap();
+        let repos: Vec<_> = pending.iter().map(|d| d.repo_canonical.clone()).collect();
+        assert!(
+            repos.contains(&None),
+            "the repo-less day it left is re-sent: {repos:?}"
+        );
+        let left = pending.iter().find(|d| d.repo_canonical.is_none()).unwrap();
+        assert_eq!(left.sessions, 0);
     }
 
     #[tokio::test]

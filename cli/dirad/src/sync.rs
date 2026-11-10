@@ -840,6 +840,12 @@ async fn flush(
     // backlog could never drain — `flush` returned `Nothing` and no later flush
     // reconsidered it.
     if events.is_empty() && artifact_rows.is_empty() && token_rows.is_empty() {
+        // Day rollups still waiting (the last flush's changes, or days a late
+        // event re-opened) go out on their own instead of waiting for new
+        // activity to carry them.
+        if send_pending_day_rollups(state, device_key, client, &cloud_url, &device_id).await? {
+            return Ok(FlushOutcome::Synced);
+        }
         return Ok(FlushOutcome::Nothing);
     }
 
@@ -1606,6 +1612,60 @@ pub(crate) async fn post_chained(
         tracing::debug!("record acked batch for day rollups: {e}");
     }
     Ok(body)
+}
+
+/// Send pending day rollups in a batch of their own (nothing else to carry them).
+/// `true` when one was sent.
+async fn send_pending_day_rollups(
+    state: &AppState,
+    device_key: &DeviceKey,
+    client: &reqwest::Client,
+    cloud_url: &str,
+    device_id: &str,
+) -> Result<bool, SyncError> {
+    if !state.store.has_pending_day_rollups().await.unwrap_or(false) {
+        return Ok(false);
+    }
+    let rollups = state
+        .store
+        .pending_day_rollups(DAY_ROLLUPS_PER_BATCH)
+        .await
+        .map_err(|e| SyncError::Fatal(format!("read day rollups: {e}")))?;
+    if rollups.is_empty() {
+        return Ok(false);
+    }
+    let keys: Vec<(String, Option<String>)> = rollups
+        .iter()
+        .map(|d| (d.day.clone(), d.repo_canonical.clone()))
+        .collect();
+    let batch = dira_contract::AttestationBatch {
+        batch_id: ulid::Ulid::generate().to_string(),
+        device_id: device_id.to_string(),
+        generated_at: crate::heartbeat::fmt_rfc3339(time::OffsetDateTime::now_utc()),
+        seq: 0,
+        prev_batch_hash: String::new(),
+        chain_epoch: 0,
+        client: None,
+        capture_health: None,
+        intervals: vec![],
+        sessions: vec![],
+        token_usage: vec![],
+        artifacts: vec![],
+        day_rollups: rollups,
+    };
+    let url = format!("{}/api/v1/ingest", cloud_url.trim_end_matches('/'));
+    let mut chain = crate::chain::Chain::load(&state.store).await;
+    post_chained(
+        state, device_key, client, &url, device_id, &mut chain, batch,
+    )
+    .await
+    .map_err(|(e, _)| e)?;
+    state
+        .store
+        .mark_day_rollups_sent(&keys)
+        .await
+        .map_err(|e| SyncError::Fatal(format!("mark day rollups: {e}")))?;
+    Ok(true)
 }
 
 /// Most day rollups one batch carries; the rest follow in later flushes.

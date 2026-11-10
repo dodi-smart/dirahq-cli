@@ -22,13 +22,20 @@ CREATE TABLE IF NOT EXISTS session_paths (
 -- (`repo` '' = none), so each day can be re-sent as a `DayRollup` the cloud
 -- reconciles against. Keyed by the wire ids, so a re-sent interval, rollup or
 -- token row replaces itself instead of counting twice.
+-- An interval also keeps its session and span: a late hook replayed from the
+-- spool can split an interval that was already sent into two new ones, and the
+-- stale wider row must then be replaced, not summed with them.
 CREATE TABLE IF NOT EXISTS day_intervals (
     id            TEXT PRIMARY KEY,
     day           TEXT NOT NULL,
     repo          TEXT NOT NULL,
-    human_seconds INTEGER NOT NULL
+    human_seconds INTEGER NOT NULL,
+    session_id    TEXT NOT NULL,
+    started_at    TEXT NOT NULL,
+    ended_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS day_intervals_day ON day_intervals (day, repo);
+CREATE INDEX IF NOT EXISTS day_intervals_session ON day_intervals (session_id);
 
 CREATE TABLE IF NOT EXISTS day_sessions (
     session_id         TEXT PRIMARY KEY,

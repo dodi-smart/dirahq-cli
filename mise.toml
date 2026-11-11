@@ -2,7 +2,11 @@
 # Rust builds the capture layer (cli/* + contract); just runs the task recipes;
 # node/bun run the JS release tooling (semantic-release + commitlint).
 [tools]
-rust = "stable"
+# `mr_boxington` runs Cargo through mbx (https://mr-boxington.jdx.dev): one
+# shared compile cache across this checkout and every worktree, and target/
+# becomes a managed link that is pruned when the worktree goes or ages out.
+rust = { version = "stable", mr_boxington = true }
+"mr-boxington" = "1.30.0"
 just = "latest"
 node = "24"
 bun = "latest"

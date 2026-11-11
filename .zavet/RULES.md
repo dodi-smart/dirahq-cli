@@ -48,3 +48,9 @@ agent context at session start. Keep it short and non-negotiable.
 - A headless run (`DIRA_HEADLESS`, or `GITHUB_ACTIONS=true`) never reports a
   human signal: the `dira hook` shim withholds those and forwards the rest.
   Never infer presence from the cloud runtime id. See DIRASH-0047.
+- Letopis surfaces answer simply for anyone, keep the detail open below the
+  answer and put everything in the MCP (suite principle, dirahq-cloud D-0090).
+  Human-facing output opens with at most four figures or sentences a
+  non-technical reader can act on, words first; breakdowns follow the answer,
+  never above it, and are trimmed by audience, not folded away. Absent data is
+  written as words, never `0`.

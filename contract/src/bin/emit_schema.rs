@@ -59,5 +59,14 @@ fn main() -> std::io::Result<()> {
     std::fs::write(&responses_out, responses_json + "\n")?;
     eprintln!("wrote {}", responses_out.display());
 
+    // The check catalogue (DIRASH-0069): loop and change check ids in one
+    // format. Data, not a schema: the cloud vendors it and pins proba's
+    // registry to it.
+    let catalogue = serde_json::to_string_pretty(&dira_contract::catalogue::catalogue())
+        .expect("catalogue serializes");
+    let catalogue_out = dir.join("check-catalogue.json");
+    std::fs::write(&catalogue_out, catalogue + "\n")?;
+    eprintln!("wrote {}", catalogue_out.display());
+
     Ok(())
 }

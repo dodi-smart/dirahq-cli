@@ -23,6 +23,8 @@
 //!   `wire_contract_carries_no_content_fields` test, so nothing else can ever
 //!   join them silently.
 
+pub mod catalogue;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

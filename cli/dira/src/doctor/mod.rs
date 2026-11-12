@@ -112,6 +112,14 @@ impl Check {
     }
 }
 
+/// The report's name and bottom lines.
+pub(crate) const DOCTOR: render::Kind = render::Kind {
+    command: "dira doctor",
+    fail: "capture is not working — fix the failures above",
+    warn: "capture is working, with warnings",
+    ok: "all clear — capture is working",
+};
+
 /// Every check id, in the order they run and render.
 ///
 /// Cause first: daemon reachability, then the daemon's own self-report, then
@@ -271,9 +279,9 @@ pub(crate) async fn run(config: &Config, args: Args) -> i32 {
     }
     let code = exit_code(&results);
     if args.json {
-        render::print_json(&results, code);
+        render::print_json(&results, code, &DOCTOR);
     } else {
-        render::print_human(&results, args.verbose, code);
+        render::print_human(&results, args.verbose, code, &DOCTOR);
     }
     code
 }

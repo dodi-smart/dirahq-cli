@@ -22,6 +22,8 @@ const REPORT_SCHEMA: u32 = 1;
 #[derive(Serialize)]
 struct Report<'a> {
     schema: u32,
+    /// Which command wrote the report: `dira doctor` or `dira loop lint`.
+    command: &'static str,
     dira: &'static str,
     generated_at: String,
     summary: Summary,
@@ -51,9 +53,10 @@ fn summarize(checks: &[Check], exit_code: i32) -> Summary {
 }
 
 /// Exactly one JSON object on stdout, and nothing else.
-pub(crate) fn print_json(checks: &[Check], exit_code: i32) {
+pub(crate) fn print_json(checks: &[Check], exit_code: i32, kind: &Kind) {
     let report = Report {
         schema: REPORT_SCHEMA,
+        command: kind.command,
         dira: env!("CARGO_PKG_VERSION"),
         generated_at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -66,7 +69,7 @@ pub(crate) fn print_json(checks: &[Check], exit_code: i32) {
     // `BufWriter` — the exit would drop it.
     match serde_json::to_string_pretty(&report) {
         Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("dira doctor: could not serialize the report: {e}"),
+        Err(e) => eprintln!("{}: could not serialize the report: {e}", kind.command),
     }
 }
 
@@ -85,7 +88,16 @@ fn mark(level: Level) -> (&'static str, Role) {
     }
 }
 
-pub(crate) fn print_human(checks: &[Check], verbose: bool, exit_code: i32) {
+/// Which command a report belongs to: its name, and the bottom line for each
+/// verdict (failure, warning, all clear). Each caller owns its own.
+pub(crate) struct Kind {
+    pub command: &'static str,
+    pub fail: &'static str,
+    pub warn: &'static str,
+    pub ok: &'static str,
+}
+
+pub(crate) fn print_human(checks: &[Check], verbose: bool, exit_code: i32, kind: &Kind) {
     let shown: Vec<&Check> = checks
         .iter()
         .filter(|c| verbose || c.level != Level::Skip)
@@ -150,7 +162,7 @@ pub(crate) fn print_human(checks: &[Check], verbose: bool, exit_code: i32) {
             )
         );
     }
-    let (verdict, role) = verdict_line(s.verdict);
+    let (verdict, role) = verdict_line(s.verdict, kind);
     println!("{}", theme::paint(verdict, role));
 }
 
@@ -159,14 +171,11 @@ fn counts_line(s: &Summary) -> String {
 }
 
 /// The bottom line, which is the only line most people read.
-fn verdict_line(verdict: Level) -> (&'static str, Role) {
+fn verdict_line(verdict: Level, v: &Kind) -> (&'static str, Role) {
     match verdict {
-        Level::Fail => (
-            "capture is not working — fix the failures above",
-            Role::Negative,
-        ),
-        Level::Warn => ("capture is working, with warnings", Role::Compute),
-        _ => ("all clear — capture is working", Role::Engaged),
+        Level::Fail => (v.fail, Role::Negative),
+        Level::Warn => (v.warn, Role::Compute),
+        _ => (v.ok, Role::Engaged),
     }
 }
 
@@ -196,6 +205,7 @@ mod tests {
         let cs = checks();
         let report = Report {
             schema: REPORT_SCHEMA,
+            command: "dira doctor",
             dira: env!("CARGO_PKG_VERSION"),
             generated_at: "2026-08-09T00:00:00Z".into(),
             summary: summarize(&cs, 2),
@@ -235,10 +245,18 @@ mod tests {
 
     #[test]
     fn the_verdict_line_names_the_worst_level() {
-        assert!(verdict_line(Level::Ok).0.contains("all clear"));
-        assert!(verdict_line(Level::Skip).0.contains("all clear"));
-        assert!(verdict_line(Level::Warn).0.contains("with warnings"));
-        assert!(verdict_line(Level::Fail).0.contains("not working"));
+        assert!(verdict_line(Level::Ok, &super::super::DOCTOR)
+            .0
+            .contains("all clear"));
+        assert!(verdict_line(Level::Skip, &super::super::DOCTOR)
+            .0
+            .contains("all clear"));
+        assert!(verdict_line(Level::Warn, &super::super::DOCTOR)
+            .0
+            .contains("with warnings"));
+        assert!(verdict_line(Level::Fail, &super::super::DOCTOR)
+            .0
+            .contains("not working"));
     }
 
     #[test]

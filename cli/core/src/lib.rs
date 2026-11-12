@@ -12,6 +12,7 @@ pub mod config;
 pub mod env;
 pub mod httpclient;
 pub mod identity;
+pub mod loop_recipe;
 pub mod model;
 pub mod orchestration;
 pub mod pricing;

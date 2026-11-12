@@ -78,6 +78,11 @@ dira status           # today's summary — engaged, agent, compute, unbilled
 dira doctor           # is capture actually working? (add --probe to prove it end to end)
 ```
 
+Describe your delivery loop as a recipe in `.dira/loop.yml` and check it offline with
+`dira loop lint`: schema, references, and the loop review checks the recipe alone can
+decide. [`examples/loops/dodi-factory.yml`](examples/loops/dodi-factory.yml) is a full
+example; the format is in [`.zavet/specs/loop-recipe.md`](.zavet/specs/loop-recipe.md).
+
 Prefer to do it yourself? Every step `onboard` runs is its own command — `dira init`,
 `dira daemon install`, `dira device link`, `dira zavet install`.
 

@@ -77,6 +77,8 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 # Serialization + schema
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The loop recipe (`.dira/loop.yml`, DIRASH-0068): the maintained serde_yaml fork.
+serde_norway = "0.9"
 schemars = "1"
 
 # Crypto + identity

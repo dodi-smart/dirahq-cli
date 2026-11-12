@@ -17,6 +17,8 @@ dira-contract.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `loop_recipe`: parse `.dira/loop.yml` (DIRASH-0068).
+serde_norway.workspace = true
 sqlx.workspace = true
 time.workspace = true
 ulid.workspace = true

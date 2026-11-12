@@ -15,6 +15,7 @@ mod hook_health;
 mod hook_yield;
 mod init;
 mod json_splice;
+mod loop_cmd;
 mod onboard;
 mod render;
 mod session_titles;
@@ -543,6 +544,29 @@ Examples:
         #[arg(long)]
         probe: bool,
     },
+    /// Check a delivery-loop recipe (`.dira/loop.yml`).
+    #[command(
+        long_about = "\
+A loop recipe writes your delivery loop down as data: its stages, the agent
+lanes and model families that hold them, the gates before a stage or a merge,
+the merge tiers, holdouts, round caps and kill switches.
+
+`dira loop lint` parses the recipe, checks its references, and runs the loop
+review checks (L1 to L15) that the recipe alone can decide. A check whose
+inputs are not in the recipe is skipped, never failed. It reads; it never
+edits. Exit codes match `dira doctor`: 0 all clear, 1 any warning, 2 any
+failure.",
+        after_help = "\
+Examples:
+  dira loop lint                        lint .dira/loop.yml in this directory
+  dira loop lint examples/loops/dodi-factory.yml
+  dira loop lint --json                 one JSON object, the doctor report shape
+  dira loop lint --verbose              also show skipped checks and detail"
+    )]
+    Loop {
+        #[command(subcommand)]
+        action: LoopAction,
+    },
     /// Update dira to the latest release (resolve, verify, atomic swap, restart).
     #[command(
         long_about = "\
@@ -661,6 +685,22 @@ Examples:
     Meetings {
         #[command(subcommand)]
         action: Option<MeetingsCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LoopAction {
+    /// Parse, validate and review a loop recipe.
+    Lint {
+        /// The recipe file, or a directory holding `.dira/loop.yml`.
+        /// Default: `.dira/loop.yml` in the working directory.
+        path: Option<PathBuf>,
+        /// Machine-readable output: one JSON object on stdout, nothing else.
+        #[arg(long)]
+        json: bool,
+        /// Also show skipped checks and each finding's detail.
+        #[arg(long, short)]
+        verbose: bool,
     },
 }
 
@@ -1175,6 +1215,19 @@ async fn main() -> Result<()> {
     // interpret ANSI escapes, or every painted line leaks its SGR bytes.
     theme::enable_ansi();
     let cli = Cli::parse();
+    // A recipe lint reads one file. It needs no config, daemon or store, so a
+    // broken config.toml must not stop it.
+    if let Command::Loop {
+        action:
+            LoopAction::Lint {
+                path,
+                json,
+                verbose,
+            },
+    } = &cli.command
+    {
+        std::process::exit(loop_cmd::run(path.as_deref(), *json, *verbose));
+    }
     let config = Config::load().map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let cwd = std::env::current_dir()
         .ok()
@@ -1268,6 +1321,8 @@ async fn main() -> Result<()> {
         Command::Watch { interval } => {
             return tui::run(&config, std::time::Duration::from_millis(*interval)).await;
         }
+        // Dispatched before `Config::load` above.
+        Command::Loop { .. } => unreachable!(),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(*shell, &mut cmd, "dira", &mut std::io::stdout());
@@ -1637,6 +1692,7 @@ async fn main() -> Result<()> {
         | Command::Hook { .. }
         | Command::Nuke { .. }
         | Command::Completions { .. }
+        | Command::Loop { .. }
         | Command::Version { .. }
         | Command::Doctor { .. }
         | Command::Update { .. } => unreachable!(),

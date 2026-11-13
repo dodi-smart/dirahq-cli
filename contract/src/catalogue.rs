@@ -22,7 +22,7 @@
 use serde::Serialize;
 
 /// Bumped on every change to [`CATALOGUE`], additive or not.
-pub const CATALOGUE_VERSION: u32 = 1;
+pub const CATALOGUE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -332,6 +332,33 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         "Merge commit signed",
         "proba D-0041",
     ),
+    // 585, the DODI factory's own conventions (proba D-0099): read from the
+    // host alone, advisory, and a pass is `inferred` at most, so each can cost
+    // a rung once a workspace makes it required and never award one.
+    c(
+        "factory.no_test_weakening",
+        "ci",
+        585,
+        Advisory,
+        "The agent kept the tests and gates",
+        "proba D-0099",
+    ),
+    c(
+        "factory.holdout_untouched",
+        "ci",
+        585,
+        Advisory,
+        "The holdout list stayed frozen",
+        "proba D-0099",
+    ),
+    c(
+        "factory.judge_family",
+        "review",
+        585,
+        Advisory,
+        "Verified by another model family",
+        "proba D-0099",
+    ),
     // 750: dira capturing on the workstation.
     c(
         "dira.authorship",
@@ -496,6 +523,39 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_change_check_sits_at_or_below_its_elements_rung() {
+        // proba only reads a check for the rung its element decides when the
+        // check contributes at or below it, so a `ci` check at 999 is dead.
+        for c in CATALOGUE.iter().filter(|c| c.scope == CheckScope::Change) {
+            let ceiling = match c.element {
+                Some("ci" | "review") => 585,
+                Some("authorship" | "supervision") => 750,
+                Some("intent") => 999,
+                other => panic!("{}: unknown element {other:?}", c.id),
+            };
+            assert!(c.rung.unwrap_or(0) <= ceiling, "{}", c.id);
+        }
+    }
+
+    #[test]
+    fn the_factory_checks_match_probas_registry() {
+        // Mirrors proba's registry (D-0099): an element swap here would make the
+        // open CLI and the cloud disagree about what a `proba:<id>` gate judges.
+        for (id, element) in [
+            ("factory.no_test_weakening", "ci"),
+            ("factory.holdout_untouched", "ci"),
+            ("factory.judge_family", "review"),
+        ] {
+            let c = lookup_in(CheckScope::Change, id).unwrap_or_else(|| panic!("{id} missing"));
+            assert_eq!(
+                (c.element, c.default_severity, c.rung),
+                (Some(element), Advisory, Some(585)),
+                "{id}"
+            );
         }
     }
 

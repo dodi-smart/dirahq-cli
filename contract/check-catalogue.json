@@ -1,0 +1,365 @@
+{
+  "catalogue_version": 2,
+  "checks": [
+    {
+      "id": "L1",
+      "scope": "loop",
+      "default_severity": "required",
+      "impact": "high",
+      "title": "The author grades its own work",
+      "basis": "vision §6.5, §13.1 #2",
+      "improvement": "an independent judge of another family, or a non-model validator, as a required verdict"
+    },
+    {
+      "id": "L2",
+      "scope": "loop",
+      "default_severity": "required",
+      "impact": "high",
+      "title": "Agents can weaken the tests that judge them",
+      "basis": "vision §6.5, §13.1 #4",
+      "improvement": "freeze holdout paths and refuse rounds that touch them with a push guard"
+    },
+    {
+      "id": "L3",
+      "scope": "loop",
+      "default_severity": "required",
+      "impact": "critical",
+      "title": "Agent lanes can write to production",
+      "basis": "vision §6.5, §13.1 #6",
+      "improvement": "scope agent credentials to the repo; move production needs into a read-only observe lane"
+    },
+    {
+      "id": "L4",
+      "scope": "loop",
+      "default_severity": "advisory",
+      "impact": "medium",
+      "title": "Rules live only in a prompt",
+      "basis": "vision §6.5, §13.1 #3",
+      "improvement": "back each gate with a proba check (`proba:<id>`), or name the hook, check or branch rule that enforces it"
+    },
+    {
+      "id": "L5",
+      "scope": "loop",
+      "default_severity": "advisory",
+      "impact": "medium",
+      "title": "Implementation starts without a plan",
+      "basis": "vision §6.5, §13.1 #1",
+      "improvement": "make the implement stage need a plan stage"
+    },
+    {
+      "id": "L6",
+      "scope": "loop",
+      "default_severity": "required",
+      "impact": "high",
+      "title": "Throughput outruns review",
+      "basis": "vision §6.5, §13.1 #5",
+      "improvement": "give the dispatcher a WIP cap and a review-wait ceiling"
+    },
+    {
+      "id": "L7",
+      "scope": "loop",
+      "default_severity": "required",
+      "impact": "high",
+      "title": "Autonomy above its evidence",
+      "basis": "vision §6.5, §5",
+      "improvement": "lower the tier, or collect the outcome evidence the next rung needs"
+    },
+    {
+      "id": "L8",
+      "scope": "loop",
+      "default_severity": "required",
+      "impact": "high",
+      "title": "No way to stop",
+      "basis": "vision §6.5, principle 9",
+      "improvement": "a kill switch per automation class, and a round cap on every fix loop"
+    },
+    {
+      "id": "L9",
+      "scope": "loop",
+      "default_severity": "advisory",
+      "impact": "medium",
+      "title": "Spend nobody can explain",
+      "basis": "vision §6.5, §8",
+      "improvement": "price every agent run"
+    },
+    {
+      "id": "L10",
+      "scope": "loop",
+      "default_severity": "advisory",
+      "impact": "low",
+      "title": "State smeared across labels and fields",
+      "basis": "vision §6.5, DODI-00001",
+      "improvement": "one source per fact: fields as state, labels as requests"
+    },
+    {
+      "id": "L11",
+      "scope": "loop",
+      "default_severity": "advisory",
+      "impact": "medium",
+      "title": "Specs drift from code",
+      "basis": "vision §6.5, zavet",
+      "improvement": "a spec staleness check"
+    },
+    {
+      "id": "L12",
+      "scope": "loop",
+      "default_severity": "advisory",
+      "impact": "medium",
+      "title": "Model changes go unmeasured",
+      "basis": "vision §6.5, §13.1 #7",
+      "improvement": "mark model changes and compare the next 20 merges"
+    },
+    {
+      "id": "L13",
+      "scope": "loop",
+      "default_severity": "advisory",
+      "impact": "low",
+      "title": "Tool and instruction sprawl",
+      "basis": "vision §6.5, §13.1 #7",
+      "improvement": "prune to what sessions use"
+    },
+    {
+      "id": "L14",
+      "scope": "loop",
+      "default_severity": "advisory",
+      "impact": "medium",
+      "title": "Questions rot",
+      "basis": "vision §6.5, §12.4",
+      "improvement": "route questions; a waiting-on-people view"
+    },
+    {
+      "id": "L15",
+      "scope": "loop",
+      "default_severity": "required",
+      "impact": "high",
+      "title": "Stuck required checks get resolved silently",
+      "basis": "vision §6.5, DODI-00062",
+      "improvement": "a recorded sign-off path; no bypass actor on the ruleset"
+    },
+    {
+      "id": "host.ci",
+      "scope": "change",
+      "default_severity": "required",
+      "element": "ci",
+      "rung": 585,
+      "title": "CI green at merge",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "host.review",
+      "scope": "change",
+      "default_severity": "required",
+      "element": "review",
+      "rung": 585,
+      "title": "Review by a non-author human",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "host.review_current",
+      "scope": "change",
+      "default_severity": "required",
+      "element": "review",
+      "rung": 585,
+      "title": "The approval covers what merged",
+      "basis": "proba D-0046"
+    },
+    {
+      "id": "host.machine_review",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "review",
+      "rung": 585,
+      "title": "Reviewed by an app",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "host.branch_rules",
+      "scope": "change",
+      "default_severity": "off",
+      "element": "review",
+      "rung": 585,
+      "title": "The branch demanded a review or a check",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "host.agent_trailer",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "authorship",
+      "rung": 585,
+      "title": "Agent authorship declared",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "host.self_merge",
+      "scope": "change",
+      "default_severity": "off",
+      "element": "review",
+      "rung": 585,
+      "title": "Not merged by its own author",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "host.signed_commits",
+      "scope": "change",
+      "default_severity": "off",
+      "element": "authorship",
+      "rung": 585,
+      "title": "Merge commit signed",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "factory.no_test_weakening",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "ci",
+      "rung": 585,
+      "title": "The agent kept the tests and gates",
+      "basis": "proba D-0099"
+    },
+    {
+      "id": "factory.holdout_untouched",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "ci",
+      "rung": 585,
+      "title": "The holdout list stayed frozen",
+      "basis": "proba D-0099"
+    },
+    {
+      "id": "factory.judge_family",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "review",
+      "rung": 585,
+      "title": "Verified by another model family",
+      "basis": "proba D-0099"
+    },
+    {
+      "id": "dira.authorship",
+      "scope": "change",
+      "default_severity": "required",
+      "element": "authorship",
+      "rung": 750,
+      "title": "Authorship from a signed session",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "dira.supervision",
+      "scope": "change",
+      "default_severity": "required",
+      "element": "supervision",
+      "rung": 750,
+      "title": "Supervision minutes recorded",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "dira.sessions",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "authorship",
+      "rung": 750,
+      "title": "Every commit accounted for",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "dira.supervision_ratio",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "supervision",
+      "rung": 750,
+      "title": "Supervision meets your floor",
+      "basis": "proba D-0045"
+    },
+    {
+      "id": "dira.supervisor_not_reviewer",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "supervision",
+      "rung": 750,
+      "title": "Supervised and reviewed by different people",
+      "basis": "proba D-0041"
+    },
+    {
+      "id": "zavet.trailers",
+      "scope": "change",
+      "default_severity": "required",
+      "element": "intent",
+      "rung": 999,
+      "title": "Guarded changes carry a trailer",
+      "basis": "proba D-0044"
+    },
+    {
+      "id": "zavet.decisions",
+      "scope": "change",
+      "default_severity": "required",
+      "element": "intent",
+      "rung": 999,
+      "title": "Decisions referenced",
+      "basis": "proba D-0044"
+    },
+    {
+      "id": "zavet.guards",
+      "scope": "change",
+      "default_severity": "required",
+      "element": "intent",
+      "rung": 999,
+      "title": "Guards respected",
+      "basis": "proba D-0044"
+    },
+    {
+      "id": "zavet.specs",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "intent",
+      "rung": 999,
+      "title": "Covering spec named",
+      "basis": "proba D-0044"
+    },
+    {
+      "id": "zavet.spec_current",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "intent",
+      "rung": 999,
+      "title": "Covering spec current at merge",
+      "basis": "proba D-0044"
+    },
+    {
+      "id": "zavet.audit",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "intent",
+      "rung": 999,
+      "title": "Knowledge audit clean",
+      "basis": "proba D-0044"
+    },
+    {
+      "id": "zavet.verify",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "intent",
+      "rung": 999,
+      "title": "Bound checks pass",
+      "basis": "proba D-0044"
+    },
+    {
+      "id": "zavet.trailer_matches",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "intent",
+      "rung": 999,
+      "title": "The cited decision governs these paths",
+      "basis": "proba D-0044"
+    },
+    {
+      "id": "zavet.decision_current",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "intent",
+      "rung": 999,
+      "title": "The cited decision was still current",
+      "basis": "proba D-0044"
+    }
+  ]
+}

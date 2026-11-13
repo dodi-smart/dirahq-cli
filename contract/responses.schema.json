@@ -108,6 +108,14 @@
             "type": "string"
           }
         },
+        "capabilities": {
+          "description": "2.1: named cloud behaviours a device may rely on, beyond what the\nversion range says. Absent (an older cloud) means none. See\n[`CAPABILITY_RESTATEMENT_WINDOWS`].",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "minSchemaVersion": {
           "description": "The oldest contract version the cloud still accepts, e.g. `\"1.0.0\"`.",
           "type": "string",

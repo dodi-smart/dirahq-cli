@@ -256,6 +256,7 @@ jobs:
             contract/billing-summary.schema.json \
             contract/knowledge.schema.json \
             contract/responses.schema.json \
+            contract/check-catalogue.json \
             contract/testdata/signing-vector.json \
             install.sh \
             install.ps1 \

@@ -1,0 +1,213 @@
+# DODI SMART's agent factory as a loop recipe (v0).
+#
+# Describes the shared workflows in dodi-smart/.github as of release 1.48.0:
+# issue-triage, dispatch, issue-implement, pr-iterate, pr-review, judge and the
+# merge gate (actions/merge-gate, policy `factory`). It describes the loop; it
+# does not run it. Lint it with:
+#
+#   dira loop lint examples/loops/dodi-factory.yml
+#
+# Paths in `enforced_by` are relative to dodi-smart/.github; `proba:<id>`
+# names a check proba observes on every merge. Spec:
+# .zavet/specs/loop-recipe.md. Decision: DIRASH-0068.
+version: 0
+recipe: dodi-smart/factory@1
+tracker: { adapter: github }
+
+# Fields are state, labels are requests (DODI-00001). Each fact has one source.
+state:
+  stage: "field:Triage state"
+  mode: "field:Agent mode"
+  risk: "field:Risk"
+  effort: "field:Effort"
+  priority: "field:Priority"
+
+# Every Claude lane runs claude-code-action through actions/run-agent, which
+# prices each run from actions/pick-model/prices.tsv. Models come from
+# actions/pick-model by stage. Reach is not declared yet: the blast-radius
+# audit (vision §12.1 move 2) has not asserted it, so L3 skips.
+lanes:
+  triage:
+    runtime: claude-code-action
+    pool: metered
+    family: anthropic
+    model: { default: opus }
+    pricing: table
+  implement:
+    runtime: claude-code-action
+    pool: metered
+    family: anthropic
+    model:
+      default: sonnet
+      rules:
+        - when: "effort == High or risk in (High, Critical) or priority == Urgent or risk or effort unset"
+          use: opus
+    pricing: table
+  fix:
+    runtime: claude-code-action
+    pool: metered
+    family: anthropic
+    model:
+      default: sonnet
+      rules:
+        - when: "fix-review, or round >= 2, or risk in (High, Critical), effort == High, priority == Urgent"
+          use: opus
+        - when: "round 1 and only `hk check --all` failed"
+          use: haiku
+    pricing: table
+  review:
+    runtime: claude-code-action
+    pool: metered
+    family: anthropic
+    model:
+      default: opus
+      rules:
+        - when: "a bot's trailered commits only (scoped review)"
+          use: sonnet
+    pricing: table
+  # Grok Bot acting as the review-only GitHub App `dodi-judge` (DODI-00065).
+  # It finds work through its own connector and never runs on DODI's runners.
+  judge:
+    runtime: grok-bot
+    pool: coworker
+    family: xai
+
+gates:
+  no-touch:
+    rule: "the item does not carry agent:no-touch (checked first, live, in every agent workflow)"
+    enforced_by: actions/agent-gate
+  planned:
+    rule: 'stage == "Plan ready"'
+    enforced_by: .github/workflows/issue-implement.yml
+  mode-allows:
+    rule: 'mode != "Human only"; "Supervised" or unset needs a requester with write access'
+    enforced_by: .github/workflows/issue-implement.yml
+  dispatchable:
+    rule: 'stage == "Plan ready" and mode == "Autonomous", not agent:implement already, not labelled before by the org App'
+    enforced_by: actions/factory
+  iterate-requested:
+    rule: "the PR carries agent:iterate"
+    enforced_by: actions/merge-gate
+  # merge-gate blocks on it; proba's `host.ci` observes it on every merge.
+  checks-green:
+    rule: 'check run "checks / PR Checks" is success on the head'
+    enforced_by: [actions/merge-gate, "proba:host.ci"]
+  review-approved:
+    rule: 'status "review / verdict" is success on the head, posted by the org App'
+    enforced_by: actions/merge-gate
+
+stages:
+  # Classify, set fields, then plan or ask blocking questions. Also runs on
+  # issue opened or reopened.
+  - id: triage
+    kind: plan
+    by: "lane:triage"
+    request: "label:agent:triage"
+    gates: [no-touch]
+    done_when: 'stage == "Plan ready"'
+
+  # Deterministic dispatcher: picks the highest-Priority eligible issue and
+  # applies agent:implement as the org App. No agent in the picker.
+  - id: dispatch
+    kind: dispatch
+    by: script
+    needs: [triage]
+    gates: [no-touch, dispatchable]
+    limits: { wip: 2, review_wait_ceiling_hours: 24 }
+
+  # Holdout tests from the plan's acceptance criteria, then code. A step pushes
+  # one round to feat|fix|chore/<n>-<slug> and opens a draft PR.
+  - id: implement
+    kind: implement
+    by: "lane:implement"
+    request: "label:agent:implement"
+    needs: [triage]
+    gates: [no-touch, planned, mode-allows]
+    done_when: "a draft PR closes the issue"
+
+  # The fix loop on red checks or a `changes` verdict. Steps with the App token
+  # push, mark ready and merge; the agent writes local commits only.
+  - id: iterate
+    kind: fix
+    by: "lane:fix"
+    request: "label:agent:iterate"
+    needs: [implement]
+    gates: [no-touch]
+    rounds: { max: 3, on_limit: give-up }
+
+  - id: review
+    kind: review
+    by: "lane:review"
+    request: "label:agent:review"
+    needs: [implement]
+    gates: [no-touch]
+    verdict: { status: "review / verdict", required: true }
+
+  # Another model family. Advisory: no gate reads `judge / verdict` yet.
+  - id: judge
+    kind: judge
+    by: "lane:judge"
+    request: "label:agent:judge"
+    needs: [implement]
+    gates: [no-touch]
+    verdict: { status: "judge / verdict", required: false }
+
+  # The tier ladder is `factory.sh tier`; the first row that matches wins.
+  - id: merge
+    kind: merge
+    by: host
+    needs: [review]
+    gates: [no-touch, iterate-requested, checks-green, review-approved]
+    tiers:
+      - name: merge
+        when: 'mode == "Autonomous" and risk == "Low" and effort == "Low"'
+        action: merge
+      - name: ready
+        when: 'mode == "Autonomous" and risk/effort in (Low/Medium, Medium/Low, Medium/Medium)'
+        action: ready
+      - name: draft
+        action: draft
+
+# One list per issue, written before the code; a fix round that touches it is
+# refused, and a merge round also refuses the lockfiles.
+holdout:
+  paths: [.factory/holdout.d/, .factory/holdout]
+  frozen: true
+  hidden: false
+  enforced_by: actions/push-round
+
+# Only Autonomous + Risk Low + Effort Low merges unattended (DODI-00038).
+autonomy:
+  rung: A3
+  scope: "Autonomous issues at Risk Low and Effort Low; in practice chores"
+
+kill_switches:
+  - name: FACTORY_DISPATCH
+    kind: variable
+    scope: org
+    stops: [dispatch]
+    off_when: "anything but 'true', unset included"
+  - name: FACTORY_AUTOMERGE
+    kind: variable
+    scope: org
+    stops: [merge]
+    off_when: "'false'"
+  - name: FACTORY_JUDGE
+    kind: variable
+    scope: org
+    stops: [judge]
+    off_when: "'false'"
+  - name: "agent:no-touch"
+    kind: label
+    scope: item
+    stops: [all]
+
+review:
+  overrides:
+    - check: L1
+      severity: off
+      reason: >-
+        Known gap. The required verdict (pr-review) runs on the authors' model
+        family. The other-family judge exists but is advisory until a gate
+        reads it; vision §12.1 move 5 closes this.
+      record: DODI-00065

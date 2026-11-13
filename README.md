@@ -1,7 +1,7 @@
 # Dira — CLI & contract (open source)
 
 <!-- dodi-badges:start -->
-[![standards v1](https://img.shields.io/badge/standards-v1-0969da)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here) [![CRA gap](https://img.shields.io/badge/CRA-gap-cf222e)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here) [![autonomy L0](https://img.shields.io/badge/autonomy-L0-6e7781)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here)
+[![standards v1](https://img.shields.io/badge/standards-v1-0969da)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here) [![CRA gap](https://img.shields.io/badge/CRA-gap-cf222e)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here) [![autonomy L2](https://img.shields.io/badge/autonomy-L2-8250df)](https://github.com/dodi-smart/.github#the-badge-that-brought-you-here)
 <!-- dodi-badges:end -->
 
 **AI-first time tracker — *"if you can clone it, you can bill it."***
@@ -77,6 +77,11 @@ the plan and changes nothing. See [docs/getting-started.md](docs/getting-started
 dira status           # today's summary — engaged, agent, compute, unbilled
 dira doctor           # is capture actually working? (add --probe to prove it end to end)
 ```
+
+Describe your delivery loop as a recipe in `.dira/loop.yml` and check it offline with
+`dira loop lint`: schema, references, and the loop review checks the recipe alone can
+decide. [`examples/loops/dodi-factory.yml`](examples/loops/dodi-factory.yml) is a full
+example; the format is in [`.zavet/specs/loop-recipe.md`](.zavet/specs/loop-recipe.md).
 
 Prefer to do it yourself? Every step `onboard` runs is its own command — `dira init`,
 `dira daemon install`, `dira device link`, `dira zavet install`.

@@ -23,6 +23,8 @@
 //!   `wire_contract_carries_no_content_fields` test, so nothing else can ever
 //!   join them silently.
 
+pub mod catalogue;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -874,7 +876,19 @@ pub struct ServerMeta {
     /// an uncompressed body rather than fail.
     #[serde(default)]
     pub accept_encodings: Vec<String>,
+    /// 2.1: named cloud behaviours a device may rely on, beyond what the
+    /// version range says. Absent (an older cloud) means none. See
+    /// [`CAPABILITY_RESTATEMENT_WINDOWS`].
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
+
+/// [`ServerMeta::capabilities`] entry: the cloud applies a batch's `windows`
+/// to the device's claims in EVERY workspace (dirahq-cloud D-0087). A device
+/// sends meeting restatements, and clips its flushes around meetings, only to
+/// a cloud that lists it: an older cloud would replace claims per workspace and
+/// bill a restated minute twice.
+pub const CAPABILITY_RESTATEMENT_WINDOWS: &str = "restatement-windows";
 
 /// A request to rotate a device's signing key, sent to
 /// `POST /api/v1/devices/rotate-key`.
@@ -1682,13 +1696,20 @@ mod tests {
             schema_version: "1.2.0".into(),
             min_schema_version: "1.0.0".into(),
             accept_encodings: Vec::new(),
+            capabilities: vec![CAPABILITY_RESTATEMENT_WINDOWS.into()],
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"schemaVersion\""));
         assert!(json.contains("\"minSchemaVersion\""));
+        assert!(json.contains("\"capabilities\":[\"restatement-windows\"]"));
         let back: ServerMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.schema_version, "1.2.0");
         assert_eq!(back.min_schema_version, "1.0.0");
+        // An older cloud's meta has no capabilities: none.
+        let old: ServerMeta =
+            serde_json::from_str(r#"{"schemaVersion":"2.1.0","minSchemaVersion":"1.2.0"}"#)
+                .unwrap();
+        assert!(old.capabilities.is_empty());
     }
 
     // The emit root is only useful if it stays complete: a fifth response type

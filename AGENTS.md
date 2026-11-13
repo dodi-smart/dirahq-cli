@@ -59,6 +59,12 @@ agent context at session start. Keep it short and non-negotiable.
 - A headless run (`DIRA_HEADLESS`, or `GITHUB_ACTIONS=true`) never reports a
   human signal: the `dira hook` shim withholds those and forwards the rest.
   Never infer presence from the cloud runtime id. See DIRASH-0047.
+- Letopis surfaces answer simply for anyone, keep the detail open below the
+  answer and put everything in the MCP (suite principle, dirahq-cloud D-0090).
+  Human-facing output opens with at most four figures or sentences a
+  non-technical reader can act on, words first; breakdowns follow the answer,
+  never above it, and are trimmed by audience, not folded away. Absent data is
+  written as words, never `0`.
 
 ### Recorded decisions (read the file before changing guarded code; ask /zavet:why)
 
@@ -120,6 +126,9 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0064 — Calendar facts are reduced on the device; attribution resolves locally; no titles, attendees or domains cross (proposed)
 - DIRASH-0065 — Meeting titles ride only their own consent-gated labels channel, never the attestation wire (proposed)
 - DIRASH-0066 — The daemon obeys the workspace meeting policy; admins can disable but never force capture on, and the user's opt-out always wins (proposed)
+- DIRASH-0067 — Meeting restatements sync when the cloud advertises restatement windows, and the day ledger clips like the cloud (active)
+- DIRASH-0068 — The loop recipe schema lives in dira-core, not the contract (active)
+- DIRASH-0069 — The check catalogue ships in the contract, the recipe still does not (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 
@@ -131,6 +140,7 @@ agent context at session start. Keep it short and non-negotiable.
 - doctor — Diagnostics — dira doctor and the capture probe (session, high)
 - harness-sources — Harness sources and hook ingestion (session, high)
 - knowledge-sync — Knowledge sync — the consent-gated second channel (session, medium)
+- loop-recipe — Loop recipe v0 and dira loop lint (session, medium)
 - onboarding — Onboarding — dira onboard and the installer handoff (session, high)
 - orchestration-sessions — Orchestration sessions and runs (session, high)
 

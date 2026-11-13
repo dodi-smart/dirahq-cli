@@ -1,5 +1,5 @@
 {
-  "catalogue_version": 1,
+  "catalogue_version": 2,
   "checks": [
     {
       "id": "L1",
@@ -207,6 +207,33 @@
       "rung": 585,
       "title": "Merge commit signed",
       "basis": "proba D-0041"
+    },
+    {
+      "id": "factory.no_test_weakening",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "ci",
+      "rung": 585,
+      "title": "The agent kept the tests and gates",
+      "basis": "proba D-0099"
+    },
+    {
+      "id": "factory.holdout_untouched",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "ci",
+      "rung": 585,
+      "title": "The holdout list stayed frozen",
+      "basis": "proba D-0099"
+    },
+    {
+      "id": "factory.judge_family",
+      "scope": "change",
+      "default_severity": "advisory",
+      "element": "review",
+      "rung": 585,
+      "title": "Verified by another model family",
+      "basis": "proba D-0099"
     },
     {
       "id": "dira.authorship",

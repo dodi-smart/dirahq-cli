@@ -1,3 +1,17 @@
+## [0.13.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.12.0...v0.13.0) (2026-11-13)
+
+### ✨ Features
+
+* **cli:** add dira loop lint for delivery-loop recipes ([3e126b5](https://github.com/dodi-smart/dirahq-cli/commit/3e126b501fed4ef34c416a6468be48ba19c47ad6))
+* **cli:** sync meetings to a cloud that applies restatement windows everywhere ([99ed06f](https://github.com/dodi-smart/dirahq-cli/commit/99ed06fd55dee534c4c047c0621c9a0d4d823a9e)), references [dodi-smart/dirahq-cloud#310](https://github.com/dodi-smart/dirahq-cloud/issues/310) [dodi-smart/dirahq-cloud#303](https://github.com/dodi-smart/dirahq-cloud/issues/303)
+* **contract:** list proba's three factory checks in the check catalogue ([#229](https://github.com/dodi-smart/dirahq-cli/issues/229)) ([c3aaee9](https://github.com/dodi-smart/dirahq-cli/commit/c3aaee98ed4256e5ab7005755f6777672f84a66d))
+* **contract:** ship one check catalogue for loop and proba checks ([3e2569b](https://github.com/dodi-smart/dirahq-cli/commit/3e2569b5647d0d2981c0c029dddbf9c83472d83e))
+
+### 📚 Documentation
+
+* **repo:** add the CRA incident response runbook from dev-standards 1.36.2 ([55c8015](https://github.com/dodi-smart/dirahq-cli/commit/55c801545991c73ca57c9f1dc6dc1542b10b536b)), references [dodi-smart/dirahq-cloud#283](https://github.com/dodi-smart/dirahq-cloud/issues/283) [dodi-smart/dev-standards#164](https://github.com/dodi-smart/dev-standards/issues/164)
+* **repo:** add the Letopis simple-answer screen principle to the standing rules ([#226](https://github.com/dodi-smart/dirahq-cli/issues/226)) ([0543f4b](https://github.com/dodi-smart/dirahq-cli/commit/0543f4b17c19e43bd91e9d2a29d7bfd4bef83be7))
+
 ## [0.12.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.11.0...v0.12.0) (2026-11-10)
 
 ### ✨ Features

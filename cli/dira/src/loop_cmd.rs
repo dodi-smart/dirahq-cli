@@ -1,11 +1,11 @@
 //! `dira loop lint [path]`: check a loop recipe (`.dira/loop.yml`).
 //!
-//! The work is `dira_core::loop_recipe::lint`; this module reads the file and
+//! The work is `dira_core::loop_recipe::lint_file`; this module picks the file and
 //! prints the results through `dira doctor`'s renderer, so the report shape,
 //! the `--json` object and the exit codes are doctor's contract (DIRASH-0022):
 //! 0 all clear, 1 any warning, 2 any failure. It reads; it never edits.
 
-use crate::doctor::{self, Check};
+use crate::doctor::{self, Check, Level};
 use dira_core::loop_recipe::{self, Finding, FindingLevel};
 use std::path::{Path, PathBuf};
 
@@ -16,22 +16,16 @@ const LINT: doctor::render::Kind = doctor::render::Kind {
     ok: "all clear — the recipe lints clean",
 };
 
-pub(crate) struct Args {
-    pub path: Option<PathBuf>,
-    pub json: bool,
-    pub verbose: bool,
-}
-
 /// Lint and print. Returns the process exit code.
-pub(crate) fn run(args: Args) -> i32 {
-    let path = resolve(args.path.as_deref());
+pub(crate) fn run(path: Option<&Path>, json: bool, verbose: bool) -> i32 {
+    let path = resolve(path);
     let checks = check_file(&path);
     let code = doctor::exit_code(&checks);
-    if args.json {
+    if json {
         doctor::render::print_json(&checks, code, &LINT);
     } else {
         println!("\nRecipe {}", path.display());
-        doctor::render::print_human(&checks, args.verbose, code, &LINT);
+        doctor::render::print_human(&checks, verbose, code, &LINT);
     }
     code
 }
@@ -46,14 +40,10 @@ fn resolve(path: Option<&Path>) -> PathBuf {
 }
 
 fn check_file(path: &Path) -> Vec<Check> {
-    match std::fs::read_to_string(path) {
-        Ok(src) => loop_recipe::lint(&src).into_iter().map(to_check).collect(),
-        Err(e) => vec![Check::fail(
-            "recipe.parse",
-            format!("cannot read {}: {e}", path.display()),
-        )
-        .remedy("write the recipe at .dira/loop.yml, or pass its path")],
-    }
+    loop_recipe::lint_file(path)
+        .into_iter()
+        .map(to_check)
+        .collect()
 }
 
 fn to_check(f: Finding) -> Check {
@@ -62,20 +52,18 @@ fn to_check(f: Finding) -> Check {
         Some(o) => format!("{} [{o}]", f.summary),
         None => f.summary,
     };
-    let c = match f.level {
-        FindingLevel::Ok => Check::ok(f.id, summary),
-        FindingLevel::Skip => Check::skip(f.id, summary),
-        FindingLevel::Warn => Check::warn(f.id, summary),
-        FindingLevel::Fail => Check::fail(f.id, summary),
+    let level = match f.level {
+        FindingLevel::Ok => Level::Ok,
+        FindingLevel::Skip => Level::Skip,
+        FindingLevel::Warn => Level::Warn,
+        FindingLevel::Fail => Level::Fail,
     };
-    let c = match f.severity {
-        Some(s) => c.detail(serde_json::json!({ "severity": s, "overridden": f.overridden })),
-        None => c,
-    };
-    match f.remedy {
-        Some(r) => c.remedy(r),
-        None => c,
+    let mut c = Check::new(f.id, level, summary);
+    c.remedy = f.remedy;
+    if let Some(s) = f.severity {
+        c.detail = serde_json::json!({ "severity": s, "overridden": f.overridden });
     }
+    c
 }
 
 #[cfg(test)]

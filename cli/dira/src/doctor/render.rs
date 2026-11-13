@@ -245,18 +245,14 @@ mod tests {
 
     #[test]
     fn the_verdict_line_names_the_worst_level() {
-        assert!(verdict_line(Level::Ok, &super::super::DOCTOR)
-            .0
-            .contains("all clear"));
-        assert!(verdict_line(Level::Skip, &super::super::DOCTOR)
-            .0
-            .contains("all clear"));
-        assert!(verdict_line(Level::Warn, &super::super::DOCTOR)
-            .0
-            .contains("with warnings"));
-        assert!(verdict_line(Level::Fail, &super::super::DOCTOR)
-            .0
-            .contains("not working"));
+        for (level, words) in [
+            (Level::Ok, "all clear"),
+            (Level::Skip, "all clear"),
+            (Level::Warn, "with warnings"),
+            (Level::Fail, "not working"),
+        ] {
+            assert!(verdict_line(level, &super::super::DOCTOR).0.contains(words));
+        }
     }
 
     #[test]

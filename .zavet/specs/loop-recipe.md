@@ -141,10 +141,12 @@ Results, in order:
 
 1. `recipe.parse`: the file reads and matches the schema (unknown keys, wrong
    types, bad enum values fail with their line and column). If it fails,
-   nothing else runs.
+   nothing else runs, unless the file declares another version: then
+   `recipe.parse` skips and `recipe.version` names it, so a newer recipe's
+   new keys never hide the real cause.
 2. `recipe.version`: `version: 0`.
 3. `recipe.refs`: every `lane:` and `needs` and gate and kill-switch target
-   exists; `needs` points backward; stage ids are unique; tiers are on a merge
+   exists; `needs` points backward; stage ids and kill-switch names are unique; tiers are on a merge
    stage with exactly one trailing default; overrides name a real check, once,
    with a reason. Dangling references fail.
 4. `recipe.unused`: lanes or gates nothing references. A warning.

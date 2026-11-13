@@ -71,13 +71,8 @@ pub(super) fn problems(r: &Recipe) -> Vec<String> {
                     st.id, st.kind
                 ));
             }
-            let defaults: Vec<usize> = tiers
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| t.when.is_none())
-                .map(|(i, _)| i)
-                .collect();
-            if defaults.len() != 1 || defaults[0] + 1 != tiers.len() {
+            let defaults = tiers.iter().filter(|t| t.when.is_none()).count();
+            if defaults != 1 || tiers.last().is_some_and(|t| t.when.is_some()) {
                 out.push(format!(
                     "stage `{}`: tiers need exactly one default (a tier with no `when`), and it comes last",
                     st.id
@@ -96,7 +91,11 @@ pub(super) fn problems(r: &Recipe) -> Vec<String> {
         seen.push(st.id.as_str());
     }
 
+    let mut switches = BTreeSet::new();
     for ks in &r.kill_switches {
+        if !switches.insert(ks.name.as_str()) {
+            out.push(format!("kill switch `{}` is defined twice", ks.name));
+        }
         if ks.stops.is_empty() {
             out.push(format!("kill switch `{}`: stops nothing", ks.name));
         }

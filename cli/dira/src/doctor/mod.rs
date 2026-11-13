@@ -65,7 +65,7 @@ pub(crate) struct Check {
 }
 
 impl Check {
-    fn new(id: &'static str, level: Level, summary: impl Into<String>) -> Self {
+    pub(crate) fn new(id: &'static str, level: Level, summary: impl Into<String>) -> Self {
         Self {
             id,
             level,

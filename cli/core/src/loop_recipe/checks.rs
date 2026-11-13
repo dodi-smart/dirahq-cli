@@ -8,9 +8,9 @@
 //! catalogue in `/contract` (DIRASH-0069). This module owns only the rules.
 
 use super::schema::{
-    By, Enforcer, Reach, Recipe, Rung, Severity, StageKind, SwitchScope, TierAction,
+    By, Enforcer, Pricing, Reach, Recipe, Rung, Severity, StageKind, SwitchScope, TierAction,
 };
-use super::{Finding, FindingLevel, Overridden};
+use super::{plural, Finding, FindingLevel, Overridden};
 use dira_contract::catalogue::{self, CatalogueEntry, CheckScope, CATALOGUE_VERSION};
 use std::collections::BTreeSet;
 
@@ -173,12 +173,17 @@ fn l1(r: &Recipe) -> Outcome {
     if required.is_empty() {
         return Outcome::Skip("no stage publishes a required verdict".into());
     }
+    // Any independent required verdict passes, wherever it sits; a lane with
+    // no family only skips when nothing else decides.
     let mut same = Vec::new();
+    let mut unknown = None;
     for s in &required {
         let status = &s.verdict.as_ref().expect("filtered").status;
         match s.holder() {
             Some(By::Lane(l)) => match family(r, l) {
-                None => return Outcome::Skip(format!("verdict lane `{l}` declares no family")),
+                None => {
+                    unknown.get_or_insert(l);
+                }
                 Some(f) if !author_families.contains(f) => {
                     return Outcome::Pass(format!(
                         "required verdict `{status}` comes from `{l}` ({f}), another family than the authors"
@@ -194,6 +199,9 @@ fn l1(r: &Recipe) -> Outcome {
                 ))
             }
         }
+    }
+    if let Some(l) = unknown {
+        return Outcome::Skip(format!("verdict lane `{l}` declares no family"));
     }
     let fams: Vec<&str> = author_families.into_iter().collect();
     Outcome::Found(format!(
@@ -212,7 +220,12 @@ fn l2(r: &Recipe) -> Outcome {
         Some(h) if !h.frozen => {
             Outcome::Found("the holdout is not frozen against the authoring agent".into())
         }
-        Some(h) => match &h.enforced_by {
+        Some(h) => match h
+            .enforced_by
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             None => Outcome::Found("the holdout freeze names nothing that enforces it".into()),
             Some(by) => Outcome::Pass(format!(
                 "holdout frozen ({} path{}), enforced by {by}{}",
@@ -349,9 +362,8 @@ fn l5(r: &Recipe) -> Outcome {
         Outcome::Pass("every agent implement stage needs a plan stage".into())
     } else {
         Outcome::Found(format!(
-            "{} start{} without needing a plan stage",
-            ticks(&unplanned),
-            if unplanned.len() == 1 { "s" } else { "" }
+            "no plan stage in `needs` for {}",
+            ticks(&unplanned)
         ))
     }
 }
@@ -458,9 +470,8 @@ fn l8(r: &Recipe) -> Outcome {
     }
     if gaps.is_empty() {
         Outcome::Pass(format!(
-            "{} kill switch{}; merge and dispatch can be stopped; fix loops are capped",
-            r.kill_switches.len(),
-            if r.kill_switches.len() == 1 { "" } else { "es" }
+            "kill switches: {}; merge and dispatch can be stopped; fix loops are capped",
+            r.kill_switches.len()
         ))
     } else {
         Outcome::Found(gaps.join("; "))
@@ -478,7 +489,7 @@ fn l9(r: &Recipe) -> Outcome {
     }
     let unpriced: Vec<&str> = declared
         .iter()
-        .filter(|(_, p)| *p == super::schema::Pricing::None)
+        .filter(|(_, p)| *p == Pricing::None)
         .map(|(l, _)| *l)
         .collect();
     if unpriced.is_empty() {
@@ -513,8 +524,6 @@ fn l10(r: &Recipe) -> Outcome {
         Outcome::Found(format!("{} held in more than one place", ticks(&smeared)))
     }
 }
-
-use super::plural;
 
 fn ticks(xs: &[&str]) -> String {
     xs.iter()
@@ -593,6 +602,22 @@ kill_switches:
         // A person's required verdict is independent of the authoring model.
         let src = BASE.replace("by: \"lane:judge\"", "by: person");
         assert_eq!(level(&src, "L1"), FindingLevel::Ok);
+    }
+
+    #[test]
+    fn l1_does_not_depend_on_stage_order() {
+        // A familyless verdict lane first, then a person's required verdict.
+        let src = BASE.replace("family: openai", "pricing: table").replace(
+            "  - id: merge\n",
+            "  - id: sign-off\n    kind: review\n    by: person\n    verdict: { status: signed-off, required: true }\n  - id: merge\n",
+        );
+        assert_eq!(level(&src, "L1"), FindingLevel::Ok);
+    }
+
+    #[test]
+    fn an_empty_holdout_enforcer_fires_l2() {
+        let src = BASE.replace("enforced_by: actions/push-round", "enforced_by: \"  \"");
+        assert_ne!(level(&src, "L2"), FindingLevel::Ok);
     }
 
     #[test]

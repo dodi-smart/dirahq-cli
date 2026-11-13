@@ -137,9 +137,7 @@ pub fn parse(src: &str) -> Result<Recipe, ParseError> {
     })
 }
 
-/// Parse, validate and review a recipe. A parse failure stops after
-/// `recipe.parse`; a wrong version or a broken reference stops before the
-/// review checks, which assume a recipe that holds together.
+/// The plural suffix for `n` of a regular noun.
 fn plural(n: usize) -> &'static str {
     if n == 1 {
         ""
@@ -148,10 +146,66 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
+/// The top-level `version`, read leniently so a newer recipe's extra keys
+/// do not hide it.
+fn declared_version(src: &str) -> Option<u32> {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        version: Option<u32>,
+    }
+    serde_norway::from_str::<Head>(src).ok()?.version
+}
+
+fn unsupported_version(v: u32) -> Finding {
+    let mut f = Finding::new(
+        "recipe.version",
+        FindingLevel::Fail,
+        format!("version {v} is not supported; this dira reads recipe version {VERSION}"),
+    );
+    f.remedy = Some(format!(
+        "update dira, or write the recipe at version {VERSION}"
+    ));
+    f
+}
+
+/// Read and lint the recipe at `path`. A file that cannot be read is a
+/// `recipe.parse` failure, like one that does not parse.
+pub fn lint_file(path: &std::path::Path) -> Vec<Finding> {
+    match std::fs::read_to_string(path) {
+        Ok(src) => lint(&src),
+        Err(e) => {
+            let mut f = Finding::new(
+                "recipe.parse",
+                FindingLevel::Fail,
+                format!("cannot read {}: {e}", path.display()),
+            );
+            f.remedy = Some(format!(
+                "write the recipe at {DEFAULT_PATH}, or pass its path"
+            ));
+            vec![f]
+        }
+    }
+}
+
+/// Parse, validate and review a recipe. A parse failure stops after
+/// `recipe.parse`; a wrong version or a broken reference stops before the
+/// review checks, which assume a recipe that holds together.
 pub fn lint(src: &str) -> Vec<Finding> {
     let recipe = match parse(src) {
         Ok(r) => r,
         Err(e) => {
+            // A newer recipe may add keys v0 rejects. Name the version, not
+            // the first unknown key.
+            if let Some(v) = declared_version(src).filter(|v| *v != VERSION) {
+                return vec![
+                    Finding::new(
+                        "recipe.parse",
+                        FindingLevel::Skip,
+                        format!("not read: written for recipe version {v}"),
+                    ),
+                    unsupported_version(v),
+                ];
+            }
             let mut f = Finding::new("recipe.parse", FindingLevel::Fail, e.to_string());
             f.remedy = Some("fix the recipe against .zavet/specs/loop-recipe.md".into());
             return vec![f];
@@ -171,16 +225,7 @@ pub fn lint(src: &str) -> Vec<Finding> {
     )];
 
     if recipe.version != VERSION {
-        let mut f = Finding::new(
-            "recipe.version",
-            FindingLevel::Fail,
-            format!(
-                "version {} is not supported; this dira reads recipe version {VERSION}",
-                recipe.version
-            ),
-        );
-        f.remedy = Some("update dira, or write the recipe at version 0".into());
-        out.push(f);
+        out.push(unsupported_version(recipe.version));
         return out;
     }
     out.push(Finding::new(
@@ -281,6 +326,34 @@ mod tests {
         let fs = lint(&src);
         assert_eq!(ids(&fs), ["recipe.parse", "recipe.version"]);
         assert_eq!(fs[1].level, FindingLevel::Fail);
+    }
+
+    #[test]
+    fn a_newer_recipe_with_new_keys_names_its_version() {
+        let src = DODI.replacen(
+            "version: 0",
+            "version: 1
+next_thing: x",
+            1,
+        );
+        let fs = lint(&src);
+        assert_eq!(ids(&fs), ["recipe.parse", "recipe.version"]);
+        assert_eq!(fs[0].level, FindingLevel::Skip);
+        assert_eq!(fs[1].level, FindingLevel::Fail);
+        assert!(fs[1].summary.contains("version 1"), "{fs:#?}");
+    }
+
+    #[test]
+    fn a_kill_switch_defined_twice_breaks_refs() {
+        let src = DODI.replacen(
+            "kill_switches:\n",
+            "kill_switches:\n  - { name: DUP, kind: variable, scope: org, stops: [all] }\n  - { name: DUP, kind: label, scope: item, stops: [all] }\n",
+            1,
+        );
+        let fs = lint(&src);
+        let refs = fs.iter().find(|f| f.id == "recipe.refs").unwrap();
+        assert_eq!(refs.level, FindingLevel::Fail);
+        assert!(refs.summary.contains("`DUP` is defined twice"), "{refs:#?}");
     }
 
     #[test]

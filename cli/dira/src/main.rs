@@ -1226,11 +1226,7 @@ async fn main() -> Result<()> {
             },
     } = &cli.command
     {
-        std::process::exit(loop_cmd::run(loop_cmd::Args {
-            path: path.clone(),
-            json: *json,
-            verbose: *verbose,
-        }));
+        std::process::exit(loop_cmd::run(path.as_deref(), *json, *verbose));
     }
     let config = Config::load().map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let cwd = std::env::current_dir()

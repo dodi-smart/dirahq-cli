@@ -1,5 +1,6 @@
 //! Knowledge sync task (M2): ship zavet decisions, specs, trailer refs, guard
-//! events, and per-repo coverage stats to `POST /api/v1/knowledge`.
+//! events, per-repo coverage stats and loop recipe lint results (DIRASH-0070)
+//! to `POST /api/v1/knowledge`.
 //!
 //! A deliberately smaller sibling of [`crate::sync`]: same debounce/backstop
 //! shape, same signing rule, same cursor-after-2xx discipline — but its own
@@ -22,18 +23,20 @@ use crate::sync::{
     next_backoff, record_channel_health, retry_after_from_headers, transient_wait, HealthChannel,
     MAX_BACKOFF,
 };
-use dira_contract::{KnowledgeEnvelope, KnowledgeRepoStats, SCHEMA_VERSION};
+use dira_contract::{KnowledgeEnvelope, KnowledgeLoopLint, KnowledgeRepoStats, SCHEMA_VERSION};
 use dira_core::identity;
 use dira_core::signing::DeviceKey;
 use dira_core::store::{ZavetDecisionRow, ZavetSpecRow};
 use dira_core::sync::knowledge::{
-    apply_spec_refs, build_knowledge_batches, knowledge_batch_id, parse_knowledge_response,
-    trailer_spec_refs, KnowledgeChunk, KnowledgeTier, KNOWLEDGE_CHUNK_ITEMS,
-    META_KNOWLEDGE_DECISION_CURSOR, META_KNOWLEDGE_GUARD_CURSOR, META_KNOWLEDGE_HEALTH,
-    META_KNOWLEDGE_SPEC_CURSOR, META_KNOWLEDGE_STATS_PREFIX, META_KNOWLEDGE_TRAILER_CURSOR,
+    apply_spec_refs, build_knowledge_batches, knowledge_batch_id, loop_lint_ack,
+    parse_knowledge_response, trailer_spec_refs, KnowledgeChunk, KnowledgeTier,
+    KNOWLEDGE_CHUNK_ITEMS, META_KNOWLEDGE_DECISION_CURSOR, META_KNOWLEDGE_GUARD_CURSOR,
+    META_KNOWLEDGE_HEALTH, META_KNOWLEDGE_SPEC_CURSOR, META_KNOWLEDGE_STATS_PREFIX,
+    META_KNOWLEDGE_TRAILER_CURSOR,
 };
 use dira_core::{config::KnowledgeSyncMode, project};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, sleep_until, Instant};
@@ -53,6 +56,9 @@ const STATS_WINDOW_DAYS: u32 = 90;
 /// Minimum interval between recomputations of one repo's stats snapshot (the
 /// git pass walks 90 days of history — cheap, but not per-flush cheap).
 const STATS_TTL: time::Duration = time::Duration::hours(6);
+/// A loop recipe larger than this is not linted for the cloud. A real one is a
+/// few KiB; this only stops a stray file from being read whole every flush.
+const LOOP_RECIPE_MAX_BYTES: u64 = 256 * 1024;
 
 /// Handle to the knowledge sync task. Cloneable; shares the trigger channel.
 #[derive(Clone)]
@@ -269,7 +275,11 @@ async fn flush_knowledge(
         .zavet_guard_events_since(&guard_id, limit * 10)
         .await
         .map_err(|e| KError::Fatal(format!("load guard events: {e}")))?;
-    let repo_stats = compute_repo_stats(state).await;
+    // Resolved once: both snapshots walk the same repos, and each lookup
+    // shells out to git.
+    let roots = known_repo_roots(state);
+    let repo_stats = compute_repo_stats(state, &roots).await;
+    let loop_lints = compute_loop_lints(state, &roots).await;
 
     let now = crate::heartbeat::fmt_rfc3339(time::OffsetDateTime::now_utc());
     let mut chunks = build_knowledge_batches(
@@ -281,6 +291,7 @@ async fn flush_knowledge(
         &trailers,
         &guard_events,
         repo_stats,
+        loop_lints,
     );
     if chunks.is_empty() {
         return Ok(Outcome::Nothing);
@@ -321,7 +332,8 @@ async fn flush_knowledge(
             // place ([`KnowledgeBatch::strip_content`]) and retry once. The
             // batch id is tier-sensitive, so it is recomputed after the strip;
             // the stats snapshot is dropped from the retry (it never was part
-            // of the window's identity — the next TTL pass re-sends it).
+            // of the window's identity — the next TTL pass re-sends it). Loop
+            // lints are metadata and stay.
             // Re-sent metadata-only chunks that overlap already-accepted ones
             // dedup by batch id / natural keys.
             tracing::warn!(
@@ -548,6 +560,10 @@ async fn post_chunks(
             if let Some(rowid) = chunk.trailer_rowid {
                 meta_put(state, META_KNOWLEDGE_TRAILER_CURSOR, &rowid.to_string()).await?;
             }
+            // Like a cursor: a snapshot counts as sent only once acknowledged.
+            for (key, value) in &chunk.acks {
+                meta_put(state, key, value).await?;
+            }
         }
     }
     Ok(Outcome::Synced)
@@ -569,6 +585,24 @@ async fn meta_put(state: &AppState, key: &str, value: &str) -> Result<(), KError
         .meta_set(key, value)
         .await
         .map_err(|e| KError::Fatal(format!("store {key}: {e}")))
+}
+
+/// Every repo the daemon has a working directory for, with its root. A repo
+/// whose root does not resolve is left out.
+///
+/// `lock_recover_map`, not a bare `lock()`: a poisoned mutex here used to
+/// return an empty snapshot, which reads downstream as "this device knows of
+/// no repos" — a confident wrong answer rather than a stale one. Every other
+/// reader of this map recovers the guard and serves what it has; see
+/// `control::lock_recover`'s note on staying stale-but-serving.
+fn known_repo_roots(state: &AppState) -> Vec<(String, PathBuf)> {
+    let dirs: Vec<String> = crate::control::lock_recover_map(&state.repo_dirs)
+        .keys()
+        .cloned()
+        .collect();
+    dirs.into_iter()
+        .filter_map(|repo| crate::control::repo_root(state, &repo).map(|root| (repo, root)))
+        .collect()
 }
 
 /// Per-repo coverage/capture snapshot for every zavet-active repo the daemon
@@ -604,23 +638,14 @@ fn coverage_globs(decisions: &[ZavetDecisionRow], specs: &[ZavetSpecRow]) -> Vec
     globs
 }
 
-async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
-    // `lock_recover_map`, not a bare `lock()`: a poisoned mutex here used to
-    // return an empty snapshot, which reads downstream as "this device knows of
-    // no repos" — a confident wrong answer rather than a stale one. Every other
-    // reader of this map recovers the guard and serves what it has; see
-    // `control::lock_recover`'s note on staying stale-but-serving.
-    let dirs: Vec<String> = crate::control::lock_recover_map(&state.repo_dirs)
-        .keys()
-        .cloned()
-        .collect();
+async fn compute_repo_stats(
+    state: &AppState,
+    roots: &[(String, PathBuf)],
+) -> Vec<KnowledgeRepoStats> {
     let now = time::OffsetDateTime::now_utc();
     let now_str = crate::heartbeat::fmt_rfc3339(now);
     let mut out = Vec::new();
-    for repo in dirs {
-        let Some(root) = crate::control::repo_root(state, &repo) else {
-            continue;
-        };
+    for (repo, root) in roots {
         if !root.join(".zavet").is_dir() {
             continue;
         }
@@ -638,23 +663,19 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
         // Coverage surface: active guard globs ∪ every spec's paths.
         let decisions = state
             .store
-            .zavet_decisions_list(&repo)
+            .zavet_decisions_list(repo)
             .await
             .unwrap_or_default();
-        let specs = state
-            .store
-            .zavet_specs_list(&repo)
-            .await
-            .unwrap_or_default();
+        let specs = state.store.zavet_specs_list(repo).await.unwrap_or_default();
         let globs = coverage_globs(&decisions, &specs);
         let spec_trailers = state
             .store
-            .zavet_spec_trailer_values(&repo)
+            .zavet_spec_trailer_values(repo)
             .await
             .unwrap_or_default();
         let trailer_shas: HashSet<String> = state
             .store
-            .zavet_trailer_shas(&repo)
+            .zavet_trailer_shas(repo)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -689,7 +710,7 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
             .filter(|sha| trailer_shas.contains(*sha))
             .count() as u64;
         let (spec_sources, spec_cited_commits) = spec_census(
-            &crate::zavet::read_config(&root),
+            &crate::zavet::read_config(root),
             &specs,
             &spec_trailers,
             &activity.nontrivial_commits,
@@ -707,6 +728,43 @@ async fn compute_repo_stats(state: &AppState) -> Vec<KnowledgeRepoStats> {
             spec_cited_commits,
         });
         let _ = state.store.meta_set(&key, &now_str).await;
+    }
+    out
+}
+
+/// Lint each known repo's `.dira/loop.yml` with `dira loop lint`'s own code
+/// and keep the entries the cloud has not acknowledged in this form
+/// (DIRASH-0070). Only ids, statuses, the path and the blob oid leave
+/// ([`dira_core::loop_recipe::wire`]); the recipe is read here and dropped.
+/// A repo with no recipe, or one that cannot be read, sends nothing.
+async fn compute_loop_lints(
+    state: &AppState,
+    roots: &[(String, PathBuf)],
+) -> Vec<KnowledgeLoopLint> {
+    use dira_core::loop_recipe::{wire, DEFAULT_PATH};
+    let mut out = Vec::new();
+    for (repo, root) in roots {
+        let path = root.join(DEFAULT_PATH);
+        match tokio::fs::metadata(&path).await {
+            Ok(m) if m.is_file() && m.len() <= LOOP_RECIPE_MAX_BYTES => {}
+            _ => continue,
+        }
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let mut lint = wire::knowledge_loop_lint(repo, DEFAULT_PATH, &bytes);
+        // A CRLF checkout (`core.autocrlf`) hashes apart from the committed
+        // blob the cloud compares with; ask git, which applies the filters.
+        if bytes.contains(&b'\r') {
+            if let Some(oid) = project::hash_object(root, DEFAULT_PATH) {
+                lint.recipe_blob_oid = oid;
+            }
+        }
+        let (key, fingerprint) = loop_lint_ack(&lint);
+        if state.store.meta_get(&key).await.ok().flatten() == Some(fingerprint) {
+            continue;
+        }
+        out.push(lint);
     }
     out
 }
@@ -993,6 +1051,168 @@ mod tests {
         let (state, _rx, _sync_rx, _knowledge_rx) =
             crate::build_state(store, config).await.unwrap();
         state
+    }
+
+    const LOOP_RECIPE: &str = include_str!("../../../examples/loops/dodi-factory.yml");
+
+    /// A linked state that knows one repo whose working tree holds `recipe`
+    /// at `.dira/loop.yml`, or no recipe at all.
+    async fn state_with_recipe(
+        cloud: &MockCloud,
+        knob: KnowledgeSyncMode,
+        recipe: Option<&str>,
+    ) -> (AppState, tempfile::TempDir) {
+        let state = linked_state(cloud, knob).await;
+        let repo = tempfile::tempdir().unwrap();
+        if let Some(recipe) = recipe {
+            std::fs::create_dir_all(repo.path().join(".dira")).unwrap();
+            std::fs::write(repo.path().join(".dira/loop.yml"), recipe).unwrap();
+        }
+        crate::control::lock_recover_map(&state.repo_dirs).insert(
+            "github.com/acme/api".to_string(),
+            repo.path().display().to_string(),
+        );
+        (state, repo)
+    }
+
+    fn loop_lints(body: &str) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["payload"]["loopLints"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_loop_recipe_sends_ids_and_statuses_and_no_recipe_text() {
+        let cloud = MockCloud::start(&["/api/v1/knowledge"]).await;
+        let (state, _repo) =
+            state_with_recipe(&cloud, KnowledgeSyncMode::Full, Some(LOOP_RECIPE)).await;
+        cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+        flush_knowledge(&state, &DeviceKey::generate(), &state.http)
+            .await
+            .unwrap();
+        let body = &cloud.requests("/api/v1/knowledge")[0];
+        let l = &loop_lints(body)[0];
+        assert_eq!(l["repoCanonical"], "github.com/acme/api");
+        assert_eq!(l["recipePath"], ".dira/loop.yml");
+        assert_eq!(
+            l["recipeBlobOid"],
+            dira_core::loop_recipe::wire::git_blob_oid(LOOP_RECIPE.as_bytes())
+        );
+        let results = l["results"].as_array().unwrap();
+        assert_eq!(results.len(), 15, "L1..L15");
+        assert_eq!(
+            results[0],
+            serde_json::json!({"id": "L1", "status": "pass", "overriddenBy": "DODI-00065"}),
+            "the example's off override names its decision, not its reason"
+        );
+        // Even at the full tier, nothing the recipe or the lint says crosses.
+        for text in [
+            "dodi-smart/factory",
+            "merge-gate",
+            "Plan ready",
+            "needs observed data",
+            "recipe.parse",
+            "Known gap",
+        ] {
+            assert!(!body.contains(text), "{text} must not cross");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loop_lint_is_resent_only_when_unacknowledged_or_changed() {
+        let cloud = MockCloud::start(&["/api/v1/knowledge"]).await;
+        let (state, repo) =
+            state_with_recipe(&cloud, KnowledgeSyncMode::Metadata, Some(LOOP_RECIPE)).await;
+        let key = DeviceKey::generate();
+
+        // A failed POST records nothing, so the lint goes again.
+        cloud.push("/api/v1/knowledge", MockResp::status(500, "boom"));
+        assert!(flush_knowledge(&state, &key, &state.http).await.is_err());
+        cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+        flush_knowledge(&state, &key, &state.http).await.unwrap();
+        assert!(loop_lints(&cloud.requests("/api/v1/knowledge")[1]).is_array());
+
+        // Acknowledged and unchanged: nothing to send.
+        let out = flush_knowledge(&state, &key, &state.http).await.unwrap();
+        assert!(matches!(out, Outcome::Nothing), "{out:?}");
+
+        // A changed recipe is a new blob and a new status, sent under a new id.
+        let changed = LOOP_RECIPE.replacen(
+            "limits: { wip: 2, review_wait_ceiling_hours: 24 }",
+            "limits: { wip: 2 }",
+            1,
+        );
+        assert_ne!(changed, LOOP_RECIPE, "fixture lost the dispatch limits");
+        std::fs::write(repo.path().join(".dira/loop.yml"), &changed).unwrap();
+        cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+        let out = flush_knowledge(&state, &key, &state.http).await.unwrap();
+        assert!(matches!(out, Outcome::Synced), "{out:?}");
+        let reqs = cloud.requests("/api/v1/knowledge");
+        let l = &loop_lints(&reqs[2])[0];
+        assert_eq!(
+            l["recipeBlobOid"],
+            dira_core::loop_recipe::wire::git_blob_oid(changed.as_bytes())
+        );
+        let l6 = l["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "L6")
+            .unwrap();
+        assert_eq!(l6["status"], "fail");
+        let id_of = |body: &str| {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["payload"]["batchId"].as_str().unwrap().to_string()
+        };
+        assert_ne!(id_of(&reqs[1]), id_of(&reqs[2]));
+    }
+
+    #[tokio::test]
+    async fn the_metadata_retry_keeps_the_loop_lint() {
+        let cloud = MockCloud::start(&["/api/v1/knowledge"]).await;
+        let (state, _repo) =
+            state_with_recipe(&cloud, KnowledgeSyncMode::Full, Some(LOOP_RECIPE)).await;
+        cloud.push(
+            "/api/v1/knowledge",
+            MockResp::status(400, r#"{"error":"content_not_allowed"}"#),
+        );
+        cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+        flush_knowledge(&state, &DeviceKey::generate(), &state.http)
+            .await
+            .unwrap();
+        let reqs = cloud.requests("/api/v1/knowledge");
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[1].contains("\"tier\":\"metadata\""));
+        assert_eq!(loop_lints(&reqs[0]), loop_lints(&reqs[1]));
+    }
+
+    #[tokio::test]
+    async fn a_repo_without_a_recipe_sends_no_loop_lint() {
+        let cloud = MockCloud::start(&["/api/v1/knowledge"]).await;
+        let (state, _repo) = state_with_recipe(&cloud, KnowledgeSyncMode::Metadata, None).await;
+        cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+        flush_knowledge(&state, &DeviceKey::generate(), &state.http)
+            .await
+            .unwrap();
+        assert!(!cloud.requests("/api/v1/knowledge")[0].contains("loopLints"));
+    }
+
+    #[tokio::test]
+    async fn a_cloud_reset_resends_an_acknowledged_loop_lint() {
+        let cloud = MockCloud::start(&["/api/v1/knowledge"]).await;
+        let (state, _repo) =
+            state_with_recipe(&cloud, KnowledgeSyncMode::Metadata, Some(LOOP_RECIPE)).await;
+        let key = DeviceKey::generate();
+        crate::sync::note_data_epoch(&state, "e1").await.unwrap();
+        cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+        flush_knowledge(&state, &key, &state.http).await.unwrap();
+        let out = flush_knowledge(&state, &key, &state.http).await.unwrap();
+        assert!(matches!(out, Outcome::Nothing), "{out:?}");
+
+        assert!(crate::sync::note_data_epoch(&state, "e2").await.unwrap());
+        cloud.push("/api/v1/knowledge", MockResp::ok("{}"));
+        flush_knowledge(&state, &key, &state.http).await.unwrap();
+        let reqs = cloud.requests("/api/v1/knowledge");
+        assert_eq!(loop_lints(&reqs[0]), loop_lints(&reqs[1]));
     }
 
     #[tokio::test]

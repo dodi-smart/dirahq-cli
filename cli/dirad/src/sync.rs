@@ -1447,8 +1447,8 @@ async fn apply_handshake(state: &AppState, body: &str) -> Result<bool, SyncError
 /// the reset.
 pub(crate) async fn note_data_epoch(state: &AppState, epoch: &str) -> Result<bool, String> {
     use dira_core::sync::knowledge::{
-        META_KNOWLEDGE_DECISION_CURSOR, META_KNOWLEDGE_GUARD_CURSOR, META_KNOWLEDGE_SPEC_CURSOR,
-        META_KNOWLEDGE_TRAILER_CURSOR,
+        META_KNOWLEDGE_DECISION_CURSOR, META_KNOWLEDGE_GUARD_CURSOR,
+        META_KNOWLEDGE_LOOP_LINT_PREFIX, META_KNOWLEDGE_SPEC_CURSOR, META_KNOWLEDGE_TRAILER_CURSOR,
     };
     use dira_core::sync::META_LAST_EPOCH;
 
@@ -1493,6 +1493,12 @@ pub(crate) async fn note_data_epoch(state: &AppState, epoch: &str) -> Result<boo
                     .await
                     .map_err(|e| format!("reset {key}: {e}"))?;
             }
+            // Acknowledged loop lints (DIRASH-0070) are per-repo cursors too.
+            state
+                .store
+                .meta_delete_prefix(META_KNOWLEDGE_LOOP_LINT_PREFIX)
+                .await
+                .map_err(|e| format!("reset loop lints: {e}"))?;
             tracing::warn!(
                 epoch = epoch,
                 "sync: cloud data epoch changed (cloud was reset) — re-sending from scratch"

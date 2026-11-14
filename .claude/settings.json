@@ -4,7 +4,7 @@
       {
         "hooks": [
           {
-            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "command": "[ ! -f \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh ] || sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
             "type": "command"
           }
         ]
@@ -14,7 +14,7 @@
       {
         "hooks": [
           {
-            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "command": "[ ! -f \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh ] || sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
             "type": "command"
           }
         ],
@@ -25,7 +25,7 @@
       {
         "hooks": [
           {
-            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "command": "[ ! -f \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh ] || sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
             "type": "command"
           }
         ],
@@ -36,7 +36,7 @@
       {
         "hooks": [
           {
-            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "command": "[ ! -f \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh ] || sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
             "type": "command"
           }
         ]
@@ -46,7 +46,7 @@
       {
         "hooks": [
           {
-            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/bootstrap.sh claude",
+            "command": "[ ! -f \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/bootstrap.sh ] || sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/bootstrap.sh claude",
             "timeout": 300,
             "type": "command"
           }
@@ -57,7 +57,7 @@
       {
         "hooks": [
           {
-            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "command": "[ ! -f \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh ] || sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
             "type": "command"
           }
         ]
@@ -67,7 +67,7 @@
       {
         "hooks": [
           {
-            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "command": "[ ! -f \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh ] || sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
             "type": "command"
           }
         ]
@@ -77,7 +77,7 @@
       {
         "hooks": [
           {
-            "command": "sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
+            "command": "[ ! -f \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh ] || sh \"${CLAUDE_PROJECT_DIR:-.}\"/.dira/hook.sh claude",
             "type": "command"
           }
         ]

@@ -93,9 +93,11 @@ jobs:
           git commit -s -m "chore(install): sync installers from dirahq-cli@${sha_short}"
           git push -u origin "${branch}" --force
 
+          # Into develop, the landing trunk (and the branch checked out above):
+          # its target guard refuses PRs into main from anything but develop.
           gh pr create \
             --repo dodi-smart/dirahq-landing \
-            --base main \
+            --base develop \
             --head "${branch}" \
             --title "chore(install): sync installers from dirahq-cli@${sha_short}" \
             --body "Automated sync of \`scripts/install.sh\` and \`scripts/install.ps1\` from dodi-smart/dirahq-cli@${sha_short} (https://github.com/dodi-smart/dirahq-cli/commit/${sha_short}). Source of truth is \`install.sh\` / \`install.ps1\` at the CLI repo root -- do not edit the landing copies by hand." \

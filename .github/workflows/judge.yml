@@ -1,0 +1,45 @@
+# Thin caller, copy to <repo>/.github/workflows/judge.yml
+#
+# Opt-in: install it only in a repo the independent judge covers, and install
+# the `dodi-judge` App on the same repo (DODI-00065). `agent:judge` on a PR
+# asks Grok Bot, acting as `dodi-judge[bot]`, for a verdict on the head commit;
+# the shared workflow turns its review into the `judge / verdict` status. No
+# gate reads that status yet. Without this caller the label does nothing.
+#
+# Each event below moves one request. A run decides once and exits:
+#   pull_request labeled           someone applied `agent:judge`: pending
+#   pull_request synchronize       the head moved under a request: pending again
+#   pull_request_review submitted  dodi-judge reviewed: the verdict
+#   schedule                       requests with no verdict before the timeout: error
+# The shared workflow's own `if:` drops every other case before a runner is
+# booked, so there is no pre-filter here.
+name: Judge
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  pull_request_review:
+    types: [submitted]
+  schedule:
+    - cron: '17,47 * * * *'
+# One request per PR at a time. Never cancelled: a cancelled verdict run would
+# leave the request pending until the sweep times it out. "-caller" keeps this
+# group apart from the shared workflow's own.
+concurrency:
+  group: ${{ github.workflow }}-caller-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+jobs:
+  judge:
+    uses: dodi-smart/.github/.github/workflows/judge.yml@v1
+    # Only the org App: it posts the status and removes the label. The judge
+    # itself holds its own key, outside this repo.
+    secrets:
+      GH_APP_CLIENT_ID: ${{ secrets.GH_APP_CLIENT_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+    # The union of what the called workflow's jobs request. The status and the
+    # label removal use the org App token.
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+    # with:
+    #   timeout-minutes: 240   # a request with no verdict this long ends in error

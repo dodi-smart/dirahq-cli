@@ -1,0 +1,49 @@
+# Thin caller, copy to <repo>/.github/workflows/dispatch.yml
+#
+# Opt-in: install it only in a repo whose agent PRs already run the fix loop
+# (`pr-iterate.yml`), and turn it on with the repo variable FACTORY_DISPATCH =
+# true (DODI-00067). Unset or anything else, the job is skipped and no runner is
+# booked. It also needs FACTORY_BUDGET_USD, the repo's agent spend in USD a
+# month: at it, or unset, nothing is dispatched (DODI-00068). It applies
+# `agent:implement`, as the org App, to the highest-Priority `Plan ready`,
+# `Autonomous` issue while open agent PRs stay under a WIP cap and their review
+# wait under a ceiling. No agent picks the work.
+#
+# Each event below can free a slot or make an issue eligible; the schedule is
+# the backstop. A bot's review is dropped by the shared workflow's `if:` before
+# a runner is booked.
+name: Dispatch
+on:
+  pull_request:
+    types: [closed]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [unlabeled, edited]
+  schedule:
+    - cron: '23 */3 * * *'
+  workflow_dispatch:
+# One run per repo at a time, so two never both see room under the cap. Never
+# cancelled: a newer run reads the facts again anyway. "-caller" keeps this
+# group apart from the shared workflow's own.
+concurrency:
+  group: ${{ github.workflow }}-caller-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  dispatch:
+    uses: dodi-smart/.github/.github/workflows/dispatch.yml@v1
+    # Only the org App: its label starts issue-implement, a GITHUB_TOKEN one
+    # would not.
+    secrets:
+      GH_APP_CLIENT_ID: ${{ secrets.GH_APP_CLIENT_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+    # The union of what the called workflow's job requests.
+    permissions:
+      issues: read
+      pull-requests: read
+      actions: read      # this month's runs, whose Agent run notices hold the spend
+      checks: read       # the notices themselves
+    # Never raise these without a new decision citing the scorecard (DODI-00067).
+    # with:
+    #   wip-cap: 2
+    #   review-wait-ceiling: 24

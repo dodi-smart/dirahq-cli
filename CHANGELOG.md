@@ -1,3 +1,9 @@
+## [0.14.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.13.0...v0.14.0) (2026-11-14)
+
+### ✨ Features
+
+* **contract:** send dira loop lint results to proba's loop assay on the knowledge channel (2.2.0) ([#233](https://github.com/dodi-smart/dirahq-cli/issues/233)) ([4df5645](https://github.com/dodi-smart/dirahq-cli/commit/4df5645b2bec5ab2c0f4f2ee78829c83cda24a1c))
+
 ## [0.13.0](https://github.com/dodi-smart/dirahq-cli/compare/v0.12.0...v0.13.0) (2026-11-13)
 
 ### ✨ Features

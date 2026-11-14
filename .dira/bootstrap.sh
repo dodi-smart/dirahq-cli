@@ -48,15 +48,15 @@ harness="${1:-claude}"
 dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 
 # Pinned at generation time; override with DIRA_VERSION for a one-off.
-version="${DIRA_VERSION:-0.6.0}"
+version="${DIRA_VERSION:-0.14.0}"
 # The literal pin, unaffected by a DIRA_VERSION override — used below to
 # decide whether the embedded release digests still apply to what we're
 # about to download.
-pinned_version="0.6.0"
+pinned_version="0.14.0"
 # Release digests embedded at generation time (empty when unpinned — the
 # bootstrap then falls back to the release's own .sha256 asset).
-expected_x86_64=""
-expected_aarch64=""
+expected_x86_64="79ea84cca74ca01966826cf053d0509497bde5cf1335c1ec87e04a9f986cc382"
+expected_aarch64="65b879ab1221bde758dd0c53bdaa572d3cdde9d0719fd91f9b82cdcf2a983678"
 repo="dodi-smart/dirahq-cli"
 
 log() {

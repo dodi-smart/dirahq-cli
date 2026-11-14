@@ -14,8 +14,8 @@ use crate::store::{
     ZavetCheck, ZavetDecisionRow, ZavetGuardEventSyncRow, ZavetSpecRow, ZavetTrailerSyncRow,
 };
 use dira_contract::{
-    KnowledgeBatch, KnowledgeCheck, KnowledgeDecision, KnowledgeGuardEvent, KnowledgeRepoStats,
-    KnowledgeSpec, KnowledgeTrailerRef,
+    KnowledgeBatch, KnowledgeCheck, KnowledgeDecision, KnowledgeGuardEvent, KnowledgeLoopLint,
+    KnowledgeRepoStats, KnowledgeSpec, KnowledgeTrailerRef,
 };
 use serde::Deserialize;
 
@@ -33,6 +33,26 @@ pub const META_KNOWLEDGE_HEALTH: &str = "knowledge_sync_health";
 /// `meta` key prefix: RFC 3339 instant the per-repo stats snapshot was last
 /// computed (`knowledge_stats_at:<canonical repo>`), throttling the git pass.
 pub const META_KNOWLEDGE_STATS_PREFIX: &str = "knowledge_stats_at:";
+/// `meta` key prefix: the fingerprint of the last loop lint the cloud
+/// acknowledged for a repo (`knowledge_loop_lint:<canonical repo>`), so an
+/// unchanged recipe is not re-sent every flush (DIRASH-0070). A cloud reset
+/// clears every key under it, like a cursor. See [`loop_lint_ack`].
+pub const META_KNOWLEDGE_LOOP_LINT_PREFIX: &str = "knowledge_loop_lint:";
+
+/// What a loop lint is compared on: the whole wire entry. A new recipe blob,
+/// a new catalogue or a rule change moves it. The batch id uses it too.
+pub fn loop_lint_fingerprint(lint: &KnowledgeLoopLint) -> String {
+    serde_json::to_string(lint).unwrap_or_default()
+}
+
+/// The `meta` write that records `lint` as acknowledged: its per-repo key and
+/// its fingerprint.
+pub fn loop_lint_ack(lint: &KnowledgeLoopLint) -> (String, String) {
+    (
+        format!("{META_KNOWLEDGE_LOOP_LINT_PREFIX}{}", lint.repo_canonical),
+        loop_lint_fingerprint(lint),
+    )
+}
 
 /// Guard events per chunk — the only high-volume stream. Decisions, specs,
 /// trailers, and repo stats ride the final chunk (mirroring how artifacts
@@ -67,6 +87,9 @@ pub struct KnowledgeChunk {
     pub decision_seq: Option<i64>,
     pub spec_seq: Option<i64>,
     pub trailer_rowid: Option<i64>,
+    /// Snapshot `meta` writes (key, value) applied on this chunk's ack, like
+    /// a cursor. Only the last chunk carries any.
+    pub acks: Vec<(String, String)>,
     pub is_last: bool,
 }
 
@@ -263,6 +286,17 @@ pub fn knowledge_batch_id(batch: &KnowledgeBatch) -> String {
     for g in &batch.guard_events {
         ids.push(format!("g:{}", g.id));
     }
+    // A snapshot like `repo_stats`, but it must take part, with the build
+    // time: the daemon re-sends a lint only when it differs from the last ack,
+    // and a recipe reverted A -> B -> A would otherwise re-send A under the id
+    // the cloud already holds, which it no-ops. Re-applying a lint is an upsert.
+    for l in &batch.loop_lints {
+        ids.push(format!(
+            "l:{}@{}",
+            loop_lint_fingerprint(l),
+            batch.generated_at
+        ));
+    }
     ids.push(format!("tier:{}", batch.tier));
     ids.sort_unstable();
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
@@ -284,11 +318,13 @@ pub fn build_knowledge_batches(
     trailers: &[ZavetTrailerSyncRow],
     guard_events: &[ZavetGuardEventSyncRow],
     repo_stats: Vec<KnowledgeRepoStats>,
+    loop_lints: Vec<KnowledgeLoopLint>,
 ) -> Vec<KnowledgeChunk> {
     let has_tail = !decisions.is_empty()
         || !specs.is_empty()
         || !trailers.is_empty()
-        || !repo_stats.is_empty();
+        || !repo_stats.is_empty()
+        || !loop_lints.is_empty();
     if guard_events.is_empty() && !has_tail {
         return Vec::new();
     }
@@ -316,6 +352,7 @@ pub fn build_knowledge_batches(
             trailer_refs: Vec::new(),
             guard_events: slice.iter().map(event_to_wire).collect(),
             repo_stats: Vec::new(),
+            loop_lints: Vec::new(),
         };
         if is_last {
             batch.decisions = decisions
@@ -325,6 +362,7 @@ pub fn build_knowledge_batches(
             batch.specs = specs.iter().map(|(_, s)| spec_to_wire(s, tier)).collect();
             batch.trailer_refs = trailers.iter().map(|t| trailer_to_wire(t, tier)).collect();
             batch.repo_stats = repo_stats.clone();
+            batch.loop_lints = loop_lints.clone();
         }
         batch.batch_id = knowledge_batch_id(&batch);
         chunks.push(KnowledgeChunk {
@@ -332,6 +370,11 @@ pub fn build_knowledge_batches(
             decision_seq: if is_last { decision_seq } else { None },
             spec_seq: if is_last { spec_seq } else { None },
             trailer_rowid: if is_last { trailer_rowid } else { None },
+            acks: if is_last {
+                loop_lints.iter().map(loop_lint_ack).collect()
+            } else {
+                Vec::new()
+            },
             is_last,
             batch,
         });
@@ -430,6 +473,7 @@ mod tests {
             &[],
             &[],
             Vec::new(),
+            Vec::new(),
         );
         assert!(chunks.is_empty());
     }
@@ -449,6 +493,7 @@ mod tests {
             &[],
             &events,
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(chunks.len(), 2);
         assert!(!chunks[0].is_last);
@@ -467,10 +512,80 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_lint_alone_builds_a_batch_whose_id_follows_the_recipe() {
+        let lint = |oid: &str| KnowledgeLoopLint {
+            repo_canonical: "github.com/acme/api".into(),
+            recipe_path: ".dira/loop.yml".into(),
+            recipe_blob_oid: oid.into(),
+            catalogue_version: 2,
+            results: vec![],
+        };
+        let build_at = |oid: &str, at: &str| {
+            build_knowledge_batches(
+                "d",
+                at,
+                KnowledgeTier::Metadata,
+                &[],
+                &[],
+                &[],
+                &[],
+                Vec::new(),
+                vec![lint(oid)],
+            )
+        };
+        let build = |oid: &str| build_at(oid, "t");
+        let a = build("aaaa");
+        assert_eq!(a.len(), 1, "a lint alone is worth a batch");
+        assert_eq!(a[0].batch.loop_lints.len(), 1);
+        assert_eq!(a[0].batch.batch_id, build("aaaa")[0].batch.batch_id);
+        assert_ne!(a[0].batch.batch_id, build("bbbb")[0].batch.batch_id);
+        // A recipe reverted to an earlier blob is a new send, not a replay
+        // the cloud would no-op.
+        assert_ne!(
+            a[0].batch.batch_id,
+            build_at("aaaa", "t2")[0].batch.batch_id
+        );
+    }
+
+    #[test]
+    fn only_the_last_chunk_acks_the_loop_lint() {
+        let lint = KnowledgeLoopLint {
+            repo_canonical: "github.com/acme/api".into(),
+            recipe_path: ".dira/loop.yml".into(),
+            recipe_blob_oid: "aaaa".into(),
+            catalogue_version: 2,
+            results: vec![],
+        };
+        let events: Vec<_> = (0..KNOWLEDGE_CHUNK_ITEMS + 1)
+            .map(|i| event(&format!("01J{i:06}")))
+            .collect();
+        let chunks = build_knowledge_batches(
+            "d",
+            "t",
+            KnowledgeTier::Metadata,
+            &[],
+            &[],
+            &[],
+            &events,
+            Vec::new(),
+            vec![lint.clone()],
+        );
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].acks.is_empty());
+        assert_eq!(
+            chunks[1].acks,
+            vec![(
+                "knowledge_loop_lint:github.com/acme/api".to_string(),
+                loop_lint_fingerprint(&lint)
+            )]
+        );
+    }
+
+    #[test]
     fn batch_id_is_deterministic_and_tier_sensitive() {
         let ds = [decision("D-0001", 1)];
         let build = |tier| {
-            build_knowledge_batches("d", "t", tier, &ds, &[], &[], &[], Vec::new())
+            build_knowledge_batches("d", "t", tier, &ds, &[], &[], &[], Vec::new(), Vec::new())
                 .pop()
                 .unwrap()
                 .batch
@@ -504,6 +619,7 @@ mod tests {
             &trailers,
             &[],
             Vec::new(),
+            Vec::new(),
         )
         .pop()
         .unwrap();
@@ -526,6 +642,7 @@ mod tests {
             &[],
             &[],
             &[],
+            Vec::new(),
             Vec::new(),
         )
         .pop()
@@ -624,6 +741,7 @@ mod tests {
                 &[],
                 &[],
                 Vec::new(),
+                Vec::new(),
             )
             .remove(0)
             .batch
@@ -704,6 +822,7 @@ mod tests {
             &[],
             &rows,
             &[],
+            Vec::new(),
             Vec::new(),
         )
         .remove(0)

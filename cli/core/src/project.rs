@@ -444,6 +444,13 @@ pub fn blob_oid(root: &Path, sha: &str, path: &str) -> Option<String> {
     git(root, &["rev-parse", &format!("{sha}:{path}")])
 }
 
+/// The blob oid git would store for the working-tree file `path`, after its
+/// clean filters (`core.autocrlf`, `.gitattributes`): the oid the file has once
+/// committed, which hashing the checkout's bytes misses on a CRLF checkout.
+pub fn hash_object(root: &Path, path: &str) -> Option<String> {
+    git(root, &["hash-object", "--", path])
+}
+
 /// A commit captured from `git log`, ready to record locally and ship as an
 /// [`dira_contract::ArtifactRef`]. Metadata only — no diff or file contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1198,6 +1205,17 @@ mod tests {
     // --- Which remote a project ref comes from (#111) ------------------------
 
     /// A repo with the given remotes, each pointing at a canonicalizable URL.
+    #[test]
+    fn hash_object_reads_a_crlf_checkout_as_its_committed_blob() {
+        let root = init_plain_repo("hash-object-crlf", "2026-01-01T00:00:00Z");
+        run_git(&root, &["config", "core.autocrlf", "true"]);
+        std::fs::write(root.join("loop.yml"), "version: 0\r\nrecipe: a/b@1\r\n").unwrap();
+        assert_eq!(
+            super::hash_object(&root, "loop.yml").as_deref(),
+            Some(crate::loop_recipe::wire::git_blob_oid(b"version: 0\nrecipe: a/b@1\n").as_str())
+        );
+    }
+
     fn init_repo_with_remotes(tag: &str, remotes: &[(&str, &str)]) -> std::path::PathBuf {
         let root = init_plain_repo(tag, "2026-01-01T00:00:00Z");
         for (name, url) in remotes {

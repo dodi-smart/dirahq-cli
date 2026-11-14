@@ -1,0 +1,61 @@
+# Thin caller, copy to <repo>/.github/workflows/pr-iterate.yml
+#
+# Opt-in: install it only in a repo whose agent PRs may run the fix loop. On a PR
+# that carries `agent:iterate` (issue-implement adds it when the issue's fields
+# allow, or a person does), the agent fixes red checks and review findings for a
+# few rounds, then the PR is marked ready, handed to a person, or, at the
+# highest autonomy tier only, squash-merged. Without this caller the label does
+# nothing.
+#
+# Each event below can move the loop. A run decides once and exits:
+#   pull_request labeled   someone applied `agent:iterate`
+#   workflow_run           PR Checks finished on a new head
+#   status                 pr-review posted `review / verdict`
+#   schedule               the sweep: open agent PRs that conflict with their base
+#   workflow_dispatch      the same sweep, by hand
+# The shared workflow's own `if:` drops every other case before a runner is
+# booked, so there is no pre-filter here.
+name: PR Iterate
+on:
+  pull_request:
+    types: [labeled]
+  # `workflows:` must match the PR Checks caller's `name:`. Agent branches are
+  # feat/, fix/ or chore/, so dependency PRs' PR Checks runs create no run here.
+  workflow_run:
+    workflows: [PR Checks]
+    types: [completed]
+    branches: ['feat/**', 'fix/**', 'chore/**']
+  status:
+  # A PR that conflicts with its base gets no PR Checks, so no event above
+  # reaches it. The shared workflow's sweep finds those PRs and merges the base
+  # in; it runs after every land, and on this schedule as a backstop.
+  schedule:
+    - cron: '41 */4 * * *'
+  workflow_dispatch:
+jobs:
+  iterate:
+    uses: dodi-smart/.github/.github/workflows/pr-iterate.yml@v1
+    # Exactly the secrets the shared workflow declares, instead of
+    # `secrets: inherit`. The fix round runs the repo's own checks; if those
+    # need a repo secret, the shared workflow has to declare it first.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_APP_CLIENT_ID: ${{ secrets.GH_APP_CLIENT_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+      AGENT_ENV_SECRET: ${{ secrets.AGENT_ENV_SECRET }}
+    # The union of what the called workflow's jobs request. A caller has to grant
+    # every one of them or the run fails at startup; add to this block when the
+    # shared workflow adds a permission. Pushes, labels and the merge use the
+    # org App token.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      checks: read
+      statuses: read
+      actions: read
+      id-token: write
+    # with:
+    #   max-rounds: 3
+    #   max-cost-usd: 20      # agent spend per issue at which the loop gives up
+    #   runner-weight: heavy   # a fix round builds and tests

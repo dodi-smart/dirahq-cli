@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "dira"
-version = "0.13.0"
+version = "0.14.0-develop.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "dira-contract"
-version = "0.13.0"
+version = "0.14.0-develop.1"
 dependencies = [
  "schemars",
  "serde",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "dira-core"
-version = "0.13.0"
+version = "0.14.0-develop.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1084,6 +1084,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "serde_norway",
+ "sha1",
  "sha2 0.11.1",
  "sqlx",
  "tempfile",
@@ -1097,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "dira-ipc"
-version = "0.13.0"
+version = "0.14.0-develop.1"
 dependencies = [
  "libc",
  "tempfile",
@@ -1107,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "dira-meetings"
-version = "0.13.0"
+version = "0.14.0-develop.1"
 dependencies = [
  "dira-contract",
  "proptest",
@@ -1119,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "dira-sources"
-version = "0.13.0"
+version = "0.14.0-develop.1"
 dependencies = [
  "dira-contract",
  "dira-core",
@@ -1129,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "dirad"
-version = "0.13.0"
+version = "0.14.0-develop.1"
 dependencies = [
  "anyhow",
  "axum",

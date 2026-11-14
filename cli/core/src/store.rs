@@ -780,6 +780,15 @@ impl Store {
         Ok(())
     }
 
+    /// Delete every `meta` key that starts with `prefix`.
+    pub async fn meta_delete_prefix(&self, prefix: &str) -> Result<u64, Error> {
+        let res = sqlx::query("DELETE FROM meta WHERE substr(key, 1, length(?1)) = ?1")
+            .bind(prefix)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Read the per-repo zavet override: `Some(true)` = forced on, `Some(false)`
     /// = forced off, `None` = follow the global `modules.zavet` knob. Keyed in
     /// `meta` as `zavet_override:<canonical repo>`.
@@ -912,6 +921,11 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        // Acknowledged loop lints (DIRASH-0070) are per-repo cursors too.
+        sqlx::query("DELETE FROM meta WHERE substr(key, 1, length(?1)) = ?1")
+            .bind(crate::sync::knowledge::META_KNOWLEDGE_LOOP_LINT_PREFIX)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok((events, tokens))
     }
@@ -5362,6 +5376,10 @@ mod tests {
             .unwrap();
         // A per-session token offset (Phase 1c) and a rollup row.
         store.meta_set("token_offset:s1", "1234").await.unwrap();
+        store
+            .meta_set("knowledge_loop_lint:github.com/acme/api", "{}")
+            .await
+            .unwrap();
         store.meta_set("token_offset:s2", "5678").await.unwrap();
         store
             .compact(
@@ -5377,6 +5395,14 @@ mod tests {
         // Both token offsets are cleared so a nuked slate re-captures tokens.
         assert_eq!(store.meta_get("token_offset:s1").await.unwrap(), None);
         assert_eq!(store.meta_get("token_offset:s2").await.unwrap(), None);
+        // So is a loop lint's ack, or the fresh slate would never re-send it.
+        assert_eq!(
+            store
+                .meta_get("knowledge_loop_lint:github.com/acme/api")
+                .await
+                .unwrap(),
+            None
+        );
         // Rollups are wiped too.
         assert!(store.rollup_totals_since(None).await.unwrap().is_empty());
     }

@@ -58,14 +58,15 @@ jobs:
       # already compiles every target, so there is no separate typecheck.
       lint: cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
       typecheck: ""
-      # Tests, then the contract drift gate: re-emit every schema and the
-      # signing vector and fail if any differs from what is committed. The cloud
+      # Tests, then the contract drift gate: re-emit every schema, the signing
+      # vector and the loop-lint conformance fixture, and fail if any differs from what is committed. The cloud
       # generates its Zod/TS from these files, so a stale one ships a wrong
       # boundary downstream while the tests stay green.
       test: >-
         cargo test --workspace
         && cargo run -q -p dira-contract --bin emit-schema
         && cargo run -q -p dira-core --bin sign_vector > contract/testdata/signing-vector.json
+        && cargo run -q -p dira-core --bin loop_lint_vector > contract/testdata/loop-lint-vector.json
         && { git diff --exit-code -- contract/ || { echo "::error::contract artifacts are stale, run 'just contract'"; false; }; }
       # Release binaries are build-release.yml's job (D-0015); a PR release build
       # would only repeat the test compile at a higher opt level.

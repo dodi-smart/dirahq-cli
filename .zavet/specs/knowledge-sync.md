@@ -1,15 +1,15 @@
 ---
 title: Knowledge sync — the consent-gated second channel
-version: 3
+version: 4
 origin: session
 verified: false
 confidence: medium
-date: 2026-10-15
+date: 2026-11-14
 paths:
   - cli/core/src/sync/knowledge.rs
   - cli/dirad/src/knowledge_sync.rs
   - cli/dirad/src/zavet_sources.rs
-decisions: [D-0001, D-0020, DIRASH-0028, DIRASH-0030, DIRASH-0039, DIRASH-0040]
+decisions: [D-0001, D-0020, DIRASH-0028, DIRASH-0030, DIRASH-0039, DIRASH-0040, DIRASH-0070]
 ---
 
 ## Overview
@@ -89,6 +89,22 @@ code rather than recorded as it was built.
     `Spec:` names a captured slug; `None` when the repo has no spec). Both
     stay in the metadata retry.
   - `SessionRollup.spec` is the slug only (D-0001).
+
+- **Loop lints** (contract 2.2.0, DIRASH-0070). For each known repo with a
+  `.dira/loop.yml`, the daemon runs `dira loop lint`'s code and sends a
+  `KnowledgeLoopLint`: recipe path, git blob oid, catalogue version, and each
+  loop check's id and status, plus a finding's severity and the decision id
+  of an override that changed it. It needs no `.zavet/`. An entry is sent when its
+  fingerprint (the serialized entry) differs from the last one the cloud
+  acknowledged for that repo (`knowledge_loop_lint:<repo>` in `meta`), so an
+  unchanged recipe is not re-sent every flush, and a dira whose rules changed
+  re-sends the new statuses. The final chunk carries these keys as its acks,
+  written only on a 2xx like a cursor, and a `dataEpoch` change or `nuke`
+  deletes them all. Entries ride the final chunk and join the batch id with
+  the build time, so a recipe reverted to an earlier blob is not no-op'd as a
+  replay. The blob oid comes from `git hash-object` when the checkout has CRLF
+  line ends, so it matches the committed blob. Entries survive the metadata
+  retry: they are metadata at every tier.
 
 ## Interfaces & data
 

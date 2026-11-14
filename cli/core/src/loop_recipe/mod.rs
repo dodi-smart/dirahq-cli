@@ -6,13 +6,15 @@
 //! that the recipe alone can decide. It reads; it never edits.
 //!
 //! Local configuration only: the schema lives here, not in `/contract`, and
-//! nothing sends a recipe off the machine (DIRASH-0068). Spec:
+//! the recipe never leaves the machine (DIRASH-0068). Only check ids and
+//! statuses do, through [`wire`] (DIRASH-0070). Spec:
 //! `.zavet/specs/loop-recipe.md`.
 
 pub mod checks;
 pub mod policy;
 mod refs;
 pub mod schema;
+pub mod wire;
 
 pub use schema::{Recipe, Severity};
 use serde::Serialize;

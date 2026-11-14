@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 
 /// The current wire schema version. Bump the major when making a breaking change;
 /// the cloud rejects unknown majors.
-pub const SCHEMA_VERSION: &str = "2.1.0";
+pub const SCHEMA_VERSION: &str = "2.2.0";
 
 /// A signed batch as it travels over the wire to `POST /api/v1/ingest`.
 ///
@@ -1028,6 +1028,12 @@ pub struct KnowledgeBatch {
     /// Per-repo coverage/capture snapshot (see [`KnowledgeRepoStats`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repo_stats: Vec<KnowledgeRepoStats>,
+    /// 2.2: `dira loop lint` results for repos that hold a loop recipe (see
+    /// [`KnowledgeLoopLint`]). Metadata at every tier (D-0001, DIRASH-0070), so
+    /// [`KnowledgeBatch::strip_content`] leaves it alone. Optional and skipped
+    /// when empty so older payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loop_lints: Vec<KnowledgeLoopLint>,
 }
 
 impl KnowledgeBatch {
@@ -1505,6 +1511,72 @@ pub struct KnowledgeRepoStats {
     pub spec_cited_commits: Option<u32>,
 }
 
+/// One repo's loop recipe lint, as `dira loop lint` computed it on the device
+/// (DIRASH-0070). The cloud's loop assay scores it (proba D-0098).
+///
+/// Ids, enums and a content identity only: no finding summary, no remedy, no
+/// override reason, no recipe text. The recipe is named by its repo-relative
+/// path and its git blob oid, which the cloud can compare with the blob it
+/// reads through the GitHub App without either side shipping the file.
+/// Upserted per (repo, recipe blob) cloud-side: a snapshot, not a stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeLoopLint {
+    /// Canonical repo ref, e.g. `github.com/acme/api`.
+    pub repo_canonical: String,
+    /// Repo-relative path of the recipe, `.dira/loop.yml` by default.
+    pub recipe_path: String,
+    /// Git blob oid of the recipe file as linted (`git hash-object`: SHA-1 of
+    /// `"blob <len>\0"` + bytes, lowercase hex). The recipe's content identity.
+    pub recipe_blob_oid: String,
+    /// The `CATALOGUE_VERSION` of `contract/check-catalogue.json` the lint ran
+    /// against, so the cloud reads each id with the right definition.
+    pub catalogue_version: u32,
+    /// One result per loop check (`L1`..`L15`), in catalogue order. Empty when
+    /// the recipe does not parse, names an unsupported version, or has a broken
+    /// reference: the lint stops before the review checks then.
+    #[serde(default)]
+    pub results: Vec<LoopLintResult>,
+}
+
+/// One loop check's outcome. Severity overrides are already applied: a check
+/// the recipe turned `off` reads `pass`, as `dira loop lint` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopLintResult {
+    /// A loop check id from the catalogue, `L1`..`L15`.
+    pub id: String,
+    pub status: LoopLintStatus,
+    /// For `warn` and `fail` only: the severity after the recipe's overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<LoopLintSeverity>,
+    /// The decision id the recipe's override cites, when an override changed
+    /// this check's severity (an `off` override that turns it into `pass`
+    /// included). An id only; the override's reason stays local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overridden_by: Option<String>,
+}
+
+/// A finding's severity after overrides. `off` never appears: an `off`
+/// finding reads `pass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LoopLintSeverity {
+    Required,
+    Advisory,
+}
+
+/// A loop check's status, `dira loop lint`'s level renamed for the wire
+/// (`ok` is `pass`). A check whose inputs are missing skips, never fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LoopLintStatus {
+    Pass,
+    Warn,
+    Fail,
+    Skip,
+}
+
 /// One declared spec-framework source in a repo, with its unit census.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1962,6 +2034,19 @@ mod tests {
                     by_state: BTreeMap::from([("active".into(), 2), ("archived".into(), 1)]),
                 }],
                 spec_cited_commits: Some(12),
+            }],
+            // Populated so the content-token walk covers the 2.2 field.
+            loop_lints: vec![KnowledgeLoopLint {
+                repo_canonical: "github.com/acme/api".into(),
+                recipe_path: ".dira/loop.yml".into(),
+                recipe_blob_oid: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".into(),
+                catalogue_version: 2,
+                results: vec![LoopLintResult {
+                    id: "L1".into(),
+                    status: LoopLintStatus::Warn,
+                    severity: Some(LoopLintSeverity::Advisory),
+                    overridden_by: Some("DODI-00065".into()),
+                }],
             }],
         }
     }
@@ -2508,8 +2593,10 @@ mod tests {
             trailer_refs: vec![],
             guard_events: vec![],
             repo_stats: vec![],
+            loop_lints: vec![],
         };
         let json = serde_json::to_string(&batch).unwrap();
+        assert!(!json.contains("loopLints"));
         assert!(!json.contains("decisions"));
         assert!(!json.contains("guardEvents"));
         assert!(!json.contains("repoStats"));

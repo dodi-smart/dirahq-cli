@@ -122,6 +122,7 @@ agent context at session start. Keep it short and non-negotiable.
 - DIRASH-0067 — Meeting restatements sync when the cloud advertises restatement windows, and the day ledger clips like the cloud (active)
 - DIRASH-0068 — The loop recipe schema lives in dira-core, not the contract (active)
 - DIRASH-0069 — The check catalogue ships in the contract, the recipe still does not (active)
+- DIRASH-0070 — Loop lint results ride the knowledge channel as ids and statuses (active)
 
 ### Living specs (.zavet/specs/ — keep current while you work)
 

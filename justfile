@@ -41,8 +41,14 @@ contract-schema:
 vector:
     cargo run -q -p dira-core --bin sign_vector > contract/testdata/signing-vector.json
 
-# Regenerate both contract artifacts (schema + signing fixture).
-contract: contract-schema vector
+# Emit the loop-lint conformance fixture: recipes and the exact L1..L10 statuses
+# `dira loop lint` gives them. The cloud's TypeScript port tests against it
+# (DIRASH-0070).
+loop-vector:
+    cargo run -q -p dira-core --bin loop_lint_vector > contract/testdata/loop-lint-vector.json
+
+# Regenerate every contract artifact (schema + signing and loop-lint fixtures).
+contract: contract-schema vector loop-vector
 
 # Refresh the bundled model-price table from models.dev.
 #

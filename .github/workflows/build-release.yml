@@ -230,7 +230,7 @@ jobs:
           }
           Write-Host "both binaries are free of VCRUNTIME140 / api-ms-win-crt-* imports"
 
-  # Attach the contract artifacts (schema + signing fixture) and both installers to the
+  # Attach the contract artifacts (schemas + signing and loop-lint fixtures) and both installers to the
   # release so the cloud repo's `just contract-pull` and
   # https://github.com/dodi-smart/dirahq-cli/releases/latest/download/{install.sh,install.ps1}
   # (permanent fallback URLs) all work with no sibling checkout.
@@ -258,6 +258,7 @@ jobs:
             contract/responses.schema.json \
             contract/check-catalogue.json \
             contract/testdata/signing-vector.json \
+            contract/testdata/loop-lint-vector.json \
             install.sh \
             install.ps1 \
             --clobber

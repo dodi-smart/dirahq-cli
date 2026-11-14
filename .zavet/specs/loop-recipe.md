@@ -1,6 +1,6 @@
 ---
 title: Loop recipe v0 and dira loop lint
-version: 2
+version: 3
 origin: session
 verified: false
 confidence: medium
@@ -10,7 +10,8 @@ paths:
   - cli/dira/src/loop_cmd.rs
   - examples/loops/**
   - contract/src/catalogue.rs
-decisions: [D-0001, DIRASH-0022, DIRASH-0068, DIRASH-0069]
+  - contract/testdata/loop-lint-vector.json
+decisions: [D-0001, DIRASH-0022, DIRASH-0068, DIRASH-0069, DIRASH-0070]
 checks:
   - the DODI factory example lints clean :: cargo test -p dira-core -- loop_recipe::tests::the_dodi_factory_example_lints_clean
   - an unknown field is a schema failure with its line :: cargo test -p dira-core -- loop_recipe::tests::an_unknown_field_fails_with_a_line
@@ -23,6 +24,8 @@ checks:
   - a proba-backed gate is observed and an unknown id is a finding :: cargo test -p dira-core -- loop_recipe::checks::tests::a_proba_backed_gate_is_observed_and_an_unknown_id_is_a_finding
   - a required gate makes its proba check required :: cargo test -p dira-core -- loop_recipe::policy::tests::a_required_gate_makes_its_check_required_and_the_stricter_gate_wins
   - the dial is stated or derived from the rung :: cargo test -p dira-core -- loop_recipe::policy::tests::the_dial_is_stated_or_derived_from_the_rung
+  - only loop check ids and statuses cross :: cargo test -p dira-core --lib -- loop_recipe::wire::tests
+  - the loop-lint conformance fixture is current :: cargo test -p dira-core --test loop_lint_vector
   - exit codes follow doctor :: cargo test -p dira --bin dira -- loop_cmd::tests::exit_codes_follow_doctor
 ---
 
@@ -46,6 +49,17 @@ that exists; it does not run one.
 The recipe is local configuration, read from disk and never sent anywhere.
 It lives in `dira-core` (`cli/core/src/loop_recipe/`), not in `/contract`:
 see DIRASH-0068.
+
+The lint result does leave the machine, as metadata only (DIRASH-0070). When
+knowledge sync is on, the daemon lints each repo's `.dira/loop.yml` and sends
+a `loopLints[]` entry on the knowledge channel: the recipe path, its git blob
+oid, the catalogue version, and each loop check's id and status (`pass`,
+`warn`, `fail`, `skip`), a finding's severity after overrides, and the
+decision id an override cites (`overriddenBy`). Summaries, remedies, override reasons and the
+`recipe.*` results stay local. `loop_recipe::wire` builds the entry.
+`contract/testdata/loop-lint-vector.json` pins the `L1`..`L10` statuses for a
+set of recipes, so the cloud's TypeScript port of those checks can test
+against the Rust rules. `just loop-vector` regenerates it.
 
 **Loop checks and proba checks.** The two judge different things. A loop
 check judges the loop's design, offline, from the recipe. A proba check judges
@@ -194,7 +208,8 @@ high; L4, L5, L9, L11, L12, L14 medium; L10, L13 low.
   `lint` in v0.
 - Evaluating rule expressions, or fetching anything from a tracker or host.
 - Sending the recipe to the cloud. If a later phase needs the cloud to read a
-  recipe, that is a new decision and a new wire record (DIRASH-0068).
+  recipe, that is a new decision and a new wire record (DIRASH-0068). Lint
+  results are not the recipe: their ids and statuses cross (DIRASH-0070).
 - Budgets enforcement or a readiness record. `budgets` is read only so L8 can
   credit it.
 

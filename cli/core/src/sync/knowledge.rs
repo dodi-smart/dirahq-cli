@@ -316,6 +316,7 @@ pub fn build_knowledge_batches(
             trailer_refs: Vec::new(),
             guard_events: slice.iter().map(event_to_wire).collect(),
             repo_stats: Vec::new(),
+            loop_lints: Vec::new(),
         };
         if is_last {
             batch.decisions = decisions

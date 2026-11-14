@@ -72,6 +72,13 @@
             "$ref": "#/$defs/KnowledgeGuardEvent"
           }
         },
+        "loopLints": {
+          "description": "2.2: `dira loop lint` results for repos that hold a loop recipe (see\n[`KnowledgeLoopLint`]). Metadata at every tier (D-0001, DIRASH-0070), so\n[`KnowledgeBatch::strip_content`] leaves it alone. Optional and skipped\nwhen empty so older payloads stay byte-identical.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KnowledgeLoopLint"
+          }
+        },
         "repoStats": {
           "description": "Per-repo coverage/capture snapshot (see [`KnowledgeRepoStats`]).",
           "type": "array",
@@ -305,6 +312,44 @@
         "at",
         "decisionId",
         "kind"
+      ]
+    },
+    "KnowledgeLoopLint": {
+      "description": "One repo's loop recipe lint, as `dira loop lint` computed it on the device\n(DIRASH-0070). The cloud's loop assay scores it (proba D-0098).\n\nIds, enums and a content identity only: no finding summary, no remedy, no\noverride reason, no recipe text. The recipe is named by its repo-relative\npath and its git blob oid, which the cloud can compare with the blob it\nreads through the GitHub App without either side shipping the file.\nUpserted per (repo, recipe blob) cloud-side: a snapshot, not a stream.",
+      "type": "object",
+      "properties": {
+        "catalogueVersion": {
+          "description": "The `CATALOGUE_VERSION` of `contract/check-catalogue.json` the lint ran\nagainst, so the cloud reads each id with the right definition.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "recipeBlobOid": {
+          "description": "Git blob oid of the recipe file as linted (`git hash-object`: SHA-1 of\n`\"blob <len>\\0\"` + bytes, lowercase hex). The recipe's content identity.",
+          "type": "string"
+        },
+        "recipePath": {
+          "description": "Repo-relative path of the recipe, `.dira/loop.yml` by default.",
+          "type": "string"
+        },
+        "repoCanonical": {
+          "description": "Canonical repo ref, e.g. `github.com/acme/api`.",
+          "type": "string"
+        },
+        "results": {
+          "description": "One result per loop check (`L1`..`L15`), in catalogue order. Empty when\nthe recipe does not parse, names an unsupported version, or has a broken\nreference: the lint stops before the review checks then.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/LoopLintResult"
+          }
+        }
+      },
+      "required": [
+        "repoCanonical",
+        "recipePath",
+        "recipeBlobOid",
+        "catalogueVersion"
       ]
     },
     "KnowledgeRepoStats": {
@@ -575,6 +620,59 @@
         "sha",
         "seq",
         "key"
+      ]
+    },
+    "LoopLintResult": {
+      "description": "One loop check's outcome. Severity overrides are already applied: a check\nthe recipe turned `off` reads `pass`, as `dira loop lint` reports it.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "A loop check id from the catalogue, `L1`..`L15`.",
+          "type": "string"
+        },
+        "overriddenBy": {
+          "description": "The decision id the recipe's override cites, when an override changed\nthis check's severity (an `off` override that turns it into `pass`\nincluded). An id only; the override's reason stays local.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "description": "For `warn` and `fail` only: the severity after the recipe's overrides.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoopLintSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/LoopLintStatus"
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ]
+    },
+    "LoopLintSeverity": {
+      "description": "A finding's severity after overrides. `off` never appears: an `off`\nfinding reads `pass`.",
+      "type": "string",
+      "enum": [
+        "required",
+        "advisory"
+      ]
+    },
+    "LoopLintStatus": {
+      "description": "A loop check's status, `dira loop lint`'s level renamed for the wire\n(`ok` is `pass`). A check whose inputs are missing skips, never fails.",
+      "type": "string",
+      "enum": [
+        "pass",
+        "warn",
+        "fail",
+        "skip"
       ]
     },
     "RepoSpecSource": {

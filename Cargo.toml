@@ -89,6 +89,10 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 # Note: sha2 0.11 (digest 0.11) dropped the hasher's `io::Write` impl, so
 # `verify_sha256` streams the file through `update()` instead of `io::copy`.
 sha2 = "0.11"
+# The git blob oid that names a loop recipe on the knowledge wire
+# (DIRASH-0070), computed in-process so it matches what GitHub reports for the
+# same file. Same digest 0.11 line as sha2; already in the tree.
+sha1 = "0.11"
 # Hex-encode/decode the sha256 digest `dira update` compares against the
 # published `.sha256` asset. Already resolved transitively (sqlx-macros-core);
 # promoted to a direct dep rather than added fresh.

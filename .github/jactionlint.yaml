@@ -47,10 +47,6 @@ ignores:
     uses: dodi-smart/.github/*
     reason: the shared checks run the repo's own build, which needs the repo's own secrets
   - rule: secrets-inherit
-    file: .github/workflows/pr-iterate.yml
-    uses: dodi-smart/.github/*
-    reason: the shared fix loop needs the Claude token and the org App secrets
-  - rule: secrets-inherit
     file: .github/workflows/pr-review.yml
     uses: dodi-smart/.github/*
     reason: the shared review workflow needs the org App and Claude secrets

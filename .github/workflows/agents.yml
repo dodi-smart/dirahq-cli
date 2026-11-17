@@ -36,9 +36,13 @@ on:
 # here too. See references/hooks.md, "Caller permissions".
 jobs:
   # Triggers: apply the `agent:triage` label, or comment `@claude triage` /
-  # `@claude plan`. The bare `/triage` and `/plan` forms were retired: three
-  # surfaces for one action meant the exclusion guard in claude.yml had to be
-  # hand-synced with this list in every repo, and it had already drifted.
+  # `@claude plan`. A plain comment on an issue carrying a `needs:*` label is
+  # also passed on: it may be the answer to triage's questions. The shared
+  # workflow runs triage again only if `Triage state` is still `Needs info`.
+  # A bot's comment never passes, or triage's own reply would restart it.
+  # The bare `/triage` and `/plan` forms were retired: three surfaces for one
+  # action meant the exclusion guard in claude.yml had to be hand-synced with
+  # this list in every repo, and it had already drifted.
   triage:
     # The reusable workflow gates internally (bots, commands, agent:no-touch),
     # but this cheap pre-filter keeps unrelated comment traffic from starting a
@@ -47,6 +51,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch'
       || (github.event_name == 'issue_comment' && (contains(github.event.comment.body, '@claude triage') || contains(github.event.comment.body, '@claude plan')))
+      || (github.event_name == 'issue_comment' && github.event.sender.type != 'Bot'
+          && !github.event.issue.pull_request && !contains(github.event.comment.body, '@claude')
+          && contains(join(github.event.issue.labels.*.name, ' '), 'needs:'))
       || (github.event_name == 'issues' && github.event.action != 'labeled')
       || (github.event_name == 'issues' && github.event.label.name == 'agent:triage')
     uses: dodi-smart/.github/.github/workflows/issue-triage.yml@v1
@@ -83,6 +90,17 @@ jobs:
     # with:
     #   runner-weight: heavy      # the default; implementing means building
     #   base-branch: develop      # defaults to the repo's default branch, develop
+
+  # Triggers: a person applies `agent:decompose` to an Epic or an Initiative
+  # whose triage proposed children. A script, not an agent, creates them as
+  # sub-issues. A bot applying the label is refused: the person is the point.
+  decompose:
+    if: >-
+      github.event_name == 'issues' && github.event.action == 'labeled'
+      && github.event.label.name == 'agent:decompose' && github.event.sender.type != 'Bot'
+    uses: dodi-smart/.github/.github/workflows/issue-decompose.yml@v1
+    permissions:
+      issues: write
 
   # THIS REPLACES claude.yml (as claude-assist.yml did). Delete claude.yml too,
   # if it is still there — it never checked `agent:no-touch`.

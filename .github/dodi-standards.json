@@ -11,9 +11,9 @@
     },
     ".github/jactionlint.yaml": {
       "kind": "rendered",
-      "sha256": "56ae569e233745eace56b2618fd65b740f4d5b04a7f46e7f847f14c2ca9664a2",
+      "sha256": "59c270f9707aaedb06f50e7c9d8bad3839e90c23639808267ef30909a724e63c",
       "template": "jactionlint.yaml",
-      "version": "1.25.3"
+      "version": "1.46.0"
     },
     ".github/renovate.json5": {
       "kind": "seeded",
@@ -39,11 +39,29 @@
       "template": "workflows/deps-verify.yml",
       "version": "1.36.0"
     },
+    ".github/workflows/dispatch.yml": {
+      "kind": "rendered",
+      "sha256": "a865d25538d60c1cbbd7374153ff7d78bae6364c9a6f89c9d7ebd235bc6986f3",
+      "template": "workflows/dispatch.yml",
+      "version": "1.46.0"
+    },
+    ".github/workflows/judge.yml": {
+      "kind": "rendered",
+      "sha256": "8467b7553717f1dc59c6b3e8ff48ba16b16647bce2134f674d33a86b7c4a4647",
+      "template": "workflows/judge.yml",
+      "version": "1.46.0"
+    },
     ".github/workflows/pr-checks.yml": {
       "kind": "rendered",
       "sha256": "866f910f8f1c6a7ab9b1b95b7de84bec78c5f75523d220af742ca0d257969820",
       "template": "workflows/pr-checks.yml",
       "version": "1.36.0"
+    },
+    ".github/workflows/pr-iterate.yml": {
+      "kind": "rendered",
+      "sha256": "255fb0771795c0bcc485d60a4e9ca54349c84eca12004338cab5214e386754d7",
+      "template": "workflows/pr-iterate.yml",
+      "version": "1.46.0"
     },
     ".github/workflows/pr-review.yml": {
       "kind": "rendered",
@@ -60,9 +78,9 @@
     },
     ".gitleaks.toml": {
       "kind": "seeded",
-      "sha256": "4984cf5b022a8222da5009f7ee38e9a12a609ab1c15f2fa175e318ca947aa6c9",
+      "sha256": "02ffd577fc834b401db54c391bfd1dd5e521c84cc0b902891fbf5c9055ec29c8",
       "template": "gitleaks.toml",
-      "version": "1.25.3"
+      "version": "1.46.0"
     },
     "SECURITY.md": {
       "kind": "filled",
@@ -84,9 +102,9 @@
     },
     "mise.toml": {
       "kind": "seeded",
-      "sha256": "d8782eff4b0cb8c680eb225228e4e77c34950a90c83845b691ae94dd4abfb6a0",
+      "sha256": "bdbc0dd46c337a8d946d2bae2c04f3c26d62120d7a2915b917252927ed0d756a",
       "template": "mise.toml",
-      "version": "1.28.0"
+      "version": "1.46.0"
     },
     "typos.toml": {
       "kind": "seeded",
@@ -106,5 +124,5 @@
   },
   "schema": 1,
   "stack": "rust",
-  "version": "1.36.2"
+  "version": "1.46.0"
 }

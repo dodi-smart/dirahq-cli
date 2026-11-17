@@ -23,9 +23,9 @@
     },
     ".github/workflows/agents.yml": {
       "kind": "rendered",
-      "sha256": "cea19350c2bdec760aaaf9f8ce563be421cfdf4ebbc6ebe3beaf221536ba1b65",
+      "sha256": "80f166854d85daf5922c53088c4590ad68539f17269800830b9743ae7fb17ec1",
       "template": "workflows/agents.yml",
-      "version": "1.25.3"
+      "version": "1.46.0"
     },
     ".github/workflows/deps-automerge.yml": {
       "kind": "rendered",

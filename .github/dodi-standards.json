@@ -102,9 +102,9 @@
     },
     "mise.toml": {
       "kind": "seeded",
-      "sha256": "bdbc0dd46c337a8d946d2bae2c04f3c26d62120d7a2915b917252927ed0d756a",
+      "sha256": "cb3cfd41d33a88e54b6295d9b3b02068783c3a425d732a1582dffd38f22ac8cc",
       "template": "mise.toml",
-      "version": "1.46.0"
+      "version": "1.52.0"
     },
     "typos.toml": {
       "kind": "seeded",
@@ -124,5 +124,5 @@
   },
   "schema": 1,
   "stack": "rust",
-  "version": "1.46.0"
+  "version": "1.52.0"
 }
